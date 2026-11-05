@@ -170,6 +170,42 @@ const MIGRATIONS: ReadonlyArray<string> = [
     value text not null
   );
   `,
+  // 8: scheduled tasks and heartbeats.
+  `
+  create table schedules (
+    id text primary key,
+    bot_id text not null references bots(id) on delete cascade,
+    kind text not null,                -- 'task' | 'heartbeat'
+    name text not null,
+    prompt text not null,
+    spec text not null,
+    timezone text not null,
+    provider text,                     -- task runs; null uses the bot's default worker
+    model text,
+    effort text,
+    cwd text,
+    enabled integer not null default 1,
+    created_by text not null,          -- 'user' | 'bot'
+    next_run_at integer,
+    last_run_at integer,
+    last_status text,
+    failure_streak integer not null default 0,
+    run_count integer not null default 0,
+    created_at integer not null,
+    updated_at integer not null
+  );
+  create index schedules_bot on schedules(bot_id);
+  create table schedule_runs (
+    id text primary key,
+    schedule_id text not null references schedules(id) on delete cascade,
+    session_id text references sessions(id) on delete set null,
+    started_at integer not null,
+    finished_at integer,
+    status text not null,
+    summary text
+  );
+  create index schedule_runs_schedule on schedule_runs(schedule_id, started_at);
+  `,
 ];
 
 export class Database extends Context.Service<Database, DatabaseSync>()("apollo/Database") {}

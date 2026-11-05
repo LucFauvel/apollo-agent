@@ -5,6 +5,7 @@ import { Auth } from "./auth/Auth.ts";
 import { Compaction } from "./Compaction.ts";
 import { LocalModels } from "./local/LocalModels.ts";
 import { ProviderSettings } from "./ProviderSettings.ts";
+import { Scheduler } from "./schedule/Scheduler.ts";
 import { SessionManager } from "./SessionManager.ts";
 import { Store } from "./Store.ts";
 
@@ -17,12 +18,16 @@ export const layer = ApolloRpcs.toLayer(
     const compaction = yield* Compaction;
     const providerSettings = yield* ProviderSettings;
     const localModels = yield* LocalModels;
+    const scheduler = yield* Scheduler;
     // Errors from the local-model service reach the UI as plain messages.
     const local = <A, R>(effect: Effect.Effect<A, Error, R>) =>
       effect.pipe(Effect.mapError((error) => new ApolloError({ code: "internal", message: error.message })));
 
     return {
-      "app.snapshot": () => manager.snapshot,
+      "app.snapshot": () =>
+        Effect.all([manager.snapshot, scheduler.list()]).pipe(
+          Effect.map(([snapshot, schedules]) => ({ ...snapshot, schedules })),
+        ),
       "app.changes": () =>
         Stream.merge(
           manager.changes,
@@ -42,6 +47,13 @@ export const layer = ApolloRpcs.toLayer(
       "localModels.cancelDownload": ({ model }) => local(localModels.cancelDownload(model)),
       "localModels.delete": ({ model }) => local(localModels.deleteModel(model)),
       "localModels.setDefault": ({ model }) => localModels.setDefault(model),
+
+      "schedules.create": (input) => scheduler.create(input, "user"),
+      "schedules.update": (input) => scheduler.update(input),
+      "schedules.delete": ({ scheduleId }) => scheduler.remove(scheduleId),
+      "schedules.runNow": ({ scheduleId }) => scheduler.runNow(scheduleId),
+      "schedules.runs": ({ scheduleId }) => scheduler.runs(scheduleId),
+      "schedules.preview": ({ spec, timezone }) => scheduler.preview(spec, timezone),
 
       "storage.report": () => compaction.report,
       "storage.compact": () => compaction.compact,

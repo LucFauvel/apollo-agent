@@ -93,6 +93,10 @@ function Item({ item, respond }: { item: TranscriptItem; respond: Responders }) 
         </div>
       );
     case "assistant":
+      // A scheduled run or heartbeat with nothing to report.
+      if (!item.streaming && item.text.trim() === "[SILENT]") {
+        return <div className="text-[11px] text-zinc-600 italic">Nothing to report.</div>;
+      }
       return (
         <div className="markdown text-sm leading-relaxed text-zinc-200">
           <Markdown remarkPlugins={[remarkGfm]}>{item.text}</Markdown>
@@ -182,11 +186,11 @@ function Composer({ session, disabled }: { session: Session; disabled: boolean }
 export function SessionView({
   session,
   bot,
-  onShowKnowledge,
+  onTogglePanel,
 }: {
   session: Session;
   bot: Bot;
-  onShowKnowledge: () => void;
+  onTogglePanel: (panel: "knowledge" | "schedules") => void;
 }) {
   const items = useTranscript(session.id);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -200,6 +204,11 @@ export function SessionView({
     ),
   );
   const tokens = session.usage.inputTokens + session.usage.outputTokens;
+  const scheduleCount = useApp((s) => {
+    let n = 0;
+    for (const schedule of s.schedules.values()) if (schedule.botId === bot.id && schedule.enabled) n++;
+    return n;
+  });
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -265,7 +274,10 @@ export function SessionView({
             Reflect
           </Button>
         ) : null}
-        <Button size="sm" variant="ghost" onClick={onShowKnowledge}>
+        <Button size="sm" variant="ghost" title="Scheduled tasks and heartbeats" onClick={() => onTogglePanel("schedules")}>
+          Schedules{scheduleCount > 0 ? <span className="text-zinc-500 tabular-nums">{scheduleCount}</span> : null}
+        </Button>
+        <Button size="sm" variant="ghost" onClick={() => onTogglePanel("knowledge")}>
           Knowledge
         </Button>
         {session.role !== "main" ? (

@@ -58,6 +58,16 @@ export const buildInstructions = (input: {
           "- Match the model and effort to the task: cheap and fast for simple work, stronger for hard problems.",
           "- If Apollo says the bot is paused, stop delegating and tell the user; only they can resume it.",
           "Summarize worker results for the user instead of pasting them verbatim.",
+          "",
+          "### Acting on your own",
+          "You can schedule work for later or for regular intervals with `apollo_schedule_create`:",
+          "- kind `task`: a self-contained job that runs in a fresh worker session (it does not see this conversation),",
+          "  e.g. a daily digest. Its result comes back to you as an `[Apollo]` message and the user gets a notification.",
+          "- kind `heartbeat`: a recurring prompt sent into this conversation, for check-ins that need your context.",
+          "- `schedule` reads like \"every 2h\", \"weekdays at 9am\", \"every monday 8:30\", \"in 30m\", \"tomorrow at 9am\" or cron.",
+          "Only schedule what the user asked for or clearly agreed to, and tell them what you set up.",
+          "`apollo_schedule_list`, `apollo_schedule_update` and `apollo_schedule_delete` manage schedules.",
+          "When a scheduled run or heartbeat has nothing worth telling the user, answer exactly `[SILENT]`.",
         ].join("\n"),
       );
       break;

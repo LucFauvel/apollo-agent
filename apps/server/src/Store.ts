@@ -430,6 +430,13 @@ const makeStore = (db: DatabaseSync) => {
         );
         return { sessionId, seq, at, event };
       }),
+    /** The session's last event seq (0 when it has none). */
+    latestSeq: (sessionId: SessionId) =>
+      Effect.sync(
+        () =>
+          lastSeq.get(sessionId) ??
+          Number(get("select max(seq) as seq from session_events where session_id = ?", sessionId)?.seq ?? 0),
+      ),
     listEvents: (sessionId: SessionId, afterSeq: number) =>
       Effect.sync(() =>
         all(

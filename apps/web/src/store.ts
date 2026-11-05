@@ -1,4 +1,15 @@
-import type { AppChange, AppSnapshot, Bot, BotId, LocalModelsState, Session, SessionId, Usage } from "@apollo/contracts";
+import type {
+  AppChange,
+  AppSnapshot,
+  Bot,
+  BotId,
+  LocalModelsState,
+  Schedule,
+  ScheduleId,
+  Session,
+  SessionId,
+  Usage,
+} from "@apollo/contracts";
 import * as Stream from "effect/Stream";
 import { useSyncExternalStore } from "react";
 import { follow } from "./rpc.ts";
@@ -13,7 +24,17 @@ export interface AppState {
   readonly knowledgeVersion: ReadonlyMap<BotId | "global", number>;
   /** llama.cpp engine, server and model library; loaded when first needed. */
   readonly localModels: LocalModelsState | null;
+  readonly schedules: ReadonlyMap<ScheduleId, Schedule>;
 }
+
+export type Notice = Extract<AppChange, { _tag: "Notify" }>;
+const noticeListeners = new Set<(notice: Notice) => void>();
+
+/** Calls `listener` for each notification the server sends while connected. */
+export const onNotify = (listener: (notice: Notice) => void) => {
+  noticeListeners.add(listener);
+  return () => void noticeListeners.delete(listener);
+};
 
 let state: AppState = {
   connected: false,
@@ -22,6 +43,7 @@ let state: AppState = {
   usageToday: new Map(),
   knowledgeVersion: new Map(),
   localModels: null,
+  schedules: new Map(),
 };
 const listeners = new Set<() => void>();
 
@@ -52,7 +74,8 @@ const apply = (change: AppChange) => {
       const bots = new Map(state.bots);
       bots.delete(change.botId);
       const sessions = new Map([...state.sessions].filter(([, s]) => s.botId !== change.botId));
-      return setState({ ...state, bots, sessions });
+      const schedules = new Map([...state.schedules].filter(([, s]) => s.botId !== change.botId));
+      return setState({ ...state, bots, sessions, schedules });
     }
     case "SessionUpserted":
       return setState({
@@ -71,6 +94,16 @@ const apply = (change: AppChange) => {
       return setState({ ...state, knowledgeVersion: bump(change.botId ?? "global") });
     case "LocalModelsChanged":
       return setState({ ...state, localModels: change.state });
+    case "ScheduleUpserted":
+      return setState({ ...state, schedules: new Map(state.schedules).set(change.schedule.id, change.schedule) });
+    case "ScheduleDeleted": {
+      const schedules = new Map(state.schedules);
+      schedules.delete(change.scheduleId);
+      return setState({ ...state, schedules });
+    }
+    case "Notify":
+      for (const listener of noticeListeners) listener(change);
+      return;
   }
 };
 
@@ -97,6 +130,7 @@ export const startSync = () =>
           bots: new Map(item.bots.map((b) => [b.id, b])),
           sessions: new Map(item.sessions.map((s) => [s.id, s])),
           usageToday: new Map(item.usageToday.map((u) => [u.botId, u.usage])),
+          schedules: new Map(item.schedules.map((s) => [s.id, s])),
         });
       } else {
         apply(item);

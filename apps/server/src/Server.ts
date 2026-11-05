@@ -14,6 +14,7 @@ import * as ApolloMcp from "./mcp/ApolloMcp.ts";
 import * as LocalModels from "./local/LocalModels.ts";
 import * as ProviderSettings from "./ProviderSettings.ts";
 import * as RpcHandlers from "./RpcHandlers.ts";
+import * as Scheduler from "./schedule/Scheduler.ts";
 import * as SessionManager from "./SessionManager.ts";
 import * as Store from "./Store.ts";
 
@@ -43,6 +44,7 @@ const layerHttpServer = Layer.unwrap(
 );
 
 const layerCore = Compaction.layer.pipe(
+  Layer.provideMerge(Scheduler.layer),
   Layer.provideMerge(SessionManager.layer),
   Layer.provideMerge(SessionManager.layerProviders),
   Layer.provideMerge(LocalModels.layer),

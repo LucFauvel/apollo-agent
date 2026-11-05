@@ -8,6 +8,9 @@ import {
   MemoryId,
   MemoryKind,
   ProviderKind,
+  type Schedule,
+  ScheduleId,
+  ScheduleKind,
   type Session,
   SessionId,
   SessionStatus,
@@ -22,6 +25,7 @@ import * as Schema from "effect/Schema";
 import { McpProtocol, McpServer, Tool, Toolkit } from "effect/ai";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { transcriptForReflection } from "../Instructions.ts";
+import { Scheduler } from "../schedule/Scheduler.ts";
 import { SessionManager } from "../SessionManager.ts";
 import { Store } from "../Store.ts";
 
@@ -251,6 +255,86 @@ const InterruptSession = Tool.make("apollo_interrupt_session", {
   success: Schema.Struct({}),
 });
 
+const ScheduleSummary = Schema.Struct({
+  id: ScheduleId,
+  kind: ScheduleKind,
+  name: Schema.String,
+  prompt: Schema.String,
+  schedule: Schema.String,
+  enabled: Schema.Boolean,
+  createdBy: Schema.String,
+  nextRunAt: Schema.NullOr(Schema.String),
+  lastRunAt: Schema.NullOr(Schema.String),
+  lastStatus: Schema.NullOr(Schema.String),
+});
+
+const iso = (at: number | null) => (at === null ? null : new Date(at).toISOString());
+
+const summarizeSchedule = (s: Schedule) => ({
+  id: s.id,
+  kind: s.kind,
+  name: s.name,
+  prompt: s.prompt,
+  schedule: `${s.description} (${s.timezone})`,
+  enabled: s.enabled,
+  createdBy: s.createdBy,
+  nextRunAt: iso(s.nextRunAt),
+  lastRunAt: iso(s.lastRunAt),
+  lastStatus: s.lastStatus,
+});
+
+const ScheduleList = Tool.make("apollo_schedule_list", {
+  ...shared,
+  description: "List this bot's scheduled tasks and heartbeats (orchestrator only).",
+  success: Schema.Struct({ schedules: Schema.Array(ScheduleSummary) }),
+}).annotate(Tool.Readonly, true);
+
+const ScheduleCreate = Tool.make("apollo_schedule_create", {
+  ...shared,
+  description: [
+    "Schedule work for later or on a recurring basis (orchestrator only; only for what the user asked for or agreed to).",
+    "kind `task`: `prompt` runs in a fresh worker session that does not see this conversation, so make it self-contained;",
+    "its result comes back to you and the user is notified. kind `heartbeat`: `prompt` is sent into this conversation.",
+    '`schedule`: "every 2h", "daily at 9am", "weekdays at 8:30", "every monday 9am", "in 30m", "tomorrow at 9am",',
+    '"2026-12-01 09:00" or a 5-field cron expression. Recurring schedules run at most every 5 minutes.',
+  ].join(" "),
+  parameters: Schema.Struct({
+    kind: ScheduleKind,
+    name: Schema.String,
+    prompt: Schema.String,
+    schedule: Schema.String,
+    /** IANA time zone; defaults to this machine's. */
+    timezone: Schema.optional(Schema.String),
+    /** Task runs only: provider, model and effort (defaults to the bot's worker settings). */
+    provider: Schema.optional(ProviderKind),
+    model: Schema.optional(Schema.String),
+    effort: Schema.optional(Schema.String),
+    cwd: Schema.optional(Schema.String),
+  }),
+  success: ScheduleSummary,
+});
+
+const ScheduleUpdate = Tool.make("apollo_schedule_update", {
+  ...shared,
+  description: "Change, pause (`enabled: false`) or resume one of this bot's schedules (orchestrator only).",
+  parameters: Schema.Struct({
+    id: ScheduleId,
+    name: Schema.optional(Schema.String),
+    prompt: Schema.optional(Schema.String),
+    schedule: Schema.optional(Schema.String),
+    timezone: Schema.optional(Schema.String),
+    enabled: Schema.optional(Schema.Boolean),
+  }),
+  success: ScheduleSummary,
+});
+
+const ScheduleDelete = Tool.make("apollo_schedule_delete", {
+  ...shared,
+  description: "Delete one of this bot's schedules (orchestrator only).",
+  parameters: Schema.Struct({ id: ScheduleId }),
+  success: Schema.Struct({}),
+});
+
 export const ApolloToolkit = Toolkit.make(
   MemorySearch,
   MemorySave,
@@ -266,6 +350,10 @@ export const ApolloToolkit = Toolkit.make(
   SendToSession,
   WaitSession,
   InterruptSession,
+  ScheduleList,
+  ScheduleCreate,
+  ScheduleUpdate,
+  ScheduleDelete,
 );
 
 const invalid = (message: string) => new ApolloError({ code: "invalid", message });
@@ -274,6 +362,27 @@ const handlers = ApolloToolkit.toLayer(
   Effect.gen(function* () {
     const store = yield* Store;
     const manager = yield* SessionManager;
+    const scheduler = yield* Scheduler;
+
+    /**
+     * Schedules belong to the orchestrator, and never to a turn a schedule started:
+     * a scheduled run that schedules more runs could multiply without anyone asking.
+     */
+    const scheduleCaller = Effect.gen(function* () {
+      const caller = yield* McpCaller;
+      if (caller.role !== "main") return yield* invalid("only the bot's orchestrator session can manage schedules");
+      if (yield* scheduler.isScheduledTurn(caller.sessionId)) {
+        return yield* invalid("schedules cannot be changed from a scheduled run or heartbeat; ask the user");
+      }
+      return caller;
+    });
+
+    const ownSchedule = (botId: BotId, id: ScheduleId) =>
+      Effect.gen(function* () {
+        const schedule = yield* scheduler.get(id);
+        if (schedule.botId !== botId) return yield* invalid("that schedule belongs to another bot");
+        return schedule;
+      });
 
     /** A session the caller may control: same bot, and not the caller itself. */
     const ownSession = (callerBot: BotId, id: SessionId) =>
@@ -493,6 +602,45 @@ const handlers = ApolloToolkit.toLayer(
           const caller = yield* McpCaller;
           yield* ownSession(caller.botId, sessionId);
           yield* manager.interrupt(sessionId);
+          return {};
+        }),
+
+      apollo_schedule_list: () =>
+        Effect.gen(function* () {
+          const caller = yield* McpCaller;
+          if (caller.role !== "main") return yield* invalid("only the bot's orchestrator session can manage schedules");
+          return { schedules: (yield* scheduler.list(caller.botId)).map(summarizeSchedule) };
+        }),
+
+      apollo_schedule_create: ({ kind, name, prompt, schedule, timezone, provider, model, effort, cwd }) =>
+        Effect.gen(function* () {
+          const caller = yield* scheduleCaller;
+          const bot = yield* store.getBot(caller.botId);
+          const base = provider && provider !== bot.defaultWorker.provider ? { provider } : null;
+          const selection =
+            base || model || effort
+              ? { ...(base ?? bot.defaultWorker), ...(model ? { model } : {}), ...(effort ? { effort } : {}) }
+              : null;
+          const created = yield* scheduler.create(
+            { botId: caller.botId, kind, name, prompt, spec: schedule, timezone, provider: selection, cwd },
+            "bot",
+          );
+          return summarizeSchedule(created);
+        }),
+
+      apollo_schedule_update: ({ id, name, prompt, schedule, timezone, enabled }) =>
+        Effect.gen(function* () {
+          const caller = yield* scheduleCaller;
+          yield* ownSchedule(caller.botId, id);
+          const updated = yield* scheduler.update({ scheduleId: id, name, prompt, spec: schedule, timezone, enabled });
+          return summarizeSchedule(updated);
+        }),
+
+      apollo_schedule_delete: ({ id }) =>
+        Effect.gen(function* () {
+          const caller = yield* scheduleCaller;
+          yield* ownSchedule(caller.botId, id);
+          yield* scheduler.remove(id);
           return {};
         }),
     };

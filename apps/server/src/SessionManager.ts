@@ -774,6 +774,16 @@ const make = Effect.gen(function* () {
         return bot;
       }),
 
+    /** Publishes a change to every connected client. */
+    publish,
+    /** Notes that the orchestrator's next turn was started by a schedule, not by a runaway loop. */
+    resetAutonomy: (botId: BotId) => Effect.sync(() => void autonomousTurns.delete(botId)),
+    appendNotice: (id: SessionId, level: "info" | "warning" | "error", message: string) =>
+      appendEvent(id, { _tag: "Notice", level, message }).pipe(Effect.asVoid),
+    isBusy: (id: SessionId) => Effect.map(store.getSession(id), (s) => isBusy(s.status)),
+    busyWorkers: (botId: BotId) =>
+      Effect.map(busySessions(botId), (sessions) => sessions.filter((s) => s.role === "worker").length),
+
     resumeBot: (botId: BotId) =>
       Effect.gen(function* () {
         const current = yield* store.getBot(botId);

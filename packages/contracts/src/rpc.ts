@@ -1,5 +1,13 @@
 import * as Schema from "effect/Schema";
 import { Rpc, RpcGroup } from "effect/rpc";
+import {
+  CreateScheduleInput,
+  Schedule,
+  ScheduleId,
+  SchedulePreview,
+  ScheduleRun,
+  UpdateScheduleInput,
+} from "./schedule.ts";
 import { LlamaBackend, LocalModelsState, ModelCandidate, ModelDetails, SuggestedModel } from "./local.ts";
 import {
   ApprovalDecision,
@@ -46,6 +54,16 @@ export const AppChange = Schema.Union([
   Schema.TaggedStruct("SkillChanged", { botId: Schema.NullOr(BotId) }),
   Schema.TaggedStruct("BotUsageToday", { botId: BotId, usage: Usage }),
   Schema.TaggedStruct("LocalModelsChanged", { state: LocalModelsState }),
+  Schema.TaggedStruct("ScheduleUpserted", { schedule: Schedule }),
+  Schema.TaggedStruct("ScheduleDeleted", { scheduleId: ScheduleId, botId: BotId }),
+  /** Something the user should see now: clients show it as a desktop notification. */
+  Schema.TaggedStruct("Notify", {
+    botId: BotId,
+    /** The session to open when the notification is clicked. */
+    sessionId: Schema.NullOr(SessionId),
+    title: Schema.String,
+    body: Schema.String,
+  }),
 ]);
 export type AppChange = typeof AppChange.Type;
 
@@ -54,6 +72,7 @@ export const AppSnapshot = Schema.Struct({
   sessions: Schema.Array(Session),
   /** Each bot's usage today (server local time). */
   usageToday: Schema.Array(Schema.Struct({ botId: BotId, usage: Usage })),
+  schedules: Schema.Array(Schedule),
 });
 export type AppSnapshot = typeof AppSnapshot.Type;
 
@@ -169,6 +188,20 @@ export class ApolloRpcs extends RpcGroup.make(
     success: SessionEvent,
     error,
     stream: true,
+  }),
+
+  // --- schedules (bots acting on their own) -------------------------------
+  Rpc.make("schedules.create", { payload: CreateScheduleInput, success: Schedule, error }),
+  Rpc.make("schedules.update", { payload: UpdateScheduleInput, success: Schedule, error }),
+  Rpc.make("schedules.delete", { payload: { scheduleId: ScheduleId }, error }),
+  /** Starts a run now, outside the schedule. Fails while one is running. */
+  Rpc.make("schedules.runNow", { payload: { scheduleId: ScheduleId }, error }),
+  /** Recent runs, newest first. */
+  Rpc.make("schedules.runs", { payload: { scheduleId: ScheduleId }, success: Schema.Array(ScheduleRun), error }),
+  Rpc.make("schedules.preview", {
+    payload: { spec: Schema.String, timezone: Schema.optional(Schema.String) },
+    success: SchedulePreview,
+    error,
   }),
 
   // --- storage -----------------------------------------------------------

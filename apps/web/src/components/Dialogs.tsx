@@ -6,15 +6,15 @@ import { useApp } from "../store.ts";
 import { type ModelChoice, ModelPicker } from "./ModelPicker.tsx";
 import { Button, cx, Field, inputClass, Modal, PROVIDERS } from "./ui.tsx";
 
-const NO_CHOICE: ModelChoice = { model: null, effort: null };
+export const NO_CHOICE: ModelChoice = { model: null, effort: null };
 
-const selection = (provider: ProviderKind, choice: ModelChoice): ProviderSelection => ({
+export const selection = (provider: ProviderKind, choice: ModelChoice): ProviderSelection => ({
   provider,
   ...(choice.model?.trim() ? { model: choice.model.trim() } : {}),
   ...(choice.effort ? { effort: choice.effort } : {}),
 });
 
-function ProviderPicker({
+export function ProviderPicker({
   value,
   onChange,
 }: {

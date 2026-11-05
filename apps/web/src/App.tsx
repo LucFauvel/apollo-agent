@@ -5,10 +5,26 @@ import { DevicesDialog } from "./components/DevicesDialog.tsx";
 import { LocalModelsDialog } from "./components/LocalModelsDialog.tsx";
 import { ProvidersDialog } from "./components/ProvidersDialog.tsx";
 import { KnowledgePanel } from "./components/KnowledgePanel.tsx";
+import { SchedulesPanel } from "./components/SchedulesPanel.tsx";
 import { SessionView } from "./components/SessionView.tsx";
 import { Sidebar } from "./components/Sidebar.tsx";
 import { Button } from "./components/ui.tsx";
-import { startSync, useApp } from "./store.ts";
+import { onNotify, startSync, useApp } from "./store.ts";
+
+/** Shows server notifications (scheduled results, failures) on the desktop; clicking opens the session. */
+const useDesktopNotifications = (open: (id: SessionId) => void) =>
+  useEffect(
+    () =>
+      onNotify((notice) => {
+        if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+        const notification = new Notification(notice.title, { body: notice.body });
+        notification.onclick = () => {
+          window.focus();
+          if (notice.sessionId) open(notice.sessionId);
+        };
+      }),
+    [open],
+  );
 
 export function App() {
   useEffect(() => startSync(), []);
@@ -17,7 +33,9 @@ export function App() {
   const [dialog, setDialog] = useState<
     { kind: "bot" } | { kind: "session"; bot: Bot } | { kind: "botSettings"; bot: Bot } | { kind: "devices" } | { kind: "providers" } | { kind: "localModels" } | null
   >(null);
-  const [showKnowledge, setShowKnowledge] = useState(false);
+  const [panel, setPanel] = useState<"knowledge" | "schedules" | null>(null);
+  const togglePanel = (next: "knowledge" | "schedules") => setPanel((current) => (current === next ? null : next));
+  useDesktopNotifications(setSelectedId);
 
   const session = useApp((s) => (selectedId ? s.sessions.get(selectedId) : undefined));
   const bot = useApp((s) => (session ? s.bots.get(session.botId) : undefined));
@@ -40,7 +58,7 @@ export function App() {
         onProviders={() => setDialog({ kind: "providers" })}
       />
       {session && bot ? (
-        <SessionView session={session} bot={bot} onShowKnowledge={() => setShowKnowledge((v) => !v)} />
+        <SessionView session={session} bot={bot} onTogglePanel={togglePanel} />
       ) : (
         <main className="flex flex-1 flex-col items-center justify-center gap-3 text-center">
           <div className="text-lg font-semibold text-zinc-100">Apollo</div>
@@ -52,7 +70,10 @@ export function App() {
           </Button>
         </main>
       )}
-      {showKnowledge && bot ? <KnowledgePanel bot={bot} onClose={() => setShowKnowledge(false)} /> : null}
+      {panel === "knowledge" && bot ? <KnowledgePanel bot={bot} onClose={() => setPanel(null)} /> : null}
+      {panel === "schedules" && bot ? (
+        <SchedulesPanel bot={bot} onClose={() => setPanel(null)} onOpenSession={setSelectedId} />
+      ) : null}
 
       {dialog?.kind === "bot" ? (
         <NewBotDialog

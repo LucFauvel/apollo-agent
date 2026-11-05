@@ -182,6 +182,35 @@ apps/desktop         Electron shell (spawns the server, loads the UI)
   report back, and reflection is skipped. Your own messages always go through.
   **Resume** clears the pause. It is refused while the bot is still over a daily budget:
   raise the budget, or wait until tomorrow (local time).
+- **Acting on their own.** A bot can run on a schedule as well as when you message it.
+  Open **Schedules** in the session header, or ask the orchestrator to set something up
+  (its `apollo_schedule_*` MCP tools). There are two kinds:
+  - **Tasks** run their prompt in a fresh worker session (`⏱ name`). The worker does not see the
+    orchestrator's conversation, so the prompt must be self-contained. Its final message goes to the
+    orchestrator as an Apollo message and to a desktop notification. Clicking the notification
+    opens the run's session.
+  - **Heartbeats** send their prompt into the orchestrator's own conversation, for check-ins that
+    need its context.
+
+  A run with nothing to report answers `[SILENT]`. Nothing is delivered for it, and the transcript
+  shows "Nothing to report".
+
+  Schedules read like `every 30m`, `daily at 9am`, `weekdays at 8:30`, `every mon, wed and fri 8:15`,
+  `in 2h`, `tomorrow at 9am` or `2026-12-01 09:00`, or take a cron expression. They use the
+  schedule's time zone (by default, the machine's). The editor previews the next runs.
+
+  Scheduling rules:
+  - Recurring schedules run at most every 5 minutes.
+  - The scheduler checks every 30 s. A run that cannot start (the bot is paused, a heartbeat's
+    orchestrator is busy, or every worker slot is taken) waits up to half its period, between
+    2 minutes and 2 hours. After that it is skipped. Runs missed while Apollo was closed are
+    skipped the same way, and they never pile up.
+  - Runs follow the bot's guardrails: budgets and pauses apply, and a task counts as a worker.
+    A scheduled turn starts a new count of autonomous orchestrator turns.
+  - A schedule that fails three times in a row turns itself off.
+  - A turn started by a schedule cannot create or change schedules, so runs cannot multiply.
+  - The orchestrator may own at most 20 schedules.
+  - Only the 5 most recent task sessions per schedule are kept. **History** keeps the last 50 runs.
 - **Approvals.** In `approval-required` mode, Claude's `canUseTool` and Codex's approval
   requests both surface as the same approval card.
 - **Input requests.** When an MCP server asks the user for input (an MCP elicitation, from
@@ -209,6 +238,10 @@ Apollo only talks to **paired devices**, the same model t3code uses:
 - The server binds to `127.0.0.1` by default.
 
 ## Known gaps / next steps
+
+- Schedules only run while Apollo is running. The desktop app quits when its window closes,
+  so a "keep running in the tray" mode would let bots work while the window is closed.
+  Webhooks and file watchers are not triggers yet.
 
 - Local models: Claude Code's prompt and tool definitions are about 13k tokens, and small
   models call tools unreliably, so results depend on the model. Managed llama.cpp was tried
