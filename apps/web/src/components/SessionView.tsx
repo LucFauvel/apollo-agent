@@ -4,6 +4,10 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { errorMessage, rpc } from "../rpc.ts";
 import { type TranscriptItem, useTranscript } from "../transcript.ts";
+import { formatUsage, usageTitle } from "../format.ts";
+import { useModelLabel } from "../models.ts";
+import { useApp } from "../store.ts";
+import { SessionSettingsDialog } from "./Dialogs.tsx";
 import { InputRequestItem } from "./InputRequest.tsx";
 import { Button, cx, ProviderBadge, StatusDot } from "./ui.tsx";
 
@@ -188,6 +192,14 @@ export function SessionView({
   const scrollRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const modelLabel = useModelLabel(session.provider, session.model);
+  const botBusy = useApp((s) =>
+    [...s.sessions.values()].some(
+      (x) => x.botId === bot.id && (x.status === "running" || x.status === "waiting-approval" || x.status === "starting"),
+    ),
+  );
+  const tokens = session.usage.inputTokens + session.usage.outputTokens;
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -216,8 +228,32 @@ export function SessionView({
           </div>
           <div className="truncate font-mono text-[11px] text-zinc-500">{session.cwd}</div>
         </div>
-        <ProviderBadge provider={session.provider} model={session.model} />
+        <button
+          className="rounded transition-opacity hover:opacity-80"
+          title="Session settings: model, effort, permissions"
+          onClick={() => setSettingsOpen(true)}
+        >
+          <ProviderBadge provider={session.provider} model={modelLabel} effort={session.effort} />
+        </button>
+        {tokens > 0 ? (
+          <span className="shrink-0 text-[11px] text-zinc-500 tabular-nums" title={`This session: ${usageTitle(session.usage)}`}>
+            {formatUsage(session.usage)}
+          </span>
+        ) : null}
+        {settingsOpen ? (
+          <SessionSettingsDialog bot={bot} session={session} onClose={() => setSettingsOpen(false)} />
+        ) : null}
         {actionError ? <span className="max-w-60 truncate text-xs text-red-400">{actionError}</span> : null}
+        {botBusy ? (
+          <Button
+            size="sm"
+            variant="danger"
+            title={`Interrupt everything ${bot.name} is running and pause its automated work`}
+            onClick={() => act((c) => c["bots.stop"]({ botId: bot.id }))}
+          >
+            Stop all
+          </Button>
+        ) : null}
         {session.role !== "reflection" ? (
           <Button
             size="sm"
@@ -246,6 +282,21 @@ export function SessionView({
           </Button>
         ) : null}
       </header>
+      {bot.pausedReason !== null ? (
+        <div className="flex shrink-0 items-center gap-3 border-b border-amber-700/30 bg-amber-950/30 px-4 py-2 text-xs">
+          <span className="text-amber-200">
+            <span className="font-medium">{bot.name} is paused:</span> {bot.pausedReason}. Workers will not start or
+            report back until you resume. Your messages still go through.
+          </span>
+          <Button
+            size="sm"
+            className="ml-auto shrink-0"
+            onClick={() => act((c) => c["bots.resume"]({ botId: bot.id }))}
+          >
+            Resume
+          </Button>
+        </div>
+      ) : null}
 
       <div
         ref={scrollRef}

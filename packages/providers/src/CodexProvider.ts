@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent, ApprovalDecision } from "@apollo/contracts";
 import * as Deferred from "effect/Deferred";
@@ -17,6 +18,12 @@ const fail = (message: string) => new ProviderError({ provider: "codex", message
 
 // Minimal views of the `codex app-server` v2 protocol. Generate the full
 // bindings with `codex app-server generate-ts --out <dir>` when extending.
+interface CodexTokens {
+  readonly inputTokens: number;
+  readonly cachedInputTokens: number;
+  readonly outputTokens: number;
+}
+
 interface CodexQuestion {
   readonly id: string;
   readonly header: string;
@@ -148,8 +155,61 @@ export interface CodexProviderConfig {
   readonly executable?: string | undefined;
 }
 
+interface CodexModel {
+  readonly id: string;
+  readonly model: string;
+  readonly displayName: string;
+  readonly description: string;
+  readonly hidden: boolean;
+  readonly isDefault: boolean;
+  readonly supportedReasoningEfforts: ReadonlyArray<{ readonly reasoningEffort: string }>;
+  readonly defaultReasoningEffort: string | null;
+}
+
+/** Starts a short-lived `codex app-server` to ask which models it offers. */
+const listCodexModels = (config: CodexProviderConfig) =>
+  Effect.gen(function* () {
+    const rpc = yield* spawnJsonRpcProcess({
+      command: config.executable ?? "codex",
+      args: ["app-server"],
+      cwd: homedir(),
+      handlers: {
+        onNotification: () => Effect.void,
+        onRequest: (method) => Effect.fail(new JsonRpcFailure({ message: `Apollo does not handle ${method}` })),
+        onExit: () => Effect.void,
+      },
+    }).pipe(Effect.mapError((error) => fail(error.message)));
+    const call = (method: string, params: unknown) =>
+      rpc.request(method, params).pipe(Effect.mapError((error) => fail(`${method}: ${error.message}`)));
+    yield* call("initialize", { clientInfo: { name: "apollo", title: "Apollo", version: "0.0.0" }, capabilities: null });
+    yield* rpc.notify("initialized", {});
+
+    const models: Array<CodexModel> = [];
+    let cursor: string | null = null;
+    do {
+      const page = (yield* call("model/list", { cursor, limit: 100 })) as {
+        data: Array<CodexModel>;
+        nextCursor: string | null;
+      };
+      models.push(...page.data);
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+
+    return models
+      .filter((m) => !m.hidden)
+      .map((m) => ({
+        id: m.model,
+        label: m.displayName,
+        description: m.description,
+        isDefault: m.isDefault,
+        efforts: m.supportedReasoningEfforts.map((e) => e.reasoningEffort),
+        defaultEffort: m.defaultReasoningEffort,
+      }));
+  }).pipe(Effect.scoped, Effect.timeout("30 seconds"), Effect.mapError((e) => (e instanceof ProviderError ? e : fail("listing models timed out"))));
+
 export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider => ({
   kind: "codex",
+  listModels: listCodexModels(config),
   open: Effect.fn("CodexProvider.open")(function* (options: ProviderSessionOptions, emit: Emit) {
     const agent = (event: AgentEvent) => emit({ _tag: "Event", event });
     const pendingApprovals = new Map<string, Deferred.Deferred<ApprovalDecision>>();
@@ -186,6 +246,20 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
             _tag: "TurnCompleted",
             outcome: turn.status === "inProgress" ? "completed" : turn.status,
             error: turn.error?.message ?? null,
+          });
+        }
+        case "thread/tokenUsage/updated": {
+          // `total` is the thread's running total; Codex reports no cost.
+          const total = (p.tokenUsage as { total: CodexTokens }).total;
+          const cached = Math.min(total.cachedInputTokens, total.inputTokens);
+          return emit({
+            _tag: "UsageTotals",
+            totals: {
+              inputTokens: total.inputTokens - cached,
+              cachedInputTokens: cached,
+              outputTokens: total.outputTokens,
+              costUsd: 0,
+            },
           });
         }
         case "item/agentMessage/delta":
@@ -368,7 +442,11 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
           ? call("turn/steer", { threadId, expectedTurnId: activeTurnId, input: input(text) }).pipe(
               Effect.asVoid,
             )
-          : call("turn/start", { threadId, input: input(text) }).pipe(Effect.asVoid),
+          : call("turn/start", {
+              threadId,
+              input: input(text),
+              ...(options.effort ? { effort: options.effort } : {}),
+            }).pipe(Effect.asVoid),
       interrupt: Effect.suspend(() =>
         activeTurnId === null
           ? Effect.void

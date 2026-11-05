@@ -1,4 +1,12 @@
-import type { Bot, BotId, Session, SessionId, SessionRole } from "@apollo/contracts";
+import {
+  type Bot,
+  type BotId,
+  DEFAULT_BOT_LIMITS,
+  EMPTY_USAGE,
+  type Session,
+  type SessionId,
+  type SessionRole,
+} from "@apollo/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -16,6 +24,8 @@ const bot = (id: string): Bot => ({
   defaultWorker: { provider: "codex" },
   runtimeMode: "full-access",
   autoLearn: false,
+  limits: DEFAULT_BOT_LIMITS,
+  pausedReason: null,
   mainSessionId: `${id}-main` as SessionId,
   createdAt: 0,
   updatedAt: 0,
@@ -29,11 +39,14 @@ const session = (id: string, botId: string, role: SessionRole = "worker"): Sessi
   title: id,
   provider: "codex",
   model: null,
+  effort: null,
+  runtimeMode: null,
   cwd: "/tmp",
   status: "idle",
   resumeId: null,
   lastMessage: null,
   completedTurns: 0,
+  usage: EMPTY_USAGE,
   createdAt: 0,
   updatedAt: 0,
 });
@@ -136,6 +149,28 @@ describe("transcript search", () => {
 
       yield* store.deleteSession("a-1" as SessionId);
       expect(yield* store.searchTranscripts("a" as BotId, "login", 10, null)).toHaveLength(1);
+    }).pipe(Effect.provide(layer)),
+  );
+});
+
+describe("usage", () => {
+  const totals = (input: number, cost = 0) => ({ inputTokens: input, cachedInputTokens: 0, outputTokens: 0, costUsd: cost });
+
+  it.effect("records only what a running total adds, without double counting resumes", () =>
+    Effect.gen(function* () {
+      const store = yield* seed;
+      const id = "a-1" as SessionId;
+      yield* store.recordUsage(id, totals(100, 1));
+      yield* store.recordUsage(id, totals(250, 2));
+      // A resumed conversation reports the same running total again.
+      yield* store.recordUsage(id, totals(250, 2));
+      expect((yield* store.getSession(id)).usage).toEqual(totals(250, 2));
+
+      // The provider started counting afresh (new conversation): all of it is new.
+      const { today } = yield* store.recordUsage(id, totals(40, 0.5));
+      expect((yield* store.getSession(id)).usage).toEqual(totals(290, 2.5));
+      expect(today).toEqual(totals(290, 2.5));
+      expect(yield* store.usageToday("b" as BotId)).toEqual(EMPTY_USAGE);
     }).pipe(Effect.provide(layer)),
   );
 });

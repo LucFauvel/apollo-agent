@@ -218,6 +218,8 @@ const SpawnSession = Tool.make("apollo_spawn_session", {
     prompt: Schema.String,
     provider: Schema.optional(ProviderKind),
     model: Schema.optional(Schema.String),
+    /** Reasoning effort, e.g. `low` for simple tasks or `high` for hard ones. */
+    effort: Schema.optional(Schema.String),
     cwd: Schema.optional(Schema.String),
     notifyOnCompletion: Schema.optional(Schema.Boolean),
   }),
@@ -440,18 +442,20 @@ const handlers = ApolloToolkit.toLayer(
           return { sessions: sessions.filter((s) => s.role !== "reflection").map(summarize) };
         }),
 
-      apollo_spawn_session: ({ title, prompt, provider, model, cwd, notifyOnCompletion }) =>
+      apollo_spawn_session: ({ title, prompt, provider, model, effort, cwd, notifyOnCompletion }) =>
         Effect.gen(function* () {
           const caller = yield* McpCaller;
           if (caller.role !== "main") {
             return yield* invalid("only the bot's orchestrator session can spawn workers");
           }
           const bot = yield* store.getBot(caller.botId);
-          const selection = provider
-            ? { provider, ...(model ? { model } : {}) }
-            : model
-              ? { ...bot.defaultWorker, model }
-              : bot.defaultWorker;
+          if (bot.pausedReason !== null) {
+            return yield* invalid(`${bot.name} is paused (${bot.pausedReason}). Only the user can resume it.`);
+          }
+          yield* manager.guardWorkerCapacity(bot.id);
+          // A different provider starts from its own defaults; the same one inherits the bot's.
+          const base = provider && provider !== bot.defaultWorker.provider ? { provider } : bot.defaultWorker;
+          const selection = { ...base, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
           const session = yield* manager.createSession({
             botId: bot.id,
             title,
@@ -468,7 +472,9 @@ const handlers = ApolloToolkit.toLayer(
       apollo_send_to_session: ({ sessionId, message }) =>
         Effect.gen(function* () {
           const caller = yield* McpCaller;
-          yield* ownSession(caller.botId, sessionId);
+          const target = yield* ownSession(caller.botId, sessionId);
+          // Steering a running worker adds no concurrency; waking an idle one does.
+          if (target.status === "idle" || target.status === "error") yield* manager.guardWorkerCapacity(caller.botId);
           yield* manager.send(sessionId, message, "bot");
           return summarize(yield* store.getSession(sessionId));
         }),

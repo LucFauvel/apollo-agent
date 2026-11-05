@@ -33,19 +33,36 @@ export function Button({
 const providerStyles: Record<ProviderKind, string> = {
   claude: "bg-orange-500/10 text-orange-300 ring-orange-500/20",
   codex: "bg-sky-500/10 text-sky-300 ring-sky-500/20",
+  llamacpp: "bg-emerald-500/10 text-emerald-300 ring-emerald-500/20",
 };
 
-export function ProviderBadge({ provider, model }: { provider: ProviderKind; model?: string | null }) {
+/** Display names, in the order pickers list them. */
+export const PROVIDERS: ReadonlyArray<{ kind: ProviderKind; name: string; detail: string }> = [
+  { kind: "claude", name: "Claude Code", detail: "Agent SDK" },
+  { kind: "codex", name: "Codex", detail: "app-server" },
+  { kind: "llamacpp", name: "llama.cpp", detail: "local model" },
+];
+
+export function ProviderBadge({
+  provider,
+  model,
+  effort,
+}: {
+  provider: ProviderKind;
+  /** Display name of the model; omitted means the provider's default. */
+  model?: string | null;
+  effort?: string | null;
+}) {
+  const parts = [provider, model, effort].filter(Boolean);
   return (
     <span
       className={cx(
         "inline-flex shrink-0 items-center rounded px-1.5 py-px font-mono text-[10px] ring-1 ring-inset",
         providerStyles[provider],
       )}
-      title={model ?? `${provider} (default model)`}
+      title={`${provider} · ${model ?? "default model"}${effort ? ` · ${effort} effort` : ""}`}
     >
-      {provider}
-      {model ? `·${model}` : ""}
+      {parts.join(" · ")}
     </span>
   );
 }
@@ -68,11 +85,13 @@ export function Modal({
   onClose,
   children,
   footer,
+  wide = false,
 }: {
   title: string;
   onClose: () => void;
   children: ReactNode;
   footer: ReactNode;
+  wide?: boolean;
 }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -82,7 +101,7 @@ export function Modal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onMouseDown={onClose}>
       <div
-        className="w-full max-w-lg rounded-xl border border-zinc-800 bg-zinc-950 shadow-2xl"
+        className={cx("w-full rounded-xl border border-zinc-800 bg-zinc-950 shadow-2xl", wide ? "max-w-3xl" : "max-w-lg")}
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="border-b border-zinc-800 px-5 py-3 text-sm font-semibold text-zinc-100">{title}</div>

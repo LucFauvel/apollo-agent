@@ -1,8 +1,8 @@
 import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentEvent, SessionId } from "@apollo/contracts";
-import type { Provider } from "@apollo/providers";
+import { type AgentEvent, type BotLimits, DEFAULT_BOT_LIMITS, type ProviderKind, type SessionId } from "@apollo/contracts";
+import type { Provider, ProviderSessionOptions } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -16,30 +16,64 @@ import * as SessionManager from "./SessionManager.ts";
 import * as Store from "./Store.ts";
 
 const dataDir = mkdtempSync(join(tmpdir(), "apollo-test-"));
-/** Skill plugin dirs passed to opened sessions, and how often they were told to reload. */
-const skillDirs: Array<string | null> = [];
+/** Options of every opened provider session, and how often skills were reloaded. */
+const opened: Array<ProviderSessionOptions> = [];
 let skillReloads = 0;
+let modelListings = 0;
+let interrupts = 0;
 
-/** A provider that answers every message with `echo: <text>` in one turn. */
-const echoProvider = (kind: "claude" | "codex"): Provider => ({
+/** Each turn of the fake provider uses this much (as a running total per conversation). */
+const TURN_USAGE = { inputTokens: 1000, cachedInputTokens: 0, outputTokens: 100, costUsd: 0.01 };
+
+/**
+ * A provider that answers every message with `echo: <text>` in one turn and
+ * reports TURN_USAGE per turn. Messages containing "slow" take a while, unless
+ * interrupted.
+ */
+const echoProvider = (kind: ProviderKind): Provider => ({
   kind,
+  listModels: Effect.sync(() => {
+    modelListings++;
+    return [{ id: `${kind}-big`, label: "Big", description: "", isDefault: true, efforts: ["low", "high"], defaultEffort: "low" }];
+  }),
   open: (options, emit) =>
     Effect.gen(function* () {
-      skillDirs.push(options.skillsPluginDir);
+      opened.push(options);
       const agent = (event: AgentEvent) => emit({ _tag: "Event", event });
       yield* emit({ _tag: "ResumeId", resumeId: `${kind}-thread` });
       const scope = yield* Effect.scope;
       let n = 0;
+      let interrupted = false;
       return {
         send: (text: string) =>
           Effect.gen(function* () {
             const itemId = `msg-${++n}`;
+            interrupted = false;
             yield* agent({ _tag: "TurnStarted" });
             yield* agent({ _tag: "AssistantDelta", itemId, text: "echo: " });
+            if (text.includes("slow")) {
+              for (let i = 0; i < 40 && !interrupted; i++) yield* Effect.sleep("25 millis");
+            }
             yield* agent({ _tag: "AssistantMessage", itemId, text: `echo: ${text}` });
-            yield* agent({ _tag: "TurnCompleted", outcome: "completed", error: null });
+            yield* emit({
+              _tag: "UsageTotals",
+              totals: {
+                inputTokens: TURN_USAGE.inputTokens * n,
+                cachedInputTokens: 0,
+                outputTokens: TURN_USAGE.outputTokens * n,
+                costUsd: TURN_USAGE.costUsd * n,
+              },
+            });
+            yield* agent({
+              _tag: "TurnCompleted",
+              outcome: interrupted ? "interrupted" : "completed",
+              error: null,
+            });
           }).pipe(Effect.forkIn(scope), Effect.asVoid),
-        interrupt: Effect.void,
+        interrupt: Effect.sync(() => {
+          interrupts++;
+          interrupted = true;
+        }),
         respondApproval: () => Effect.void,
         respondInput: () => Effect.void,
         reloadSkills: Effect.sync(() => void skillReloads++),
@@ -52,6 +86,7 @@ const layerWith = (budgetBytes: number) => SessionManager.layer.pipe(
     Layer.succeed(SessionManager.Providers, {
       claude: echoProvider("claude"),
       codex: echoProvider("codex"),
+      llamacpp: echoProvider("llamacpp"),
     }),
   ),
   Layer.provideMerge(Store.layer),
@@ -64,6 +99,7 @@ const layerWith = (budgetBytes: number) => SessionManager.layer.pipe(
       webDistDir: null,
       baseUrl: "http://127.0.0.1:0",
       claudeExecutable: undefined,
+      llamaCpp: { baseUrl: "http://127.0.0.1:8080", apiKey: null },
       codexExecutable: undefined,
       allowedOrigins: [],
       publicUrl: "http://127.0.0.1:0",
@@ -214,7 +250,7 @@ describe("SessionManager", () => {
       yield* manager.send(bot.mainSessionId, "hi");
       yield* waitIdle(manager, bot.mainSessionId);
 
-      const dir = skillDirs.at(-1)!;
+      const dir = opened.at(-1)!.skillsPluginDir!;
       expect(dir).toBe(join(dataDir, "skills", bot.id));
       expect(readdirSync(join(dir, "skills"))).toEqual([]);
 
@@ -276,4 +312,162 @@ describe("SessionManager", () => {
       expect(messages).toHaveLength(1);
     }).pipe(Effect.provide(Compaction.layer.pipe(Layer.provideMerge(layerWith(1))))),
   );
+
+  it.live("applies new session settings by reopening and resuming the conversation", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const bot = yield* createBot(manager);
+      yield* manager.send(bot.mainSessionId, "first");
+      yield* waitIdle(manager, bot.mainSessionId);
+      expect(opened.at(-1)).toMatchObject({ model: null, effort: null, runtimeMode: "full-access" });
+      expect(yield* manager.isLive(bot.mainSessionId)).toBe(true);
+
+      const updated = yield* manager.updateSessionSettings({
+        sessionId: bot.mainSessionId,
+        model: "claude-big",
+        effort: "high",
+        runtimeMode: "approval-required",
+      });
+      expect(updated).toMatchObject({ model: "claude-big", effort: "high", runtimeMode: "approval-required" });
+      expect(yield* manager.isLive(bot.mainSessionId)).toBe(false);
+
+      yield* manager.send(bot.mainSessionId, "second");
+      yield* waitIdle(manager, bot.mainSessionId);
+      expect(opened.at(-1)).toMatchObject({
+        model: "claude-big",
+        effort: "high",
+        runtimeMode: "approval-required",
+        resumeId: "claude-thread",
+      });
+
+      // A title change alone keeps the process.
+      yield* manager.updateSessionSettings({ sessionId: bot.mainSessionId, title: "Renamed" });
+      expect(yield* manager.isLive(bot.mainSessionId)).toBe(true);
+
+      // Clearing the override follows the bot again.
+      yield* manager.updateSessionSettings({ sessionId: bot.mainSessionId, runtimeMode: null });
+      yield* manager.send(bot.mainSessionId, "third");
+      yield* waitIdle(manager, bot.mainSessionId);
+      expect(opened.at(-1)?.runtimeMode).toBe("full-access");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("caches provider model lists", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const before = modelListings;
+      const models = yield* manager.listModels("codex");
+      yield* manager.listModels("codex");
+      expect(models[0]?.id).toBe("codex-big");
+      expect(modelListings).toBe(before + 1);
+    }).pipe(Effect.provide(layer)),
+  );
+
+  describe("guardrails", () => {
+    const botWith = (manager: SessionManager.SessionManager["Service"], limits: Partial<BotLimits>) =>
+      manager.createBot({
+        name: "Guarded",
+        instructions: "",
+        cwd: "/tmp",
+        main: { provider: "claude" },
+        defaultWorker: { provider: "codex" },
+        runtimeMode: "full-access",
+        autoLearn: false,
+        limits: { ...DEFAULT_BOT_LIMITS, ...limits },
+      });
+
+    it.live("tracks usage per session and per bot per day", () =>
+      Effect.gen(function* () {
+        const manager = yield* SessionManager.SessionManager;
+        const store = yield* Store.Store;
+        const bot = yield* botWith(manager, {});
+        for (const text of ["one", "two"]) {
+          yield* manager.send(bot.mainSessionId, text);
+          yield* waitIdle(manager, bot.mainSessionId);
+        }
+        const session = yield* store.getSession(bot.mainSessionId);
+        expect(session.usage).toEqual({ inputTokens: 2000, cachedInputTokens: 0, outputTokens: 200, costUsd: 0.02 });
+        const today = (yield* manager.snapshot).usageToday.find((u) => u.botId === bot.id);
+        expect(today?.usage.inputTokens).toBe(2000);
+      }).pipe(Effect.provide(layer)),
+    );
+
+    it.live("pauses automated work over the daily budget, but lets the user through", () =>
+      Effect.gen(function* () {
+        const manager = yield* SessionManager.SessionManager;
+        const store = yield* Store.Store;
+        const bot = yield* botWith(manager, { dailyTokenBudget: 1500 });
+        yield* manager.send(bot.mainSessionId, "first");
+        yield* waitIdle(manager, bot.mainSessionId);
+        expect((yield* store.getBot(bot.id)).pausedReason).toBeNull();
+
+        yield* manager.send(bot.mainSessionId, "second");
+        yield* waitIdle(manager, bot.mainSessionId);
+        const paused = yield* store.getBot(bot.id);
+        expect(paused.pausedReason).toContain("over its budget of 1,500");
+        const notices = (yield* store.listEvents(bot.mainSessionId, 0)).filter((e) => e.event._tag === "Notice");
+        expect(notices).toHaveLength(1);
+
+        const refused = yield* Effect.flip(manager.send(bot.mainSessionId, "worker report", "system"));
+        expect(refused.message).toContain("paused");
+        yield* manager.send(bot.mainSessionId, "the user can still talk");
+        yield* waitIdle(manager, bot.mainSessionId);
+
+        expect((yield* Effect.flip(manager.resumeBot(bot.id))).message).toContain("Raise the budget");
+        yield* manager.updateBot({ botId: bot.id, limits: { ...paused.limits, dailyTokenBudget: 100_000 } });
+        expect((yield* manager.resumeBot(bot.id)).pausedReason).toBeNull();
+        yield* manager.send(bot.mainSessionId, "worker report", "system");
+      }).pipe(Effect.provide(layer)),
+    );
+
+    it.live("pauses after too many orchestrator turns without the user", () =>
+      Effect.gen(function* () {
+        const manager = yield* SessionManager.SessionManager;
+        const store = yield* Store.Store;
+        const bot = yield* botWith(manager, { maxAutonomousTurns: 2 });
+        const automated = (text: string) =>
+          manager.send(bot.mainSessionId, text, "system").pipe(Effect.andThen(waitIdle(manager, bot.mainSessionId)));
+
+        yield* automated("report 1");
+        yield* automated("report 2");
+        expect((yield* Effect.flip(automated("report 3"))).message).toContain("too many turns");
+        expect((yield* store.getBot(bot.id)).pausedReason).toContain("2 orchestrator turns in a row");
+
+        yield* manager.resumeBot(bot.id);
+        yield* automated("report 4");
+        // A user message resets the count.
+        yield* manager.send(bot.mainSessionId, "hello");
+        yield* waitIdle(manager, bot.mainSessionId);
+        yield* automated("report 5");
+        yield* automated("report 6");
+      }).pipe(Effect.provide(layer)),
+    );
+
+    it.live("limits concurrent workers and stops everything on demand", () =>
+      Effect.gen(function* () {
+        const manager = yield* SessionManager.SessionManager;
+        const store = yield* Store.Store;
+        const bot = yield* botWith(manager, { maxConcurrentWorkers: 1 });
+        const worker = yield* manager.createSession({
+          botId: bot.id,
+          title: "slow worker",
+          provider: { provider: "codex" },
+          prompt: "slow task",
+        });
+        expect((yield* Effect.flip(manager.guardWorkerCapacity(bot.id))).message).toContain("limit 1");
+
+        // Let the worker's turn get going before stopping it.
+        yield* Effect.sleep("100 millis");
+        const before = interrupts;
+        const stopped = yield* manager.stopBot(bot.id);
+        expect(stopped.pausedReason).toBe("you stopped it");
+        expect(interrupts).toBe(before + 1);
+        const { session } = yield* waitIdle(manager, worker.id);
+        expect(session.status).toBe("idle");
+        yield* manager.guardWorkerCapacity(bot.id);
+        const events = yield* store.listEvents(worker.id, 0);
+        expect(events.at(-1)?.event).toMatchObject({ _tag: "TurnCompleted", outcome: "interrupted" });
+      }).pipe(Effect.provide(layer)),
+    );
+  });
 });

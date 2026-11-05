@@ -24,6 +24,7 @@ const runTurn = (prompt: string, answer: (session: ProviderSession, request: Pen
       {
         cwd: process.cwd(),
         model: null,
+        effort: null,
         resumeId: null,
         instructions: "",
         runtimeMode: "approval-required",
@@ -65,10 +66,38 @@ const fill = (response: InputResponse) => (session: ProviderSession, request: Pe
   session.respondInput(request.requestId, response);
 
 describe("CodexProvider", () => {
+  it.live("lists visible models with their reasoning efforts", () =>
+    Effect.gen(function* () {
+      const models = yield* makeCodexProvider({ executable: fakeCodex }).listModels;
+      expect(models).toEqual([
+        {
+          id: "gpt-fast",
+          label: "GPT Fast",
+          description: "Quick edits",
+          isDefault: false,
+          efforts: ["low", "medium"],
+          defaultEffort: "low",
+        },
+        {
+          id: "gpt-deep",
+          label: "GPT Deep",
+          description: "Hard problems",
+          isDefault: true,
+          efforts: ["medium", "high"],
+          defaultEffort: "medium",
+        },
+      ]);
+    }),
+  );
+
   it.live("normalizes a turn and grants requested permissions for the session", () =>
     Effect.gen(function* () {
       const { emissions, tags, reply } = yield* runTurn("hello", approve("accept-for-session"));
       expect(emissions[0]).toEqual({ _tag: "ResumeId", resumeId: "thread-1" });
+      expect(emissions.find((e) => e._tag === "UsageTotals")).toEqual({
+        _tag: "UsageTotals",
+        totals: { inputTokens: 600, cachedInputTokens: 400, outputTokens: 50, costUsd: 0 },
+      });
       expect(tags).toEqual([
         "TurnStarted",
         "ApprovalRequested",

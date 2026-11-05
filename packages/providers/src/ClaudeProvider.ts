@@ -1,15 +1,17 @@
 import {
   query,
   type CanUseTool,
+  type EffortLevel,
   type OnElicitation,
   type Options,
   type PermissionResult,
   type SDKMessage,
   type SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentEvent, ApprovalDecision } from "@apollo/contracts";
+import type { AgentEvent, ApprovalDecision, ModelOption, ProviderKind } from "@apollo/contracts";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { makeAsyncInbox } from "./AsyncInbox.ts";
 import { fieldsFromSchema, makeInputRequests } from "./InputRequests.ts";
@@ -21,8 +23,6 @@ import {
   summarizeToolInput,
   truncate,
 } from "./Provider.ts";
-
-const fail = (message: string) => new ProviderError({ provider: "claude", message });
 
 const errorMessage = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
 
@@ -39,14 +39,90 @@ const toolResultText = (content: unknown): string => {
   return "";
 };
 
+/**
+ * Where Claude Code sends its model requests, when not to Anthropic: any server
+ * that speaks the Anthropic Messages API (llama.cpp's llama-server, for one).
+ */
+export interface ClaudeBackend {
+  readonly kind: ProviderKind;
+  readonly listModels: Effect.Effect<ReadonlyArray<ModelOption>, ProviderError>;
+  /**
+   * Resolves the model a session runs and the environment that points Claude Code
+   * at the backend. Runs each time a session opens.
+   */
+  readonly prepare: (
+    model: string | null,
+  ) => Effect.Effect<{ readonly model: string | null; readonly env: Environment }, ProviderError, Scope.Scope>;
+  /** Claude Code prices tokens as Anthropic models; a local backend costs nothing. */
+  readonly free: boolean;
+}
+
+/** Overrides for Claude Code's environment; `undefined` removes a variable. */
+export type Environment = Record<string, string | undefined>;
+
 export interface ClaudeProviderConfig {
   /** Override the `claude` executable (defaults to the one bundled with the SDK). */
   readonly executable?: string | undefined;
+  /**
+   * Environment overrides (credentials, for one), read each time Claude Code starts
+   * so that settings changes apply to the next session.
+   */
+  readonly environment?: Effect.Effect<Environment, ProviderError> | undefined;
+  readonly backend?: ClaudeBackend | undefined;
 }
 
-export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider => ({
-  kind: "claude",
+const withEnvironment = (env: Environment | null) => (env ? { env: { ...process.env, ...env } } : {});
+
+/** Starts Claude Code without a prompt just to ask which models it offers. */
+const listClaudeModels = (config: ClaudeProviderConfig, fail: (message: string) => ProviderError) =>
+  Effect.flatMap(config.environment ?? Effect.succeed(null), (env) => Effect.tryPromise({
+    try: async () => {
+      const inbox = makeAsyncInbox<SDKUserMessage>();
+      const abort = new AbortController();
+      const q = query({
+        prompt: inbox,
+        options: {
+          abortController: abort,
+          settingSources: ["user"],
+          ...withEnvironment(env),
+          ...(config.executable ? { pathToClaudeCodeExecutable: config.executable } : {}),
+        },
+      });
+      try {
+        return await q.supportedModels();
+      } finally {
+        inbox.close();
+        q.close();
+      }
+    },
+    catch: (cause) => fail(`listing models failed: ${errorMessage(cause)}`),
+  })).pipe(
+    Effect.timeout("30 seconds"),
+    Effect.mapError((error) => (error instanceof ProviderError ? error : fail("listing models timed out"))),
+    Effect.map((models) => {
+      // Claude Code lists a "default" alias row; Apollo shows that as "no model chosen".
+      const alias = models.find((m) => m.value === "default");
+      return models.filter((m) => m !== alias).map((m) => ({
+        id: m.value,
+        label: m.displayName,
+        description: m.description,
+        isDefault: alias?.resolvedModel !== undefined && m.resolvedModel === alias.resolvedModel,
+        efforts: m.supportsEffort ? [...(m.supportedEffortLevels ?? [])] : [],
+        defaultEffort: null,
+      }));
+    }),
+  );
+
+export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider => {
+  const kind = config.backend?.kind ?? "claude";
+  const fail = (message: string) => new ProviderError({ provider: kind, message });
+  return {
+  kind,
+  listModels: config.backend?.listModels ?? listClaudeModels(config, fail),
   open: Effect.fn("ClaudeProvider.open")(function* (options: ProviderSessionOptions, emit: Emit) {
+    const backend = config.backend
+      ? yield* config.backend.prepare(options.model)
+      : { model: options.model, env: config.environment ? yield* config.environment : null };
     const context = yield* Effect.context<never>();
     const run = Effect.runForkWith(context);
     const agent = (event: AgentEvent) => emit({ _tag: "Event", event });
@@ -123,7 +199,9 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
       includePartialMessages: true,
       settingSources: ["user", "project", "local"],
       systemPrompt: { type: "preset", preset: "claude_code", append: options.instructions },
-      ...(options.model ? { model: options.model } : {}),
+      ...(backend.model ? { model: backend.model } : {}),
+      ...withEnvironment(backend.env),
+      ...(options.effort ? { effort: options.effort as EffortLevel } : {}),
       ...(options.resumeId ? { resume: options.resumeId } : {}),
       ...(config.executable ? { pathToClaudeCodeExecutable: config.executable } : {}),
       ...(options.runtimeMode === "full-access"
@@ -244,6 +322,18 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
                   : message.errors.join("\n") || message.subtype;
             interruptRequested = false;
             inTurn = false;
+            // modelUsage covers subagents and internal calls too; both it and the
+            // cost are running totals for the conversation.
+            const models = Object.values(message.modelUsage ?? {});
+            yield* emit({
+              _tag: "UsageTotals",
+              totals: {
+                inputTokens: models.reduce((n, m) => n + m.inputTokens + m.cacheCreationInputTokens, 0),
+                cachedInputTokens: models.reduce((n, m) => n + m.cacheReadInputTokens, 0),
+                outputTokens: models.reduce((n, m) => n + m.outputTokens, 0),
+                costUsd: config.backend?.free ? 0 : (message.total_cost_usd ?? 0),
+              },
+            });
             yield* agent({ _tag: "TurnCompleted", outcome, error });
             if ((message.queued_turn_count ?? 0) > 0) {
               inTurn = true;
@@ -309,4 +399,5 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
         }),
     };
   }),
-});
+  };
+};

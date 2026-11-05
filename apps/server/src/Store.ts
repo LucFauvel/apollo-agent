@@ -5,7 +5,11 @@ import {
   ApolloError,
   type Bot,
   type BotId,
+  type BotLimits,
   CORE_MEMORY_LIMITS,
+  DEFAULT_BOT_LIMITS,
+  EMPTY_USAGE,
+  type Usage,
   type CoreMemory,
   type CoreMemoryTarget,
   coreMemoryUsage,
@@ -51,9 +55,12 @@ const toBot = (r: Row): Bot => ({
   defaultWorker: {
     provider: r.worker_provider as ProviderKind,
     ...(r.worker_model ? { model: r.worker_model as string } : {}),
+    ...(r.worker_effort ? { effort: r.worker_effort as string } : {}),
   },
   runtimeMode: r.runtime_mode as RuntimeMode,
   autoLearn: r.auto_learn === 1,
+  limits: r.limits ? { ...DEFAULT_BOT_LIMITS, ...(JSON.parse(r.limits as string) as Partial<BotLimits>) } : DEFAULT_BOT_LIMITS,
+  pausedReason: (r.paused_reason as string | null) ?? null,
   mainSessionId: r.main_session_id as SessionId,
   createdAt: Number(r.created_at),
   updatedAt: Number(r.updated_at),
@@ -67,11 +74,14 @@ const toSession = (r: Row): Session => ({
   title: r.title as string,
   provider: r.provider as ProviderKind,
   model: (r.model as string | null) ?? null,
+  effort: (r.effort as string | null) ?? null,
+  runtimeMode: (r.runtime_mode as RuntimeMode | null) ?? null,
   cwd: r.cwd as string,
   status: r.status as SessionStatus,
   resumeId: (r.resume_id as string | null) ?? null,
   lastMessage: (r.last_message as string | null) ?? null,
   completedTurns: Number(r.completed_turns),
+  usage: r.usage ? (JSON.parse(r.usage as string) as Usage) : EMPTY_USAGE,
   createdAt: Number(r.created_at),
   updatedAt: Number(r.updated_at),
 });
@@ -86,6 +96,42 @@ const toMemory = (r: Row): Memory => ({
   createdAt: Number(r.created_at),
   lastUsedAt: r.last_used_at === null || r.last_used_at === undefined ? null : Number(r.last_used_at),
 });
+
+/** Today in the server's time zone, as YYYY-MM-DD. */
+export const localDay = (at = Date.now()) => new Date(at).toLocaleDateString("sv-SE");
+
+const addUsage = (a: Usage, b: Usage): Usage => ({
+  inputTokens: a.inputTokens + b.inputTokens,
+  cachedInputTokens: a.cachedInputTokens + b.cachedInputTokens,
+  outputTokens: a.outputTokens + b.outputTokens,
+  costUsd: a.costUsd + b.costUsd,
+});
+
+/**
+ * What a provider's new running total adds over the last one seen. A total
+ * that went down means the provider started counting afresh (a new
+ * conversation), so all of it is new.
+ */
+export const usageDelta = (previous: Usage, next: Usage): Usage => {
+  const fields = ["inputTokens", "cachedInputTokens", "outputTokens", "costUsd"] as const;
+  if (fields.some((f) => next[f] < previous[f])) return next;
+  return {
+    inputTokens: next.inputTokens - previous.inputTokens,
+    cachedInputTokens: next.cachedInputTokens - previous.cachedInputTokens,
+    outputTokens: next.outputTokens - previous.outputTokens,
+    costUsd: next.costUsd - previous.costUsd,
+  };
+};
+
+const toDailyUsage = (r: Row | undefined): Usage =>
+  r
+    ? {
+        inputTokens: Number(r.input_tokens),
+        cachedInputTokens: Number(r.cached_input_tokens),
+        outputTokens: Number(r.output_tokens),
+        costUsd: Number(r.cost_usd),
+      }
+    : EMPTY_USAGE;
 
 /** Lowercased, whitespace-collapsed text: two memories with the same key are duplicates. */
 const dedupeKey = (text: string) => text.toLowerCase().replace(/\s+/g, " ").replace(/[.!\s]+$/, "").trim();
@@ -132,6 +178,8 @@ export interface SessionPatch {
   readonly resumeId?: string | null;
   readonly lastMessage?: string | null;
   readonly model?: string | null;
+  readonly effort?: string | null;
+  readonly runtimeMode?: RuntimeMode | null;
 }
 
 const makeStore = (db: DatabaseSync) => {
@@ -155,25 +203,40 @@ const makeStore = (db: DatabaseSync) => {
     });
 
   return {
+    // --- settings --------------------------------------------------------
+    getSetting: (key: string) =>
+      Effect.sync(() => (get("select value from settings where key = ?", key)?.value as string | undefined) ?? null),
+    /** `null` deletes the setting. */
+    setSetting: (key: string, value: string | null) =>
+      Effect.sync(() => {
+        if (value === null) run("delete from settings where key = ?", key);
+        else run("insert into settings (key, value) values (?, ?) on conflict (key) do update set value = excluded.value", key, value);
+      }),
+
     // --- bots ------------------------------------------------------------
     listBots: Effect.sync(() => all("select * from bots order by created_at").map(toBot)),
     getBot,
     insertBot: (bot: Bot) =>
       Effect.sync(() => {
         run(
-          `insert into bots (id, name, instructions, cwd, main_provider, main_model, worker_provider,
-             worker_model, runtime_mode, auto_learn, main_session_id, created_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `insert into bots (id, name, instructions, cwd, main_provider, main_model, main_effort, worker_provider,
+             worker_model, worker_effort, runtime_mode, auto_learn, limits, paused_reason, main_session_id,
+             created_at, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           bot.id,
           bot.name,
           bot.instructions,
           bot.cwd,
           bot.main.provider,
           bot.main.model ?? null,
+          bot.main.effort ?? null,
           bot.defaultWorker.provider,
           bot.defaultWorker.model ?? null,
+          bot.defaultWorker.effort ?? null,
           bot.runtimeMode,
           bot.autoLearn ? 1 : 0,
+          JSON.stringify(bot.limits),
+          bot.pausedReason,
           bot.mainSessionId,
           bot.createdAt,
           bot.updatedAt,
@@ -183,15 +246,21 @@ const makeStore = (db: DatabaseSync) => {
     updateBot: (bot: Bot) =>
       Effect.sync(() => {
         run(
-          `update bots set name = ?, instructions = ?, cwd = ?, worker_provider = ?, worker_model = ?,
-             runtime_mode = ?, auto_learn = ?, updated_at = ? where id = ?`,
+          `update bots set name = ?, instructions = ?, cwd = ?, main_model = ?, main_effort = ?,
+             worker_provider = ?, worker_model = ?, worker_effort = ?,
+             runtime_mode = ?, auto_learn = ?, limits = ?, paused_reason = ?, updated_at = ? where id = ?`,
           bot.name,
           bot.instructions,
           bot.cwd,
+          bot.main.model ?? null,
+          bot.main.effort ?? null,
           bot.defaultWorker.provider,
           bot.defaultWorker.model ?? null,
+          bot.defaultWorker.effort ?? null,
           bot.runtimeMode,
           bot.autoLearn ? 1 : 0,
+          JSON.stringify(bot.limits),
+          bot.pausedReason,
           bot.updatedAt,
           bot.id,
         );
@@ -211,9 +280,9 @@ const makeStore = (db: DatabaseSync) => {
     insertSession: (session: Session) =>
       Effect.sync(() => {
         run(
-          `insert into sessions (id, bot_id, role, parent_session_id, title, provider, model, cwd,
-             status, resume_id, last_message, completed_turns, created_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `insert into sessions (id, bot_id, role, parent_session_id, title, provider, model, effort,
+             runtime_mode, cwd, status, resume_id, last_message, completed_turns, created_at, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           session.id,
           session.botId,
           session.role,
@@ -221,6 +290,8 @@ const makeStore = (db: DatabaseSync) => {
           session.title,
           session.provider,
           session.model,
+          session.effort,
+          session.runtimeMode,
           session.cwd,
           session.status,
           session.resumeId,
@@ -237,17 +308,78 @@ const makeStore = (db: DatabaseSync) => {
         const next: Session = { ...current, ...patch, updatedAt: Date.now() };
         run(
           `update sessions set title = ?, status = ?, resume_id = ?, last_message = ?, model = ?,
-             updated_at = ? where id = ?`,
+             effort = ?, runtime_mode = ?, updated_at = ? where id = ?`,
           next.title,
           next.status,
           next.resumeId,
           next.lastMessage,
           next.model,
+          next.effort,
+          next.runtimeMode,
           next.updatedAt,
           id,
         );
         return next;
       }),
+    /**
+     * Records a provider's running usage total for a session: adds what is new to
+     * the session and to its bot's day. Returns the session and the bot's day total.
+     */
+    recordUsage: (id: SessionId, totals: Usage, at = Date.now()) =>
+      Effect.gen(function* () {
+        const session = yield* getSession(id);
+        const row = get("select provider_usage from sessions where id = ?", id);
+        const previous = row?.provider_usage ? (JSON.parse(row.provider_usage as string) as Usage) : EMPTY_USAGE;
+        const delta = usageDelta(previous, totals);
+        const usage = addUsage(session.usage, delta);
+        const day = localDay(at);
+        db.exec("begin");
+        try {
+          run(
+            "update sessions set usage = ?, provider_usage = ? where id = ?",
+            JSON.stringify(usage),
+            JSON.stringify(totals),
+            id,
+          );
+          run(
+            `insert into usage_daily (bot_id, day, input_tokens, cached_input_tokens, output_tokens, cost_usd)
+             values (?, ?, ?, ?, ?, ?)
+             on conflict (bot_id, day) do update set
+               input_tokens = input_tokens + excluded.input_tokens,
+               cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
+               output_tokens = output_tokens + excluded.output_tokens,
+               cost_usd = cost_usd + excluded.cost_usd`,
+            session.botId,
+            day,
+            delta.inputTokens,
+            delta.cachedInputTokens,
+            delta.outputTokens,
+            delta.costUsd,
+          );
+          db.exec("commit");
+        } catch (error) {
+          db.exec("rollback");
+          throw error;
+        }
+        const today = toDailyUsage(get("select * from usage_daily where bot_id = ? and day = ?", session.botId, day));
+        return { session: { ...session, usage }, today };
+      }),
+    /** Each bot's usage on `day`. */
+    usageOn: (day = localDay()) =>
+      Effect.sync(() =>
+        all("select * from usage_daily where day = ?", day).map((r) => ({
+          botId: r.bot_id as BotId,
+          usage: toDailyUsage(r),
+        })),
+      ),
+    usageToday: (botId: BotId) =>
+      Effect.sync(() => toDailyUsage(get("select * from usage_daily where bot_id = ? and day = ?", botId, localDay()))),
+    setBotPaused: (botId: BotId, reason: string | null) =>
+      Effect.gen(function* () {
+        run("update bots set paused_reason = ?, updated_at = ? where id = ?", reason, Date.now(), botId);
+        return yield* getBot(botId);
+      }),
+
     /** Records a finished turn; returns the updated session and turns since the last reflection. */
     recordTurn: (id: SessionId) =>
       Effect.gen(function* () {

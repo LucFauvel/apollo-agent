@@ -13,7 +13,9 @@ const policy = { budgetBytes: 1e9, archiveLimit: 3, detailRetentionMs: 30 * DAY 
 const setup = (): DatabaseSync => {
   const db = Database.open(join(mkdtempSync(join(tmpdir(), "apollo-compact-")), "apollo.db"));
   db.exec(`
-    insert into bots values ('a', 'A', '', '/tmp', 'claude', null, 'codex', null, 'full-access', 0, 'a-main', 0, 0);
+    insert into bots (id, name, instructions, cwd, main_provider, worker_provider, runtime_mode, auto_learn,
+      main_session_id, created_at, updated_at)
+      values ('a', 'A', '', '/tmp', 'claude', 'codex', 'full-access', 0, 'a-main', 0, 0);
     insert into sessions (id, bot_id, role, title, provider, cwd, status, created_at, updated_at)
       values ('s', 'a', 'worker', 'S', 'codex', '/tmp', 'idle', 0, 0);
   `);

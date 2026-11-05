@@ -1,7 +1,9 @@
 import type { Bot, SessionId } from "@apollo/contracts";
 import { useEffect, useState } from "react";
-import { NewBotDialog, NewSessionDialog } from "./components/Dialogs.tsx";
+import { BotSettingsDialog, NewBotDialog, NewSessionDialog } from "./components/Dialogs.tsx";
 import { DevicesDialog } from "./components/DevicesDialog.tsx";
+import { LocalModelsDialog } from "./components/LocalModelsDialog.tsx";
+import { ProvidersDialog } from "./components/ProvidersDialog.tsx";
 import { KnowledgePanel } from "./components/KnowledgePanel.tsx";
 import { SessionView } from "./components/SessionView.tsx";
 import { Sidebar } from "./components/Sidebar.tsx";
@@ -13,7 +15,7 @@ export function App() {
 
   const [selectedId, setSelectedId] = useState<SessionId | null>(null);
   const [dialog, setDialog] = useState<
-    { kind: "bot" } | { kind: "session"; bot: Bot } | { kind: "devices" } | null
+    { kind: "bot" } | { kind: "session"; bot: Bot } | { kind: "botSettings"; bot: Bot } | { kind: "devices" } | { kind: "providers" } | { kind: "localModels" } | null
   >(null);
   const [showKnowledge, setShowKnowledge] = useState(false);
 
@@ -33,7 +35,9 @@ export function App() {
         onSelect={setSelectedId}
         onNewBot={() => setDialog({ kind: "bot" })}
         onNewSession={(b) => setDialog({ kind: "session", bot: b })}
+        onBotSettings={(b) => setDialog({ kind: "botSettings", bot: b })}
         onDevices={() => setDialog({ kind: "devices" })}
+        onProviders={() => setDialog({ kind: "providers" })}
       />
       {session && bot ? (
         <SessionView session={session} bot={bot} onShowKnowledge={() => setShowKnowledge((v) => !v)} />
@@ -59,7 +63,12 @@ export function App() {
           }}
         />
       ) : null}
+      {dialog?.kind === "botSettings" ? <BotSettingsDialog bot={dialog.bot} onClose={() => setDialog(null)} /> : null}
       {dialog?.kind === "devices" ? <DevicesDialog onClose={() => setDialog(null)} /> : null}
+      {dialog?.kind === "providers" ? (
+        <ProvidersDialog onClose={() => setDialog(null)} onLocalModels={() => setDialog({ kind: "localModels" })} />
+      ) : null}
+      {dialog?.kind === "localModels" ? <LocalModelsDialog onClose={() => setDialog(null)} /> : null}
       {dialog?.kind === "session" ? (
         <NewSessionDialog
           bot={dialog.bot}

@@ -1,11 +1,12 @@
 # Apollo
 
 Apollo is a desktop app for running **bots**: long-lived personas that orchestrate
-**Claude Code** and **Codex** sessions and share **memory** and **skills** across both.
+**Claude Code**, **Codex** and **local llama.cpp** sessions and share **memory** and
+**skills** across all of them.
 
 - A bot has one **orchestrator** (main) session you talk to, plus any number of
   **worker** sessions, shown nested under it. Each session picks its own provider,
-  so one bot can mix Claude and Codex workers.
+  so one bot can mix Claude, Codex and local workers.
 - The orchestrator delegates through Apollo's MCP tools (`apollo_spawn_session`,
   `apollo_wait_session`, …). Workers report back when they finish a turn.
 - Memory and skills live in Apollo, not in either agent, so whatever one provider
@@ -40,6 +41,35 @@ The installed app uses the `claude` and `codex` CLIs on your `PATH`; it reads th
 still find them. It does not ship Claude Code's own 300+ MB binary. Set
 `APOLLO_CLAUDE_BIN` / `APOLLO_CODEX_BIN` to use specific ones.
 
+**Providers** (sidebar footer) holds credentials and endpoints:
+
+- *Claude Code* signs in with your `claude login` by default. That can be a Claude subscription
+  or a Console account. You can save an Anthropic API key and switch to it; switching back keeps
+  the key. Keys are stored in Apollo's database and never sent back to the UI. Anthropic's terms
+  do not allow third-party products to offer claude.ai (subscription) login without approval,
+  so builds you distribute should use API keys.
+- *llama.cpp* runs local models with the Claude Code harness: tools, MCP, skills and
+  approvals work as they do for Claude. By default Apollo manages it (**Local models**):
+  - **Install.** Apollo downloads the official llama.cpp release for your hardware. CUDA
+    builds come with their runtime; Vulkan, ROCm, Metal and CPU builds are also available.
+    Each download is checked against GitHub's published SHA-256, and newer builds are
+    offered as updates.
+  - **Server.** Apollo runs llama-server in router mode on a private port with a random key.
+    It starts with Apollo, restarts if it crashes, and stops when Apollo quits. Models load
+    on first use and unload after 15 idle minutes. `--fit` sizes each model to memory with
+    at least 64K context, and an 8-bit KV cache halves that cache's memory.
+  - **Finding models**, like Hermes: suggestions are the most downloaded chat models from
+    ggml-org, unsloth, bartowski and LM Studio, and search covers all GGUF models on
+    Hugging Face. Each build is sized for this machine before download: weights, plus a KV
+    cache estimated from the model's GGUF header (read with a ranged request), plus buffers.
+    The result is *Fits your GPU*, *Uses system RAM* or *Too big*. Apollo suggests the best
+    build that fits, never below 4-bit, and marks the largest model that runs fully on the
+    GPU with ★. Downloads go through llama-server, with progress.
+
+  Or choose *My own server* and point Apollo at a llama-server you run yourself, for example
+  `llama-server -m model.gguf -c 65536`. It needs the Anthropic Messages API (`/v1/messages`,
+  January 2026 or later).
+
 Dev state goes to `./.apollo-dev`; otherwise Apollo stores everything in `~/.apollo`
 (`APOLLO_DATA_DIR` overrides both).
 
@@ -47,6 +77,7 @@ Dev state goes to `./.apollo-dev`; otherwise Apollo stores everything in `~/.apo
 | --- | --- | --- |
 | `APOLLO_PORT` / `APOLLO_HOST` | `4317` / `127.0.0.1` | Server bind address |
 | `APOLLO_DATA_DIR` | `~/.apollo` | SQLite database location |
+| `APOLLO_LLAMACPP_URL` / `APOLLO_LLAMACPP_API_KEY` | `http://127.0.0.1:8080` / none | llama-server defaults, until changed under Providers |
 | `APOLLO_CLAUDE_BIN` / `APOLLO_CODEX_BIN` | SDK's own (dev), `claude` on PATH (installed) / `codex` | Provider executables |
 | `APOLLO_WEB_DIST` | unset | Serve a built UI from the server |
 | `APOLLO_ALLOWED_ORIGINS` | unset | Extra browser origins allowed to call the API (comma-separated) |
@@ -74,6 +105,7 @@ packages/contracts   Domain schemas + typed RPC group (Effect Schema / effect/rp
 packages/providers   Provider adapters behind one interface
                      ClaudeProvider → Claude Agent SDK (streaming input)
                      CodexProvider  → `codex app-server` JSON-RPC over stdio
+                     LlamaCppProvider → ClaudeProvider pointed at llama-server
 apps/server          Effect 4 server: SessionManager, SQLite store, MCP server, WS RPC
 apps/web             React 19 + Vite + Tailwind UI
 apps/desktop         Electron shell (spawns the server, loads the UI)
@@ -120,6 +152,36 @@ apps/desktop         Electron shell (spawns the server, loads the UI)
   budget it drops old tool events, then the least recently active idle workers. Messages,
   orchestrator history, core memory and active skills are never removed to meet the budget.
   Freed pages go back to the OS (incremental vacuum).
+- **Local models.** The llama.cpp provider is the Claude adapter with a different backend.
+  Each session gets a small local proxy in front of llama-server, and Claude Code's environment
+  points at it (`ANTHROPIC_BASE_URL`). The proxy folds the `system` messages Claude Code puts
+  mid-conversation into the neighbouring user message, because many chat templates (Qwen3.5,
+  for one) reject a system message that is not first. Claude Code authenticates to the proxy
+  with a throwaway token, so neither your Anthropic credentials nor the llama-server key are in
+  its environment. All of Claude Code's model aliases, including the small model it uses for
+  background work, are set to the local model. Its context limit comes from llama-server's
+  `/props`, so auto-compaction starts in time. Usage is recorded at $0.
+- **Models and settings.** Model lists come from the CLIs themselves (Claude Code's
+  `supportedModels`, Codex's `model/list`, llama-server's `/v1/models`), cached for 30 minutes, with each model's reasoning
+  effort levels. Every session has its own model, effort and permissions (or follows the bot's);
+  open them from the provider badge in the session header. A change closes the provider process
+  and the next message resumes the same conversation with the new settings; a running turn
+  finishes first. The orchestrator can also pick a model and effort per worker.
+- **Usage and guardrails.** Apollo records each session's token usage, and its cost for Claude.
+  Codex reports no cost and local models cost nothing, so both count as $0. The figures are also totalled per bot per
+  day, and they show in the session header, in the sidebar and in bot settings. Each bot has
+  limits, which you set in its settings:
+  - workers running at once (default 4); spawning more is refused;
+  - orchestrator turns in a row that you did not start (default 25);
+  - a daily token budget (fresh input + output) and a daily cost budget, both unlimited
+    by default.
+
+  Hitting a turn or budget limit **pauses** the bot. Going over a budget also interrupts the
+  turns it is running. **Stop all** in the session header pauses the bot and interrupts every
+  running turn. While a bot is paused, workers do not start, are not messaged, and do not
+  report back, and reflection is skipped. Your own messages always go through.
+  **Resume** clears the pause. It is refused while the bot is still over a daily budget:
+  raise the budget, or wait until tomorrow (local time).
 - **Approvals.** In `approval-required` mode, Claude's `canUseTool` and Codex's approval
   requests both surface as the same approval card.
 - **Input requests.** When an MCP server asks the user for input (an MCP elicitation, from
@@ -147,6 +209,11 @@ Apollo only talks to **paired devices**, the same model t3code uses:
 - The server binds to `127.0.0.1` by default.
 
 ## Known gaps / next steps
+
+- Local models: Claude Code's prompt and tool definitions are about 13k tokens, and small
+  models call tools unreliably, so results depend on the model. Managed llama.cpp was tried
+  on Linux with CUDA, not yet on Windows or macOS. If Apollo is killed outright (no clean
+  shutdown), its llama-server keeps running until stopped.
 
 - Archive and transcript search are keyword-based (FTS5), like Hermes. Embeddings could be
   added behind `searchMemories` / `searchTranscripts` if paraphrased lookups start missing.

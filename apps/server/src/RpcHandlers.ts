@@ -1,7 +1,10 @@
-import { ApolloRpcs } from "@apollo/contracts";
+import { ApolloError, type AppChange, ApolloRpcs } from "@apollo/contracts";
+import * as Stream from "effect/Stream";
 import * as Effect from "effect/Effect";
 import { Auth } from "./auth/Auth.ts";
 import { Compaction } from "./Compaction.ts";
+import { LocalModels } from "./local/LocalModels.ts";
+import { ProviderSettings } from "./ProviderSettings.ts";
 import { SessionManager } from "./SessionManager.ts";
 import { Store } from "./Store.ts";
 
@@ -12,20 +15,51 @@ export const layer = ApolloRpcs.toLayer(
     const store = yield* Store;
     const auth = yield* Auth;
     const compaction = yield* Compaction;
+    const providerSettings = yield* ProviderSettings;
+    const localModels = yield* LocalModels;
+    // Errors from the local-model service reach the UI as plain messages.
+    const local = <A, R>(effect: Effect.Effect<A, Error, R>) =>
+      effect.pipe(Effect.mapError((error) => new ApolloError({ code: "internal", message: error.message })));
 
     return {
       "app.snapshot": () => manager.snapshot,
-      "app.changes": () => manager.changes,
+      "app.changes": () =>
+        Stream.merge(
+          manager.changes,
+          localModels.changes.pipe(Stream.map((state): AppChange => ({ _tag: "LocalModelsChanged", state }))),
+        ),
+
+      "localModels.state": () => localModels.state,
+      "localModels.installEngine": ({ backend }) => local(localModels.installEngine(backend)),
+      "localModels.checkForUpdate": () => localModels.checkForUpdate,
+      "localModels.startServer": () => local(localModels.startServer),
+      "localModels.stopServer": () => localModels.stopServer,
+      "localModels.logs": () => localModels.logs,
+      "localModels.suggested": () => local(localModels.suggested),
+      "localModels.search": ({ query }) => local(localModels.search(query)),
+      "localModels.details": ({ repo }) => local(localModels.details(repo)),
+      "localModels.download": ({ repo, quant }) => local(localModels.download(repo, quant)),
+      "localModels.cancelDownload": ({ model }) => local(localModels.cancelDownload(model)),
+      "localModels.delete": ({ model }) => local(localModels.deleteModel(model)),
+      "localModels.setDefault": ({ model }) => localModels.setDefault(model),
 
       "storage.report": () => compaction.report,
       "storage.compact": () => compaction.compact,
 
+      "providers.models": ({ provider }) => manager.listModels(provider),
+      "providers.settings": () => providerSettings.view,
+      "providers.updateSettings": (input) =>
+        providerSettings.update(input).pipe(Effect.tap(() => manager.refreshModels)),
+
       "bots.create": (input) => manager.createBot(input),
       "bots.update": (input) => manager.updateBot(input),
       "bots.delete": ({ botId }) => manager.deleteBot(botId),
+      "bots.stop": ({ botId }) => manager.stopBot(botId),
+      "bots.resume": ({ botId }) => manager.resumeBot(botId),
 
       "sessions.create": ({ botId, title, provider, cwd, prompt }) =>
         manager.createSession({ botId, title, provider, cwd, prompt }),
+      "sessions.update": (input) => manager.updateSessionSettings(input),
       "sessions.send": ({ sessionId, text }) => manager.send(sessionId, text, "user"),
       "sessions.interrupt": ({ sessionId }) => manager.interrupt(sessionId),
       "sessions.close": ({ sessionId }) => manager.closeSession(sessionId),

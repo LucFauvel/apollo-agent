@@ -99,7 +99,8 @@ const waitForHealth = async (url: string, timeoutMs = 20_000) => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`${url}/health`);
+      // A request that reaches the port while the server is still starting can stall.
+      const response = await fetch(`${url}/health`, { signal: AbortSignal.timeout(2000) });
       if (response.ok) return;
     } catch {
       // not up yet

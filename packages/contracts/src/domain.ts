@@ -23,7 +23,8 @@ export const Timestamp = Schema.Number;
 // Providers
 // ---------------------------------------------------------------------------
 
-export const ProviderKind = Schema.Literals(["claude", "codex"]);
+/** `llamacpp`: a local model behind llama.cpp's llama-server, driven by the Claude Code harness. */
+export const ProviderKind = Schema.Literals(["claude", "codex", "llamacpp"]);
 export type ProviderKind = typeof ProviderKind.Type;
 
 /**
@@ -37,8 +38,70 @@ export const ProviderSelection = Schema.Struct({
   provider: ProviderKind,
   /** Provider-specific model id. Omitted means the provider's default. */
   model: Schema.optional(Schema.String),
+  /** Reasoning effort level, as the provider names it (e.g. `high`). Omitted means the model's default. */
+  effort: Schema.optional(Schema.String),
 });
 export type ProviderSelection = typeof ProviderSelection.Type;
+
+/** A model a provider offers, as reported by the provider itself. */
+export const ModelOption = Schema.Struct({
+  id: Schema.String,
+  label: Schema.String,
+  description: Schema.String,
+  /** Used when no model is chosen. */
+  isDefault: Schema.Boolean,
+  /** Reasoning effort levels the model accepts (empty when it has none). */
+  efforts: Schema.Array(Schema.String),
+  defaultEffort: Schema.NullOr(Schema.String),
+});
+export type ModelOption = typeof ModelOption.Type;
+
+// ---------------------------------------------------------------------------
+// Usage & guardrails
+// ---------------------------------------------------------------------------
+
+/** Token and cost totals. `costUsd` only counts providers that report a cost (Claude). */
+export const Usage = Schema.Struct({
+  /** Input tokens processed fresh (not read from the prompt cache). */
+  inputTokens: Schema.Number,
+  cachedInputTokens: Schema.Number,
+  outputTokens: Schema.Number,
+  costUsd: Schema.Number,
+});
+export type Usage = typeof Usage.Type;
+
+export const EMPTY_USAGE: Usage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, costUsd: 0 };
+
+/** "$12.34" for a dollar or more; two significant digits below ("$0.0034"). */
+export const formatUsd = (usd: number): string =>
+  usd >= 1 || usd === 0 ? `$${usd.toFixed(2)}` : `$${Number(usd.toPrecision(2))}`;
+
+/** Tokens that count against a token budget: fresh input plus output. */
+export const billableTokens = (usage: Usage) => usage.inputTokens + usage.outputTokens;
+
+/**
+ * Limits on what a bot does without the user. When one is hit the bot pauses:
+ * automated work (spawning or messaging workers, worker reports, reflections)
+ * is refused until the user resumes it. The user's own messages always go through.
+ */
+export const BotLimits = Schema.Struct({
+  /** Workers that may run a turn at the same time. */
+  maxConcurrentWorkers: Schema.Number,
+  /** Orchestrator turns in a row not started by the user (e.g. reacting to worker reports). */
+  maxAutonomousTurns: Schema.Number,
+  /** Fresh input + output tokens per day, across all the bot's sessions. */
+  dailyTokenBudget: Schema.NullOr(Schema.Number),
+  /** Estimated spend per day; only providers that report cost count. */
+  dailyCostBudgetUsd: Schema.NullOr(Schema.Number),
+});
+export type BotLimits = typeof BotLimits.Type;
+
+export const DEFAULT_BOT_LIMITS: BotLimits = {
+  maxConcurrentWorkers: 4,
+  maxAutonomousTurns: 25,
+  dailyTokenBudget: null,
+  dailyCostBudgetUsd: null,
+};
 
 // ---------------------------------------------------------------------------
 // Bots
@@ -62,6 +125,9 @@ export const Bot = Schema.Struct({
   runtimeMode: RuntimeMode,
   /** Run a reflection pass after sessions to extract memories and skill proposals. */
   autoLearn: Schema.Boolean,
+  limits: BotLimits,
+  /** Why automated work is paused, or `null` when the bot runs freely. */
+  pausedReason: Schema.NullOr(Schema.String),
   mainSessionId: SessionId,
   createdAt: Timestamp,
   updatedAt: Timestamp,
@@ -99,6 +165,9 @@ export const Session = Schema.Struct({
   title: Schema.String,
   provider: ProviderKind,
   model: Schema.NullOr(Schema.String),
+  effort: Schema.NullOr(Schema.String),
+  /** Overrides the bot's runtime mode for this session; `null` follows the bot. */
+  runtimeMode: Schema.NullOr(RuntimeMode),
   cwd: Schema.String,
   status: SessionStatus,
   /** Provider-native id used to resume the conversation (Claude session id / Codex thread id). */
@@ -106,6 +175,8 @@ export const Session = Schema.Struct({
   /** Last assistant message, kept for list views and orchestration tools. */
   lastMessage: Schema.NullOr(Schema.String),
   completedTurns: Schema.Number,
+  /** Everything this session has used since Apollo started tracking it. */
+  usage: Usage,
   createdAt: Timestamp,
   updatedAt: Timestamp,
 });
@@ -354,3 +425,33 @@ export const PairResponse = Schema.Struct({
   sessionToken: Schema.NullOr(Schema.String),
 });
 export type PairResponse = typeof PairResponse.Type;
+
+// ---------------------------------------------------------------------------
+// Provider settings
+// ---------------------------------------------------------------------------
+
+/** How Claude Code signs in: the user's own `claude` login (subscription), or an API key saved in Apollo. */
+export const ClaudeAuth = Schema.Literals(["subscription", "api-key"]);
+export type ClaudeAuth = typeof ClaudeAuth.Type;
+
+/** `managed`: Apollo installs and runs llama-server. `external`: one the user runs. */
+export const LlamaCppMode = Schema.Literals(["managed", "external"]);
+export type LlamaCppMode = typeof LlamaCppMode.Type;
+
+/** Provider settings as the UI sees them. Keys are write-only: only whether one is saved. */
+export const ProviderSettings = Schema.Struct({
+  claude: Schema.Struct({ auth: ClaudeAuth, apiKeySaved: Schema.Boolean }),
+  llamacpp: Schema.Struct({ mode: LlamaCppMode, baseUrl: Schema.String, apiKeySaved: Schema.Boolean }),
+});
+export type ProviderSettings = typeof ProviderSettings.Type;
+
+/** A key field: omitted keeps the saved key, `null` clears it. */
+const KeyUpdate = Schema.optional(Schema.NullOr(Schema.String));
+
+export const UpdateProviderSettingsInput = Schema.Struct({
+  claude: Schema.optional(Schema.Struct({ auth: Schema.optional(ClaudeAuth), apiKey: KeyUpdate })),
+  llamacpp: Schema.optional(
+    Schema.Struct({ mode: Schema.optional(LlamaCppMode), baseUrl: Schema.optional(Schema.String), apiKey: KeyUpdate }),
+  ),
+});
+export type UpdateProviderSettingsInput = typeof UpdateProviderSettingsInput.Type;

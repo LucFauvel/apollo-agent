@@ -1,10 +1,13 @@
 import * as Schema from "effect/Schema";
 import { Rpc, RpcGroup } from "effect/rpc";
+import { LlamaBackend, LocalModelsState, ModelCandidate, ModelDetails, SuggestedModel } from "./local.ts";
 import {
   ApprovalDecision,
   InputResponse,
   Bot,
   BotId,
+  BotLimits,
+  Usage,
   ClientId,
   CoreMemory,
   CoreMemoryTarget,
@@ -13,6 +16,10 @@ import {
   MemoryKind,
   PairedClient,
   PairingToken,
+  ModelOption,
+  ProviderKind,
+  ProviderSettings,
+  UpdateProviderSettingsInput,
   ProviderSelection,
   RuntimeMode,
   Session,
@@ -37,12 +44,16 @@ export const AppChange = Schema.Union([
   Schema.TaggedStruct("SessionDeleted", { sessionId: SessionId }),
   Schema.TaggedStruct("MemoryChanged", { botId: Schema.NullOr(BotId) }),
   Schema.TaggedStruct("SkillChanged", { botId: Schema.NullOr(BotId) }),
+  Schema.TaggedStruct("BotUsageToday", { botId: BotId, usage: Usage }),
+  Schema.TaggedStruct("LocalModelsChanged", { state: LocalModelsState }),
 ]);
 export type AppChange = typeof AppChange.Type;
 
 export const AppSnapshot = Schema.Struct({
   bots: Schema.Array(Bot),
   sessions: Schema.Array(Session),
+  /** Each bot's usage today (server local time). */
+  usageToday: Schema.Array(Schema.Struct({ botId: BotId, usage: Usage })),
 });
 export type AppSnapshot = typeof AppSnapshot.Type;
 
@@ -54,6 +65,7 @@ export const CreateBotInput = Schema.Struct({
   defaultWorker: ProviderSelection,
   runtimeMode: RuntimeMode,
   autoLearn: Schema.Boolean,
+  limits: Schema.optional(BotLimits),
 });
 export type CreateBotInput = typeof CreateBotInput.Type;
 
@@ -62,9 +74,12 @@ export const UpdateBotInput = Schema.Struct({
   name: Schema.optional(Schema.String),
   instructions: Schema.optional(Schema.String),
   cwd: Schema.optional(Schema.String),
+  /** Model and effort of the orchestrator; its provider cannot change. */
+  main: Schema.optional(ProviderSelection),
   defaultWorker: Schema.optional(ProviderSelection),
   runtimeMode: Schema.optional(RuntimeMode),
   autoLearn: Schema.optional(Schema.Boolean),
+  limits: Schema.optional(BotLimits),
 });
 export type UpdateBotInput = typeof UpdateBotInput.Type;
 
@@ -78,6 +93,16 @@ export const CreateSessionInput = Schema.Struct({
 });
 export type CreateSessionInput = typeof CreateSessionInput.Type;
 
+/** Session settings; omitted fields stay as they are. Changes apply from the next turn. */
+export const UpdateSessionInput = Schema.Struct({
+  sessionId: SessionId,
+  title: Schema.optional(Schema.String),
+  model: Schema.optional(Schema.NullOr(Schema.String)),
+  effort: Schema.optional(Schema.NullOr(Schema.String)),
+  runtimeMode: Schema.optional(Schema.NullOr(RuntimeMode)),
+});
+export type UpdateSessionInput = typeof UpdateSessionInput.Type;
+
 const error = ApolloError;
 
 export class ApolloRpcs extends RpcGroup.make(
@@ -85,13 +110,46 @@ export class ApolloRpcs extends RpcGroup.make(
   Rpc.make("app.snapshot", { success: AppSnapshot, error }),
   Rpc.make("app.changes", { success: AppChange, stream: true }),
 
+  // --- providers ---------------------------------------------------------
+  Rpc.make("providers.models", {
+    payload: { provider: ProviderKind },
+    success: Schema.Array(ModelOption),
+    error,
+  }),
+  Rpc.make("providers.settings", { success: ProviderSettings, error }),
+  /** Applies to provider processes started afterwards. */
+  Rpc.make("providers.updateSettings", { payload: UpdateProviderSettingsInput, success: ProviderSettings, error }),
+
+  // --- local models (llama.cpp managed by Apollo) -------------------------
+  Rpc.make("localModels.state", { success: LocalModelsState, error }),
+  /** Downloads and verifies a llama.cpp build; progress arrives as `LocalModelsChanged`. */
+  Rpc.make("localModels.installEngine", { payload: { backend: LlamaBackend }, error }),
+  Rpc.make("localModels.checkForUpdate", { success: LocalModelsState, error }),
+  Rpc.make("localModels.startServer", { error }),
+  Rpc.make("localModels.stopServer", { error }),
+  /** The last lines llama-server printed. */
+  Rpc.make("localModels.logs", { success: Schema.Array(Schema.String), error }),
+  /** Popular models from trusted GGUF publishers, sized for this machine. */
+  Rpc.make("localModels.suggested", { success: Schema.Array(SuggestedModel), error }),
+  Rpc.make("localModels.search", { payload: { query: Schema.String }, success: Schema.Array(ModelCandidate), error }),
+  Rpc.make("localModels.details", { payload: { repo: Schema.String }, success: ModelDetails, error }),
+  Rpc.make("localModels.download", { payload: { repo: Schema.String, quant: Schema.String }, error }),
+  Rpc.make("localModels.cancelDownload", { payload: { model: Schema.String }, error }),
+  Rpc.make("localModels.delete", { payload: { model: Schema.String }, error }),
+  Rpc.make("localModels.setDefault", { payload: { model: Schema.NullOr(Schema.String) }, error }),
+
   // --- bots --------------------------------------------------------------
   Rpc.make("bots.create", { payload: CreateBotInput, success: Bot, error }),
   Rpc.make("bots.update", { payload: UpdateBotInput, success: Bot, error }),
   Rpc.make("bots.delete", { payload: { botId: BotId }, error }),
+  /** Interrupts everything the bot is doing and pauses its automated work. */
+  Rpc.make("bots.stop", { payload: { botId: BotId }, success: Bot, error }),
+  /** Lifts a pause. Fails while the bot is over today's budget. */
+  Rpc.make("bots.resume", { payload: { botId: BotId }, success: Bot, error }),
 
   // --- sessions ----------------------------------------------------------
   Rpc.make("sessions.create", { payload: CreateSessionInput, success: Session, error }),
+  Rpc.make("sessions.update", { payload: UpdateSessionInput, success: Session, error }),
   Rpc.make("sessions.send", { payload: { sessionId: SessionId, text: Schema.String }, error }),
   Rpc.make("sessions.interrupt", { payload: { sessionId: SessionId }, error }),
   Rpc.make("sessions.close", { payload: { sessionId: SessionId }, error }),

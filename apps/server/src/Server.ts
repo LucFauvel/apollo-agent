@@ -11,6 +11,8 @@ import * as AuthHttp from "./auth/http.ts";
 import * as Config from "./Config.ts";
 import * as Database from "./Database.ts";
 import * as ApolloMcp from "./mcp/ApolloMcp.ts";
+import * as LocalModels from "./local/LocalModels.ts";
+import * as ProviderSettings from "./ProviderSettings.ts";
 import * as RpcHandlers from "./RpcHandlers.ts";
 import * as SessionManager from "./SessionManager.ts";
 import * as Store from "./Store.ts";
@@ -43,6 +45,8 @@ const layerHttpServer = Layer.unwrap(
 const layerCore = Compaction.layer.pipe(
   Layer.provideMerge(SessionManager.layer),
   Layer.provideMerge(SessionManager.layerProviders),
+  Layer.provideMerge(LocalModels.layer),
+  Layer.provideMerge(ProviderSettings.layer),
   Layer.provideMerge(Auth.layer),
   Layer.provideMerge(Store.layer),
   Layer.provideMerge(Database.layer),

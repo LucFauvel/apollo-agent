@@ -1,10 +1,18 @@
-import type { AgentEvent, ApprovalDecision, InputResponse, ProviderKind, RuntimeMode } from "@apollo/contracts";
+import {
+  type AgentEvent,
+  type ApprovalDecision,
+  type InputResponse,
+  type ModelOption,
+  ProviderKind,
+  type RuntimeMode,
+  type Usage,
+} from "@apollo/contracts";
 import type * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
 export class ProviderError extends Schema.TaggedError<ProviderError>()("ProviderError", {
-  provider: Schema.Literals(["claude", "codex"]),
+  provider: ProviderKind,
   message: Schema.String,
 }) {}
 
@@ -18,6 +26,8 @@ export interface McpEndpoint {
 export interface ProviderSessionOptions {
   readonly cwd: string;
   readonly model: string | null;
+  /** Reasoning effort level; `null` uses the model's default. */
+  readonly effort: string | null;
   /** Provider-native conversation id to resume, if any. */
   readonly resumeId: string | null;
   /** Extra instructions layered on top of the provider's own system prompt. */
@@ -36,6 +46,11 @@ export type ProviderEmission =
   | { readonly _tag: "Event"; readonly event: AgentEvent }
   /** The provider assigned (or confirmed) its native conversation id. */
   | { readonly _tag: "ResumeId"; readonly resumeId: string }
+  /**
+   * Usage so far in this provider conversation. Cumulative, and it may include
+   * turns from before a resume, so consumers record the difference.
+   */
+  | { readonly _tag: "UsageTotals"; readonly totals: Usage }
   /** The underlying process/connection ended; the session must be reopened. */
   | { readonly _tag: "Exited"; readonly reason: string };
 
@@ -65,6 +80,8 @@ export interface Provider {
     options: ProviderSessionOptions,
     emit: Emit,
   ) => Effect.Effect<ProviderSession, ProviderError, Scope.Scope>;
+  /** Models the provider offers to this user (asks the CLI, so it takes a moment). */
+  readonly listModels: Effect.Effect<ReadonlyArray<ModelOption>, ProviderError>;
 }
 
 /** Compact one-line description of a tool input for transcript display. */

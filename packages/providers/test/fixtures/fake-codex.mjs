@@ -25,6 +25,32 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
   switch (msg.method) {
     case "initialize":
       return send({ id: msg.id, result: { userAgent: "fake" } });
+    case "model/list": {
+      // Two pages, to exercise pagination; the hidden model must be filtered out.
+      const model = (id, displayName, description, efforts, extra = {}) => ({
+        id,
+        model: id,
+        displayName,
+        description,
+        hidden: false,
+        isDefault: false,
+        supportedReasoningEfforts: efforts.map((reasoningEffort) => ({ reasoningEffort, description: "" })),
+        defaultReasoningEffort: efforts[0],
+        ...extra,
+      });
+      return send({
+        id: msg.id,
+        result: msg.params.cursor
+          ? { data: [model("gpt-deep", "GPT Deep", "Hard problems", ["medium", "high"], { isDefault: true })], nextCursor: null }
+          : {
+              data: [
+                model("gpt-fast", "GPT Fast", "Quick edits", ["low", "medium"]),
+                model("gpt-old", "GPT Old", "Retired", [], { hidden: true }),
+              ],
+              nextCursor: "page-2",
+            },
+      });
+    }
     case "thread/start":
     case "thread/resume":
       return send({ id: msg.id, result: { thread: { id: msg.params.threadId ?? "thread-1" } } });
@@ -62,6 +88,11 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
       send({
         method: "item/completed",
         params: { item: { type: "agentMessage", id: "msg-1", text: JSON.stringify(grant) } },
+      });
+      const breakdown = { totalTokens: 1050, inputTokens: 1000, cachedInputTokens: 400, cacheWriteInputTokens: 0, outputTokens: 50, reasoningOutputTokens: 10 };
+      send({
+        method: "thread/tokenUsage/updated",
+        params: { threadId: "thread-1", turnId: "turn-1", tokenUsage: { total: breakdown, last: breakdown, modelContextWindow: null } },
       });
       return send({
         method: "turn/completed",

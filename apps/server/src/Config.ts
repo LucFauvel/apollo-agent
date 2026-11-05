@@ -14,6 +14,8 @@ export interface ServerConfigShape {
   readonly baseUrl: string;
   readonly claudeExecutable: string | undefined;
   readonly codexExecutable: string | undefined;
+  /** Defaults for the llama.cpp provider until changed in the settings. */
+  readonly llamaCpp: { readonly baseUrl: string; readonly apiKey: string | null };
   /**
    * Browser origins allowed to call the server. Requests without an `Origin`
    * header (CLIs, agents, Electron's own server checks) are always allowed.
@@ -66,6 +68,10 @@ export const fromEnv = (env: NodeJS.ProcessEnv = process.env): ServerConfigShape
     },
     claudeExecutable: env.APOLLO_CLAUDE_BIN,
     codexExecutable: env.APOLLO_CODEX_BIN,
+    llamaCpp: {
+      baseUrl: env.APOLLO_LLAMACPP_URL || "http://127.0.0.1:8080",
+      apiKey: env.APOLLO_LLAMACPP_API_KEY || null,
+    },
     allowedOrigins: [
       `http://127.0.0.1:${port}`,
       `http://localhost:${port}`,

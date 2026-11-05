@@ -1,4 +1,5 @@
 import type { Bot, Session, SessionId } from "@apollo/contracts";
+import { formatUsage, usageTitle } from "../format.ts";
 import { useApp } from "../store.ts";
 import { Button, cx, ProviderBadge, StatusDot } from "./ui.tsx";
 
@@ -37,13 +38,16 @@ function BotGroup({
   selectedId,
   onSelect,
   onNewSession,
+  onSettings,
 }: {
   bot: Bot;
   sessions: ReadonlyArray<Session>;
   selectedId: SessionId | null;
   onSelect: (id: SessionId) => void;
   onNewSession: (bot: Bot) => void;
+  onSettings: (bot: Bot) => void;
 }) {
+  const today = useApp((s) => s.usageToday.get(bot.id));
   const main = sessions.find((s) => s.id === bot.mainSessionId);
   const children = sessions
     .filter((s) => s.id !== bot.mainSessionId)
@@ -63,8 +67,25 @@ function BotGroup({
             {bot.name.slice(0, 1).toUpperCase()}
           </span>
           <span className="min-w-0 flex-1 truncate text-sm font-medium text-zinc-100">{bot.name}</span>
+          {bot.pausedReason !== null ? (
+            <span className="rounded bg-amber-500/15 px-1 text-[10px] text-amber-300" title={`Paused: ${bot.pausedReason}`}>
+              paused
+            </span>
+          ) : null}
           {main ? <StatusDot status={main.status} /> : null}
           {busy > 0 ? <span className="text-[10px] text-emerald-400">{busy} running</span> : null}
+        </button>
+        {today ? (
+          <span className="shrink-0 text-[10px] text-zinc-600 group-hover:hidden" title={`Today: ${usageTitle(today)}`}>
+            {formatUsage(today).replace(" tokens", "")}
+          </span>
+        ) : null}
+        <button
+          className="hidden text-xs text-zinc-500 group-hover:block hover:text-zinc-200"
+          title="Bot settings"
+          onClick={() => onSettings(bot)}
+        >
+          ⚙
         </button>
         <button
           className="text-zinc-500 opacity-0 group-hover:opacity-100 hover:text-zinc-200"
@@ -86,13 +107,17 @@ export function Sidebar({
   onSelect,
   onNewBot,
   onNewSession,
+  onBotSettings,
   onDevices,
+  onProviders,
 }: {
   selectedId: SessionId | null;
   onSelect: (id: SessionId) => void;
   onNewBot: () => void;
   onNewSession: (bot: Bot) => void;
+  onBotSettings: (bot: Bot) => void;
   onDevices: () => void;
+  onProviders: () => void;
 }) {
   const bots = useApp((s) => s.bots);
   const sessions = useApp((s) => s.sessions);
@@ -116,6 +141,7 @@ export function Sidebar({
             selectedId={selectedId}
             onSelect={onSelect}
             onNewSession={onNewSession}
+            onSettings={onBotSettings}
           />
         ))}
         {bots.size === 0 && connected ? (
@@ -125,7 +151,10 @@ export function Sidebar({
       <div className="flex items-center gap-2 border-t border-zinc-800/80 px-3 py-2 text-[11px] text-zinc-500">
         <span className={cx("size-1.5 rounded-full", connected ? "bg-emerald-500" : "bg-amber-500 animate-pulse")} />
         {connected ? "Connected" : "Connecting…"}
-        <button className="ml-auto hover:text-zinc-200" onClick={onDevices}>
+        <button className="ml-auto hover:text-zinc-200" onClick={onProviders}>
+          Providers
+        </button>
+        <button className="hover:text-zinc-200" onClick={onDevices}>
           Devices
         </button>
       </div>

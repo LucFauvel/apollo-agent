@@ -140,6 +140,36 @@ const MIGRATIONS: ReadonlyArray<string> = [
     where json_extract(event, '$._tag') in ('UserMessage', 'AssistantMessage');
   create index session_events_at on session_events(at);
   `,
+  // 5: reasoning effort, and per-session runtime mode overrides.
+  `
+  alter table bots add column main_effort text;
+  alter table bots add column worker_effort text;
+  alter table sessions add column effort text;
+  alter table sessions add column runtime_mode text;
+  `,
+  // 6: usage tracking and guardrails.
+  `
+  alter table bots add column limits text;          -- JSON BotLimits; null means defaults
+  alter table bots add column paused_reason text;
+  alter table sessions add column usage text;        -- JSON Usage counted by Apollo
+  alter table sessions add column provider_usage text; -- last running total the provider reported
+  create table usage_daily (
+    bot_id text not null references bots(id) on delete cascade,
+    day text not null,                               -- server-local YYYY-MM-DD
+    input_tokens integer not null default 0,
+    cached_input_tokens integer not null default 0,
+    output_tokens integer not null default 0,
+    cost_usd real not null default 0,
+    primary key (bot_id, day)
+  );
+  `,
+  // 7: app-wide settings (provider credentials and endpoints).
+  `
+  create table settings (
+    key text primary key,
+    value text not null
+  );
+  `,
 ];
 
 export class Database extends Context.Service<Database, DatabaseSync>()("apollo/Database") {}
