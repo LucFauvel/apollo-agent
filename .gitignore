@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dist-electron/
+out/
+.apollo-dev/
+*.tsbuildinfo
+.env
+.DS_Store
+apps/desktop/build/
+apps/desktop/release/

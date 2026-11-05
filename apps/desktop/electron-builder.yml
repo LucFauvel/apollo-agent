@@ -1,0 +1,29 @@
+# Installers for the desktop app: `pnpm package` (or `pnpm package:dir` for an
+# unpacked build to test quickly). Output goes to apps/desktop/release/.
+appId: dev.apollo.desktop
+productName: Apollo
+executableName: apollo
+directories:
+  output: release
+files:
+  - dist-electron/**/*
+  - package.json
+# Kept outside the asar archive: the server runs as a separate Node process.
+extraResources:
+  - from: build/server
+    to: server
+  - from: ../web/dist
+    to: web
+# No native modules: the server is a single bundle and node:sqlite is built in.
+npmRebuild: false
+linux:
+  target: [AppImage]
+  category: Development
+mac:
+  target: [dmg]
+  category: public.app-category.developer-tools
+win:
+  target: [nsis]
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true

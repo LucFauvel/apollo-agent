@@ -1,0 +1,26 @@
+{
+  "name": "@apollo/desktop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "ensure:electron": "node -e \"require('electron')\" 2>/dev/null || (cd node_modules/electron && node install.js)",
+    "build": "tsc -p .",
+    "dev": "pnpm ensure:electron && tsc -p . && APOLLO_DEV_URL=http://127.0.0.1:5733 electron .",
+    "start": "pnpm ensure:electron && pnpm --filter @apollo/web build && tsc -p . && electron .",
+    "typecheck": "tsc --noEmit -p .",
+    "bundle:server": "node scripts/bundle-server.ts",
+    "package": "pnpm build:package && electron-builder --publish never",
+    "package:dir": "pnpm build:package && electron-builder --dir --publish never",
+    "build:package": "pnpm --filter @apollo/web build && tsc -p . && node scripts/bundle-server.ts"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "electron": "44.10.1",
+    "electron-builder": "^26.18.0",
+    "esbuild": "^0.28.2",
+    "typescript": "catalog:"
+  },
+  "description": "Apollo desktop app"
+}

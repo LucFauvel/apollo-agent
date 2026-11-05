@@ -1,0 +1,21 @@
+packages:
+  - apps/*
+  - packages/*
+
+catalog:
+  "@effect/platform-node": 4.1.2
+  "@effect/vitest": 4.1.2
+  "@types/node": 24.12.4
+  "@types/react": ~19.3.0
+  "@types/react-dom": ~19.3.0
+  effect: 4.1.2
+  react: 19.3.0
+  react-dom: 19.3.0
+  typescript: ^5.9.0
+  vitest: ^5.0.0
+
+allowBuilds:
+  electron: true
+  esbuild: true
+  # Squirrel.Windows installer helper; Apollo builds NSIS installers instead.
+  electron-winstaller: false

@@ -1,0 +1,20 @@
+{
+  "name": "@apollo/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": { "apollo": "./src/bin.ts" },
+  "scripts": {
+    "dev": "node --watch --watch-path=src --watch-path=../../packages src/bin.ts",
+    "start": "node src/bin.ts",
+    "typecheck": "tsc --noEmit -p .",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@apollo/contracts": "workspace:*",
+    "@apollo/providers": "workspace:*",
+    "@effect/platform-node": "catalog:",
+    "effect": "catalog:"
+  },
+  "devDependencies": { "typescript": "catalog:", "@types/node": "catalog:", "vitest": "catalog:", "@effect/vitest": "catalog:" }
+}
