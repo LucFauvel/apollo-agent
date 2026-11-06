@@ -1,0 +1,59 @@
+{
+  "expo": {
+    "name": "Apollo",
+    "slug": "apollo-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "dev.ocx64.apollo.mobile",
+      "buildNumber": "202611060955",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "dev.ocx64.apollo.mobile"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "scheme": "apollo",
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Apollo uses the camera to scan the pairing QR code shown on your computer.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ],
+      "expo-secure-store",
+      [
+        "expo-notifications",
+        {
+          "mode": "production",
+          "color": "#818cf8"
+        }
+      ]
+    ],
+    "splash": {
+      "backgroundColor": "#09090b"
+    },
+    "owner": "ocx64",
+    "extra": {
+      "eas": {
+        "projectId": "4406ce74-cc9f-424c-9810-ff98125cc132"
+      }
+    }
+  }
+}

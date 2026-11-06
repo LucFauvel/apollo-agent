@@ -1,0 +1,9 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    // Workspace packages import their files with explicit .ts extensions (Metro resolves them).
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  }
+}
