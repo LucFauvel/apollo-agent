@@ -110,7 +110,8 @@ const ORDER: ReadonlyArray<ActivityCategory> = [
 ];
 
 export const toolCategory = (name: string): ActivityCategory => {
-  if (name === "Agent" || name === "Task") return "agent";
+  // Claude Code's Agent / Task tools; Codex's subagent steps arrive as "Subagent wait" etc.
+  if (name === "Agent" || name === "Task" || name.startsWith("Subagent ")) return "agent";
   const n = name.toLowerCase();
   if (/(^|__)apollo_browser_/.test(n)) return "browser";
   if (/(^|__)apollo_(show|preview)_html$/.test(n)) return "visual";
@@ -199,7 +200,7 @@ export const bySubagent = (step: ActivityStep, steps: ReadonlyArray<ActivityStep
   step.kind === "tool" && step.parent !== undefined && steps.some((s) => s.key === step.parent);
 
 /** A tool's name as a heading: a subagent call reads as "Subagent". */
-export const stepTitle = (step: ToolStep) => (toolCategory(step.name) === "agent" ? "Subagent" : toolName(step.name));
+export const stepTitle = (step: ToolStep) => (step.name === "Agent" || step.name === "Task" ? "Subagent" : toolName(step.name));
 
 /** A thought's first line, without markdown markers, for its collapsed row. */
 export const firstLine = (text: string) =>

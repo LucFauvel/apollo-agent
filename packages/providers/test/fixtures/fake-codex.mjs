@@ -84,6 +84,26 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
             reason: "needs network",
             permissions: { network: { enabled: true }, fileSystem: null },
           });
+      if (JSON.stringify(msg.params.input).includes("subagent")) {
+        // As codex 0.167 reports a subagent: its own thread, turn and items on this connection.
+        const sub = "thread-sub";
+        const subTurn = { id: "turn-sub", status: "inProgress", error: null };
+        const activity = (id, kind) => ({ type: "subAgentActivity", id, kind, agentThreadId: sub, agentPath: "/root/list_files", model: null, reasoningEffort: null });
+        send({ method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", item: activity("act-1", "started") } });
+        send({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: activity("act-1", "started") } });
+        send({ method: "turn/started", params: { threadId: sub, turn: subTurn } });
+        const wait = { type: "collabAgentToolCall", id: "wait-1", tool: "wait", status: "inProgress", senderThreadId: "thread-1", receiverThreadIds: [], prompt: null, model: null, reasoningEffort: null, agentsStates: {} };
+        send({ method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", item: wait } });
+        const ls = { type: "commandExecution", id: "cmd-sub", command: "ls", aggregatedOutput: null, exitCode: null };
+        send({ method: "item/started", params: { threadId: sub, turnId: "turn-sub", item: ls } });
+        send({ method: "item/completed", params: { threadId: sub, turnId: "turn-sub", item: { ...ls, aggregatedOutput: "x.txt", exitCode: 0 } } });
+        send({ method: "item/agentMessage/delta", params: { threadId: sub, turnId: "turn-sub", itemId: "msg-sub", delta: "Found " } });
+        send({ method: "item/completed", params: { threadId: sub, turnId: "turn-sub", item: { type: "agentMessage", id: "msg-sub", text: "Found x.txt" } } });
+        send({ method: "item/started", params: { threadId: "thread-1", turnId: "turn-1", item: activity("act-2", "completed") } });
+        send({ method: "turn/completed", params: { threadId: sub, turn: { ...subTurn, status: "completed" } } });
+        send({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: activity("act-2", "completed") } });
+        send({ method: "item/completed", params: { threadId: "thread-1", turnId: "turn-1", item: { ...wait, status: "completed" } } });
+      }
       send({ method: "item/agentMessage/delta", params: { itemId: "msg-1", delta: "granted " } });
       send({
         method: "item/completed",

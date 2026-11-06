@@ -66,6 +66,23 @@ const fill = (response: InputResponse) => (session: ProviderSession, request: Pe
   session.respondInput(request.requestId, response);
 
 describe("CodexProvider", () => {
+  it.live("shows a subagent's steps under it, without taking over the session's turn", () =>
+    Effect.gen(function* () {
+      const { events, tags } = yield* runTurn("use a subagent", approve("accept"));
+      // The subagent's own turn neither starts nor ends the session's.
+      expect(tags.filter((t) => t === "TurnStarted").length).toBe(1);
+      expect(tags.filter((t) => t === "TurnCompleted").length).toBe(1);
+      expect(tags.at(-1)).toBe("TurnCompleted");
+      expect(events).toContainEqual({ _tag: "ToolStarted", itemId: "act-1", name: "Agent", summary: "list files" });
+      expect(events).toContainEqual({ _tag: "ToolStarted", itemId: "cmd-sub", name: "shell", summary: "ls", parentItemId: "act-1" });
+      // Its report is the output of its step, not a reply in the conversation.
+      expect(events).toContainEqual({ _tag: "ToolCompleted", itemId: "act-1", output: "Found x.txt", isError: false });
+      expect(events.filter((e) => e._tag === "AssistantMessage" || e._tag === "AssistantDelta").map((e) => e.itemId)).toEqual(["msg-1", "msg-1"]);
+      expect(events.filter((e) => e._tag === "ToolStarted" && e.itemId === "act-1").length).toBe(1);
+      expect(events).toContainEqual({ _tag: "ToolStarted", itemId: "wait-1", name: "Subagent wait", summary: "" });
+    }),
+  );
+
   it.live("lists visible models with their reasoning efforts", () =>
     Effect.gen(function* () {
       const models = yield* makeCodexProvider({ executable: fakeCodex }).listModels;

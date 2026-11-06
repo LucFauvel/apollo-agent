@@ -68,7 +68,35 @@ type CodexItem =
       readonly error: { readonly message?: string } | null;
     }
   | { readonly type: "webSearch"; readonly id: string; readonly query?: string }
+  | {
+      /** A subagent started, was talked to, stopped or finished (reported in the thread that owns it). */
+      readonly type: "subAgentActivity";
+      readonly id: string;
+      readonly kind: "started" | "interacted" | "interrupted" | "completed";
+      readonly agentThreadId: string;
+      readonly agentPath: string;
+    }
+  | {
+      /** spawn / wait / send input / close ... on subagents. */
+      readonly type: "collabAgentToolCall";
+      readonly id: string;
+      readonly tool: string;
+      readonly status: "inProgress" | "completed" | "failed" | "interrupted";
+      readonly receiverThreadIds: ReadonlyArray<string>;
+      readonly prompt: string | null;
+      readonly agentsStates: Record<string, { readonly status: string; readonly message: string | null } | undefined>;
+    }
   | { readonly type: string; readonly id: string };
+
+/** `spawnAgent` → "spawn", `sendInput` → "send input". */
+const collabVerb = (tool: string) =>
+  tool
+    .replace(/Agent$/, "")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .toLowerCase();
+
+/** A subagent's name from its path: `/root/list_files` → "list files". */
+const agentName = (path: string) => (path.split("/").filter(Boolean).at(-1) ?? path).replace(/_/g, " ");
 
 const toolStart = (item: CodexItem): AgentEvent | null => {
   switch (item.type) {
@@ -302,8 +330,88 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
     const inputs = makeInputRequests(agent, fail);
     let inputCounter = 0;
 
+    // --- subagents ------------------------------------------------------------
+    // Codex runs each subagent as a thread of its own, on this same connection: its turns
+    // are not the session's turns, and its messages are its report, not the agent's reply.
+    // Its tool calls are shown under the "Subagent" step that started it.
+
+    /** Subagents by thread id: their step in the conversation and their latest message. */
+    const subagents = new Map<string, { step: string; lastMessage: string }>();
+    /** Items already shown (Codex reports some on both item/started and item/completed). */
+    const shown = new Set<string>();
+    const once = (key: string, effect: Effect.Effect<void>) =>
+      Effect.suspend(() => {
+        if (shown.has(key)) return Effect.void;
+        shown.add(key);
+        return effect;
+      });
+
+    /** A subagent item, reported in thread `from` (the session's thread or another subagent's). */
+    const subagentItem = (from: string, item: CodexItem): Effect.Effect<void> => {
+      const parentItemId = from === threadId ? undefined : subagents.get(from)?.step;
+      if (item.type === "subAgentActivity") {
+        const it = item as Extract<CodexItem, { type: "subAgentActivity" }>;
+        if (it.kind === "started") {
+          subagents.set(it.agentThreadId, { step: it.id, lastMessage: "" });
+          return once(
+            it.id,
+            agent({ _tag: "ToolStarted", itemId: it.id, name: "Agent", summary: agentName(it.agentPath), ...(parentItemId ? { parentItemId } : {}) }),
+          );
+        }
+        const sub = subagents.get(it.agentThreadId);
+        if (!sub || (it.kind !== "completed" && it.kind !== "interrupted")) return Effect.void;
+        return once(
+          `${sub.step}:done`,
+          agent({ _tag: "ToolCompleted", itemId: sub.step, output: truncate(sub.lastMessage || "(no report)", 4000), isError: it.kind === "interrupted" }),
+        );
+      }
+      // collabAgentToolCall
+      const it = item as Extract<CodexItem, { type: "collabAgentToolCall" }>;
+      const names = it.receiverThreadIds.map((id) => {
+        const sub = subagents.get(id);
+        return sub ? sub.step : id;
+      });
+      const started = once(
+        it.id,
+        agent({
+          _tag: "ToolStarted",
+          itemId: it.id,
+          name: `Subagent ${collabVerb(it.tool)}`,
+          summary: truncate(it.prompt ?? (names.length > 0 ? `${names.length} subagent${names.length === 1 ? "" : "s"}` : ""), 200),
+          ...(parentItemId ? { parentItemId } : {}),
+        }),
+      );
+      if (it.status === "inProgress") return started;
+      const states = Object.values(it.agentsStates).flatMap((state) => (state ? [`${state.status}${state.message ? `: ${state.message}` : ""}`] : []));
+      return Effect.andThen(
+        started,
+        once(
+          `${it.id}:done`,
+          agent({ _tag: "ToolCompleted", itemId: it.id, output: truncate(states.join("\n"), 4000), isError: it.status === "failed" }),
+        ),
+      );
+    };
+
+    /** A notification from a subagent's thread. */
+    const fromSubagent = (from: string, method: string, p: Record<string, unknown>): Effect.Effect<void> => {
+      const item = p.item as CodexItem | undefined;
+      if (!item || (method !== "item/started" && method !== "item/completed")) return Effect.void;
+      if (item.type === "subAgentActivity" || item.type === "collabAgentToolCall") return subagentItem(from, item);
+      const sub = subagents.get(from);
+      if (item.type === "agentMessage") {
+        if (sub && method === "item/completed") sub.lastMessage = (item as Extract<CodexItem, { type: "agentMessage" }>).text;
+        return Effect.void;
+      }
+      if (item.type === "reasoning") return Effect.void;
+      const event = method === "item/started" ? toolStart(item) : itemCompleted(item);
+      if (!event) return Effect.void;
+      return agent(event._tag === "ToolStarted" && sub ? { ...event, parentItemId: sub.step } : event);
+    };
+
     const onNotification = (method: string, params: unknown): Effect.Effect<void> => {
       const p = params as Record<string, unknown>;
+      const from = typeof p.threadId === "string" ? p.threadId : null;
+      if (from !== null && threadId !== null && from !== threadId) return fromSubagent(from, method, p);
       switch (method) {
         case "turn/started": {
           activeTurnId = (p.turn as CodexTurn).id;
@@ -358,11 +466,15 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
             text: p.delta as string,
           });
         case "item/started": {
-          const event = toolStart(p.item as CodexItem);
+          const item = p.item as CodexItem;
+          if (item.type === "subAgentActivity" || item.type === "collabAgentToolCall") return subagentItem(threadId ?? "", item);
+          const event = toolStart(item);
           return event ? agent(event) : Effect.void;
         }
         case "item/completed": {
-          const event = itemCompleted(p.item as CodexItem);
+          const item = p.item as CodexItem;
+          if (item.type === "subAgentActivity" || item.type === "collabAgentToolCall") return subagentItem(threadId ?? "", item);
+          const event = itemCompleted(item);
           return event ? agent(event) : Effect.void;
         }
         case "error": {

@@ -9,7 +9,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "dev.ocx64.apollo.mobile",
-      "buildNumber": "202611061611",
+      "buildNumber": "202611061621",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
         "NSMicrophoneUsageDescription": "Apollo listens when you dictate or talk with your bot.",
