@@ -1,3 +1,7 @@
+import { AppSettings, ProjectInfo, UpdateAppSettingsInput } from "./appSettings.ts";
+import { PullRequest } from "./pullRequests.ts";
+import { RemoteAccess } from "./remote.ts";
+import { ProviderVersion } from "./connectors.ts";
 import * as Schema from "effect/Schema";
 import { Rpc, RpcGroup } from "effect/rpc";
 import {
@@ -8,6 +12,8 @@ import {
   ScheduleRun,
   UpdateScheduleInput,
 } from "./schedule.ts";
+import { OnePasswordField, OnePasswordItem, OnePasswordStatus, SecretResponse } from "./secrets.ts";
+import { BrowserFrame, BrowserInput, BrowserStatus, BrowserTab } from "./browser.ts";
 import { LlamaBackend, LocalModelsState, ModelCandidate, ModelDetails, SuggestedModel } from "./local.ts";
 import {
   ApprovalDecision,
@@ -37,6 +43,8 @@ import {
   SkillId,
   StorageReport,
   SkillStatus,
+  BotAvatar,
+  AttachmentRef,
 } from "./domain.ts";
 
 export class ApolloError extends Schema.TaggedError<ApolloError>()("ApolloError", {
@@ -56,6 +64,10 @@ export const AppChange = Schema.Union([
   Schema.TaggedStruct("LocalModelsChanged", { state: LocalModelsState }),
   Schema.TaggedStruct("ScheduleUpserted", { schedule: Schedule }),
   Schema.TaggedStruct("ScheduleDeleted", { scheduleId: ScheduleId, botId: BotId }),
+  Schema.TaggedStruct("BrowserTabUpserted", { tab: BrowserTab }),
+  Schema.TaggedStruct("BrowserTabClosed", { tabId: Schema.String, botId: BotId }),
+  Schema.TaggedStruct("PullRequestUpserted", { pullRequest: PullRequest }),
+  Schema.TaggedStruct("PullRequestRemoved", { url: Schema.String, sessionId: SessionId }),
   /** Something the user should see now: clients show it as a desktop notification. */
   Schema.TaggedStruct("Notify", {
     botId: BotId,
@@ -73,11 +85,25 @@ export const AppSnapshot = Schema.Struct({
   /** Each bot's usage today (server local time). */
   usageToday: Schema.Array(Schema.Struct({ botId: BotId, usage: Usage })),
   schedules: Schema.Array(Schedule),
+  browserTabs: Schema.Array(BrowserTab),
+  pullRequests: Schema.Array(PullRequest),
 });
 export type AppSnapshot = typeof AppSnapshot.Type;
 
+/** A command typed as `/name args` in the message box. */
+export const SlashCommand = Schema.Struct({
+  name: Schema.String,
+  description: Schema.String,
+  argumentHint: Schema.String,
+  /** `apollo`: handled by Apollo; `provider`: sent to the agent's harness as a message. */
+  source: Schema.Literals(["apollo", "provider"]),
+});
+export type SlashCommand = typeof SlashCommand.Type;
+
 export const CreateBotInput = Schema.Struct({
   name: Schema.String,
+  /** Omitted: a random one. */
+  avatar: Schema.optional(BotAvatar),
   instructions: Schema.String,
   cwd: Schema.String,
   main: ProviderSelection,
@@ -91,6 +117,7 @@ export type CreateBotInput = typeof CreateBotInput.Type;
 export const UpdateBotInput = Schema.Struct({
   botId: BotId,
   name: Schema.optional(Schema.String),
+  avatar: Schema.optional(BotAvatar),
   instructions: Schema.optional(Schema.String),
   cwd: Schema.optional(Schema.String),
   /** Model and effort of the orchestrator; its provider cannot change. */
@@ -107,6 +134,8 @@ export const CreateSessionInput = Schema.Struct({
   title: Schema.String,
   provider: ProviderSelection,
   cwd: Schema.optional(Schema.String),
+  /** `worktree`: work in its own git worktree and branch (the workspace must be a git repo). */
+  isolation: Schema.optional(Schema.Literals(["shared", "worktree"])),
   /** Optional first message, sent as soon as the session exists. */
   prompt: Schema.optional(Schema.String),
 });
@@ -136,8 +165,18 @@ export class ApolloRpcs extends RpcGroup.make(
     error,
   }),
   Rpc.make("providers.settings", { success: ProviderSettings, error }),
+  /** Installed and latest versions of Claude Code, Codex and llama.cpp (checked every few hours). */
+  Rpc.make("providers.versions", { payload: { refresh: Schema.optional(Schema.Boolean) }, success: Schema.Array(ProviderVersion), error }),
+  /** Updates a provider's tool (`claude update`, `codex update`, or a new llama.cpp build). */
+  Rpc.make("providers.update", { payload: { provider: ProviderKind }, success: ProviderVersion, error }),
   /** Applies to provider processes started afterwards. */
   Rpc.make("providers.updateSettings", { payload: UpdateProviderSettingsInput, success: ProviderSettings, error }),
+
+  // --- app settings --------------------------------------------------------
+  Rpc.make("app.settings", { success: AppSettings, error }),
+  Rpc.make("app.updateSettings", { payload: UpdateAppSettingsInput, success: AppSettings, error }),
+  /** Projects found in the project folders (git repos and folders with a project manifest). */
+  Rpc.make("app.projects", { success: Schema.Array(ProjectInfo), error }),
 
   // --- local models (llama.cpp managed by Apollo) -------------------------
   Rpc.make("localModels.state", { success: LocalModelsState, error }),
@@ -156,6 +195,10 @@ export class ApolloRpcs extends RpcGroup.make(
   Rpc.make("localModels.cancelDownload", { payload: { model: Schema.String }, error }),
   Rpc.make("localModels.delete", { payload: { model: Schema.String }, error }),
   Rpc.make("localModels.setDefault", { payload: { model: Schema.NullOr(Schema.String) }, error }),
+  /** The reviewer for auto mode on local models; `null` uses rules only. */
+  Rpc.make("localModels.setReviewer", { payload: { model: Schema.NullOr(Schema.String) }, error }),
+  /** Downloads the recommended reviewer model and selects it once it is ready. */
+  Rpc.make("localModels.installReviewer", { error }),
 
   // --- bots --------------------------------------------------------------
   Rpc.make("bots.create", { payload: CreateBotInput, success: Bot, error }),
@@ -169,8 +212,27 @@ export class ApolloRpcs extends RpcGroup.make(
   // --- sessions ----------------------------------------------------------
   Rpc.make("sessions.create", { payload: CreateSessionInput, success: Session, error }),
   Rpc.make("sessions.update", { payload: UpdateSessionInput, success: Session, error }),
-  Rpc.make("sessions.send", { payload: { sessionId: SessionId, text: Schema.String }, error }),
+  Rpc.make("sessions.send", {
+    payload: { sessionId: SessionId, text: Schema.String, attachments: Schema.optional(Schema.Array(AttachmentRef)) },
+    error,
+  }),
   Rpc.make("sessions.interrupt", { payload: { sessionId: SessionId }, error }),
+  /** Slash commands for the message box: Apollo's own, then the provider's (Claude Code custom commands, skills). */
+  Rpc.make("sessions.commands", { payload: { sessionId: SessionId }, success: Schema.Array(SlashCommand), error }),
+  Rpc.make("sessions.runCommand", {
+    payload: { sessionId: SessionId, name: Schema.String, args: Schema.String },
+    error,
+  }),
+  /** Stops watching (or forgets) a pull request linked to a session. */
+  Rpc.make("pullRequests.unlink", { payload: { sessionId: SessionId, url: Schema.String }, error }),
+  /**
+   * Keeps a message out of the bot's memory: session search, apollo_session_read and the
+   * reflection pass skip it. The live conversation with the agent is not changed.
+   */
+  Rpc.make("sessions.setMemoryExclusion", {
+    payload: { sessionId: SessionId, seq: Schema.Number, excluded: Schema.Boolean },
+    error,
+  }),
   Rpc.make("sessions.close", { payload: { sessionId: SessionId }, error }),
   Rpc.make("sessions.delete", { payload: { sessionId: SessionId }, error }),
   Rpc.make("sessions.respondApproval", {
@@ -242,7 +304,37 @@ export class ApolloRpcs extends RpcGroup.make(
   Rpc.make("skills.delete", { payload: { skillId: SkillId }, error }),
 
   // --- devices -----------------------------------------------------------
+  // --- secrets -------------------------------------------------------------
+  Rpc.make("secrets.respond", {
+    payload: { sessionId: SessionId, requestId: Schema.String, response: SecretResponse },
+    error,
+  }),
+  Rpc.make("secrets.onePasswordStatus", { success: OnePasswordStatus, error }),
+  Rpc.make("secrets.onePasswordSearch", {
+    payload: { query: Schema.String },
+    success: Schema.Array(OnePasswordItem),
+    error,
+  }),
+  Rpc.make("secrets.onePasswordFields", {
+    payload: { itemId: Schema.String, vaultId: Schema.String },
+    success: Schema.Array(OnePasswordField),
+    error,
+  }),
+
+  // --- built-in browser ----------------------------------------------------
+  Rpc.make("browser.status", { success: BrowserStatus, error }),
+  /** Opens a page for a bot, owned by its orchestrator. */
+  Rpc.make("browser.open", { payload: { botId: BotId, url: Schema.String }, success: BrowserTab, error }),
+  Rpc.make("browser.navigate", { payload: { tabId: Schema.String, url: Schema.String }, error }),
+  Rpc.make("browser.close", { payload: { tabId: Schema.String }, error }),
+  Rpc.make("browser.input", { payload: { tabId: Schema.String, input: BrowserInput }, error }),
+  /** Live frames of a tab while the stream is open. */
+  Rpc.make("browser.watch", { payload: { tabId: Schema.String }, success: BrowserFrame, error, stream: true }),
+
   Rpc.make("auth.listClients", { success: Schema.Array(PairedClient), error }),
+  /** Reaching Apollo from phones over Tailscale. */
+  Rpc.make("remote.status", { success: RemoteAccess, error }),
+  Rpc.make("remote.setTailscale", { payload: { enabled: Schema.Boolean }, success: RemoteAccess, error }),
   Rpc.make("auth.revokeClient", { payload: { clientId: ClientId }, error }),
   Rpc.make("auth.createPairingToken", {
     payload: { label: Schema.String },

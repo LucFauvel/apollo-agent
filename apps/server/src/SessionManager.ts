@@ -1,4 +1,5 @@
-import { rmSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
+import { isAbsolute, join, relative } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
   type AgentEvent,
@@ -24,6 +25,11 @@ import {
   type UpdateBotInput,
   type UpdateSessionInput,
   type Usage,
+  randomAvatar,
+  type SessionWorktree,
+  type AttachmentRef,
+  type ConnectorInfo,
+  type SlashCommand,
 } from "@apollo/contracts";
 import {
   makeClaudeProvider,
@@ -48,15 +54,27 @@ import * as PubSub from "effect/PubSub";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import { AppSettings } from "./AppSettings.ts";
+import { findAttachment, removeAttachments } from "./attachments.ts";
+import { createWorktree, type FinishAction, finishWorktree, retireWorktree, worktreeStatus } from "./worktrees/Git.ts";
 import { ServerConfig } from "./Config.ts";
 import {
   buildInstructions,
   MCP_SERVER_NAME,
   reflectionPrompt,
   transcriptForReflection,
+  withoutExcluded,
 } from "./Instructions.ts";
 import { pluginDir, syncSkills } from "./SkillSync.ts";
 import { newId, Store } from "./Store.ts";
+
+/** Commands Apollo handles itself, whatever the provider. */
+const APOLLO_COMMANDS: ReadonlyArray<Omit<SlashCommand, "source">> = [
+  { name: "compact", description: "Summarize the conversation so far to free context", argumentHint: "[what to keep]" },
+  { name: "clear", description: "Start a fresh conversation in this session (memory and skills stay)", argumentHint: "" },
+  { name: "stop", description: "Stop the current turn", argumentHint: "" },
+  { name: "reflect", description: "Save what this session learned to memory now", argumentHint: "" },
+];
 
 /** Run a reflection pass after this many completed turns (when the bot has autoLearn). */
 const REFLECT_EVERY_TURNS = 3;
@@ -96,6 +114,8 @@ export const layerProviders = Layer.effect(
       codex: makeCodexProvider({ executable: config.codexExecutable }),
       llamacpp: makeLlamaCppProvider({
         executable: config.claudeExecutable,
+        // Auto mode's reviewer: a small local model the user picked (asks when there is none).
+        review: (call) => localModels.review(call),
         connection: Effect.flatMap(
           settings.read,
           ({ llamacpp }): Effect.Effect<LlamaCppConnection, ProviderError> =>
@@ -120,6 +140,9 @@ interface LiveSession {
 const invalid = (message: string) => new ApolloError({ code: "invalid", message });
 const providerFailure = (message: string) => new ApolloError({ code: "provider", message });
 
+/** A turn is under way (not just the process starting). */
+const inTurn = (status: SessionStatus) => status === "running" || status === "waiting-approval";
+
 const isBusy = (status: SessionStatus) =>
   status === "starting" || status === "running" || status === "waiting-approval";
 
@@ -127,7 +150,23 @@ const make = Effect.gen(function* () {
   const store = yield* Store;
   const config = yield* ServerConfig;
   const providers = yield* Providers;
+  const appSettings = yield* AppSettings;
+  // Absent in tests that run without local models.
+  const localModels = yield* Effect.serviceOption(LocalModels);
   const managerScope = yield* Effect.scope;
+
+  /** Expands `~` and creates the bot's workspace folder if it does not exist yet. */
+  const prepareWorkspace = (path: string) =>
+    Effect.gen(function* () {
+      const cwd = appSettings.expand(path);
+      if (!cwd) return yield* invalid("a workspace folder is required");
+      if (!isAbsolute(cwd)) return yield* invalid(`use a full path for the workspace: ${cwd}`);
+      yield* Effect.try({
+        try: () => mkdirSync(cwd, { recursive: true }),
+        catch: (error) => invalid(`cannot create ${cwd}: ${(error as Error).message}`),
+      });
+      return cwd;
+    });
 
   const changes = yield* PubSub.unbounded<AppChange>();
   const events = yield* PubSub.unbounded<SessionEvent>();
@@ -189,6 +228,10 @@ const make = Effect.gen(function* () {
             yield* onUsage(id, emission.totals);
             return;
           }
+          case "ContextUsage": {
+            yield* updateSession(id, { context: { used: emission.used, window: emission.window } });
+            return;
+          }
           case "Exited": {
             // Ignore exits from a session we already replaced or closed on purpose.
             if (generations.get(id) !== generation) return;
@@ -211,8 +254,8 @@ const make = Effect.gen(function* () {
           }
           case "Event": {
             const event = emission.event;
-            if (event._tag === "AssistantDelta") {
-              // Deltas are live-only (seq 0); the final AssistantMessage is persisted.
+            if (event._tag === "AssistantDelta" || event._tag === "ReasoningDelta" || event._tag === "ToolPending") {
+              // Live-only (seq 0); the final AssistantMessage / Reasoning / ToolStarted is persisted.
               yield* PubSub.publish(events, { sessionId: id, seq: 0, at: Date.now(), event });
               return;
             }
@@ -289,6 +332,7 @@ const make = Effect.gen(function* () {
           Effect.as(pluginDir(config.dataDir, bot.id)),
           Effect.catch((cause) => Effect.logWarning("skill sync failed", cause).pipe(Effect.as(null))),
         );
+        const { projectFolders } = yield* appSettings.read;
         const token = randomUUID();
         const generation = {};
         generations.set(id, generation);
@@ -302,7 +346,15 @@ const make = Effect.gen(function* () {
               model: session.model,
               effort: session.effort,
               resumeId: session.resumeId,
-              instructions: buildInstructions({ bot, session, core, skills }),
+              instructions: buildInstructions({
+                bot,
+                session,
+                core,
+                skills,
+                projectFolders,
+                connectors: Object.fromEntries([...connectorCache].map(([kind, { list }]) => [kind, list])),
+              }),
+              extraDirectories: projectFolders,
               runtimeMode: session.runtimeMode ?? bot.runtimeMode,
               mcp: { name: MCP_SERVER_NAME, url: `${config.baseUrl}/mcp`, bearerToken: token },
               skillsPluginDir,
@@ -425,8 +477,12 @@ const make = Effect.gen(function* () {
       if (pendingReopen.delete(id)) yield* reopenWithNewSettings(id);
 
       if (session.role === "reflection") {
-        // A reflection is one-shot: free its process once it has answered.
-        yield* background(closeSession(id));
+        // A reflection is one-shot and only matters for what it saved (memories and
+        // skill proposals keep no link to it): remove it once it has answered.
+        if (event.outcome !== "completed") {
+          yield* Effect.logWarning(`reflection ${id} ended ${event.outcome}${event.error ? `: ${event.error}` : ""}`);
+        }
+        yield* background(removeSession(id));
         return;
       }
 
@@ -466,10 +522,23 @@ const make = Effect.gen(function* () {
 
   // --- public API ---------------------------------------------------------
 
-  const send = (id: SessionId, text: string, author: MessageAuthor = "user") =>
+  const send = (
+    id: SessionId,
+    text: string,
+    author: MessageAuthor = "user",
+    attachments: ReadonlyArray<AttachmentRef> = [],
+  ) =>
     Effect.gen(function* () {
-      if (text.trim().length === 0) return yield* invalid("message is empty");
+      if (text.trim().length === 0 && attachments.length === 0) return yield* invalid("message is empty");
+      const files = attachments.map((ref) => findAttachment(config.dataDir, id, ref.id));
+      if (files.some((f) => f === null)) return yield* invalid("an attachment is missing; upload it again");
       const target = yield* store.getSession(id);
+      if (target.provider === "llamacpp" && Option.isSome(localModels)) {
+        const blocking = yield* localModels.value.downloadBlocking(target.model);
+        if (blocking) {
+          return yield* invalid(`${blocking} is still downloading. Send the message once the download finishes.`);
+        }
+      }
       if (author === "user") {
         // The user is back in the loop.
         if (target.role === "main") autonomousTurns.delete(target.botId);
@@ -477,13 +546,18 @@ const make = Effect.gen(function* () {
         yield* guardAutomated(target);
       }
       const entry = yield* ensureOpen(id);
-      yield* appendEvent(id, { _tag: "UserMessage", text, author });
+      yield* appendEvent(id, {
+        _tag: "UserMessage",
+        text,
+        author,
+        ...(attachments.length > 0 ? { attachments: files.map((f) => ({ id: f!.id, name: f!.name, mime: f!.mime, size: f!.size })) } : {}),
+      });
       // Mark busy before the provider acknowledges the turn, so a caller that
       // immediately waits on this session (e.g. apollo_wait_session) cannot see
       // a stale "idle". TurnCompleted flips it back.
       const before = yield* store.getSession(id);
       if (!isBusy(before.status)) yield* updateSession(id, { status: "running" });
-      yield* entry.provider.send(text).pipe(
+      yield* entry.provider.send(text, files.map((f) => ({ path: f!.path, name: f!.name, mime: f!.mime, size: f!.size }))).pipe(
         Effect.mapError((error) => providerFailure(error.message)),
         Effect.tapError(() => updateSession(id, { status: "idle" }).pipe(Effect.ignore)),
       );
@@ -497,12 +571,24 @@ const make = Effect.gen(function* () {
     readonly role: SessionRole;
     readonly parentSessionId: SessionId | null;
     readonly id?: SessionId;
+    readonly isolation?: "shared" | "worktree" | undefined;
   }) =>
     Effect.gen(function* () {
       const bot = yield* store.getBot(input.botId);
       const now = Date.now();
+      const id = input.id ?? newId<SessionId>("ses");
+      let cwd = input.cwd?.trim() ? appSettings.expand(input.cwd) : bot.cwd;
+      let worktree: SessionWorktree | null = null;
+      if (input.isolation === "worktree") {
+        const created = yield* Effect.tryPromise({
+          try: () => createWorktree(config.dataDir, id, cwd, input.title),
+          catch: (error) => invalid(`could not create a worktree: ${(error as Error).message}`),
+        });
+        worktree = created.worktree;
+        cwd = created.cwd;
+      }
       const session = yield* store.insertSession({
-        id: input.id ?? newId<SessionId>("ses"),
+        id,
         botId: bot.id,
         role: input.role,
         parentSessionId: input.parentSessionId,
@@ -511,7 +597,9 @@ const make = Effect.gen(function* () {
         model: input.provider.model ?? null,
         effort: input.provider.effort ?? null,
         runtimeMode: null,
-        cwd: input.cwd?.trim() || bot.cwd,
+        cwd,
+        worktree,
+        context: null,
         status: "idle",
         resumeId: null,
         lastMessage: null,
@@ -575,6 +663,39 @@ const make = Effect.gen(function* () {
     ),
   ) as unknown as Record<ProviderKind, readonly [(typeof providers)[ProviderKind]["listModels"], Effect.Effect<void>]>;
 
+  // Connectors and MCP servers each provider's sessions can reach, for the orchestrator.
+  // Listing asks the CLIs without a conversation (no tokens) but takes seconds: cached.
+  const connectorCache = new Map<ProviderKind, { readonly at: number; readonly list: ReadonlyArray<ConnectorInfo> }>();
+  const CONNECTORS_TTL_MS = 30 * 60_000;
+  const listConnectors = (kind: ProviderKind, refresh = false) =>
+    Effect.gen(function* () {
+      const cached = connectorCache.get(kind);
+      if (cached && !refresh && Date.now() - cached.at < CONNECTORS_TTL_MS) return cached.list;
+      const list = providers[kind].listConnectors
+        ? yield* providers[kind].listConnectors!.pipe(Effect.mapError((error) => providerFailure(error.message)))
+        : [];
+      connectorCache.set(kind, { at: Date.now(), list });
+      return list;
+    });
+  yield* Effect.forEach(Object.keys(providers) as Array<ProviderKind>, (kind) =>
+    listConnectors(kind).pipe(Effect.catch((error) => Effect.logInfo(`could not list ${kind} connectors: ${error.message}`))),
+  ).pipe(Effect.delay(Duration.seconds(3)), Effect.forkIn(managerScope));
+
+  /** Closes a session's process and deletes it with its log (a worktree's branch is kept). */
+  const removeSession = (id: SessionId) =>
+    Effect.gen(function* () {
+      yield* closeSession(id);
+      const session = yield* store.getSession(id);
+      removeAttachments(config.dataDir, id);
+      if (session.worktree) {
+        yield* Effect.tryPromise(() => retireWorktree(session.worktree!)).pipe(
+          Effect.catch((error) => Effect.logWarning(`could not remove the worktree of ${id}`, error)),
+        );
+      }
+      yield* store.deleteSession(id);
+      yield* publish({ _tag: "SessionDeleted", sessionId: id });
+    });
+
   const closeSession = (id: SessionId) =>
     Effect.gen(function* () {
       generations.delete(id);
@@ -583,11 +704,19 @@ const make = Effect.gen(function* () {
       if (session.status !== "idle") yield* updateSession(id, { status: "idle" });
     });
 
+  const interrupt = (id: SessionId) =>
+    Effect.suspend(() => {
+      const entry = live.get(id);
+      return entry ? entry.provider.interrupt.pipe(Effect.mapError((e) => providerFailure(e.message))) : Effect.void;
+    });
+
   const reflect = (id: SessionId): Effect.Effect<Session, ApolloError> =>
     Effect.gen(function* () {
       const source = yield* store.getSession(id);
       if (source.role === "reflection") return yield* invalid("cannot reflect on a reflection");
-      const transcript = transcriptForReflection(yield* store.listEvents(id, 0));
+      const transcript = transcriptForReflection(
+        withoutExcluded(yield* store.listEvents(id, 0), yield* store.memoryExclusions(id)),
+      );
       if (transcript.length === 0) return yield* invalid("session has no transcript yet");
       yield* store.resetReflectionCounter(id);
       const reflection = yield* createSession({
@@ -603,12 +732,19 @@ const make = Effect.gen(function* () {
     });
 
   yield* store.resetLiveStatuses;
+  // Reflections remove themselves when done; clear any left from before (or cut short by a restart).
+  for (const session of yield* store.listSessions()) {
+    if (session.role === "reflection") yield* store.deleteSession(session.id);
+  }
   yield* Effect.addFinalizer(() =>
     Effect.forEach([...live.keys()], closeLive, { discard: true }),
   );
 
   return {
     changes: Stream.fromPubSub(changes),
+
+    /** Every session's events as they happen (live only, no history). */
+    liveEvents: Stream.fromPubSub(events),
 
     snapshot: Effect.all({ bots: store.listBots, sessions: store.listSessions(), usageToday: store.usageOn() }),
 
@@ -632,12 +768,14 @@ const make = Effect.gen(function* () {
     createBot: (input: CreateBotInput) =>
       Effect.gen(function* () {
         if (input.name.trim().length === 0) return yield* invalid("bot name is required");
+        const cwd = yield* prepareWorkspace(input.cwd);
         const now = Date.now();
         const bot: Bot = {
           id: newId<BotId>("bot"),
           name: input.name.trim(),
+          avatar: input.avatar ?? randomAvatar(),
           instructions: input.instructions,
-          cwd: input.cwd,
+          cwd,
           main: input.main,
           defaultWorker: input.defaultWorker,
           runtimeMode: input.runtimeMode,
@@ -664,11 +802,13 @@ const make = Effect.gen(function* () {
     updateBot: (input: UpdateBotInput) =>
       Effect.gen(function* () {
         const current = yield* store.getBot(input.botId);
+        const cwd = input.cwd !== undefined && input.cwd.trim() !== current.cwd ? yield* prepareWorkspace(input.cwd) : undefined;
         const bot: Bot = {
           ...current,
           ...(input.name !== undefined ? { name: input.name } : {}),
+          ...(input.avatar !== undefined ? { avatar: input.avatar } : {}),
           ...(input.instructions !== undefined ? { instructions: input.instructions } : {}),
-          ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
+          ...(cwd !== undefined ? { cwd } : {}),
           ...(input.main !== undefined ? { main: { ...input.main, provider: current.main.provider } } : {}),
           ...(input.defaultWorker !== undefined ? { defaultWorker: input.defaultWorker } : {}),
           ...(input.runtimeMode !== undefined ? { runtimeMode: input.runtimeMode } : {}),
@@ -706,11 +846,110 @@ const make = Effect.gen(function* () {
         yield* publish({ _tag: "BotDeleted", botId });
       }),
 
+    /** Slash commands for a session: Apollo's own, then its harness's (which needs the session open; no tokens). */
+    listCommands: (id: SessionId) =>
+      Effect.gen(function* () {
+        const own: Array<SlashCommand> = APOLLO_COMMANDS.map((c) => ({ ...c, source: "apollo" }));
+        const entry = yield* ensureOpen(id).pipe(Effect.option);
+        if (entry._tag === "None") return own;
+        const theirs = yield* entry.value.provider.commands.pipe(Effect.orElseSucceed(() => []));
+        const taken = new Set(own.map((c) => c.name));
+        return [
+          ...own,
+          ...theirs.filter((c) => !taken.has(c.name)).map((c): SlashCommand => ({ ...c, source: "provider" })),
+        ];
+      }),
+
+    /**
+     * Runs `/name args` from the message box. Apollo's commands act on the session;
+     * anything else goes to the agent's harness as a message (Claude Code custom commands, skills).
+     */
+    runCommand: (id: SessionId, name: string, args: string) =>
+      Effect.gen(function* () {
+        const session = yield* store.getSession(id);
+        switch (name) {
+          case "compact": {
+            if (inTurn(session.status)) return yield* invalid("wait for the current turn to finish, then compact");
+            const entry = yield* ensureOpen(id);
+            yield* appendEvent(id, { _tag: "Notice", level: "info", message: "Compacting the conversation…" });
+            yield* entry.provider.compact(args).pipe(Effect.mapError((error) => providerFailure(error.message)));
+            return;
+          }
+          case "clear": {
+            if (inTurn(session.status)) return yield* invalid("stop the current turn first (/stop)");
+            // Under the session's lock: a process still starting (e.g. from listing commands)
+            // finishes first and is then closed, so it cannot come back on the old conversation.
+            yield* Semaphore.withPermit(
+              lockFor(id),
+              Effect.gen(function* () {
+                yield* closeSession(id);
+                yield* updateSession(id, { resumeId: null, context: null, status: "idle" });
+              }),
+            );
+            // The chat starts over too; the earlier messages stay in the log for search and memory.
+            yield* appendEvent(id, { _tag: "ConversationCleared" });
+            return;
+          }
+          case "stop":
+            return yield* interrupt(id);
+          case "reflect":
+            yield* reflect(id);
+            return;
+          default:
+            return yield* send(id, `/${name}${args.trim() ? ` ${args.trim()}` : ""}`, "user");
+        }
+      }),
+
+    /** A worker's worktree: its commits, uncommitted changes and diff summary. */
+    worktreeStatus: (id: SessionId) =>
+      Effect.gen(function* () {
+        const session = yield* store.getSession(id);
+        if (!session.worktree) return yield* invalid(`${session.title} does not have its own worktree`);
+        return yield* Effect.tryPromise({
+          try: () => worktreeStatus(session.worktree!),
+          catch: (error) => invalid((error as Error).message),
+        });
+      }),
+
+    /** Merges, keeps (as a branch) or discards a worker's worktree; the session then works in the main checkout. */
+    finishWorktree: (id: SessionId, action: FinishAction) =>
+      Effect.gen(function* () {
+        const session = yield* store.getSession(id);
+        const worktree = session.worktree;
+        if (!worktree) return yield* invalid(`${session.title} does not have its own worktree`);
+        if (isBusy(session.status)) return yield* invalid(`${session.title} is still working; wait for it to finish its turn`);
+        const result = yield* Effect.tryPromise({
+          try: () => finishWorktree(worktree, action),
+          catch: (error) => invalid((error as Error).message),
+        });
+        yield* closeSession(id);
+        const sub = relative(worktree.path, session.cwd);
+        const next = yield* updateSession(id, {
+          worktree: null,
+          cwd: sub && !sub.startsWith("..") ? join(worktree.repoPath, sub) : worktree.repoPath,
+        });
+        yield* appendEvent(id, { _tag: "Notice", level: "info", message: result.message });
+        return { ...result, session: next };
+      }),
+
+    /** Keeps one message out of the bot's memory, or puts it back. */
+    setMemoryExclusion: (sessionId: SessionId, seq: number, excluded: boolean) =>
+      Effect.gen(function* () {
+        const event = yield* store.eventAt(sessionId, seq);
+        if (!event || (event._tag !== "UserMessage" && event._tag !== "AssistantMessage")) {
+          return yield* invalid("only messages can be excluded from memory");
+        }
+        yield* store.setMemoryExclusion(sessionId, seq, excluded);
+        // Recorded in the log too, so every open transcript shows it.
+        yield* appendEvent(sessionId, { _tag: "MemoryExclusion", seq, excluded });
+      }),
+
     createSession: (input: {
       readonly botId: BotId;
       readonly title: string;
       readonly provider: ProviderSelection;
       readonly cwd?: string | undefined;
+      readonly isolation?: "shared" | "worktree" | undefined;
       readonly prompt?: string | undefined;
       readonly parentSessionId?: SessionId | null;
       readonly notifyParent?: boolean;
@@ -722,6 +961,7 @@ const make = Effect.gen(function* () {
           title: input.title,
           provider: input.provider,
           cwd: input.cwd,
+          isolation: input.isolation,
           role: "worker",
           parentSessionId: input.parentSessionId ?? null,
         });
@@ -734,13 +974,7 @@ const make = Effect.gen(function* () {
 
     send,
 
-    interrupt: (id: SessionId) =>
-      Effect.suspend(() => {
-        const entry = live.get(id);
-        return entry
-          ? entry.provider.interrupt.pipe(Effect.mapError((e) => providerFailure(e.message)))
-          : Effect.void;
-      }),
+    interrupt,
 
     respondApproval: (id: SessionId, requestId: string, decision: ApprovalDecision) =>
       Effect.suspend(() => {
@@ -778,6 +1012,8 @@ const make = Effect.gen(function* () {
     publish,
     /** Notes that the orchestrator's next turn was started by a schedule, not by a runaway loop. */
     resetAutonomy: (botId: BotId) => Effect.sync(() => void autonomousTurns.delete(botId)),
+    /** Appends an Apollo-originated event (visuals, secret requests) to a session's log. */
+    appendEvent: (id: SessionId, event: AgentEvent) => appendEvent(id, event).pipe(Effect.asVoid),
     appendNotice: (id: SessionId, level: "info" | "warning" | "error", message: string) =>
       appendEvent(id, { _tag: "Notice", level, message }).pipe(Effect.asVoid),
     isBusy: (id: SessionId) => Effect.map(store.getSession(id), (s) => isBusy(s.status)),
@@ -794,6 +1030,8 @@ const make = Effect.gen(function* () {
         yield* publish({ _tag: "BotUpserted", bot });
         return bot;
       }),
+    /** What a provider's sessions can reach: claude.ai connectors, ChatGPT apps, MCP servers. */
+    listConnectors,
     listModels: (provider: ProviderKind) =>
       modelLists[provider][0].pipe(Effect.mapError((error) => providerFailure(error.message))),
     /** Forgets cached model lists, after credentials or endpoints change. */
@@ -803,9 +1041,7 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const session = yield* store.getSession(id);
         if (session.role === "main") return yield* invalid("delete the bot to remove its main session");
-        yield* closeSession(id);
-        yield* store.deleteSession(id);
-        yield* publish({ _tag: "SessionDeleted", sessionId: id });
+        yield* removeSession(id);
       }),
 
     reflect,

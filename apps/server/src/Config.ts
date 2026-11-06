@@ -26,6 +26,12 @@ export interface ServerConfigShape {
   /** Per-launch secret from the desktop app; lets it pair itself without user action. */
   readonly desktopBootstrapToken: string | undefined;
   readonly storage: StoragePolicy;
+  readonly browser: {
+    /** A Chromium-based browser to run; found automatically when unset. */
+    readonly executable: string | undefined;
+    /** Run without a window (the UI shows a live view either way). */
+    readonly headless: boolean;
+  };
 }
 
 /** Limits that keep Apollo's database from growing without bound (see Compaction.ts). */
@@ -65,6 +71,10 @@ export const fromEnv = (env: NodeJS.ProcessEnv = process.env): ServerConfigShape
       budgetBytes: positive(env.APOLLO_MAX_STORAGE_MB, 2048) * 1024 * 1024,
       archiveLimit: Math.floor(positive(env.APOLLO_MEMORY_ARCHIVE_LIMIT, 2000)),
       detailRetentionMs: positive(env.APOLLO_DETAIL_RETENTION_DAYS, 30) * DAY_MS,
+    },
+    browser: {
+      executable: env.APOLLO_BROWSER_BIN || undefined,
+      headless: env.APOLLO_BROWSER_HEADLESS !== "0",
     },
     claudeExecutable: env.APOLLO_CLAUDE_BIN,
     codexExecutable: env.APOLLO_CODEX_BIN,

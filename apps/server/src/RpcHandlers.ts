@@ -1,9 +1,16 @@
 import { ApolloError, type AppChange, ApolloRpcs } from "@apollo/contracts";
 import * as Stream from "effect/Stream";
 import * as Effect from "effect/Effect";
+import { AppSettings } from "./AppSettings.ts";
+import { PullRequests } from "./pullRequests/PullRequests.ts";
+import { ProviderVersions } from "./ProviderVersions.ts";
+import { Tailscale } from "./remote/Tailscale.ts";
 import { Auth } from "./auth/Auth.ts";
+import { Browser } from "./browser/Browser.ts";
+import { Secrets } from "./secrets/Secrets.ts";
 import { Compaction } from "./Compaction.ts";
 import { LocalModels } from "./local/LocalModels.ts";
+import { RECOMMENDED_REVIEWER } from "./local/Reviewer.ts";
 import { ProviderSettings } from "./ProviderSettings.ts";
 import { Scheduler } from "./schedule/Scheduler.ts";
 import { SessionManager } from "./SessionManager.ts";
@@ -19,14 +26,20 @@ export const layer = ApolloRpcs.toLayer(
     const providerSettings = yield* ProviderSettings;
     const localModels = yield* LocalModels;
     const scheduler = yield* Scheduler;
+    const browser = yield* Browser;
+    const secrets = yield* Secrets;
+    const appSettings = yield* AppSettings;
+    const pullRequests = yield* PullRequests;
+    const providerVersions = yield* ProviderVersions;
+    const tailscale = yield* Tailscale;
     // Errors from the local-model service reach the UI as plain messages.
     const local = <A, R>(effect: Effect.Effect<A, Error, R>) =>
       effect.pipe(Effect.mapError((error) => new ApolloError({ code: "internal", message: error.message })));
 
     return {
       "app.snapshot": () =>
-        Effect.all([manager.snapshot, scheduler.list()]).pipe(
-          Effect.map(([snapshot, schedules]) => ({ ...snapshot, schedules })),
+        Effect.all([manager.snapshot, scheduler.list(), browser.list(), pullRequests.list]).pipe(
+          Effect.map(([snapshot, schedules, browserTabs, prs]) => ({ ...snapshot, schedules, browserTabs, pullRequests: prs })),
         ),
       "app.changes": () =>
         Stream.merge(
@@ -46,7 +59,17 @@ export const layer = ApolloRpcs.toLayer(
       "localModels.download": ({ repo, quant }) => local(localModels.download(repo, quant)),
       "localModels.cancelDownload": ({ model }) => local(localModels.cancelDownload(model)),
       "localModels.delete": ({ model }) => local(localModels.deleteModel(model)),
+      "providers.versions": ({ refresh }) => providerVersions.versions(refresh ?? false),
+      "providers.update": ({ provider }) => providerVersions.update(provider),
       "localModels.setDefault": ({ model }) => localModels.setDefault(model),
+      "localModels.setReviewer": ({ model }) => localModels.setReviewer(model),
+      // Selected right away; reviews ask the user until the download finishes.
+      "localModels.installReviewer": () =>
+        local(
+          localModels
+            .download(RECOMMENDED_REVIEWER.repo, RECOMMENDED_REVIEWER.quant)
+            .pipe(Effect.andThen(localModels.setReviewer(`${RECOMMENDED_REVIEWER.repo}:${RECOMMENDED_REVIEWER.quant}`))),
+        ),
 
       "schedules.create": (input) => scheduler.create(input, "user"),
       "schedules.update": (input) => scheduler.update(input),
@@ -55,10 +78,26 @@ export const layer = ApolloRpcs.toLayer(
       "schedules.runs": ({ scheduleId }) => scheduler.runs(scheduleId),
       "schedules.preview": ({ spec, timezone }) => scheduler.preview(spec, timezone),
 
+      "secrets.respond": ({ sessionId, requestId, response }) => secrets.respond(sessionId, requestId, response),
+      "secrets.onePasswordStatus": () => secrets.onePasswordStatus,
+      "secrets.onePasswordSearch": ({ query }) => secrets.onePasswordSearch(query),
+      "secrets.onePasswordFields": ({ itemId, vaultId }) => secrets.onePasswordFields(itemId, vaultId),
+
+      "browser.status": () => browser.status,
+      "browser.open": ({ botId, url }) =>
+        Effect.flatMap(store.getBot(botId), (bot) => browser.openForUser(bot.id, bot.mainSessionId, url)),
+      "browser.navigate": ({ tabId, url }) => browser.navigateForUser(tabId, url).pipe(Effect.asVoid),
+      "browser.close": ({ tabId }) => browser.closeForUser(tabId),
+      "browser.input": ({ tabId, input }) => browser.input(tabId, input),
+      "browser.watch": ({ tabId }) => browser.watch(tabId),
+
       "storage.report": () => compaction.report,
       "storage.compact": () => compaction.compact,
 
       "providers.models": ({ provider }) => manager.listModels(provider),
+      "app.settings": () => appSettings.read,
+      "app.updateSettings": (input) => appSettings.update(input),
+      "app.projects": () => appSettings.projects,
       "providers.settings": () => providerSettings.view,
       "providers.updateSettings": (input) =>
         providerSettings.update(input).pipe(Effect.tap(() => manager.refreshModels)),
@@ -69,11 +108,16 @@ export const layer = ApolloRpcs.toLayer(
       "bots.stop": ({ botId }) => manager.stopBot(botId),
       "bots.resume": ({ botId }) => manager.resumeBot(botId),
 
-      "sessions.create": ({ botId, title, provider, cwd, prompt }) =>
-        manager.createSession({ botId, title, provider, cwd, prompt }),
+      "sessions.create": ({ botId, title, provider, cwd, isolation, prompt }) =>
+        manager.createSession({ botId, title, provider, cwd, isolation, prompt }),
       "sessions.update": (input) => manager.updateSessionSettings(input),
-      "sessions.send": ({ sessionId, text }) => manager.send(sessionId, text, "user"),
+      "sessions.send": ({ sessionId, text, attachments }) => manager.send(sessionId, text, "user", attachments ?? []),
       "sessions.interrupt": ({ sessionId }) => manager.interrupt(sessionId),
+      "sessions.commands": ({ sessionId }) => manager.listCommands(sessionId),
+      "sessions.runCommand": ({ sessionId, name, args }) => manager.runCommand(sessionId, name, args),
+      "pullRequests.unlink": ({ sessionId, url }) => pullRequests.unlink(sessionId, url),
+      "sessions.setMemoryExclusion": ({ sessionId, seq, excluded }) =>
+        manager.setMemoryExclusion(sessionId, seq, excluded),
       "sessions.close": ({ sessionId }) => manager.closeSession(sessionId),
       "sessions.delete": ({ sessionId }) => manager.deleteSession(sessionId),
       "sessions.respondApproval": ({ sessionId, requestId, decision }) =>
@@ -117,6 +161,8 @@ export const layer = ApolloRpcs.toLayer(
         }),
 
       "auth.listClients": () => Effect.sync(() => auth.listClients()),
+      "remote.status": () => tailscale.read,
+      "remote.setTailscale": ({ enabled }) => tailscale.setEnabled(enabled),
       "auth.revokeClient": ({ clientId }) => Effect.sync(() => auth.revokeClient(clientId)),
       "auth.createPairingToken": ({ label }) => Effect.sync(() => auth.createPairingToken(label)),
     };

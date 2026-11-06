@@ -5,6 +5,8 @@ productName: Apollo
 executableName: apollo
 directories:
   output: release
+  # icon.icns / icon.ico / icon.png, rendered from resources/icons/*.svg by `pnpm icons`.
+  buildResources: resources
 files:
   - dist-electron/**/*
   - package.json
@@ -14,6 +16,8 @@ extraResources:
     to: server
   - from: ../web/dist
     to: web
+  - from: resources/tray
+    to: tray
 # No native modules: the server is a single bundle and node:sqlite is built in.
 npmRebuild: false
 linux:

@@ -1,36 +1,111 @@
 @import "tailwindcss";
 
+@theme {
+  --animate-fade-in: fade-in 120ms ease-out;
+  --animate-pop-in: pop-in 140ms cubic-bezier(0.2, 0.9, 0.3, 1.2);
+  --animate-slide-in: slide-in 160ms ease-out;
+  --animate-fade-up: fade-up 240ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  --animate-shimmer: shimmer 1.8s linear infinite;
+
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes pop-in {
+    from { opacity: 0; transform: translateY(4px) scale(0.98); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes fade-up {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes shimmer {
+    from { background-position: 200% 0; }
+    to { background-position: -200% 0; }
+  }
+  @keyframes slide-in {
+    from { opacity: 0; transform: translateX(12px); }
+    to { opacity: 1; transform: none; }
+  }
+}
+
 :root {
   color-scheme: dark;
-  font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
+  font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-feature-settings: "cv11", "ss01";
   -webkit-font-smoothing: antialiased;
 }
 
-/* Minimal typography for rendered markdown. */
+/* Text that shimmers while a step is in progress. */
+.shimmer-text {
+  background: linear-gradient(90deg, var(--color-zinc-500) 0%, var(--color-zinc-500) 40%, var(--color-zinc-200) 50%, var(--color-zinc-500) 60%, var(--color-zinc-500) 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: var(--animate-shimmer);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+}
+
+::selection { background: rgb(113 113 122 / 0.45); }
+
+/* Thin, unobtrusive scrollbars. */
+* { scrollbar-width: thin; scrollbar-color: var(--color-zinc-800) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb { background: var(--color-zinc-800); border-radius: 9999px; border: 3px solid transparent; background-clip: content-box; }
+*::-webkit-scrollbar-thumb:hover { background-color: var(--color-zinc-700); }
+*::-webkit-scrollbar-track { background: transparent; }
+
+select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2371717a' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 0.5rem center; background-size: 14px; padding-right: 2rem !important; }
+
+/* Typography for rendered markdown. */
 .markdown > * + * { margin-top: 0.75em; }
-.markdown h1, .markdown h2, .markdown h3 { font-weight: 600; color: var(--color-zinc-100); }
-.markdown h1 { font-size: 1.15em; }
-.markdown h2 { font-size: 1.05em; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4 { font-weight: 600; color: var(--color-zinc-100); margin-top: 1.1em; }
+.markdown h1 { font-size: 1.2em; }
+.markdown h2 { font-size: 1.08em; }
+.markdown h3 { font-size: 1em; }
 .markdown ul { list-style: disc; padding-left: 1.25em; }
 .markdown ol { list-style: decimal; padding-left: 1.25em; }
 .markdown li + li { margin-top: 0.25em; }
-.markdown a { color: var(--color-sky-300); text-decoration: underline; }
-.markdown strong { color: var(--color-zinc-100); }
+.markdown li::marker { color: var(--color-zinc-600); }
+.markdown a { color: var(--color-sky-300); text-decoration: underline; text-underline-offset: 2px; text-decoration-color: rgb(125 211 252 / 0.4); }
+.markdown a:hover { text-decoration-color: currentColor; }
+.markdown strong { color: var(--color-zinc-100); font-weight: 600; }
+.markdown hr { border-color: var(--color-zinc-800); }
 .markdown code {
-  font-family: ui-monospace, monospace;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
   font-size: 0.85em;
   background: var(--color-zinc-800);
-  border-radius: 0.25rem;
+  border-radius: 0.3rem;
   padding: 0.1em 0.35em;
 }
 .markdown pre {
   background: var(--color-zinc-900);
   border: 1px solid var(--color-zinc-800);
-  border-radius: 0.5rem;
+  border-radius: 0.6rem;
   padding: 0.75em 1em;
   overflow-x: auto;
+  line-height: 1.55;
 }
-.markdown pre code { background: none; padding: 0; }
-.markdown table { border-collapse: collapse; font-size: 0.9em; }
-.markdown th, .markdown td { border: 1px solid var(--color-zinc-800); padding: 0.25em 0.6em; }
+.markdown pre code { background: none; padding: 0; font-size: 0.82em; }
+.markdown table { border-collapse: collapse; font-size: 0.9em; display: block; overflow-x: auto; }
+.markdown th { background: var(--color-zinc-900); font-weight: 600; text-align: left; color: var(--color-zinc-300); }
+.markdown th, .markdown td { border: 1px solid var(--color-zinc-800); padding: 0.35em 0.7em; }
 .markdown blockquote { border-left: 2px solid var(--color-zinc-700); padding-left: 0.75em; color: var(--color-zinc-400); }
+
+/* Desktop app on macOS (no native title bar). */
+.titlebar-hidden .app-drag {
+  -webkit-app-region: drag;
+  app-region: drag;
+  user-select: none;
+}
+.titlebar-hidden .app-drag :is(button, a, input, select, textarea, [role="button"], [role="menu"]) {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+.titlebar-hidden .traffic-light-inset {
+  padding-left: 84px;
+}

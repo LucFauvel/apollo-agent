@@ -5,7 +5,9 @@ import type { AgentEvent } from "@apollo/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
-import { foldSystemMessages, llamaCppEnvironment, makeLlamaCppProvider } from "../src/LlamaCppProvider.ts";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { foldSystemMessages, llamaCppEnvironment, makeLlamaCppProvider, startProxy } from "../src/LlamaCppProvider.ts";
 import type { ProviderEmission } from "../src/Provider.ts";
 import { startFakeLlamaServer } from "./fixtures/fake-llama-server.ts";
 
@@ -53,9 +55,47 @@ describe("LlamaCppProvider", () => {
       ANTHROPIC_API_KEY: "apollo-local",
       ANTHROPIC_SMALL_FAST_MODEL: "m",
       CLAUDE_CODE_MAX_CONTEXT_TOKENS: "8192",
+      // Deferred tool loading would void llama-server's prompt cache mid-conversation.
+      ENABLE_TOOL_SEARCH: "false",
     });
     expect("CLAUDE_CODE_OAUTH_TOKEN" in env && env.CLAUDE_CODE_OAUTH_TOKEN).toBe(undefined);
   });
+
+  it.live("survives a client cancelling a streamed response mid-way (Stop)", () =>
+    Effect.gen(function* () {
+      // An upstream that streams slowly, like a model generating.
+      const upstream = createServer((_req, res) => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write("event: ping\ndata: {}\n\n");
+        const timer = setInterval(() => res.write("event: ping\ndata: {}\n\n"), 20);
+        res.on("close", () => clearInterval(timer));
+      });
+      yield* Effect.promise(() => new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve)));
+      const port = (upstream.address() as AddressInfo).port;
+      const proxy = yield* startProxy({ baseUrl: `http://127.0.0.1:${port}`, apiKey: "k" });
+
+      const abort = new AbortController();
+      const response = yield* Effect.promise(() =>
+        fetch(`${proxy.baseUrl}/v1/messages`, {
+          method: "POST",
+          signal: abort.signal,
+          headers: { authorization: `Bearer ${proxy.apiKey}`, "content-type": "application/json" },
+          body: JSON.stringify({ stream: true, messages: [] }),
+        }),
+      );
+      const reader = response.body!.getReader();
+      yield* Effect.promise(() => reader.read());
+      abort.abort();
+      yield* Effect.sleep("200 millis");
+
+      // Still serving after the cancelled stream.
+      const again = yield* Effect.promise(() =>
+        fetch(`${proxy.baseUrl}/v1/models`, { headers: { authorization: `Bearer ${proxy.apiKey}` } }).then((r) => r.status),
+      );
+      expect(again).toBe(200);
+      upstream.close();
+    }).pipe(Effect.scoped),
+  );
 
   it("folds mid-conversation system messages into the neighbouring user message", () => {
     expect(
@@ -111,6 +151,11 @@ describe("LlamaCppProvider", () => {
 
         const events = emissions.flatMap((e): Array<AgentEvent> => (e._tag === "Event" ? [e.event] : []));
         expect(events).toContainEqual(expect.objectContaining({ _tag: "AssistantMessage", text: "PONG" }));
+        // Thinking streams as it is written, then lands as one Reasoning item with the same id.
+        const thinking = events.filter((e) => e._tag === "ReasoningDelta");
+        expect(thinking.map((e) => (e._tag === "ReasoningDelta" ? e.text : "")).join("")).toBe("The user wants a pong.");
+        const reasoning = events.find((e) => e._tag === "Reasoning");
+        expect(reasoning).toMatchObject({ text: "The user wants a pong.", itemId: thinking[0]?._tag === "ReasoningDelta" ? thinking[0].itemId : "" });
         expect(events.at(-1)).toMatchObject({ _tag: "TurnCompleted", outcome: "completed" });
 
         const calls = server.requests.filter((r) => r.path === "/v1/messages");
@@ -122,6 +167,8 @@ describe("LlamaCppProvider", () => {
           // Chat templates only accept a system message first.
           const roles = (call.body as { messages?: Array<{ role: string }> }).messages?.map((m) => m.role) ?? [];
           expect(roles).not.toContain("system");
+          // The local model is told it is not Claude.
+          expect(JSON.stringify(call.body?.system ?? "")).toContain("You are not Claude");
         }
         const usage = emissions.find((e) => e._tag === "UsageTotals");
         expect(usage).toMatchObject({ totals: { costUsd: 0 } });

@@ -8,12 +8,14 @@ import type {
   ScheduleRunStatus,
   SessionId,
 } from "@apollo/contracts";
+import { CalendarClock, HeartPulse, History, Loader2, Pencil, Play, Plus, Timer, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { errorMessage, rpc } from "../rpc.ts";
 import { useApp } from "../store.ts";
 import { NO_CHOICE, ProviderPicker, selection } from "./Dialogs.tsx";
 import { type ModelChoice, ModelPicker } from "./ModelPicker.tsx";
-import { Button, cx, Field, inputClass, Modal } from "./ui.tsx";
+import { ProviderLogo } from "./icons.tsx";
+import { Badge, Button, cx, EmptyState, ErrorText, Field, IconButton, inputClass, Modal, OptionCards, Panel, providerName, Toggle } from "./ui.tsx";
 
 /** Re-renders every `ms`, for relative times. */
 const useNow = (ms = 30_000) => {
@@ -52,15 +54,17 @@ const statusStyle: Record<ScheduleRunStatus, string> = {
 };
 
 function StatusChip({ status }: { status: ScheduleRunStatus }) {
-  return <span className={cx("rounded px-1.5 py-px text-[10px] font-medium", statusStyle[status])}>{status}</span>;
+  return <span className={cx("rounded-md px-1.5 py-px text-[10px] font-medium", statusStyle[status])}>{status}</span>;
 }
 
-const kindInfo: Record<ScheduleKind, { label: string; detail: string }> = {
+const kindInfo: Record<ScheduleKind, { label: string; detail: string; icon: typeof Timer }> = {
   task: {
+    icon: Timer,
     label: "Task",
     detail: "Runs the prompt in a fresh worker session, then reports to the orchestrator. For self-contained jobs.",
   },
   heartbeat: {
+    icon: HeartPulse,
     label: "Heartbeat",
     detail: "Sends the prompt into the orchestrator's own conversation, for check-ins that need its context.",
   },
@@ -94,13 +98,13 @@ function RunHistory({ schedule, onOpenSession }: { schedule: Schedule; onOpenSes
       {runs.map((run) => {
         const session = run.sessionId ? sessions.get(run.sessionId) : undefined;
         return (
-          <div key={run.id} className="rounded border border-zinc-800/80 px-2 py-1.5">
+          <div key={run.id} className="rounded-lg bg-zinc-900/60 px-2.5 py-2">
             <div className="flex items-center gap-1.5 text-[10px] text-zinc-500">
               <StatusChip status={run.status} />
               <span title={absoluteTime(run.startedAt)}>{relativeTime(run.startedAt, now)}</span>
               {session ? (
                 <button className="ml-auto hover:text-zinc-200" onClick={() => onOpenSession(session.id)}>
-                  open session →
+                  Open session →
                 </button>
               ) : null}
             </div>
@@ -131,77 +135,72 @@ function ScheduleCard({
     rpc(f).catch((e) => setError(errorMessage(e)));
   };
 
+  const KindIcon = kindInfo[schedule.kind].icon;
+  const running = schedule.lastStatus === "running";
+
   return (
-    <div className={cx("rounded-md border border-zinc-800/80 p-2.5", !schedule.enabled && "opacity-60")}>
-      <div className="flex items-start gap-2">
+    <div className={cx("group rounded-xl border border-zinc-800/80 bg-zinc-900/30 p-3 transition-colors hover:border-zinc-700/80", !schedule.enabled && "opacity-60")}>
+      <div className="flex items-start gap-2.5">
+        <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-lg bg-zinc-800/80 text-zinc-400" title={kindInfo[schedule.kind].label}>
+          <KindIcon className="size-3.5" strokeWidth={1.75} />
+        </span>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5">
-            <span className="truncate text-sm font-medium text-zinc-100">{schedule.name}</span>
-            <span className="shrink-0 rounded bg-zinc-800 px-1.5 py-px text-[10px] text-zinc-400">
-              {kindInfo[schedule.kind].label.toLowerCase()}
-            </span>
+            <span className="truncate text-[13px] font-medium text-zinc-100">{schedule.name}</span>
+            {schedule.provider ? <ProviderLogo provider={schedule.provider.provider} size={12} className="shrink-0" /> : null}
             {schedule.createdBy === "bot" ? (
-              <span className="shrink-0 rounded bg-violet-500/15 px-1.5 py-px text-[10px] text-violet-300" title="Created by the orchestrator">
+              <Badge tone="violet" title="Created by the orchestrator">
                 by bot
-              </span>
+              </Badge>
             ) : null}
           </div>
           <div className="mt-0.5 text-[11px] text-zinc-400">{schedule.description}</div>
         </div>
-        <label className="flex shrink-0 cursor-pointer items-center gap-1 text-[11px] text-zinc-400" title={schedule.enabled ? "Turn off" : "Turn on"}>
-          <input
-            type="checkbox"
-            checked={schedule.enabled}
-            onChange={(e) => act((c) => c["schedules.update"]({ scheduleId: schedule.id, enabled: e.target.checked }))}
-          />
-          on
-        </label>
+        <Toggle
+          checked={schedule.enabled}
+          title={schedule.enabled ? "Turn off" : "Turn on"}
+          onChange={(enabled) => act((c) => c["schedules.update"]({ scheduleId: schedule.id, enabled }))}
+        />
       </div>
-      <div className="mt-1.5 line-clamp-2 text-[11px] text-zinc-500" title={schedule.prompt}>
+      <div className="mt-2 line-clamp-2 text-xs leading-relaxed text-zinc-500" title={schedule.prompt}>
         {schedule.prompt}
       </div>
-      <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-zinc-500">
-        {schedule.nextRunAt !== null ? (
-          <span title={absoluteTime(schedule.nextRunAt)}>next {relativeTime(schedule.nextRunAt, now)}</span>
-        ) : (
-          <span>{schedule.enabled ? "no upcoming run" : "off"}</span>
-        )}
-        {schedule.lastStatus ? (
-          <span className="flex items-center gap-1">
-            · last <StatusChip status={schedule.lastStatus} />
+      <div className="mt-2.5 flex items-center gap-2 text-[11px] text-zinc-500">
+        {running ? (
+          <span className="flex items-center gap-1 text-emerald-300">
+            <Loader2 className="size-3 animate-spin" /> Running
           </span>
-        ) : null}
-        {schedule.failureStreak > 0 ? <span className="text-red-400">· {schedule.failureStreak} failed in a row</span> : null}
-      </div>
-      <div className="mt-2 flex gap-1">
-        <Button
-          size="sm"
-          variant="ghost"
-          disabled={schedule.lastStatus === "running"}
-          onClick={() => act((c) => c["schedules.runNow"]({ scheduleId: schedule.id }))}
-        >
-          {schedule.lastStatus === "running" ? "Running…" : "Run now"}
-        </Button>
-        <Button size="sm" variant="ghost" onClick={() => setShowRuns((v) => !v)}>
-          History
-        </Button>
-        <Button size="sm" variant="ghost" onClick={onEdit}>
-          Edit
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          className="ml-auto"
-          onClick={() => {
-            if (confirm(`Delete schedule "${schedule.name}"?`)) act((c) => c["schedules.delete"]({ scheduleId: schedule.id }));
-          }}
-        >
-          Delete
-        </Button>
+        ) : schedule.nextRunAt !== null ? (
+          <span title={absoluteTime(schedule.nextRunAt)}>Next {relativeTime(schedule.nextRunAt, now)}</span>
+        ) : (
+          <span>{schedule.enabled ? "No upcoming run" : "Off"}</span>
+        )}
+        {schedule.lastStatus && !running ? <StatusChip status={schedule.lastStatus} /> : null}
+        {schedule.failureStreak > 0 ? <span className="text-red-400">{schedule.failureStreak} failed in a row</span> : null}
+        <span className="ml-auto flex items-center opacity-60 transition-opacity group-hover:opacity-100">
+          <IconButton
+            icon={Play}
+            label="Run now"
+            size="sm"
+            disabled={running}
+            onClick={() => act((c) => c["schedules.runNow"]({ scheduleId: schedule.id }))}
+          />
+          <IconButton icon={History} label="History" size="sm" active={showRuns} onClick={() => setShowRuns((v) => !v)} />
+          <IconButton icon={Pencil} label="Edit" size="sm" onClick={onEdit} />
+          <IconButton
+            icon={Trash2}
+            label="Delete"
+            size="sm"
+            className="hover:text-red-300"
+            onClick={() => {
+              if (confirm(`Delete schedule "${schedule.name}"?`)) act((c) => c["schedules.delete"]({ scheduleId: schedule.id }));
+            }}
+          />
+        </span>
       </div>
       {error ? <div className="mt-1 text-[11px] text-red-400">{error}</div> : null}
       {showRuns ? (
-        <div className="mt-2 border-t border-zinc-800/80 pt-2">
+        <div className="mt-2.5 border-t border-zinc-800/80 pt-2.5">
           <RunHistory schedule={schedule} onOpenSession={onOpenSession} />
         </div>
       ) : null}
@@ -266,7 +265,13 @@ export function ScheduleDialog({ bot, schedule, onClose }: { bot: Bot; schedule:
 
   return (
     <Modal
-      title={schedule ? `Edit schedule · ${schedule.name}` : `New schedule · ${bot.name}`}
+      title={schedule ? `Edit ${schedule.name}` : "New schedule"}
+      description={schedule ? kindInfo[schedule.kind].detail : `Something ${bot.name} does on its own, on a schedule.`}
+      icon={
+        <span className="flex size-9 items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900 text-zinc-400">
+          <CalendarClock className="size-4.5" strokeWidth={1.75} />
+        </span>
+      }
       onClose={onClose}
       footer={
         <>
@@ -280,24 +285,19 @@ export function ScheduleDialog({ bot, schedule, onClose }: { bot: Bot; schedule:
       }
     >
       {schedule ? null : (
-        <Field label="Kind">
-          <div className="grid grid-cols-2 gap-2">
-            {(Object.keys(kindInfo) as Array<ScheduleKind>).map((k) => (
-              <button
-                key={k}
-                type="button"
-                onClick={() => setKind(k)}
-                className={cx(
-                  "rounded-md border px-3 py-2 text-left",
-                  kind === k ? "border-zinc-500 bg-zinc-800/70" : "border-zinc-800 hover:border-zinc-700",
-                )}
-              >
-                <div className="text-sm font-medium text-zinc-100">{kindInfo[k].label}</div>
-                <div className="mt-0.5 text-[11px] text-zinc-500">{kindInfo[k].detail}</div>
-              </button>
-            ))}
-          </div>
-        </Field>
+        <OptionCards
+          value={kind}
+          onChange={setKind}
+          options={(Object.keys(kindInfo) as Array<ScheduleKind>).map((k) => {
+            const Icon = kindInfo[k].icon;
+            return {
+              value: k,
+              label: kindInfo[k].label,
+              detail: kindInfo[k].detail,
+              icon: <Icon className="size-4 text-zinc-400" strokeWidth={1.75} />,
+            };
+          })}
+        />
       )}
       <Field label="Name">
         <input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} placeholder="Morning digest" autoFocus />
@@ -355,11 +355,20 @@ export function ScheduleDialog({ bot, schedule, onClose }: { bot: Bot; schedule:
         <>
           <Field label="Worker">
             <div className="space-y-2">
-              <label className="flex items-center gap-2 text-xs text-zinc-300">
-                <input type="checkbox" checked={useBotDefault} onChange={(e) => setUseBotDefault(e.target.checked)} />
-                Use the bot's default worker ({bot.defaultWorker.provider}
-                {bot.defaultWorker.model ? ` · ${bot.defaultWorker.model}` : ""})
-              </label>
+              <Toggle
+                checked={useBotDefault}
+                onChange={setUseBotDefault}
+                label={
+                  <span className="flex items-center gap-1.5">
+                    Use the bot's default worker
+                    <ProviderLogo provider={bot.defaultWorker.provider} size={13} />
+                    <span className="text-zinc-500">
+                      {providerName(bot.defaultWorker.provider)}
+                      {bot.defaultWorker.model ? ` · ${bot.defaultWorker.model}` : ""}
+                    </span>
+                  </span>
+                }
+              />
               {useBotDefault ? null : (
                 <>
                   <ProviderPicker
@@ -379,7 +388,7 @@ export function ScheduleDialog({ bot, schedule, onClose }: { bot: Bot; schedule:
           </Field>
         </>
       ) : null}
-      {error ? <div className="text-xs text-red-400">{error}</div> : null}
+      <ErrorText>{error}</ErrorText>
     </Modal>
   );
 }
@@ -400,16 +409,15 @@ export function SchedulesPanel({
   useEffect(askForNotifications, []);
 
   return (
-    <aside className="flex w-96 shrink-0 flex-col border-l border-zinc-800/80 bg-zinc-950">
-      <div className="flex h-12 items-center gap-2 border-b border-zinc-800/80 px-3">
-        <span className="text-xs font-medium text-zinc-100">Schedules</span>
-        <Button size="sm" className="ml-auto" onClick={() => setEditing("new")}>
-          New
+    <Panel
+      title={<span className="text-[13px] font-semibold text-zinc-100">Schedules</span>}
+      actions={
+        <Button size="sm" onClick={() => setEditing("new")}>
+          <Plus /> New
         </Button>
-        <Button size="sm" variant="ghost" onClick={onClose}>
-          ✕
-        </Button>
-      </div>
+      }
+      onClose={onClose}
+    >
       <div className="flex-1 space-y-2 overflow-y-auto p-3">
         {bot.pausedReason !== null && schedules.some((s) => s.enabled) ? (
           <div className="rounded-md border border-amber-700/30 bg-amber-950/30 px-2.5 py-2 text-[11px] text-amber-200">
@@ -420,16 +428,16 @@ export function SchedulesPanel({
           <ScheduleCard key={schedule.id} schedule={schedule} onEdit={() => setEditing(schedule)} onOpenSession={onOpenSession} />
         ))}
         {schedules.length === 0 ? (
-          <p className="text-xs text-zinc-500">
-            Nothing scheduled. Schedule a task (a self-contained job in a fresh worker, like a morning digest) or a
-            heartbeat (a recurring check-in in {bot.name}'s own conversation). You can also ask {bot.name} to set one
-            up. Results reach its conversation and your desktop notifications.
-          </p>
+          <EmptyState icon={CalendarClock} title="Nothing scheduled">
+            Schedule a <span className="text-zinc-300">task</span> (a self-contained job in a fresh worker, like a morning
+            digest) or a <span className="text-zinc-300">heartbeat</span> (a recurring check-in in {bot.name}'s own
+            conversation). You can also ask {bot.name} to set one up.
+          </EmptyState>
         ) : null}
       </div>
       {editing !== null ? (
         <ScheduleDialog bot={bot} schedule={editing === "new" ? null : editing} onClose={() => setEditing(null)} />
       ) : null}
-    </aside>
+    </Panel>
   );
 }

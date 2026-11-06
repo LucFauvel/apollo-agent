@@ -14,17 +14,21 @@ import {
   type Session,
   SessionId,
   SessionStatus,
-  type SessionRole,
   Skill,
 } from "@apollo/contracts";
-import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import { McpProtocol, McpServer, Tool, Toolkit } from "effect/ai";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
-import { transcriptForReflection } from "../Instructions.ts";
+import { transcriptForReflection, withoutExcluded } from "../Instructions.ts";
+import * as BrowserTools from "./BrowserTools.ts";
+import * as JobTools from "./JobTools.ts";
+import * as PullRequestTools from "./PullRequestTools.ts";
+import * as UserTools from "./UserTools.ts";
+import * as WorktreeTools from "./WorktreeTools.ts";
+import { McpCaller } from "./Caller.ts";
 import { Scheduler } from "../schedule/Scheduler.ts";
 import { SessionManager } from "../SessionManager.ts";
 import { Store } from "../Store.ts";
@@ -33,10 +37,7 @@ import { Store } from "../Store.ts";
 // Caller identity: every agent session gets its own bearer token.
 // ---------------------------------------------------------------------------
 
-export class McpCaller extends Context.Service<
-  McpCaller,
-  { readonly sessionId: SessionId; readonly botId: BotId; readonly role: SessionRole }
->()("apollo/McpCaller") {}
+export { McpCaller };
 
 const authMiddleware = HttpRouter.middleware<{ provides: McpCaller }>()(
   Effect.gen(function* () {
@@ -225,6 +226,11 @@ const SpawnSession = Tool.make("apollo_spawn_session", {
     /** Reasoning effort, e.g. `low` for simple tasks or `high` for hard ones. */
     effort: Schema.optional(Schema.String),
     cwd: Schema.optional(Schema.String),
+    /**
+     * `worktree`: the worker gets its own git worktree on a new branch, so parallel workers do not
+     * edit the same files. Finish it with apollo_worktree_finish (merge, keep or discard).
+     */
+    isolation: Schema.optional(Schema.Literals(["shared", "worktree"])),
     notifyOnCompletion: Schema.optional(Schema.Boolean),
   }),
   success: SessionSummary,
@@ -335,7 +341,19 @@ const ScheduleDelete = Tool.make("apollo_schedule_delete", {
   success: Schema.Struct({}),
 });
 
+const Notify = Tool.make("apollo_notify", {
+  ...shared,
+  description: [
+    "Send the user a desktop notification; clicking it opens this session.",
+    "Use it for things they asked to hear about or must act on now (a long job finished, a decision is needed),",
+    "not for routine progress. Keep `title` to a few words and `body` to a sentence or two.",
+  ].join(" "),
+  parameters: Schema.Struct({ title: Schema.String, body: Schema.String }),
+  success: Schema.Struct({ sent: Schema.Boolean }),
+}).annotate(Tool.Destructive, false);
+
 export const ApolloToolkit = Toolkit.make(
+  Notify,
   MemorySearch,
   MemorySave,
   MemoryForget,
@@ -394,6 +412,20 @@ const handlers = ApolloToolkit.toLayer(
       });
 
     return {
+      apollo_notify: ({ title, body }) =>
+        Effect.gen(function* () {
+          const caller = yield* McpCaller;
+          if (!title.trim() && !body.trim()) return yield* invalid("title and body are empty");
+          yield* manager.publish({
+            _tag: "Notify",
+            botId: caller.botId,
+            sessionId: caller.sessionId,
+            title: title.trim().slice(0, 120),
+            body: body.trim().slice(0, 400),
+          });
+          return { sent: true };
+        }),
+
       apollo_memory_search: ({ query, limit }) =>
         Effect.gen(function* () {
           const caller = yield* McpCaller;
@@ -498,7 +530,10 @@ const handlers = ApolloToolkit.toLayer(
           const caller = yield* McpCaller;
           const session = yield* store.getSession(sessionId);
           if (session.botId !== caller.botId) return yield* invalid("that session belongs to another bot");
-          const events = yield* store.eventsAround(sessionId, seq, Math.min(Math.max(radius ?? 10, 1), 50));
+          const events = withoutExcluded(
+            yield* store.eventsAround(sessionId, seq, Math.min(Math.max(radius ?? 10, 1), 50)),
+            yield* store.memoryExclusions(sessionId),
+          );
           return { transcript: transcriptForReflection(events, 20_000) || "(nothing to show in that range)" };
         }),
 
@@ -551,7 +586,7 @@ const handlers = ApolloToolkit.toLayer(
           return { sessions: sessions.filter((s) => s.role !== "reflection").map(summarize) };
         }),
 
-      apollo_spawn_session: ({ title, prompt, provider, model, effort, cwd, notifyOnCompletion }) =>
+      apollo_spawn_session: ({ title, prompt, provider, model, effort, cwd, isolation, notifyOnCompletion }) =>
         Effect.gen(function* () {
           const caller = yield* McpCaller;
           if (caller.role !== "main") {
@@ -570,6 +605,7 @@ const handlers = ApolloToolkit.toLayer(
             title,
             provider: selection,
             cwd,
+            isolation,
             prompt,
             parentSessionId: caller.sessionId,
             notifyParent: notifyOnCompletion ?? true,
@@ -654,5 +690,12 @@ export const layer = McpServer.layerHttp({
   path: "/mcp",
   protocols: [McpProtocol.v2025_11_25, McpProtocol.v2025_06_18, McpProtocol.v2025_03_26],
   allowSessionTermination: true,
-  registrations: McpServer.toolkit(ApolloToolkit).pipe(Layer.provide(handlers)),
+  registrations: Layer.mergeAll(
+    McpServer.toolkit(ApolloToolkit).pipe(Layer.provide(handlers)),
+    McpServer.toolkit(BrowserTools.BrowserToolkit).pipe(Layer.provide(BrowserTools.handlers)),
+    McpServer.toolkit(UserTools.UserToolkit).pipe(Layer.provide(UserTools.handlers)),
+    McpServer.toolkit(JobTools.JobToolkit).pipe(Layer.provide(JobTools.handlers)),
+    McpServer.toolkit(WorktreeTools.WorktreeToolkit).pipe(Layer.provide(WorktreeTools.handlers)),
+    McpServer.toolkit(PullRequestTools.PullRequestToolkit).pipe(Layer.provide(PullRequestTools.handlers)),
+  ),
 }).pipe(Layer.provide(authMiddleware));

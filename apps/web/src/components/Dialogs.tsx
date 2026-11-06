@@ -1,10 +1,29 @@
 import type { Bot, BotLimits, ProviderKind, ProviderSelection, RuntimeMode, Session } from "@apollo/contracts";
-import { useState } from "react";
+import { type BotAvatar as BotAvatarValue, type ProjectInfo, randomAvatar } from "@apollo/contracts";
+import { AvatarPicker } from "./BlobAvatar.tsx";
+import { FolderGit2 } from "lucide-react";
+import { useCallback, useEffect, useId, useState } from "react";
+import { slugify, suggestBotName, tildify, useAppSettings } from "../appSettings.ts";
 import { formatUsage, usageTitle } from "../format.ts";
 import { errorMessage, rpc } from "../rpc.ts";
 import { useApp } from "../store.ts";
 import { type ModelChoice, ModelPicker } from "./ModelPicker.tsx";
-import { Button, cx, Field, inputClass, Modal, PROVIDERS } from "./ui.tsx";
+import { ProviderLogo } from "./icons.tsx";
+import { LocalModelSetup } from "./LocalModelsDialog.tsx";
+import { BotAvatar } from "./Sidebar.tsx";
+import {
+  Button,
+  cx,
+  ErrorText,
+  Field,
+  FormSection,
+  inputClass,
+  Modal,
+  OptionCards,
+  PROVIDERS,
+  providerName,
+  Toggle,
+} from "./ui.tsx";
 
 export const NO_CHOICE: ModelChoice = { model: null, effort: null };
 
@@ -22,36 +41,130 @@ export function ProviderPicker({
   onChange: (provider: ProviderKind) => void;
 }) {
   return (
-    <div className="grid grid-cols-3 gap-2">
-      {PROVIDERS.map(({ kind: provider, name, detail }) => (
-        <button
-          key={provider}
-          type="button"
-          onClick={() => onChange(provider)}
-          className={cx(
-            "rounded-md border px-3 py-2 text-left text-sm",
-            value === provider
-              ? "border-zinc-400 bg-zinc-800 text-zinc-100"
-              : "border-zinc-800 text-zinc-400 hover:border-zinc-700",
-          )}
-        >
-          <div className="font-medium">{name}</div>
-          <div className="truncate text-[11px] text-zinc-500">{detail}</div>
-        </button>
-      ))}
+    <OptionCards
+      value={value}
+      onChange={onChange}
+      options={PROVIDERS.map(({ kind, name, detail }) => ({
+        value: kind,
+        label: name,
+        detail,
+        icon: <ProviderLogo provider={kind} size={18} />,
+      }))}
+    />
+  );
+}
+
+/** Provider cards with the model and effort picker underneath. */
+function ProviderModelPicker({
+  provider,
+  onProvider,
+  choice,
+  onChoice,
+}: {
+  provider: ProviderKind;
+  onProvider: (provider: ProviderKind) => void;
+  choice: ModelChoice;
+  onChoice: (choice: ModelChoice) => void;
+}) {
+  // A model downloaded from the inline setup becomes the choice straight away.
+  const onSelect = useCallback((model: string) => onChoice({ model, effort: null }), [onChoice]);
+  return (
+    <div className="space-y-2">
+      <ProviderPicker value={provider} onChange={onProvider} />
+      <ModelPicker provider={provider} value={choice} onChange={onChoice} quietErrors={provider === "llamacpp"} />
+      {provider === "llamacpp" ? <LocalModelSetup onSelect={onSelect} /> : null}
     </div>
   );
 }
 
+/** The model picker for a provider that cannot change, labelled with its logo. */
+function FixedProviderModel({
+  provider,
+  choice,
+  onChoice,
+}: {
+  provider: ProviderKind;
+  choice: ModelChoice;
+  onChoice: (choice: ModelChoice) => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2 text-[13px] text-zinc-300">
+        <ProviderLogo provider={provider} size={16} />
+        {providerName(provider)}
+      </div>
+      <ModelPicker provider={provider} value={choice} onChange={onChoice} />
+    </div>
+  );
+}
+
+const PERMISSIONS = [
+  { value: "approval-required", label: "Ask first", detail: "Prompts before risky actions" },
+  { value: "auto", label: "Auto", detail: "A reviewer model decides; asks you when unsure" },
+  { value: "full-access", label: "Full access", detail: "Never prompts" },
+] as const satisfies ReadonlyArray<{ value: RuntimeMode; label: string; detail: string }>;
+
+/** A workspace path input that suggests the user's projects (from the project folders in Settings). */
+function WorkspaceField({
+  value,
+  onChange,
+  projects,
+  home,
+  hint,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  projects: ReadonlyArray<ProjectInfo>;
+  home: string;
+  hint?: string;
+}) {
+  const listId = useId();
+  return (
+    <Field label="Workspace" hint={hint}>
+      <div className="relative">
+        <input
+          className={cx(inputClass, "font-mono text-xs", projects.length > 0 && "pr-8")}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="~/Apollo/atlas"
+          list={projects.length > 0 ? listId : undefined}
+          spellCheck={false}
+        />
+        {projects.length > 0 ? (
+          <FolderGit2
+            className="pointer-events-none absolute top-1/2 right-2.5 size-3.5 -translate-y-1/2 text-zinc-600"
+            aria-label={`${projects.length} projects to pick from`}
+          />
+        ) : null}
+      </div>
+      {projects.length > 0 ? (
+        <datalist id={listId}>
+          {projects.map((p) => (
+            <option key={p.path} value={tildify(p.path, home)} label={p.name} />
+          ))}
+        </datalist>
+      ) : null}
+    </Field>
+  );
+}
+
 export function NewBotDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (bot: Bot) => void }) {
-  const [name, setName] = useState("");
+  const bots = useApp((s) => s.bots);
+  const { settings, projects } = useAppSettings();
+  const [name, setName] = useState(() => suggestBotName([...bots.values()].map((b) => b.name)));
+  const [avatar, setAvatar] = useState<BotAvatarValue>(() => randomAvatar());
   const [instructions, setInstructions] = useState("");
   const [cwd, setCwd] = useState("");
+  // The workspace follows the name until the user edits it.
+  const [cwdEdited, setCwdEdited] = useState(false);
+  useEffect(() => {
+    if (!cwdEdited && settings) setCwd(tildify(`${settings.workspaceRoot}/${slugify(name)}`, settings.homeDir));
+  }, [name, cwdEdited, settings]);
   const [main, setMain] = useState<ProviderKind>("claude");
   const [mainModel, setMainModel] = useState<ModelChoice>(NO_CHOICE);
   const [worker, setWorker] = useState<ProviderKind>("codex");
   const [workerModel, setWorkerModel] = useState<ModelChoice>(NO_CHOICE);
-  const [runtimeMode, setRuntimeMode] = useState<RuntimeMode>("approval-required");
+  const [runtimeMode, setRuntimeMode] = useState<RuntimeMode>("auto");
   const [autoLearn, setAutoLearn] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -61,6 +174,7 @@ export function NewBotDialog({ onClose, onCreated }: { onClose: () => void; onCr
     rpc((c) =>
       c["bots.create"]({
         name,
+        avatar,
         instructions,
         cwd,
         main: selection(main, mainModel),
@@ -76,7 +190,10 @@ export function NewBotDialog({ onClose, onCreated }: { onClose: () => void; onCr
 
   return (
     <Modal
+      wide
       title="New bot"
+      description="A persona with an orchestrator you talk to, and workers it delegates to."
+      icon={<AvatarPicker value={avatar} onChange={setAvatar} />}
       onClose={onClose}
       footer={
         <>
@@ -89,59 +206,72 @@ export function NewBotDialog({ onClose, onCreated }: { onClose: () => void; onCr
         </>
       }
     >
-      <Field label="Name">
-        <input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} placeholder="Atlas" autoFocus />
-      </Field>
-      <Field label="Workspace" hint="Default working directory for this bot's sessions.">
-        <input className={inputClass} value={cwd} onChange={(e) => setCwd(e.target.value)} placeholder="/home/me/projects/app" />
-      </Field>
-      <Field label="Instructions" hint="Persona and standing instructions, shared by every session of this bot.">
-        <textarea
-          className={cx(inputClass, "min-h-20")}
-          value={instructions}
-          onChange={(e) => setInstructions(e.target.value)}
-          placeholder="You maintain the billing service. Prefer small PRs…"
+      <FormSection title="Identity">
+        <Field label="Name">
+          <input
+            className={inputClass}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onFocus={(e) => e.target.select()}
+            placeholder="Atlas"
+            autoFocus
+          />
+        </Field>
+        <WorkspaceField
+          value={cwd}
+          onChange={(v) => {
+            setCwd(v);
+            setCwdEdited(true);
+          }}
+          projects={projects}
+          home={settings?.homeDir ?? ""}
+          hint={
+            projects.length > 0
+              ? "Created if it doesn't exist. Pick one of your projects to work in it directly."
+              : "Created if it doesn't exist. Add your project folders in Settings to pick from them."
+          }
         />
-      </Field>
-      <Field label="Orchestrator">
-        <div className="space-y-2">
-          <ProviderPicker
-            value={main}
-            onChange={(p) => {
-              setMain(p);
-              setMainModel(NO_CHOICE);
-            }}
+        <Field label="Instructions" hint="Persona and standing instructions, shared by every session of this bot.">
+          <textarea
+            className={cx(inputClass, "min-h-20")}
+            value={instructions}
+            onChange={(e) => setInstructions(e.target.value)}
+            placeholder="You maintain the billing service. Prefer small PRs…"
           />
-          <ModelPicker provider={main} value={mainModel} onChange={setMainModel} />
-        </div>
-      </Field>
-      <Field label="Default worker" hint="The bot can still pick either provider, model and effort per task.">
-        <div className="space-y-2">
-          <ProviderPicker
-            value={worker}
-            onChange={(p) => {
-              setWorker(p);
-              setWorkerModel(NO_CHOICE);
-            }}
-          />
-          <ModelPicker provider={worker} value={workerModel} onChange={setWorkerModel} />
-        </div>
-      </Field>
-      <Field label="Permissions">
-        <select
-          className={inputClass}
-          value={runtimeMode}
-          onChange={(e) => setRuntimeMode(e.target.value as RuntimeMode)}
-        >
-          <option value="approval-required">Ask before risky actions</option>
-          <option value="full-access">Full access (no prompts)</option>
-        </select>
-      </Field>
-      <label className="flex items-center gap-2 text-sm text-zinc-300">
-        <input type="checkbox" checked={autoLearn} onChange={(e) => setAutoLearn(e.target.checked)} />
-        Learn automatically (reflect on sessions to save memories and propose skills)
-      </label>
-      {error ? <div className="text-xs text-red-400">{error}</div> : null}
+        </Field>
+      </FormSection>
+      <FormSection title="Orchestrator" description="The session you talk to. It plans and delegates.">
+        <ProviderModelPicker
+          provider={main}
+          onProvider={(p) => {
+            setMain(p);
+            setMainModel(NO_CHOICE);
+          }}
+          choice={mainModel}
+          onChoice={setMainModel}
+        />
+      </FormSection>
+      <FormSection title="Default worker" description="The bot can still pick any provider, model and effort per task.">
+        <ProviderModelPicker
+          provider={worker}
+          onProvider={(p) => {
+            setWorker(p);
+            setWorkerModel(NO_CHOICE);
+          }}
+          choice={workerModel}
+          onChoice={setWorkerModel}
+        />
+      </FormSection>
+      <FormSection title="Behaviour">
+        <OptionCards value={runtimeMode} onChange={setRuntimeMode} options={PERMISSIONS} />
+        <Toggle
+          checked={autoLearn}
+          onChange={setAutoLearn}
+          label="Learn automatically"
+          description="Reflect on finished sessions to save memories and propose skills."
+        />
+      </FormSection>
+      <ErrorText>{error}</ErrorText>
     </Modal>
   );
 }
@@ -163,6 +293,7 @@ export function NewSessionDialog({
       : NO_CHOICE;
   const [model, setModel] = useState<ModelChoice>(() => workerDefaults(bot.defaultWorker.provider));
   const [cwd, setCwd] = useState(bot.cwd);
+  const [worktree, setWorktree] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -175,6 +306,7 @@ export function NewSessionDialog({
         title: title || prompt.slice(0, 48),
         provider: selection(provider, model),
         cwd,
+        ...(worktree ? { isolation: "worktree" as const } : {}),
         ...(prompt.trim() ? { prompt } : {}),
       }),
     )
@@ -185,7 +317,9 @@ export function NewSessionDialog({
 
   return (
     <Modal
-      title={`New session · ${bot.name}`}
+      title="New session"
+      description={`A worker session for ${bot.name}, outside the orchestrator.`}
+      icon={<BotAvatar avatar={bot.avatar} size="lg" />}
       onClose={onClose}
       footer={
         <>
@@ -198,36 +332,36 @@ export function NewSessionDialog({
         </>
       }
     >
-      <Field label="Provider">
-        <div className="space-y-2">
-          <ProviderPicker
-            value={provider}
-            onChange={(p) => {
-              setProvider(p);
-              setModel(workerDefaults(p));
-            }}
-          />
-          <ModelPicker provider={provider} value={model} onChange={setModel} />
-        </div>
-      </Field>
-      <Field label="Title">
-        <input className={inputClass} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Fix flaky tests" autoFocus />
-      </Field>
-      <Field label="Working directory">
-        <input className={inputClass} value={cwd} onChange={(e) => setCwd(e.target.value)} />
-      </Field>
+      <ProviderModelPicker
+        provider={provider}
+        onProvider={(p) => {
+          setProvider(p);
+          setModel(workerDefaults(p));
+        }}
+        choice={model}
+        onChoice={setModel}
+      />
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Title">
+          <input className={inputClass} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Fix flaky tests" autoFocus />
+        </Field>
+        <Field label="Working directory">
+          <input className={cx(inputClass, "font-mono text-xs")} value={cwd} onChange={(e) => setCwd(e.target.value)} />
+        </Field>
+      </div>
+      <Toggle
+        checked={worktree}
+        onChange={setWorktree}
+        label="Own git worktree"
+        description="Works on a new branch in its own checkout, so it does not collide with other sessions. The working directory must be in a git repository."
+      />
       <Field label="First message" hint="Optional. Sent as soon as the session starts.">
         <textarea className={cx(inputClass, "min-h-24")} value={prompt} onChange={(e) => setPrompt(e.target.value)} />
       </Field>
-      {error ? <div className="text-xs text-red-400">{error}</div> : null}
+      <ErrorText>{error}</ErrorText>
     </Modal>
   );
 }
-
-const runtimeLabel: Record<RuntimeMode, string> = {
-  "approval-required": "Ask before risky actions",
-  "full-access": "Full access (no prompts)",
-};
 
 /** Title, model, effort and permissions of one session. Changes apply from its next turn. */
 export function SessionSettingsDialog({ bot, session, onClose }: { bot: Bot; session: Session; onClose: () => void }) {
@@ -237,6 +371,7 @@ export function SessionSettingsDialog({ bot, session, onClose }: { bot: Bot; ses
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const busy = session.status === "running" || session.status === "waiting-approval" || session.status === "starting";
+  const botMode = PERMISSIONS.find((p) => p.value === bot.runtimeMode)!;
 
   const save = () => {
     setSaving(true);
@@ -256,7 +391,17 @@ export function SessionSettingsDialog({ bot, session, onClose }: { bot: Bot; ses
 
   return (
     <Modal
-      title={session.role === "main" ? `${bot.name} · orchestrator settings` : "Session settings"}
+      title={session.role === "main" ? `${bot.name} · orchestrator` : "Session settings"}
+      description={
+        busy
+          ? "The session is working: changes apply once its current turn ends."
+          : "Changes apply from the next message. The conversation continues where it left off."
+      }
+      icon={
+        <span className="flex size-9 items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900">
+          <ProviderLogo provider={session.provider} size={18} />
+        </span>
+      }
       onClose={onClose}
       footer={
         <>
@@ -274,29 +419,17 @@ export function SessionSettingsDialog({ bot, session, onClose }: { bot: Bot; ses
           <input className={inputClass} value={title} onChange={(e) => setTitle(e.target.value)} />
         </Field>
       ) : null}
-      <Field
-        label={`Model · ${session.provider === "claude" ? "Claude Code" : "Codex"}`}
-        hint="The provider is fixed for a session; start a new one to switch."
-      >
-        <ModelPicker provider={session.provider} value={choice} onChange={setChoice} />
+      <Field label="Model" hint="The provider is fixed for a session; start a new one to switch.">
+        <FixedProviderModel provider={session.provider} choice={choice} onChoice={setChoice} />
       </Field>
       <Field label="Permissions">
-        <select
-          className={inputClass}
-          value={runtimeMode ?? ""}
-          onChange={(e) => setRuntimeMode((e.target.value || null) as RuntimeMode | null)}
-        >
-          <option value="">Same as bot ({runtimeLabel[bot.runtimeMode].toLowerCase()})</option>
-          <option value="approval-required">{runtimeLabel["approval-required"]}</option>
-          <option value="full-access">{runtimeLabel["full-access"]}</option>
-        </select>
+        <OptionCards
+          value={runtimeMode ?? "inherit"}
+          onChange={(v) => setRuntimeMode(v === "inherit" ? null : v)}
+          options={[{ value: "inherit", label: "Same as bot", detail: botMode.label }, ...PERMISSIONS]}
+        />
       </Field>
-      <p className="text-[11px] text-zinc-500">
-        {busy
-          ? "The session is working: changes apply once its current turn ends."
-          : "Changes apply from the next message. The conversation continues where it left off."}
-      </p>
-      {error ? <div className="text-xs text-red-400">{error}</div> : null}
+      <ErrorText>{error}</ErrorText>
     </Modal>
   );
 }
@@ -327,7 +460,7 @@ function LimitField({
   return (
     <Field label={label} hint={hint}>
       <input
-        className={cx(inputClass, invalid && "border-red-500/60")}
+        className={cx(inputClass, "tabular-nums", invalid && "border-red-500/60 focus:border-red-500")}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
@@ -342,6 +475,8 @@ export function BotSettingsDialog({ bot, onClose }: { bot: Bot; onClose: () => v
   const today = useApp((s) => s.usageToday.get(bot.id));
   const [name, setName] = useState(bot.name);
   const [cwd, setCwd] = useState(bot.cwd);
+  const [avatar, setAvatar] = useState<BotAvatarValue>(bot.avatar);
+  const { settings, projects } = useAppSettings();
   const [instructions, setInstructions] = useState(bot.instructions);
   const [runtimeMode, setRuntimeMode] = useState<RuntimeMode>(bot.runtimeMode);
   const [autoLearn, setAutoLearn] = useState(bot.autoLearn);
@@ -374,6 +509,7 @@ export function BotSettingsDialog({ bot, onClose }: { bot: Bot; onClose: () => v
       c["bots.update"]({
         botId: bot.id,
         name,
+        avatar,
         cwd,
         instructions,
         runtimeMode,
@@ -390,7 +526,9 @@ export function BotSettingsDialog({ bot, onClose }: { bot: Bot; onClose: () => v
 
   return (
     <Modal
-      title={`${bot.name} · settings`}
+      title={`${bot.name} settings`}
+      description={today ? <span title={usageTitle(today)}>Today so far: {formatUsage(today)}</span> : undefined}
+      icon={<AvatarPicker value={avatar} onChange={setAvatar} />}
       onClose={onClose}
       footer={
         <>
@@ -403,52 +541,44 @@ export function BotSettingsDialog({ bot, onClose }: { bot: Bot; onClose: () => v
         </>
       }
     >
-      <Field label="Name">
-        <input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} />
-      </Field>
-      <Field label="Workspace">
-        <input className={inputClass} value={cwd} onChange={(e) => setCwd(e.target.value)} />
-      </Field>
-      <Field label="Instructions">
-        <textarea className={cx(inputClass, "min-h-20")} value={instructions} onChange={(e) => setInstructions(e.target.value)} />
-      </Field>
-      <Field label={`Orchestrator model · ${bot.main.provider === "claude" ? "Claude Code" : "Codex"}`}>
-        <ModelPicker provider={bot.main.provider} value={mainModel} onChange={setMainModel} />
-      </Field>
-      <Field label="Default worker">
-        <div className="space-y-2">
-          <ProviderPicker
-            value={worker}
-            onChange={(p) => {
-              setWorker(p);
-              setWorkerModel(NO_CHOICE);
-            }}
-          />
-          <ModelPicker provider={worker} value={workerModel} onChange={setWorkerModel} />
+      <FormSection title="Identity">
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Name">
+            <input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} />
+          </Field>
+          <WorkspaceField value={cwd} onChange={setCwd} projects={projects} home={settings?.homeDir ?? ""} />
         </div>
-      </Field>
-      <Field label="Permissions">
-        <select className={inputClass} value={runtimeMode} onChange={(e) => setRuntimeMode(e.target.value as RuntimeMode)}>
-          <option value="approval-required">{runtimeLabel["approval-required"]}</option>
-          <option value="full-access">{runtimeLabel["full-access"]}</option>
-        </select>
-      </Field>
-      <label className="flex items-center gap-2 text-sm text-zinc-300">
-        <input type="checkbox" checked={autoLearn} onChange={(e) => setAutoLearn(e.target.checked)} />
-        Learn automatically
-      </label>
-
-      <div className="space-y-3 border-t border-zinc-800 pt-4">
-        <div>
-          <div className="text-sm font-medium text-zinc-200">Guardrails</div>
-          <p className="text-[11px] text-zinc-500">
-            When a limit is hit, the bot pauses: it stops starting and messaging workers until you resume it. Your own
-            messages always go through.
-            {today ? (
-              <span title={usageTitle(today)}> Today so far: {formatUsage(today)}.</span>
-            ) : null}
-          </p>
-        </div>
+        <Field label="Instructions">
+          <textarea className={cx(inputClass, "min-h-20")} value={instructions} onChange={(e) => setInstructions(e.target.value)} />
+        </Field>
+      </FormSection>
+      <FormSection title="Orchestrator">
+        <FixedProviderModel provider={bot.main.provider} choice={mainModel} onChoice={setMainModel} />
+      </FormSection>
+      <FormSection title="Default worker">
+        <ProviderModelPicker
+          provider={worker}
+          onProvider={(p) => {
+            setWorker(p);
+            setWorkerModel(NO_CHOICE);
+          }}
+          choice={workerModel}
+          onChoice={setWorkerModel}
+        />
+      </FormSection>
+      <FormSection title="Behaviour">
+        <OptionCards value={runtimeMode} onChange={setRuntimeMode} options={PERMISSIONS} />
+        <Toggle
+          checked={autoLearn}
+          onChange={setAutoLearn}
+          label="Learn automatically"
+          description="Reflect on finished sessions to save memories and propose skills."
+        />
+      </FormSection>
+      <FormSection
+        title="Guardrails"
+        description="When a limit is hit, the bot pauses: it stops starting and messaging workers until you resume it. Your own messages always go through."
+      >
         <div className="grid grid-cols-2 gap-3">
           <LimitField
             label="Workers at once"
@@ -481,8 +611,8 @@ export function BotSettingsDialog({ bot, onClose }: { bot: Bot; onClose: () => v
             invalid={invalid(limits.dailyCostBudgetUsd)}
           />
         </div>
-      </div>
-      {error ? <div className="text-xs text-red-400">{error}</div> : null}
+      </FormSection>
+      <ErrorText>{error}</ErrorText>
     </Modal>
   );
 }

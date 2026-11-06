@@ -1,9 +1,20 @@
-import type { ClaudeAuth, LlamaCppMode, ModelOption, ProviderSettings, UpdateProviderSettingsInput } from "@apollo/contracts";
-import { useEffect, useState } from "react";
+import {
+  type ClaudeAuth,
+  type ProviderKind,
+  isDownloaded,
+  type LlamaCppMode,
+  type ModelOption,
+  type ProviderSettings,
+  type UpdateProviderSettingsInput,
+} from "@apollo/contracts";
+import { ArrowUpCircle, Blocks, Check, CircleAlert, HardDrive, KeyRound, Loader2, LogIn, Server } from "lucide-react";
+import { type ReactNode, useEffect, useState } from "react";
 import { forgetModels } from "../models.ts";
 import { errorMessage, rpc } from "../rpc.ts";
+import { updateProvider, useProviderVersions } from "../versions.ts";
 import { setLocalModels, useApp } from "../store.ts";
-import { Button, cx, Field, inputClass, Modal } from "./ui.tsx";
+import { ClaudeLogo, CodexLogo, LlamaLogo } from "./icons.tsx";
+import { Button, cx, ErrorText, Field, inputClass, Modal, OptionCards } from "./ui.tsx";
 
 type Check = { status: "idle" | "checking" } | { status: "ok"; models: ReadonlyArray<ModelOption> } | { status: "error"; error: string };
 
@@ -45,37 +56,82 @@ function KeyInput({
   );
 }
 
-/** Credentials and endpoints for the providers. Changes apply to sessions started afterwards. */
-function Choice<T extends string>({
-  value,
-  onChange,
-  options,
-}: {
-  value: T;
-  onChange: (value: T) => void;
-  options: ReadonlyArray<readonly [T, string, string]>;
-}) {
+/** One provider's settings, headed by its logo. */
+/** The installed version, with an Update button when a newer one is out. */
+function VersionBadge({ provider }: { provider: ProviderKind }) {
+  const { versions, updating, error } = useProviderVersions();
+  // A llama.cpp install reports its progress through the local models state.
+  const installing = useApp((s) => (provider === "llamacpp" ? (s.localModels?.engine.installing ?? null) : null));
+  const v = versions.find((x) => x.provider === provider);
+  if (installing) {
+    const { done, total } = installing.progress;
+    return (
+      <span className="flex shrink-0 items-center gap-1.5 text-[11px] text-sky-300 tabular-nums" title={installing.step}>
+        <Loader2 className="size-3 animate-spin" />
+        {installing.step}
+        {total > 0 ? ` · ${Math.floor((done / total) * 100)}%` : ""}
+      </span>
+    );
+  }
+  if (!v) return null;
+  const busy = updating.has(provider);
+  if (error?.startsWith(`${provider}: `)) {
+    return (
+      <span className="max-w-64 shrink-0 truncate text-[11px] text-red-300" title={error}>
+        Update failed: {error.slice(provider.length + 2)}
+      </span>
+    );
+  }
+  if (v.updateAvailable) {
+    return (
+      <span className="flex shrink-0 items-center gap-2">
+        <span className="text-[11px] text-amber-300 tabular-nums">
+          {v.installed} → {v.latest}
+        </span>
+        {v.canUpdate ? (
+          <Button size="sm" variant="primary" disabled={busy} onClick={() => void updateProvider(provider)}>
+            {busy ? <Loader2 className="animate-spin" /> : <ArrowUpCircle />} {busy ? "Updating…" : "Update"}
+          </Button>
+        ) : null}
+      </span>
+    );
+  }
   return (
-    <div className="grid grid-cols-2 gap-2">
-      {options.map(([option, name, detail]) => (
-        <button
-          key={option}
-          type="button"
-          onClick={() => onChange(option)}
-          className={cx(
-            "rounded-md border px-3 py-2 text-left text-sm",
-            value === option
-              ? "border-zinc-400 bg-zinc-800 text-zinc-100"
-              : "border-zinc-800 text-zinc-400 hover:border-zinc-700",
-          )}
-        >
-          <div className="font-medium">{name}</div>
-          <div className="text-[11px] text-zinc-500">{detail}</div>
-        </button>
-      ))}
-    </div>
+    <span className="shrink-0 text-[11px] text-zinc-500 tabular-nums" title={v.note ?? undefined}>
+      {v.installed ? `${v.installed} · up to date` : (v.note ?? "")}
+    </span>
   );
 }
+
+function ProviderSection({
+  logo,
+  name,
+  detail,
+  provider,
+  children,
+}: {
+  logo: ReactNode;
+  name: string;
+  detail: string;
+  provider?: ProviderKind;
+  children: ReactNode;
+}) {
+  return (
+    <section className="space-y-3 rounded-xl border border-zinc-800/80 bg-zinc-900/20 p-4">
+      <div className="flex items-center gap-3">
+        <span className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900">{logo}</span>
+        <div className="min-w-0 flex-1">
+          <h3 className="text-sm font-semibold text-zinc-100">{name}</h3>
+          <p className="text-[11px] text-zinc-500">{detail}</p>
+        </div>
+        {provider ? <VersionBadge provider={provider} /> : null}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+const iconClass = "size-4 text-zinc-400";
 
 /** One line on the managed llama.cpp setup. */
 function ManagedSummary() {
@@ -85,11 +141,18 @@ function ManagedSummary() {
   }, []);
   if (!state) return <span className="text-zinc-500">Checking…</span>;
   if (!state.engine.installed) return <span className="text-zinc-400">llama.cpp is not installed yet.</span>;
-  const ready = state.models.filter((m) => m.status !== "downloading").length;
+  const ready = state.models.filter(isDownloaded).length;
+  const dot = { running: "bg-emerald-500", starting: "bg-amber-500 animate-pulse", stopped: "bg-zinc-600", error: "bg-red-500" }[
+    state.server.status
+  ];
   return (
-    <span className="text-zinc-400">
-      llama.cpp {state.engine.installed.tag} · {ready === 0 ? "no models yet" : `${ready} model${ready === 1 ? "" : "s"}`} · server{" "}
-      {state.server.status}
+    <span className="flex items-center gap-2 text-zinc-400">
+      <span className={cx("size-1.5 shrink-0 rounded-full", dot)} title={`Server ${state.server.status}`} />
+      <span className="font-mono text-zinc-300">{state.engine.installed.tag}</span>
+      <span className="text-zinc-600">·</span>
+      {ready === 0 ? "no models yet" : `${ready} model${ready === 1 ? "" : "s"}`}
+      <span className="text-zinc-600">·</span>
+      server {state.server.status}
     </span>
   );
 }
@@ -162,6 +225,12 @@ export function ProvidersDialog({ onClose, onLocalModels }: { onClose: () => voi
   return (
     <Modal
       title="Providers"
+      description="Credentials and endpoints. Changes apply to sessions that start after you save."
+      icon={
+        <span className="flex size-9 items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900">
+          <Blocks className="size-4.5 text-zinc-400" strokeWidth={1.75} />
+        </span>
+      }
       onClose={onClose}
       footer={
         <>
@@ -180,31 +249,20 @@ export function ProvidersDialog({ onClose, onLocalModels }: { onClose: () => voi
     >
       {settings ? (
         <>
-          <section className="space-y-3">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">Claude Code</h3>
-            <div className="grid grid-cols-2 gap-2">
-              {(
-                [
-                  ["subscription", "Claude login", "Your claude login: subscription or Console"],
-                  ["api-key", "API key", "Billed to the key's Console account"],
-                ] as const
-              ).map(([value, name, detail]) => (
-                <button
-                  key={value}
-                  type="button"
-                  onClick={() => setAuth(value)}
-                  className={cx(
-                    "rounded-md border px-3 py-2 text-left text-sm",
-                    auth === value
-                      ? "border-zinc-400 bg-zinc-800 text-zinc-100"
-                      : "border-zinc-800 text-zinc-400 hover:border-zinc-700",
-                  )}
-                >
-                  <div className="font-medium">{name}</div>
-                  <div className="text-[11px] text-zinc-500">{detail}</div>
-                </button>
-              ))}
-            </div>
+          <ProviderSection provider="claude" logo={<ClaudeLogo size={20} />} name="Claude Code" detail="Anthropic · runs through the Claude Agent SDK">
+            <OptionCards
+              value={auth}
+              onChange={setAuth}
+              options={[
+                {
+                  value: "subscription",
+                  label: "Claude login",
+                  detail: "Your claude login: subscription or Console",
+                  icon: <LogIn className={iconClass} />,
+                },
+                { value: "api-key", label: "API key", detail: "Billed to the key's Console account", icon: <KeyRound className={iconClass} /> },
+              ]}
+            />
             <Field
               label="Anthropic API key"
               hint={
@@ -222,29 +280,41 @@ export function ProvidersDialog({ onClose, onLocalModels }: { onClose: () => voi
                 placeholder="sk-ant-…"
               />
             </Field>
-          </section>
+          </ProviderSection>
 
-          <section className="space-y-3 border-t border-zinc-800 pt-4">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">llama.cpp</h3>
-            <Choice
+          <ProviderSection provider="codex" logo={<CodexLogo size={20} />} name="Codex" detail="OpenAI · runs through codex app-server">
+            <p className="text-[11px] text-zinc-500">
+              Uses the <span className="font-mono text-zinc-400">codex</span> CLI on this machine and its login. Run{" "}
+              <span className="font-mono text-zinc-400">codex login</span> to sign in.
+            </p>
+          </ProviderSection>
+
+          <ProviderSection
+            provider="llamacpp"
+            logo={<LlamaLogo size={20} />}
+            name="llama.cpp"
+            detail="Local models with the Claude Code harness: tools, MCP, skills and approvals work as with Claude."
+          >
+            <OptionCards
               value={mode}
               onChange={setMode}
               options={[
-                ["managed", "Managed by Apollo", "Installs, runs and updates llama-server"],
-                ["external", "My own server", "A llama-server you run yourself"],
+                {
+                  value: "managed",
+                  label: "Managed by Apollo",
+                  detail: "Installs, runs and updates llama-server",
+                  icon: <HardDrive className={iconClass} />,
+                },
+                { value: "external", label: "My own server", detail: "A llama-server you run yourself", icon: <Server className={iconClass} /> },
               ]}
             />
-            <p className="text-[11px] text-zinc-500">
-              Local models run with the Claude Code harness through llama-server's Anthropic-compatible API: tools, MCP,
-              skills and approvals work as with Claude. Agents need a model that is good at calling tools.
-            </p>
             {mode === "managed" ? (
-              <div className="flex items-center gap-3 rounded-md border border-zinc-800 p-3 text-xs">
+              <div className="flex items-center gap-3 rounded-lg border border-zinc-800 bg-zinc-900/50 py-2 pr-2 pl-3 text-xs">
                 <span className="min-w-0 flex-1">
                   <ManagedSummary />
                 </span>
-                <Button onClick={() => run(() => save().then(onLocalModels))} disabled={saving}>
-                  Local models…
+                <Button size="sm" onClick={() => run(() => save().then(onLocalModels))} disabled={saving}>
+                  Manage local models
                 </Button>
               </div>
             ) : (
@@ -273,29 +343,36 @@ export function ProvidersDialog({ onClose, onLocalModels }: { onClose: () => voi
                   />
                 </Field>
                 <div className="flex items-center gap-3">
-                  <Button variant="ghost" disabled={saving} onClick={testLlama}>
+                  <Button size="sm" disabled={saving} onClick={testLlama}>
                     Save and test
                   </Button>
                   <span className="min-w-0 text-[11px]">
-                    {check.status === "checking" ? <span className="text-zinc-500">Connecting…</span> : null}
+                    {check.status === "checking" ? (
+                      <span className="flex items-center gap-1 text-zinc-500">
+                        <Loader2 className="size-3 animate-spin" /> Connecting…
+                      </span>
+                    ) : null}
                     {check.status === "ok" ? (
-                      <span className="text-emerald-400">
-                        Connected:{" "}
+                      <span className="flex items-center gap-1 text-emerald-400">
+                        <Check className="size-3" /> Connected:{" "}
                         {check.models.length === 0 ? "no model loaded" : check.models.map((m) => m.label).join(", ")}
                       </span>
                     ) : null}
-                    {check.status === "error" ? <span className="text-red-400">{check.error}</span> : null}
+                    {check.status === "error" ? (
+                      <span className="flex items-center gap-1 text-red-400">
+                        <CircleAlert className="size-3" /> {check.error}
+                      </span>
+                    ) : null}
                   </span>
                 </div>
               </>
             )}
-          </section>
-          <p className="text-[11px] text-zinc-500">Changes apply to sessions that start after you save.</p>
+          </ProviderSection>
         </>
       ) : (
         <p className="text-sm text-zinc-500">Loading…</p>
       )}
-      {error ? <p className="text-xs text-red-400">{error}</p> : null}
+      <ErrorText>{error}</ErrorText>
     </Modal>
   );
 }

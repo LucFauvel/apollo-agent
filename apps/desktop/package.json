@@ -13,7 +13,8 @@
     "bundle:server": "node scripts/bundle-server.ts",
     "package": "pnpm build:package && electron-builder --publish never",
     "package:dir": "pnpm build:package && electron-builder --dir --publish never",
-    "build:package": "pnpm --filter @apollo/web build && tsc -p . && node scripts/bundle-server.ts"
+    "build:package": "pnpm --filter @apollo/web build && tsc -p . && node scripts/bundle-server.ts",
+    "icons": "pnpm ensure:electron && electron scripts/render-icons.mjs"
   },
   "devDependencies": {
     "@types/node": "catalog:",

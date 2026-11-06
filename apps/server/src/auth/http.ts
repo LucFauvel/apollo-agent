@@ -4,10 +4,11 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { ServerConfig } from "../Config.ts";
+import { Tailscale } from "../remote/Tailscale.ts";
 import { Auth, CLIENT_SESSION_TTL_MS, pairingUrl, SESSION_COOKIE } from "./Auth.ts";
 
 /** The session token a request presents: `Authorization: Bearer` or the session cookie. */
-const presentedToken = (request: HttpServerRequest.HttpServerRequest) => {
+export const presentedToken = (request: HttpServerRequest.HttpServerRequest) => {
   const header = request.headers.authorization ?? "";
   if (header.toLowerCase().startsWith("bearer ")) return header.slice(7).trim();
   return request.cookies[SESSION_COOKIE] ?? "";
@@ -25,6 +26,8 @@ const isPublic = (path: string) =>
   path === "/api/auth/session" ||
   path === "/api/auth/pair" ||
   path === "/mcp" ||
+  // Authenticated by its handler with the desktop bootstrap token.
+  path === "/api/desktop/status" ||
   !(path === "/rpc" || path.startsWith("/api/"));
 
 const cookieOptions = (request: HttpServerRequest.HttpServerRequest) => ({
@@ -46,12 +49,13 @@ export const layerGuard = HttpRouter.middleware(
   Effect.gen(function* () {
     const config = yield* ServerConfig;
     const auth = yield* Auth;
+    const tailscale = yield* Tailscale;
     const allowedOrigins = new Set(config.allowedOrigins);
     return (httpEffect) =>
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest;
         const origin = request.headers.origin;
-        if (origin !== undefined && !allowedOrigins.has(origin)) {
+        if (origin !== undefined && !allowedOrigins.has(origin) && !tailscale.isTailnetOrigin(origin)) {
           yield* Effect.logWarning("rejected request from a foreign origin", { origin, url: request.url });
           return HttpServerResponse.text("Forbidden origin", { status: 403 });
         }

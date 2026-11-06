@@ -1,4 +1,4 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { createServer } from "node:net";
@@ -24,6 +24,7 @@ import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Stream from "effect/Stream";
 import { ServerConfig } from "../Config.ts";
+import { parseVerdict, type ReviewedCall, reviewMessages } from "./Reviewer.ts";
 import { ProviderSettings } from "../ProviderSettings.ts";
 import { Store } from "../Store.ts";
 import {
@@ -39,6 +40,9 @@ import { detectHardware } from "./Hardware.ts";
 import { modelDetails, searchModels, suggestModels, TARGET_CONTEXT } from "./Lookup.ts";
 
 const DEFAULT_MODEL_KEY = "llamacpp.defaultModel";
+const REVIEWER_MODEL_KEY = "llamacpp.reviewerModel";
+/** Downloads started but not finished, resumed when llama-server starts again. */
+const PENDING_DOWNLOADS_KEY = "llamacpp.pendingDownloads";
 /** Unload a model's weights after this long without requests; the next one reloads it. */
 const IDLE_SLEEP_SECONDS = 15 * 60;
 const MAX_LOG_LINES = 400;
@@ -67,9 +71,58 @@ interface RouterModel {
   };
 }
 
-const MODEL_STATUSES = new Set<LocalModelStatus>(["unloaded", "loading", "loaded", "sleeping", "downloading", "failed"]);
+const MODEL_STATUSES = new Set<LocalModelStatus>(["unloaded", "loading", "loaded", "sleeping", "downloading", "incomplete", "failed"]);
 
-export const toLocalModel = (m: RouterModel, download: Progress | undefined): LocalModel => {
+/** llama.cpp lists a model whose download stopped part way as `incomplete`. */
+const isIncomplete = (m: RouterModel) => m.status?.value === "incomplete";
+
+/**
+ * Stops llama-server processes left running by an earlier Apollo that ended without
+ * shutting them down (a crash, a force quit): any process started from Apollo's own
+ * engines folder that is not a child of this process. They would hold memory and ports.
+ */
+export const reapOrphans = (enginesDir: string) => {
+  if (process.platform === "win32") return 0;
+  let listing = "";
+  try {
+    listing = execFileSync("ps", ["-axo", "pid=,ppid=,command="], { encoding: "utf8" });
+  } catch {
+    return 0;
+  }
+  let stopped = 0;
+  for (const line of listing.split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    if (!match) continue;
+    const [, pid, ppid, command] = match;
+    if (!command!.startsWith(`${enginesDir}/`) || Number(ppid) === process.pid || Number(pid) === process.pid) continue;
+    try {
+      process.kill(Number(pid), "SIGTERM");
+      stopped++;
+    } catch {
+      // Already gone.
+    }
+  }
+  return stopped;
+};
+
+/**
+ * Overall load progress (0-1) from a llama-server `status_change` event. Loading goes
+ * through stages (the text model, then e.g. a vision projector); the text model is
+ * nearly all of the bytes, so it counts for 90%.
+ */
+export const loadProgressOf = (progress: unknown): number | null => {
+  const p = progress as { stages?: Array<string>; current?: string; value?: number } | undefined;
+  if (!p?.stages?.length || !p.current || typeof p.value !== "number") return null;
+  const weights = p.stages.map((stage) =>
+    p.stages!.includes("text_model") ? (stage === "text_model" ? 0.9 : 0.1 / (p.stages!.length - 1 || 1)) : 1 / p.stages!.length,
+  );
+  const index = p.stages.indexOf(p.current);
+  if (index < 0) return null;
+  const done = weights.slice(0, index).reduce((sum, w) => sum + w, 0);
+  return Math.min(1, Math.max(0, done + weights[index]! * Math.min(1, Math.max(0, p.value))));
+};
+
+export const toLocalModel = (m: RouterModel, download: Progress | undefined, loadProgress: number | null = null): LocalModel => {
   const measured = m.memory?.effective ?? m.memory?.max ?? null;
   const devices = measured?.devices ?? [];
   const sizeBytes = devices.length > 0 ? devices.reduce((sum, d) => sum + d.model, 0) : null;
@@ -81,6 +134,7 @@ export const toLocalModel = (m: RouterModel, download: Progress | undefined): Lo
     status: download ? "downloading" : m.status?.failed ? "failed" : value && MODEL_STATUSES.has(value) ? value : "unloaded",
     sizeBytes,
     download: download ?? null,
+    loadProgress: !download && value === "loading" ? loadProgress : null,
     contextSize: measured?.n_ctx ?? null,
     fit: devices.length === 0 ? null : onHost > 256 * 1024 * 1024 ? "ram" : "gpu",
   };
@@ -110,12 +164,27 @@ const make = Effect.gen(function* () {
   let serverError: string | null = null;
   let routerModels: Array<RouterModel> = [];
   const downloads = new Map<string, Progress>();
+  /** Models being loaded into memory, with progress 0-1. */
+  const loading = new Map<string, number>();
+  /** Orphans from a previous run are stopped once, before the first start. */
+  let reaped = false;
   let defaultModel = yield* store.getSetting(DEFAULT_MODEL_KEY);
+  let reviewerModel = yield* store.getSetting(REVIEWER_MODEL_KEY);
+  const pendingDownloads = new Set<string>();
+  try {
+    const saved: unknown = JSON.parse((yield* store.getSetting(PENDING_DOWNLOADS_KEY)) ?? "[]");
+    if (Array.isArray(saved)) for (const id of saved) if (typeof id === "string") pendingDownloads.add(id);
+  } catch {}
+  const savePending = () =>
+    runFork(store.setSetting(PENDING_DOWNLOADS_KEY, pendingDownloads.size ? JSON.stringify([...pendingDownloads]) : null));
+  const forgetPending = (model: string) => {
+    if (pendingDownloads.delete(model)) savePending();
+  };
 
   const changes = yield* PubSub.sliding<LocalModelsState>(64);
 
   const state = (): LocalModelsState => {
-    const listed = routerModels.map((m) => toLocalModel(m, downloads.get(m.id)));
+    const listed = routerModels.map((m) => toLocalModel(m, downloads.get(m.id), loading.get(m.id) ?? null));
     const pending = [...downloads.entries()]
       .filter(([id]) => !routerModels.some((m) => m.id === id))
       .map(([id, download]): LocalModel => ({
@@ -123,6 +192,7 @@ const make = Effect.gen(function* () {
         status: "downloading",
         sizeBytes: null,
         download,
+        loadProgress: null,
         contextSize: null,
         fit: null,
       }));
@@ -138,6 +208,7 @@ const make = Effect.gen(function* () {
       server: { status: serverStatus, error: serverError },
       models: [...listed, ...pending],
       defaultModel,
+      reviewerModel,
     };
   };
 
@@ -231,14 +302,32 @@ const make = Effect.gen(function* () {
       case "download_finished":
       case "download_failed": {
         downloads.delete(event.model);
+        // A download cut short by Apollo stopping the server resumes next time.
+        if (event.event === "download_finished" || wanted) forgetPending(event.model);
         if (event.event === "download_failed") logs.push(`Download of ${event.model} failed: ${JSON.stringify(event.data ?? {})}`);
         void refreshModels().catch(() => notify());
         return;
+      }
+      case "status_change": {
+        const status = event.data?.status;
+        const model = routerModels.find((m) => m.id === event.model);
+        if (status === "loading") {
+          const progress = loadProgressOf(event.data?.progress);
+          if (progress !== null) loading.set(event.model, progress);
+          else if (!loading.has(event.model)) loading.set(event.model, 0);
+          if (model) model.status = { value: "loading" };
+          return notify(false);
+        }
+        loading.delete(event.model);
+        if (model && typeof status === "string") model.status = { value: status };
+        if (status === "loaded" || status === "unloaded") void refreshModels().catch(() => notify());
+        return notify();
       }
       case "model_status": {
         const model = routerModels.find((m) => m.id === event.model);
         const status = event.data?.status;
         if (model && typeof status === "string") model.status = { value: status };
+        if (status !== "loading") loading.delete(event.model);
         // A finished load carries the measured memory; read it.
         if (status === "loaded" || status === "unloaded") void refreshModels().catch(() => notify());
         return notify();
@@ -315,10 +404,41 @@ const make = Effect.gen(function* () {
     const signal = events.signal;
     void followEvents(signal).catch(() => undefined);
     await refreshModels();
+    resumeDownloads();
+  };
+
+  /**
+   * Starts again the downloads that were running when Apollo (or llama-server)
+   * stopped. llama.cpp keeps the partial file and continues from it.
+   */
+  const resumeDownloads = () => {
+    // llama.cpp's own record catches downloads Apollo did not save (e.g. older versions).
+    const before = pendingDownloads.size;
+    for (const m of routerModels) if (isIncomplete(m)) pendingDownloads.add(m.id);
+    if (pendingDownloads.size !== before) savePending();
+    for (const model of [...pendingDownloads]) {
+      const listed = routerModels.find((m) => m.id === model);
+      if (listed && !isIncomplete(listed) && !downloads.has(model)) {
+        forgetPending(model);
+        continue;
+      }
+      if (!downloads.has(model)) downloads.set(model, { done: 0, total: 0 });
+      logs.push(`Resuming the download of ${model}`);
+      void api("/models", { method: "POST", body: JSON.stringify({ model }) }).catch((error) => {
+        logs.push(`Could not resume ${model}: ${errorText(error)}`);
+        downloads.delete(model);
+        notify();
+      });
+    }
+    notify();
   };
 
   const startServer = (): Promise<void> => {
     if (ready) return ready;
+    if (!reaped) {
+      reaped = true;
+      reapOrphans(join(root, "engines"));
+    }
     wanted = true;
     serverStatus = "starting";
     serverError = null;
@@ -474,13 +594,16 @@ const make = Effect.gen(function* () {
         yield* requireRunning("download models");
         const model = `${repo}:${quant}`;
         downloads.set(model, { done: 0, total: 0 });
+        pendingDownloads.add(model);
+        savePending();
         notify();
         yield* attempt(() => api("/models", { method: "POST", body: JSON.stringify({ model }) })).pipe(
-          Effect.tapError(() => Effect.sync(() => (downloads.delete(model), notify()))),
+          Effect.tapError(() => Effect.sync(() => (downloads.delete(model), forgetPending(model), notify()))),
         );
       }),
     cancelDownload: (model: string) =>
       Effect.gen(function* () {
+        forgetPending(model);
         yield* attempt(() => api(`/models?model=${encodeURIComponent(model)}`, { method: "DELETE" }));
         downloads.delete(model);
         yield* attempt(refreshModels);
@@ -493,6 +616,10 @@ const make = Effect.gen(function* () {
           defaultModel = null;
           yield* store.setSetting(DEFAULT_MODEL_KEY, null);
         }
+        if (reviewerModel === model) {
+          reviewerModel = null;
+          yield* store.setSetting(REVIEWER_MODEL_KEY, null);
+        }
         yield* attempt(refreshModels);
       }),
     setDefault: (model: string | null) =>
@@ -501,16 +628,64 @@ const make = Effect.gen(function* () {
         yield* store.setSetting(DEFAULT_MODEL_KEY, model);
         notify();
       }),
+    setReviewer: (model: string | null) =>
+      Effect.gen(function* () {
+        reviewerModel = model;
+        yield* store.setSetting(REVIEWER_MODEL_KEY, model);
+        notify();
+      }),
+    /**
+     * Asks the reviewer model whether an unclear tool call may run in auto mode. `ask`
+     * whenever there is no reviewer, it is still downloading, or it does not answer in time.
+     */
+    review: (call: ReviewedCall) =>
+      Effect.gen(function* () {
+        const model = reviewerModel;
+        if (!model || !engine || downloads.has(model) || !routerModels.some((m) => m.id === model)) return "ask" as const;
+        yield* Effect.tryPromise(startServer).pipe(Effect.orElseSucceed(() => undefined));
+        const body = (yield* attempt(() =>
+          api("/v1/chat/completions", {
+            method: "POST",
+            // The first review may load the model into memory.
+            signal: AbortSignal.timeout(45_000),
+            body: JSON.stringify({
+              model,
+              messages: reviewMessages(call),
+              temperature: 0,
+              max_tokens: 8,
+              chat_template_kwargs: { enable_thinking: false },
+            }),
+          }),
+        ).pipe(Effect.orElseSucceed(() => null))) as { choices?: Array<{ message?: { content?: string } }> } | null;
+        const verdict = parseVerdict(body?.choices?.[0]?.message?.content ?? "");
+        logs.push(`Reviewer ${verdict === "allow" ? "allowed" : "asked about"} ${call.tool}`);
+        return verdict;
+      }),
 
     /**
      * The managed server, started if needed, for the llama.cpp provider. Fails with
      * what to do when nothing is set up yet.
      */
+    /**
+     * The download a session on `model` (or on the default, when `null`) has to
+     * wait for, if any.
+     */
+    downloadBlocking: (model: string | null) =>
+      Effect.sync(() => {
+        const unfinished = (id: string) => downloads.has(id) || routerModels.some((m) => m.id === id && isIncomplete(m));
+        if (model) return unfinished(model) ? model : null;
+        const ready = routerModels.some((m) => !unfinished(m.id) && !m.status?.failed);
+        if (!ready) {
+          const partial = routerModels.find(isIncomplete);
+          if (partial && downloads.size === 0) return partial.id;
+        }
+        return ready ? null : ([...downloads.keys()][0] ?? null);
+      }),
     connection: Effect.gen(function* () {
       const notReady = (message: string) => new ProviderError({ provider: "llamacpp", message });
       if (!engine) return yield* Effect.fail(notReady("llama.cpp is not installed yet. Set it up in Providers → Local models."));
       yield* Effect.tryPromise({ try: startServer, catch: (e) => notReady(`llama-server failed to start: ${errorText(e)}`) });
-      const usable = routerModels.filter((m) => !downloads.has(m.id) && !m.status?.failed);
+      const usable = routerModels.filter((m) => !downloads.has(m.id) && !m.status?.failed && !isIncomplete(m));
       if (usable.length === 0) {
         return yield* Effect.fail(notReady("No local model is downloaded yet. Pick one in Providers → Local models."));
       }

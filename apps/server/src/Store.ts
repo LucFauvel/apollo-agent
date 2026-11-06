@@ -26,6 +26,11 @@ import {
   type Skill,
   type SkillId,
   type SkillStatus,
+  AVATAR_COLORS,
+  AVATAR_SHAPES,
+  type BotAvatar,
+  seededAvatar,
+  type SessionWorktree,
 } from "@apollo/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -43,9 +48,20 @@ type Row = Record<string, SQLInputValue>;
 // Row mapping
 // ---------------------------------------------------------------------------
 
+const parseAvatar = (json: string | null, id: string): BotAvatar => {
+  if (json) {
+    try {
+      const value = JSON.parse(json) as BotAvatar;
+      if (AVATAR_SHAPES.includes(value.shape) && AVATAR_COLORS.includes(value.color)) return value;
+    } catch {}
+  }
+  return seededAvatar(id);
+};
+
 const toBot = (r: Row): Bot => ({
   id: r.id as BotId,
   name: r.name as string,
+  avatar: parseAvatar(r.avatar as string | null, r.id as string),
   instructions: r.instructions as string,
   cwd: r.cwd as string,
   main: {
@@ -77,6 +93,8 @@ const toSession = (r: Row): Session => ({
   effort: (r.effort as string | null) ?? null,
   runtimeMode: (r.runtime_mode as RuntimeMode | null) ?? null,
   cwd: r.cwd as string,
+  worktree: r.worktree ? (JSON.parse(r.worktree as string) as SessionWorktree) : null,
+  context: r.context ? (JSON.parse(r.context as string) as Session["context"]) : null,
   status: r.status as SessionStatus,
   resumeId: (r.resume_id as string | null) ?? null,
   lastMessage: (r.last_message as string | null) ?? null,
@@ -180,6 +198,9 @@ export interface SessionPatch {
   readonly model?: string | null;
   readonly effort?: string | null;
   readonly runtimeMode?: RuntimeMode | null;
+  readonly cwd?: string;
+  readonly worktree?: SessionWorktree | null;
+  readonly context?: Session["context"];
 }
 
 const makeStore = (db: DatabaseSync) => {
@@ -221,8 +242,8 @@ const makeStore = (db: DatabaseSync) => {
         run(
           `insert into bots (id, name, instructions, cwd, main_provider, main_model, main_effort, worker_provider,
              worker_model, worker_effort, runtime_mode, auto_learn, limits, paused_reason, main_session_id,
-             created_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             created_at, updated_at, avatar)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           bot.id,
           bot.name,
           bot.instructions,
@@ -240,6 +261,7 @@ const makeStore = (db: DatabaseSync) => {
           bot.mainSessionId,
           bot.createdAt,
           bot.updatedAt,
+          JSON.stringify(bot.avatar),
         );
         return bot;
       }),
@@ -248,7 +270,7 @@ const makeStore = (db: DatabaseSync) => {
         run(
           `update bots set name = ?, instructions = ?, cwd = ?, main_model = ?, main_effort = ?,
              worker_provider = ?, worker_model = ?, worker_effort = ?,
-             runtime_mode = ?, auto_learn = ?, limits = ?, paused_reason = ?, updated_at = ? where id = ?`,
+             runtime_mode = ?, auto_learn = ?, limits = ?, paused_reason = ?, updated_at = ?, avatar = ? where id = ?`,
           bot.name,
           bot.instructions,
           bot.cwd,
@@ -262,6 +284,7 @@ const makeStore = (db: DatabaseSync) => {
           JSON.stringify(bot.limits),
           bot.pausedReason,
           bot.updatedAt,
+          JSON.stringify(bot.avatar),
           bot.id,
         );
         return bot;
@@ -281,8 +304,8 @@ const makeStore = (db: DatabaseSync) => {
       Effect.sync(() => {
         run(
           `insert into sessions (id, bot_id, role, parent_session_id, title, provider, model, effort,
-             runtime_mode, cwd, status, resume_id, last_message, completed_turns, created_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             runtime_mode, cwd, status, resume_id, last_message, completed_turns, created_at, updated_at, worktree)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           session.id,
           session.botId,
           session.role,
@@ -299,6 +322,7 @@ const makeStore = (db: DatabaseSync) => {
           session.completedTurns,
           session.createdAt,
           session.updatedAt,
+          session.worktree ? JSON.stringify(session.worktree) : null,
         );
         return session;
       }),
@@ -308,7 +332,7 @@ const makeStore = (db: DatabaseSync) => {
         const next: Session = { ...current, ...patch, updatedAt: Date.now() };
         run(
           `update sessions set title = ?, status = ?, resume_id = ?, last_message = ?, model = ?,
-             effort = ?, runtime_mode = ?, updated_at = ? where id = ?`,
+             effort = ?, runtime_mode = ?, updated_at = ?, cwd = ?, worktree = ?, context = ? where id = ?`,
           next.title,
           next.status,
           next.resumeId,
@@ -317,6 +341,9 @@ const makeStore = (db: DatabaseSync) => {
           next.effort,
           next.runtimeMode,
           next.updatedAt,
+          next.cwd,
+          next.worktree ? JSON.stringify(next.worktree) : null,
+          next.context ? JSON.stringify(next.context) : null,
           id,
         );
         return next;
@@ -581,6 +608,7 @@ const makeStore = (db: DatabaseSync) => {
            join session_events e on e.rowid = f.rowid
            join sessions s on s.id = f.session_id
            where transcript_fts match ? and s.bot_id = ? and s.role != 'reflection' and s.id != ?
+             and not exists (select 1 from memory_exclusions x where x.session_id = f.session_id and x.seq = f.seq)
            order by bm25(transcript_fts) limit ?`,
           match,
           botId,
@@ -594,6 +622,25 @@ const makeStore = (db: DatabaseSync) => {
           at: Number(r.at),
           excerpt: r.excerpt as string,
         }));
+      }),
+    /** Seqs of the session's messages the user kept out of memory. */
+    memoryExclusions: (sessionId: SessionId) =>
+      Effect.sync(
+        () =>
+          new Set(
+            all("select seq from memory_exclusions where session_id = ?", sessionId).map((r) => Number(r.seq)),
+          ),
+      ),
+    setMemoryExclusion: (sessionId: SessionId, seq: number, excluded: boolean) =>
+      Effect.sync(() => {
+        if (excluded) run("insert or ignore into memory_exclusions (session_id, seq) values (?, ?)", sessionId, seq);
+        else run("delete from memory_exclusions where session_id = ? and seq = ?", sessionId, seq);
+      }),
+    /** The event at `seq`, if any. */
+    eventAt: (sessionId: SessionId, seq: number) =>
+      Effect.sync(() => {
+        const row = get("select event from session_events where session_id = ? and seq = ?", sessionId, seq);
+        return row ? (JSON.parse(row.event as string) as AgentEvent) : null;
       }),
     /** Events of a session around `seq`, for reading the context of a search hit. */
     eventsAround: (sessionId: SessionId, seq: number, radius: number) =>

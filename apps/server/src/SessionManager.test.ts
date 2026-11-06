@@ -1,7 +1,9 @@
-import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import * as AppSettings from "./AppSettings.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type AgentEvent, type BotLimits, DEFAULT_BOT_LIMITS, type ProviderKind, type SessionId } from "@apollo/contracts";
+import { AVATAR_SHAPES, type AgentEvent, type BotLimits, DEFAULT_BOT_LIMITS, type ProviderKind, type SessionId } from "@apollo/contracts";
 import type { Provider, ProviderSessionOptions } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
@@ -9,15 +11,25 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
+import { saveAttachment } from "./attachments.ts";
 import * as Compaction from "./Compaction.ts";
 import { ServerConfig } from "./Config.ts";
 import * as Database from "./Database.ts";
+import { desktopStatus } from "./DesktopStatus.ts";
+import * as Jobs from "./jobs/Jobs.ts";
+import * as Push from "./push/Push.ts";
 import * as SessionManager from "./SessionManager.ts";
 import * as Store from "./Store.ts";
 
 const dataDir = mkdtempSync(join(tmpdir(), "apollo-test-"));
 /** Options of every opened provider session, and how often skills were reloaded. */
 const opened: Array<ProviderSessionOptions> = [];
+/** Every message sent to a fake provider session, in order. */
+const sent: Array<string> = [];
+/** Instructions passed to each compaction. */
+const compactions: Array<string> = [];
+/** Attachments sent with each message, in order. */
+const sentFiles: Array<ReadonlyArray<{ path: string; name: string }>> = [];
 let skillReloads = 0;
 let modelListings = 0;
 let interrupts = 0;
@@ -32,6 +44,15 @@ const TURN_USAGE = { inputTokens: 1000, cachedInputTokens: 0, outputTokens: 100,
  */
 const echoProvider = (kind: ProviderKind): Provider => ({
   kind,
+  ...(kind === "codex"
+    ? {
+        listConnectors: Effect.succeed([
+          { name: "Slack", kind: "connector" as const, status: "connected" as const, tools: null },
+          { name: "Notion", kind: "connector" as const, status: "needs-auth" as const, tools: null },
+          { name: "node_repl", kind: "mcp" as const, status: "connected" as const, tools: 4 },
+        ]),
+      }
+    : {}),
   listModels: Effect.sync(() => {
     modelListings++;
     return [{ id: `${kind}-big`, label: "Big", description: "", isDefault: true, efforts: ["low", "high"], defaultEffort: "low" }];
@@ -45,9 +66,11 @@ const echoProvider = (kind: ProviderKind): Provider => ({
       let n = 0;
       let interrupted = false;
       return {
-        send: (text: string) =>
+        send: (text: string, attachments = []) =>
           Effect.gen(function* () {
             const itemId = `msg-${++n}`;
+            sent.push(text);
+            sentFiles.push(attachments);
             interrupted = false;
             yield* agent({ _tag: "TurnStarted" });
             yield* agent({ _tag: "AssistantDelta", itemId, text: "echo: " });
@@ -64,6 +87,7 @@ const echoProvider = (kind: ProviderKind): Provider => ({
                 costUsd: TURN_USAGE.costUsd * n,
               },
             });
+            yield* emit({ _tag: "ContextUsage", used: 1000 * n, window: 200_000 });
             yield* agent({
               _tag: "TurnCompleted",
               outcome: interrupted ? "interrupted" : "completed",
@@ -76,6 +100,8 @@ const echoProvider = (kind: ProviderKind): Provider => ({
         }),
         respondApproval: () => Effect.void,
         respondInput: () => Effect.void,
+        compact: (instructions: string) => Effect.sync(() => void compactions.push(instructions)),
+        commands: Effect.succeed([{ name: "review", description: "Review the diff", argumentHint: "[focus]" }]),
         reloadSkills: Effect.sync(() => void skillReloads++),
       };
     }),
@@ -89,6 +115,7 @@ const layerWith = (budgetBytes: number) => SessionManager.layer.pipe(
       llamacpp: echoProvider("llamacpp"),
     }),
   ),
+  Layer.provideMerge(AppSettings.layer),
   Layer.provideMerge(Store.layer),
   Layer.provideMerge(Database.layerMemory),
   Layer.provideMerge(
@@ -99,6 +126,7 @@ const layerWith = (budgetBytes: number) => SessionManager.layer.pipe(
       webDistDir: null,
       baseUrl: "http://127.0.0.1:0",
       claudeExecutable: undefined,
+      browser: { executable: undefined, headless: true },
       llamaCpp: { baseUrl: "http://127.0.0.1:8080", apiKey: null },
       codexExecutable: undefined,
       allowedOrigins: [],
@@ -126,6 +154,299 @@ const waitIdle = (manager: SessionManager.SessionManager["Service"], id: Session
   manager.waitUntilIdle(id, Duration.seconds(5));
 
 describe("SessionManager", () => {
+  it.live("pushes finished turns to paired phones and forgets unregistered ones", () => {
+    const pushed: Array<Push.PushMessage> = [];
+    const pushLayer = Push.layerWatcher.pipe(
+      Layer.provideMerge(
+        Layer.succeed(Push.PushSender, async (messages) => {
+          pushed.push(...messages);
+          return messages.map((m) =>
+            m.to === "ExponentPushToken[gone]" ? { status: "error" as const, details: { error: "DeviceNotRegistered" } } : { status: "ok" as const },
+          );
+        }),
+      ),
+      Layer.provideMerge(layer),
+    );
+    return Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const db = yield* Database.Database;
+      const tokens = Push.makePushTokens(db);
+      const now = Date.now();
+      const client = db.prepare(
+        "insert into client_sessions (id, token_hash, label, method, created_at, expires_at, last_seen_at, revoked_at) values (?, ?, 'phone', 'pairing-link', ?, ?, ?, ?)",
+      );
+      client.run("phone", "hash-1", now, now + 1e9, now, null);
+      client.run("old-phone", "hash-2", now, now + 1e9, now, now); // revoked
+      tokens.register("ExponentPushToken[live]", "phone", "ios");
+      tokens.register("ExponentPushToken[gone]", "phone", "ios");
+      tokens.register("ExponentPushToken[revoked]", "old-phone", "ios");
+
+      const bot = yield* createBot(manager);
+      yield* manager.send(bot.mainSessionId, "ship it", "user");
+      yield* waitIdle(manager, bot.mainSessionId);
+      yield* Effect.sleep("50 millis");
+
+      expect(pushed.map((m) => m.to).sort()).toEqual(["ExponentPushToken[gone]", "ExponentPushToken[live]"]);
+      expect(pushed[0]).toMatchObject({ title: "Atlas", body: "echo: ship it", data: { sessionId: bot.mainSessionId, kind: "done" } });
+      expect(tokens.active()).toEqual(["ExponentPushToken[live]"]);
+    }).pipe(Effect.provide(pushLayer));
+  });
+
+  it.live("tracks context usage and runs slash commands", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      yield* manager.send(bot.mainSessionId, "hello", "user");
+      yield* waitIdle(manager, bot.mainSessionId);
+      expect((yield* store.getSession(bot.mainSessionId)).context).toEqual({ used: 1000, window: 200_000 });
+
+      const commands = yield* manager.listCommands(bot.mainSessionId);
+      expect(commands.map((c) => `${c.source}:${c.name}`)).toEqual([
+        "apollo:compact",
+        "apollo:clear",
+        "apollo:stop",
+        "apollo:reflect",
+        "provider:review",
+      ]);
+
+      yield* manager.runCommand(bot.mainSessionId, "compact", "keep the API decisions");
+      expect(compactions.at(-1)).toBe("keep the API decisions");
+
+      // Unknown to Apollo: goes to the harness as a message.
+      yield* manager.runCommand(bot.mainSessionId, "review", "auth module");
+      yield* waitIdle(manager, bot.mainSessionId);
+      expect(sent.at(-1)).toBe("/review auth module");
+
+      // A process starting up (e.g. to list commands) is not a turn: /clear still works.
+      yield* store.updateSession(bot.mainSessionId, { status: "starting" });
+      yield* manager.runCommand(bot.mainSessionId, "clear", "");
+      const cleared = yield* store.getSession(bot.mainSessionId);
+      expect(cleared.status).toBe("idle");
+      expect(cleared).toMatchObject({ resumeId: null, context: null });
+      expect((yield* store.listEvents(bot.mainSessionId, 0)).at(-1)?.event).toEqual({ _tag: "ConversationCleared" });
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("tells the orchestrator which connectors each provider's workers can use", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      expect((yield* manager.listConnectors("codex")).map((c) => c.name)).toEqual(["Slack", "Notion", "node_repl"]);
+      expect(yield* manager.listConnectors("claude")).toEqual([]);
+      const bot = yield* createBot(manager);
+      yield* manager.send(bot.mainSessionId, "hi", "user");
+      yield* waitIdle(manager, bot.mainSessionId);
+      const instructions = opened.at(-1)!.instructions;
+      expect(instructions).toContain("### What each provider can reach");
+      expect(instructions).toContain("- Codex workers: connectors: Slack; MCP servers: node_repl (4 tools) (1 more need the user to sign in).");
+      expect(instructions).toContain("- Claude workers: no connectors.");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("passes attached files to the provider and records them on the message", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      const ref = saveAttachment(dataDir, bot.mainSessionId, "../../evil name.png", "image/png", new Uint8Array([1, 2, 3]));
+      expect(ref.name).toBe("evil name.png");
+
+      yield* manager.send(bot.mainSessionId, "what is this?", "user", [ref]);
+      yield* waitIdle(manager, bot.mainSessionId);
+      const files = sentFiles.at(-1)!;
+      expect(files.map((f) => f.name)).toEqual(["evil name.png"]);
+      expect(readFileSync(files[0]!.path)).toEqual(Buffer.from([1, 2, 3]));
+      const message = (yield* store.listEvents(bot.mainSessionId, 0)).find((e) => e.event._tag === "UserMessage")!.event;
+      expect(message).toMatchObject({ attachments: [{ id: ref.id, name: "evil name.png", mime: "image/png", size: 3 }] });
+
+      const missing = yield* manager
+        .send(bot.mainSessionId, "again", "user", [{ ...ref, id: "att_000000000000" }])
+        .pipe(Effect.flip);
+      expect(missing.message).toContain("attachment is missing");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("gives workers their own git worktree, then merges or discards it", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      const repo = mkdtempSync(join(tmpdir(), "apollo-repo-"));
+      const sh = (cmd: string, cwd = repo) => execSync(cmd, { cwd, encoding: "utf8" });
+      sh("git init -q -b main && git config user.email t@example.com && git config user.name Test");
+      writeFileSync(join(repo, "README.md"), "hello\n");
+      sh("git add -A && git commit -qm init");
+
+      const worker = yield* manager.createSession({
+        botId: bot.id,
+        title: "Add docs",
+        provider: { provider: "codex" },
+        cwd: repo,
+        isolation: "worktree",
+      });
+      expect(worker.worktree?.branch).toMatch(/^apollo\/add-docs-[0-9a-f]{4}$/);
+      expect(worker.cwd).toBe(worker.worktree!.path);
+      expect(statSync(join(worker.cwd, "README.md")).isFile()).toBe(true);
+
+      // The worker writes a file and leaves it uncommitted.
+      writeFileSync(join(worker.cwd, "DOCS.md"), "docs\n");
+      const status = yield* manager.worktreeStatus(worker.id);
+      expect(status.uncommitted).toEqual(["?? DOCS.md"]);
+
+      const merged = yield* manager.finishWorktree(worker.id, "merge");
+      expect(merged.message).toContain("Merged");
+      expect(readFileSync(join(repo, "DOCS.md"), "utf8")).toBe("docs\n");
+      expect(sh("git branch --list 'apollo/*'").trim()).toBe("");
+      // git reports the resolved path (/private/var on macOS).
+      expect((yield* store.getSession(worker.id))).toMatchObject({ worktree: null, cwd: realpathSync(repo) });
+
+      const other = yield* manager.createSession({
+        botId: bot.id,
+        title: "Try something",
+        provider: { provider: "codex" },
+        cwd: repo,
+        isolation: "worktree",
+      });
+      writeFileSync(join(other.cwd, "SCRATCH.md"), "x\n");
+      yield* manager.finishWorktree(other.id, "discard");
+      expect(sh("git branch --list 'apollo/*'").trim()).toBe("");
+      expect(sh("git status --porcelain").trim()).toBe("");
+
+      const refused = yield* manager
+        .createSession({ botId: bot.id, title: "x", provider: { provider: "codex" }, cwd: tmpdir(), isolation: "worktree" })
+        .pipe(Effect.flip);
+      expect(refused.message).toContain("not inside a git repository");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("runs background jobs, waits on them, reports the ones nobody waited on, and stops them", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const jobs = yield* Jobs.Jobs;
+      const bot = yield* createBot(manager);
+      const caller = { botId: bot.id, sessionId: bot.mainSessionId };
+
+      const build = yield* jobs.start(caller, { command: "echo building; sleep 0.2; echo done" });
+      expect(build.running).toBe(true);
+      const finished = yield* jobs.wait(caller, build.jobId, 10);
+      expect(finished).toMatchObject({ running: false, exitCode: 0, timedOut: false });
+      expect(finished.output).toBe("building\ndone");
+
+      // Nobody waits on this one: the session hears about it.
+      yield* jobs.start(caller, { command: "echo oops; exit 3" });
+      let report: string | undefined;
+      for (let i = 0; i < 80 && !report; i++) {
+        yield* Effect.sleep("25 millis");
+        report = (yield* store.listEvents(bot.mainSessionId, 0))
+          .flatMap((e) => (e.event._tag === "UserMessage" && e.event.author === "system" ? [e.event.text] : []))
+          .find((t) => t.includes("Background job"));
+      }
+      expect(report).toContain("exit code 3");
+      expect(report).toContain("oops");
+
+      const server = yield* jobs.start(caller, { command: "sleep 30", notify: false });
+      const stopped = yield* jobs.stop(caller, server.jobId);
+      expect(stopped.running).toBe(false);
+      expect(stopped.signal).toBe("SIGTERM");
+      expect((yield* jobs.list(caller)).length).toBe(3);
+
+      const other = yield* createBot(manager);
+      const denied = yield* jobs.status({ botId: other.id, sessionId: other.mainSessionId }, build.jobId).pipe(Effect.flip);
+      expect(denied.message).toContain("no background job");
+    }).pipe(Effect.provide(Jobs.layer.pipe(Layer.provideMerge(layer)))),
+  );
+
+  it.live("keeps excluded messages out of memory search and reflection", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      yield* manager.send(bot.mainSessionId, "my favourite colour is zanzibar", "user");
+      yield* waitIdle(manager, bot.mainSessionId);
+      const events = yield* store.listEvents(bot.mainSessionId, 0);
+      const message = events.find((e) => e.event._tag === "UserMessage")!;
+      const search = () => store.searchTranscripts(bot.id, "zanzibar", 10, null);
+      expect((yield* search()).length).toBe(2); // the message and the echo
+
+      yield* manager.setMemoryExclusion(bot.mainSessionId, message.seq, true);
+      expect((yield* search()).map((h) => h.seq)).not.toContain(message.seq);
+      expect((yield* store.listEvents(bot.mainSessionId, message.seq)).at(-1)?.event).toEqual({
+        _tag: "MemoryExclusion",
+        seq: message.seq,
+        excluded: true,
+      });
+      const before = sent.length;
+      yield* manager.reflect(bot.mainSessionId);
+      // The fake provider records the prompt from its own fiber.
+      for (let i = 0; i < 40 && sent.length === before; i++) yield* Effect.sleep("25 millis");
+      const prompt = sent.slice(before).find((t) => t.startsWith("Review this transcript"));
+      expect(prompt).toBeDefined();
+      expect(prompt).not.toContain("USER: my favourite colour");
+
+      yield* manager.setMemoryExclusion(bot.mainSessionId, message.seq, false);
+      expect((yield* search()).map((h) => h.seq)).toContain(message.seq);
+
+      const turn = events.find((e) => e.event._tag === "TurnStarted")!;
+      const refused = yield* manager.setMemoryExclusion(bot.mainSessionId, turn.seq, true).pipe(Effect.flip);
+      expect(refused.message).toContain("only messages");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("reports bot activity for the desktop tray", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      const idle = (yield* desktopStatus).bots.find((b) => b.id === bot.id);
+      expect(idle).toEqual({ id: bot.id, name: "Atlas", paused: false, working: 0, needsYou: 0 });
+      expect((yield* desktopStatus).localModels).toBeNull();
+
+      yield* store.updateSession(bot.mainSessionId, { status: "waiting-approval" });
+      const waiting = (yield* desktopStatus).bots.find((b) => b.id === bot.id);
+      expect(waiting).toMatchObject({ working: 0, needsYou: 1 });
+      yield* store.updateSession(bot.mainSessionId, { status: "running" });
+      expect((yield* desktopStatus).bots.find((b) => b.id === bot.id)).toMatchObject({ working: 1, needsYou: 0 });
+      yield* store.updateSession(bot.mainSessionId, { status: "idle" });
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("creates the bot's workspace folder and passes project folders to providers", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const settings = yield* AppSettings.AppSettings;
+      const projects = mkdtempSync(join(tmpdir(), "apollo-projects-"));
+      yield* settings.update({ projectFolders: [projects] });
+      const cwd = join(mkdtempSync(join(tmpdir(), "apollo-ws-")), "nested", "atlas");
+      const bot = yield* manager.createBot({
+        name: "Atlas",
+        instructions: "",
+        cwd: `${cwd}/`,
+        main: { provider: "claude" },
+        defaultWorker: { provider: "codex" },
+        runtimeMode: "full-access",
+        autoLearn: false,
+      });
+      expect(bot.cwd).toBe(cwd);
+      expect(AVATAR_SHAPES).toContain(bot.avatar.shape);
+      const updated = yield* manager.updateBot({ botId: bot.id, avatar: { shape: "ghost", color: "lime" } });
+      expect(updated.avatar).toEqual({ shape: "ghost", color: "lime" });
+      const store = yield* Store.Store;
+      expect((yield* store.getBot(bot.id)).avatar).toEqual({ shape: "ghost", color: "lime" });
+      expect(statSync(cwd).isDirectory()).toBe(true);
+      yield* manager.send(bot.mainSessionId, "hi", "user");
+      yield* waitIdle(manager, bot.mainSessionId);
+      const options = opened.at(-1)!;
+      expect(options.extraDirectories).toEqual([projects]);
+      expect(options.instructions).toContain(projects);
+      expect(options.instructions).toContain("apollo_list_projects");
+      yield* settings.update({ projectFolders: [] });
+
+      const relative = yield* manager.createBot({ ...bot, name: "Nova", cwd: "nova", limits: undefined }).pipe(Effect.flip);
+      expect(relative.message).toContain("full path");
+    }).pipe(Effect.provide(layer)),
+  );
+
   it.live("creates a bot with its orchestrator session", () =>
     Effect.gen(function* () {
       const manager = yield* SessionManager.SessionManager;
@@ -225,11 +546,11 @@ describe("SessionManager", () => {
       }
       yield* Effect.sleep(Duration.millis(100));
 
+      const prompt = sent.findLast((t) => t.startsWith("Review this transcript"));
+      expect(prompt).toContain("USER: three");
+      // A finished reflection removes itself.
       const sessions = yield* store.listSessions(bot.id);
-      const reflection = sessions.find((s) => s.role === "reflection");
-      expect(reflection).toMatchObject({ parentSessionId: bot.mainSessionId, provider: "claude" });
-      const prompt = (yield* store.listEvents(reflection!.id, 0))[0]?.event;
-      expect(prompt?._tag === "UserMessage" && prompt.text).toContain("USER: three");
+      expect(sessions.some((s) => s.role === "reflection")).toBe(false);
     }).pipe(Effect.provide(layer)),
   );
 

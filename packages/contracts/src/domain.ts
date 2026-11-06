@@ -30,8 +30,10 @@ export type ProviderKind = typeof ProviderKind.Type;
 /**
  * - `full-access`: the agent runs tools without asking.
  * - `approval-required`: risky tool calls surface as approval requests in the UI.
+ * - `auto`: a reviewer model approves or denies risky tool calls (Claude Code's auto
+ *   mode, Codex's auto review) and asks the user only when it cannot decide.
  */
-export const RuntimeMode = Schema.Literals(["full-access", "approval-required"]);
+export const RuntimeMode = Schema.Literals(["full-access", "approval-required", "auto"]);
 export type RuntimeMode = typeof RuntimeMode.Type;
 
 export const ProviderSelection = Schema.Struct({
@@ -107,6 +109,32 @@ export const DEFAULT_BOT_LIMITS: BotLimits = {
 // Bots
 // ---------------------------------------------------------------------------
 
+/** Shapes and colors of a bot's blob avatar. */
+export const AVATAR_SHAPES = ["blob", "squircle", "ghost", "bean", "flower", "cloud", "star", "drop"] as const;
+export const AVATAR_COLORS = ["coral", "sky", "mint", "grape", "sun", "ocean", "rose", "lime"] as const;
+export const BotAvatar = Schema.Struct({
+  shape: Schema.Literals(AVATAR_SHAPES),
+  color: Schema.Literals(AVATAR_COLORS),
+});
+export type BotAvatar = typeof BotAvatar.Type;
+
+/** A random avatar, for new bots. */
+export const randomAvatar = (random: () => number = Math.random): BotAvatar => ({
+  shape: AVATAR_SHAPES[Math.floor(random() * AVATAR_SHAPES.length)]!,
+  color: AVATAR_COLORS[Math.floor(random() * AVATAR_COLORS.length)]!,
+});
+
+/** A stable avatar derived from a seed (bots created before avatars existed). */
+export const seededAvatar = (seed: string): BotAvatar => {
+  let hash = 0;
+  for (const char of seed) hash = (hash * 31 + char.charCodeAt(0)) | 0;
+  const n = Math.abs(hash);
+  return {
+    shape: AVATAR_SHAPES[n % AVATAR_SHAPES.length]!,
+    color: AVATAR_COLORS[Math.floor(n / AVATAR_SHAPES.length) % AVATAR_COLORS.length]!,
+  };
+};
+
 /**
  * A bot is a long-lived persona that owns a main (orchestrator) session plus
  * any number of worker sessions, each of which may use a different provider.
@@ -114,6 +142,7 @@ export const DEFAULT_BOT_LIMITS: BotLimits = {
 export const Bot = Schema.Struct({
   id: BotId,
   name: Schema.String,
+  avatar: BotAvatar,
   /** Persona / standing instructions injected into every session the bot owns. */
   instructions: Schema.String,
   /** Default working directory for sessions. */
@@ -156,6 +185,18 @@ export const SessionStatus = Schema.Literals([
 ]);
 export type SessionStatus = typeof SessionStatus.Type;
 
+/** A worker's own git checkout: a worktree on its own branch (see `isolation: "worktree"`). */
+export const SessionWorktree = Schema.Struct({
+  /** The main checkout the worktree belongs to. */
+  repoPath: Schema.String,
+  path: Schema.String,
+  branch: Schema.String,
+  /** Commit it started from, and the branch that was checked out then. */
+  baseRef: Schema.String,
+  baseBranch: Schema.NullOr(Schema.String),
+});
+export type SessionWorktree = typeof SessionWorktree.Type;
+
 export const Session = Schema.Struct({
   id: SessionId,
   botId: BotId,
@@ -169,6 +210,10 @@ export const Session = Schema.Struct({
   /** Overrides the bot's runtime mode for this session; `null` follows the bot. */
   runtimeMode: Schema.NullOr(RuntimeMode),
   cwd: Schema.String,
+  /** Its own git worktree, while it has one. */
+  worktree: Schema.NullOr(SessionWorktree),
+  /** How full the model's context window was after the last turn, when the provider reports it. */
+  context: Schema.NullOr(Schema.Struct({ used: Schema.Number, window: Schema.Number })),
   status: SessionStatus,
   /** Provider-native id used to resume the conversation (Claude session id / Codex thread id). */
   resumeId: Schema.NullOr(Schema.String),
@@ -229,14 +274,42 @@ export type InputResponse = typeof InputResponse.Type;
 export const TurnOutcome = Schema.Literals(["completed", "interrupted", "failed"]);
 export type TurnOutcome = typeof TurnOutcome.Type;
 
+/** A file uploaded for a message (POST /api/attachments/<sessionId>). */
+export const AttachmentRef = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  mime: Schema.String,
+  size: Schema.Number,
+});
+export type AttachmentRef = typeof AttachmentRef.Type;
+
 export const AgentEvent = Schema.Union([
   Schema.TaggedStruct("UserMessage", {
     text: Schema.String,
     /** Who sent it: the human, the orchestrating bot, or Apollo itself. */
     author: MessageAuthor,
+    attachments: Schema.optional(Schema.Array(AttachmentRef)),
   }),
   Schema.TaggedStruct("TurnStarted", {}),
+  /** A browser recording an agent made; its frames are served at /api/recordings/<id>/<frame>.jpg. */
+  Schema.TaggedStruct("Recording", {
+    recordingId: Schema.String,
+    title: Schema.String,
+    frames: Schema.Number,
+    width: Schema.Number,
+    height: Schema.Number,
+    durationMs: Schema.Number,
+  }),
+  /** `/clear`: a fresh conversation starts; the chat shows nothing before this point. */
+  Schema.TaggedStruct("ConversationCleared", {}),
+  /** The user excluded (or restored) the message at `seq` from the bot's memory. */
+  Schema.TaggedStruct("MemoryExclusion", { seq: Schema.Number, excluded: Schema.Boolean }),
+  /** Live only (not stored): streamed text, then the final AssistantMessage with the same itemId. */
   Schema.TaggedStruct("AssistantDelta", { itemId: Schema.String, text: Schema.String }),
+  /** Live only: streamed thinking, then the final Reasoning with the same itemId. */
+  Schema.TaggedStruct("ReasoningDelta", { itemId: Schema.String, text: Schema.String }),
+  /** Live only: the model started writing a tool call; ToolStarted follows with its input. */
+  Schema.TaggedStruct("ToolPending", { itemId: Schema.String, name: Schema.String }),
   Schema.TaggedStruct("AssistantMessage", { itemId: Schema.String, text: Schema.String }),
   Schema.TaggedStruct("Reasoning", { itemId: Schema.String, text: Schema.String }),
   Schema.TaggedStruct("ToolStarted", {
@@ -279,6 +352,27 @@ export const AgentEvent = Schema.Union([
   Schema.TaggedStruct("Notice", {
     level: Schema.Literals(["info", "warning", "error"]),
     message: Schema.String,
+  }),
+  /** A self-contained HTML page an agent shows in the conversation (`apollo_show_html`). */
+  Schema.TaggedStruct("Visual", {
+    visualId: Schema.String,
+    title: Schema.String,
+    html: Schema.String,
+    /** Preferred height in CSS pixels; the page can grow to its content. */
+    height: Schema.NullOr(Schema.Number),
+  }),
+  /** An agent asked the user for a secret (`apollo_request_secret`). The value never enters the log. */
+  Schema.TaggedStruct("SecretRequested", {
+    requestId: Schema.String,
+    label: Schema.String,
+    reason: Schema.String,
+    placeholder: Schema.NullOr(Schema.String),
+  }),
+  Schema.TaggedStruct("SecretResolved", {
+    requestId: Schema.String,
+    outcome: Schema.Literals(["provided", "declined", "expired"]),
+    /** Where a provided secret came from. */
+    source: Schema.NullOr(Schema.Literals(["typed", "1password"])),
   }),
 ]);
 export type AgentEvent = typeof AgentEvent.Type;

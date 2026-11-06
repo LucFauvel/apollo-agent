@@ -12,13 +12,17 @@
   "dependencies": {
     "@apollo/contracts": "workspace:*",
     "effect": "catalog:",
+    "lucide-react": "^1.68.0",
+    "qrcode": "1.5.4",
     "react": "catalog:",
     "react-dom": "catalog:",
     "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "@apollo/client": "workspace:*"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
+    "@types/qrcode": "1.5.5",
     "@types/react": "catalog:",
     "@types/react-dom": "catalog:",
     "@vitejs/plugin-react": "^6.1.2",

@@ -11,6 +11,10 @@ Apollo is a desktop app for running **bots**: long-lived personas that orchestra
   `apollo_wait_session`, …). Workers report back when they finish a turn.
 - Memory and skills live in Apollo, not in either agent, so whatever one provider
   learns, the other can use.
+- A **built-in browser** gives every session a real Chromium to read and drive web pages
+  and local dev servers. You watch its tabs live in the Browser panel and can take over.
+- Agents can **show visuals** (charts, tables, mockups) in the conversation, and **ask for
+  secrets** in a private card you fill by typing or from **1Password**; they never see the value.
 
 ## Requirements
 
@@ -35,6 +39,15 @@ file with esbuild (`apps/desktop/scripts/bundle-server.ts`), then runs electron-
 an AppImage on Linux, a dmg on macOS, an NSIS installer on Windows. Each platform
 builds its own installer. `pnpm --filter @apollo/desktop package:dir` gives an unpacked
 build that is faster to try.
+
+The desktop app keeps running in the menu bar (macOS) or system tray (Windows, Linux)
+when you close its window, so scheduled tasks and workers carry on. Open it again from
+the tray icon, or quit from the tray menu.
+
+Icons come from SVG sources in `apps/desktop/resources/icons/` (the mark, the app tile and
+the tray glyph). `pnpm --filter @apollo/desktop icons` renders them with Electron into
+`resources/icon.{icns,ico,png}` and `resources/tray/*.png`. The `.icns` is only rebuilt on
+macOS. The rendered files are committed.
 
 The installed app uses the `claude` and `codex` CLIs on your `PATH`; it reads the
 `PATH` from your login shell so launchers that start apps with a minimal environment
@@ -86,8 +99,64 @@ Dev state goes to `./.apollo-dev`; otherwise Apollo stores everything in `~/.apo
 | `APOLLO_MAX_STORAGE_MB` | `2048` | Database size compaction works to stay under |
 | `APOLLO_MEMORY_ARCHIVE_LIMIT` | `2000` | Archive memories kept per bot (and globally) |
 | `APOLLO_DETAIL_RETENTION_DAYS` | `30` | Age after which tool output and reasoning are trimmed |
+| `APOLLO_BROWSER_BIN` | first Chrome/Edge/Chromium/Brave found | Browser the built-in browser runs |
+| `APOLLO_BROWSER_HEADLESS=0` | headless | Show the built-in browser's window too |
+| `APOLLO_OP_BIN` | `op` on PATH | 1Password CLI used to fill secrets |
 | `APOLLO_LOG_HTTP=1` | off | Log every HTTP request |
 | `APOLLO_SCREENSHOT` | unset | Desktop: save a PNG of the window and quit (`APOLLO_SCREENSHOT_DELAY`, `APOLLO_SCREENSHOT_JS` run first) |
+
+### Workspaces and project folders
+
+A new bot gets a suggested name and its own workspace folder, `~/Apollo/<name>`, which Apollo creates.
+Both can be changed before creating the bot. In **Settings** (gear icon in the sidebar), add the folders
+where you keep your projects (e.g. `~/git`). Apollo finds the git repositories and folders with a project
+manifest in them, up to two levels deep. You can pick one of those projects as a bot's workspace, and
+every session can read and edit them: Claude gets them as `additionalDirectories`, Codex as writable
+sandbox roots. Agents find projects with `apollo_list_projects`. The default workspace root can also
+be changed in Settings.
+
+### Built-in browser
+
+Agents get browser tools on Apollo's MCP server, modelled on T3 Code's preview tools:
+
+| Tool | Does |
+| --- | --- |
+| `apollo_browser_open` / `_navigate` | Open a page (`localhost:5173` gets http, bare hosts https), go back/forward/reload |
+| `apollo_browser_snapshot` | The page as a text outline with element refs: `- button "Save" [ref=e7]` |
+| `apollo_browser_act` | click, type, press, hover, select, scroll, by ref or CSS selector |
+| `apollo_browser_wait_for` | Wait for text, a visible selector or a URL |
+| `apollo_browser_evaluate` | Run JavaScript in the page |
+| `apollo_browser_screenshot` | Save a PNG; agents open it with their image tool (Claude Code Read, Codex view_image) |
+| `apollo_browser_tabs` / `_close` | List and close tabs |
+
+`apollo_notify` sends you a desktop notification.
+
+### Visuals and secrets
+
+- `apollo_show_html` puts a self-contained HTML page in the conversation. It runs in a
+  sandboxed frame with an opaque origin (scripts allowed, no access to Apollo's cookies,
+  storage or API), sizes itself to its content, and opens in a window of its own.
+  `apollo_preview_html` renders it in the built-in browser first and returns a PNG, the
+  content height and console output, so the agent can check it before showing it.
+- `apollo_request_secret` shows a private card: you type the value, or pick an item and
+  field from 1Password, or decline. The agent gets a one-use `secretRef` (which
+  `apollo_browser_act` can type into a password field) or, with `delivery: "file"`, a
+  0600 file under `<data dir>/secrets` to read in a shell command. References and files
+  expire after 15 minutes and are cleared at shutdown and startup. The value is never
+  written to the event log, the database or the transcript.
+- 1Password goes through its CLI (`op`, or `APOLLO_OP_BIN`), with the desktop app's CLI
+  integration or `op signin`. Apollo lists items and field labels; it reads only the
+  field you pick, on the server, so field values never reach the UI or the agent.
+
+Apollo runs the Chrome, Edge, Chromium or Brave already installed (`APOLLO_BROWSER_BIN` picks
+one), headless, with its own profile in `<data dir>/browser/profile`, so logins persist
+between sessions and stay separate from your own browser. It starts on first use and quits
+after 10 idle minutes. Tabs belong to a bot: all its sessions can use them, other bots
+cannot. Snapshots also report console errors, page errors and dialogs; Apollo accepts alerts
+and confirms and dismisses prompts, since agents cannot see them. Only http(s) pages open.
+
+The **Browser** panel (header button) streams the selected tab live. Clicking, scrolling and
+typing on it go to the page, and the address bar and back/forward/reload work as usual.
 
 ## Checks
 
@@ -250,6 +319,14 @@ Apollo only talks to **paired devices**, the same model t3code uses:
 
 - Archive and transcript search are keyword-based (FTS5), like Hermes. Embeddings could be
   added behind `searchMemories` / `searchTranscripts` if paraphrased lookups start missing.
+- Built-in browser: Apollo does not download a browser, so machines without Chrome, Edge,
+  Chromium or Brave cannot use it yet. Screenshots reach agents as files, not inline images,
+  because Effect's MCP toolkit only returns JSON. File uploads and per-bot browser profiles
+  are not supported yet.
+- Secret requests waiting for an answer are lost if the server restarts; the agent's call
+  fails and it has to ask again. A `file` secret can be read by the agent's shell like any
+  file it owns: Apollo keeps it out of the conversation, but cannot stop an agent that
+  prints it.
 - Installers are unsigned, and the app has no icon or auto-update yet.
 - Pending approvals and input requests are lost if the server restarts mid-turn; the
   provider sees the turn end.

@@ -48,8 +48,13 @@ export type EngineState = typeof EngineState.Type;
 export const ServerStatus = Schema.Literals(["stopped", "starting", "running", "error"]);
 export type ServerStatus = typeof ServerStatus.Type;
 
-export const LocalModelStatus = Schema.Literals(["unloaded", "loading", "loaded", "sleeping", "downloading", "failed"]);
+/** `incomplete`: a download that stopped part way (llama.cpp keeps the partial files). */
+export const LocalModelStatus = Schema.Literals(["unloaded", "loading", "loaded", "sleeping", "downloading", "incomplete", "failed"]);
 export type LocalModelStatus = typeof LocalModelStatus.Type;
+
+/** Whether a local model is fully on disk (it may still fail to load). */
+export const isDownloaded = (model: { readonly status: LocalModelStatus }) =>
+  model.status !== "downloading" && model.status !== "incomplete";
 
 /** A model in Apollo's library, as llama-server reports it. */
 export const LocalModel = Schema.Struct({
@@ -58,6 +63,8 @@ export const LocalModel = Schema.Struct({
   status: LocalModelStatus,
   sizeBytes: Schema.NullOr(Schema.Number),
   download: Schema.NullOr(Progress),
+  /** While `loading`: how far, 0-1, when llama-server reports it. */
+  loadProgress: Schema.NullOr(Schema.Number),
   /** Context window it loads with (measured by llama-server). */
   contextSize: Schema.NullOr(Schema.Number),
   /** Whether that fits in GPU memory, as llama-server measured it. */
@@ -71,6 +78,8 @@ export const LocalModelsState = Schema.Struct({
   server: Schema.Struct({ status: ServerStatus, error: Schema.NullOr(Schema.String) }),
   models: Schema.Array(LocalModel),
   defaultModel: Schema.NullOr(Schema.String),
+  /** Small model that reviews unclear tool calls in auto mode; `null`: rules only. */
+  reviewerModel: Schema.NullOr(Schema.String),
 });
 export type LocalModelsState = typeof LocalModelsState.Type;
 

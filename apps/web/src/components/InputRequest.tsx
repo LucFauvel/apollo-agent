@@ -1,7 +1,8 @@
 import type { InputAction, InputField, InputResponse, InputValue } from "@apollo/contracts";
+import { ClipboardList, ExternalLink } from "lucide-react";
 import { useState } from "react";
 import type { TranscriptItem } from "../transcript.ts";
-import { Button, cx, inputClass } from "./ui.tsx";
+import { Badge, Button, cx, inputClass } from "./ui.tsx";
 
 type Draft = Record<string, string | boolean | Array<string>>;
 
@@ -69,6 +70,32 @@ function FieldInput({
         </label>
       );
     case "select":
+      // A handful of options read better as cards (label, then the description after " — ").
+      if (field.options.length > 0 && field.options.length <= 6) {
+        return (
+          <div className="grid gap-1.5">
+            {field.options.map((o) => {
+              const [label, ...detail] = o.label.split(" — ");
+              const chosen = value === o.value;
+              return (
+                <button
+                  key={o.value}
+                  type="button"
+                  aria-pressed={chosen}
+                  onClick={() => onChange(chosen ? "" : o.value)}
+                  className={cx(
+                    "rounded-lg border px-3 py-2 text-left text-xs transition-colors",
+                    chosen ? "border-sky-500/60 bg-sky-500/10 text-zinc-100" : "border-zinc-800 bg-zinc-900/40 text-zinc-300 hover:border-zinc-700",
+                  )}
+                >
+                  <span className="block font-medium">{label}</span>
+                  {detail.length > 0 ? <span className="mt-0.5 block text-zinc-500">{detail.join(" — ")}</span> : null}
+                </button>
+              );
+            })}
+          </div>
+        );
+      }
       return (
         <select className={inputClass} value={typeof value === "string" ? value : ""} onChange={(e) => onChange(e.target.value)}>
           <option value="">Choose…</option>
@@ -137,12 +164,24 @@ export function InputRequestItem({
   };
 
   return (
-    <div className="rounded-lg border border-sky-700/40 bg-sky-950/20 p-3 text-sm">
-      <div className="text-[10px] font-semibold tracking-wide text-sky-300/80 uppercase">{item.source} needs input</div>
+    <div className={pending ? "rounded-xl border border-sky-700/40 bg-sky-950/20 p-3.5 text-sm" : "rounded-xl border border-zinc-800 bg-zinc-900/30 p-3.5 text-sm"}>
+      <div className="flex items-center gap-2">
+        <ClipboardList className={pending ? "size-4 text-sky-300" : "size-4 text-zinc-500"} strokeWidth={1.75} />
+        <span className={pending ? "flex-1 text-xs font-medium text-sky-200" : "flex-1 text-xs font-medium text-zinc-400"}>
+          {item.source} needs input
+        </span>
+        {!pending ? <Badge tone={item.action === "accept" ? "emerald" : "zinc"}>{resolvedLabel[item.action]}</Badge> : null}
+      </div>
       {item.message ? <div className="mt-1 whitespace-pre-wrap text-zinc-200">{item.message}</div> : null}
       {item.url ? (
-        <a className="mt-2 block truncate font-mono text-xs text-sky-300 underline" href={item.url} target="_blank" rel="noreferrer">
-          {item.url}
+        <a
+          className="mt-2 flex items-center gap-1.5 truncate font-mono text-xs text-sky-300 underline decoration-sky-300/40 underline-offset-2 hover:decoration-sky-300"
+          href={item.url}
+          target="_blank"
+          rel="noreferrer"
+        >
+          <ExternalLink className="size-3 shrink-0" />
+          <span className="truncate">{item.url}</span>
         </a>
       ) : null}
 
@@ -175,16 +214,12 @@ export function InputRequestItem({
             <Button size="sm" variant="primary" onClick={submit}>
               {item.url ? "Done" : "Submit"}
             </Button>
-            <Button size="sm" variant="danger" onClick={() => onRespond(item.requestId, { action: "decline", values: {} })}>
+            <Button size="sm" variant="ghost" onClick={() => onRespond(item.requestId, { action: "decline", values: {} })}>
               Decline
             </Button>
           </div>
         </>
-      ) : (
-        <div className={cx("mt-2 text-xs", item.action === "accept" ? "text-zinc-500" : "text-zinc-600")}>
-          {resolvedLabel[item.action]}
-        </div>
-      )}
+      ) : null}
     </div>
   );
 }

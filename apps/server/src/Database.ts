@@ -206,6 +206,45 @@ const MIGRATIONS: ReadonlyArray<string> = [
   );
   create index schedule_runs_schedule on schedule_runs(schedule_id, started_at);
   `,
+  // 9: bot avatars.
+  `
+  alter table bots add column avatar text;     -- JSON BotAvatar; null derives one from the id
+  `,
+  // 10: messages the user kept out of the bot's memory (search, session reads, reflection).
+  `
+  create table memory_exclusions (
+    session_id text not null references sessions(id) on delete cascade,
+    seq integer not null,
+    primary key (session_id, seq)
+  );
+  `,
+  // 11: workers in their own git worktree.
+  `
+  alter table sessions add column worktree text;     -- JSON SessionWorktree
+  `,
+  // 12: pull requests linked to sessions, and what Apollo last saw of them.
+  `
+  create table pull_requests (
+    session_id text not null references sessions(id) on delete cascade,
+    url text not null,
+    data text not null,                 -- JSON PullRequest
+    digest text not null default '',    -- last seen checks, reviews and comments
+    primary key (session_id, url)
+  );
+  `,
+  // 13: how full each session's context window is.
+  `
+  alter table sessions add column context text;     -- JSON { used, window }
+  `,
+  // 14: phones that get push notifications, per paired client.
+  `
+  create table push_tokens (
+    token text primary key,             -- Expo push token
+    client_id text not null,
+    platform text not null,
+    created_at integer not null
+  );
+  `,
 ];
 
 export class Database extends Context.Service<Database, DatabaseSync>()("apollo/Database") {}

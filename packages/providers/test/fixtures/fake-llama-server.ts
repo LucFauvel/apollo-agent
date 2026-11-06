@@ -45,7 +45,7 @@ export const startFakeLlamaServer = async (options: { model: string; contextSize
       type: "message",
       role: "assistant",
       model: body?.model ?? options.model,
-      content: [{ type: "text", text: options.reply }],
+      content: [{ type: "thinking", thinking: "The user wants a pong.", signature: "" }, { type: "text", text: options.reply }],
       stop_reason: "end_turn",
       stop_sequence: null,
       usage,
@@ -55,9 +55,15 @@ export const startFakeLlamaServer = async (options: { model: string; contextSize
     response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
     const send = (data: Record<string, unknown>) => response.write(`event: ${data.type}\ndata: ${JSON.stringify(data)}\n\n`);
     send({ type: "message_start", message: { ...message, content: [], stop_reason: null, usage: { ...usage, output_tokens: 1 } } });
-    send({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
-    send({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: options.reply } });
+    // A model that thinks first, in two chunks, then answers.
+    send({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } });
+    send({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "The user wants " } });
+    send({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "a pong." } });
+    send({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "" } });
     send({ type: "content_block_stop", index: 0 });
+    send({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } });
+    send({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: options.reply } });
+    send({ type: "content_block_stop", index: 1 });
     send({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } });
     send({ type: "message_stop" });
     response.end();

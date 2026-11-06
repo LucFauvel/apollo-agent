@@ -25,7 +25,7 @@ export const SESSION_COOKIE = "apollo_session";
 const newToken = () => randomBytes(32).toString("base64url");
 const hashToken = (token: string) => createHash("sha256").update(token).digest("hex");
 
-const safeEqual = (a: string, b: string) => {
+export const safeEqual = (a: string, b: string) => {
   const left = Buffer.from(a);
   const right = Buffer.from(b);
   return left.length === right.length && timingSafeEqual(left, right);

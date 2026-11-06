@@ -12,7 +12,11 @@ import {
   type ProviderSessionOptions,
   summarizeToolInput,
   truncate,
+  type Attachment,
+  attachmentNote,
+  isImageAttachment,
 } from "./Provider.ts";
+import type { ConnectorInfo } from "@apollo/contracts";
 
 const fail = (message: string) => new ProviderError({ provider: "codex", message });
 
@@ -207,9 +211,75 @@ const listCodexModels = (config: CodexProviderConfig) =>
       }));
   }).pipe(Effect.scoped, Effect.timeout("30 seconds"), Effect.mapError((e) => (e instanceof ProviderError ? e : fail("listing models timed out"))));
 
+const CODEX_STATUS: Record<string, ConnectorInfo["status"]> = {
+  connected: "connected",
+  starting: "pending",
+  notStarted: "pending",
+  authenticationRequired: "needs-auth",
+  failed: "failed",
+  cancelled: "failed",
+  disabled: "disabled",
+};
+
+/** MCP servers (from ~/.codex/config.toml and plugins) and ChatGPT apps Codex sessions load. */
+const listCodexConnectors = (config: CodexProviderConfig) =>
+  Effect.gen(function* () {
+    const rpc = yield* spawnJsonRpcProcess({
+      command: config.executable ?? "codex",
+      args: ["app-server"],
+      cwd: homedir(),
+      handlers: {
+        onNotification: () => Effect.void,
+        onRequest: (method) => Effect.fail(new JsonRpcFailure({ message: `Apollo does not handle ${method}` })),
+        onExit: () => Effect.void,
+      },
+    }).pipe(Effect.mapError((error) => fail(error.message)));
+    const call = (method: string, params: unknown) =>
+      rpc.request(method, params).pipe(Effect.mapError((error) => fail(`${method}: ${error.message}`)));
+    yield* call("initialize", { clientInfo: { name: "apollo", title: "Apollo", version: "0.0.0" }, capabilities: null });
+    yield* rpc.notify("initialized", {});
+
+    const out: Array<ConnectorInfo> = [];
+    let cursor: string | null = null;
+    do {
+      const page = (yield* call("mcpServerStatus/list", { cursor, limit: 100, detail: "toolsAndAuthOnly" })) as {
+        data: Array<{ name: string; runtimeStatus: string | null; tools?: Record<string, unknown> | null }>;
+        nextCursor: string | null;
+      };
+      for (const s of page.data) {
+        // codex_apps hosts the ChatGPT apps listed below.
+        if (s.name === "codex_apps") continue;
+        const tools = s.tools ? Object.keys(s.tools).length : null;
+        // Servers only start with a conversation; one whose tools are known is available.
+        const status = CODEX_STATUS[s.runtimeStatus ?? ""] ?? "pending";
+        out.push({ name: s.name, kind: "mcp", status: status === "pending" && tools ? "connected" : status, tools });
+      }
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+
+    // ChatGPT apps (connectors); an account without them answers with an error.
+    const apps = (yield* call("app/installed", {}).pipe(Effect.orElseSucceed(() => ({ apps: [] })))) as {
+      apps: Array<{ id: string; runtimeName: string | null; enabled: boolean; callable: boolean }>;
+    };
+    for (const app of apps.apps ?? []) {
+      out.push({
+        name: app.runtimeName ?? app.id,
+        kind: "connector",
+        status: !app.enabled ? "disabled" : app.callable ? "connected" : "needs-auth",
+        tools: null,
+      });
+    }
+    return out;
+  }).pipe(
+    Effect.scoped,
+    Effect.timeout("30 seconds"),
+    Effect.mapError((e) => (e instanceof ProviderError ? e : fail("listing connectors timed out"))),
+  );
+
 export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider => ({
   kind: "codex",
   listModels: listCodexModels(config),
+  listConnectors: listCodexConnectors(config),
   open: Effect.fn("CodexProvider.open")(function* (options: ProviderSessionOptions, emit: Emit) {
     const agent = (event: AgentEvent) => emit({ _tag: "Event", event });
     const pendingApprovals = new Map<string, Deferred.Deferred<ApprovalDecision>>();
@@ -248,19 +318,38 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
             error: turn.error?.message ?? null,
           });
         }
+        case "thread/compacted":
+          return agent({
+            _tag: "Notice",
+            level: "info",
+            message: "Context compacted. Earlier messages are now summarized for the agent.",
+          });
         case "thread/tokenUsage/updated": {
           // `total` is the thread's running total; Codex reports no cost.
-          const total = (p.tokenUsage as { total: CodexTokens }).total;
+          const usage = p.tokenUsage as { total: CodexTokens; last: CodexTokens & { totalTokens?: number }; modelContextWindow: number | null };
+          const total = usage.total;
+          // `last` is the latest request: what the context holds now.
+          const context =
+            usage.modelContextWindow && usage.last
+              ? emit({
+                  _tag: "ContextUsage",
+                  used: usage.last.totalTokens ?? usage.last.inputTokens + usage.last.outputTokens,
+                  window: usage.modelContextWindow,
+                })
+              : Effect.void;
           const cached = Math.min(total.cachedInputTokens, total.inputTokens);
-          return emit({
-            _tag: "UsageTotals",
-            totals: {
-              inputTokens: total.inputTokens - cached,
-              cachedInputTokens: cached,
-              outputTokens: total.outputTokens,
-              costUsd: 0,
-            },
-          });
+          return Effect.andThen(
+            context,
+            emit({
+              _tag: "UsageTotals",
+              totals: {
+                inputTokens: total.inputTokens - cached,
+                cachedInputTokens: cached,
+                outputTokens: total.outputTokens,
+                costUsd: 0,
+              },
+            }),
+          );
         }
         case "item/agentMessage/delta":
           return agent({
@@ -414,17 +503,23 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
       ...(options.model ? { model: options.model } : {}),
       approvalPolicy: options.runtimeMode === "full-access" ? "never" : "on-request",
       sandbox: options.runtimeMode === "full-access" ? "danger-full-access" : "workspace-write",
+      // Auto: Codex's reviewer agent decides approval requests instead of the user.
+      ...(options.runtimeMode === "auto" ? { approvalsReviewer: "auto_review" } : {}),
       developerInstructions: options.instructions,
-      ...(options.mcp
-        ? {
-            config: {
+      config: {
+        ...(options.mcp
+          ? {
               [`mcp_servers.${options.mcp.name}`]: {
                 url: options.mcp.url,
                 http_headers: { Authorization: `Bearer ${options.mcp.bearerToken}` },
               },
-            },
-          }
-        : {}),
+            }
+          : {}),
+        // The user's project folders are writable too, like the workspace.
+        ...(options.extraDirectories?.length
+          ? { "sandbox_workspace_write.writable_roots": [...options.extraDirectories] }
+          : {}),
+      },
     };
 
     const started = options.resumeId
@@ -433,18 +528,21 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
     threadId = (started as { thread: { id: string } }).thread.id;
     yield* emit({ _tag: "ResumeId", resumeId: threadId });
 
-    const input = (text: string) => [{ type: "text", text, text_elements: [] }];
+    const input = (text: string, attachments: ReadonlyArray<Attachment> = []) => [
+      ...attachments.filter(isImageAttachment).map((a) => ({ type: "localImage", path: a.path })),
+      { type: "text", text: text + attachmentNote(attachments), text_elements: [] },
+    ];
 
     return {
-      send: (text: string) =>
+      send: (text: string, attachments: ReadonlyArray<Attachment> = []) =>
         // Steer the running turn so mid-turn messages are folded in, like Claude's queue.
         activeTurnId !== null
-          ? call("turn/steer", { threadId, expectedTurnId: activeTurnId, input: input(text) }).pipe(
+          ? call("turn/steer", { threadId, expectedTurnId: activeTurnId, input: input(text, attachments) }).pipe(
               Effect.asVoid,
             )
           : call("turn/start", {
               threadId,
-              input: input(text),
+              input: input(text, attachments),
               ...(options.effort ? { effort: options.effort } : {}),
             }).pipe(Effect.asVoid),
       interrupt: Effect.suspend(() =>
@@ -453,6 +551,10 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
           : call("turn/interrupt", { threadId, turnId: activeTurnId }).pipe(Effect.asVoid),
       ),
       reloadSkills: setSkillRoots,
+      // Codex's app server compacts on request; it reports back with thread/compacted.
+      compact: () => call("thread/compact/start", { threadId }).pipe(Effect.asVoid),
+      // Codex has no slash commands over its app server; Apollo's own commands still apply.
+      commands: Effect.succeed([]),
       respondInput: inputs.respond,
       respondApproval: (requestId: string, decision: ApprovalDecision) =>
         Effect.gen(function* () {

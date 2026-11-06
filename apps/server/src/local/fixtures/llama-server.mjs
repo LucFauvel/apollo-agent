@@ -10,6 +10,11 @@ if (args.includes("--list-devices")) {
 }
 const key = arg("--api-key");
 const models = new Map();
+// A download a previous run left part way, like llama.cpp's unfinished-downloads.json.
+if (process.env.FAKE_LLAMA_INCOMPLETE) {
+  const id = process.env.FAKE_LLAMA_INCOMPLETE;
+  models.set(id, { id, status: { value: "incomplete" } });
+}
 const clients = new Set();
 const send = (event) => {
   for (const res of clients) res.write(`data: ${JSON.stringify(event)}\n\n`);
@@ -35,12 +40,23 @@ createServer(async (req, res) => {
     return;
   }
   if (url.pathname === "/models" && req.method === "GET") return json(res, 200, { data: [...models.values()] });
+  // A reviewer that allows what mentions "search" and asks about the rest.
+  if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
+    const { messages } = await body(req);
+    const text = messages.map((m) => m.content).join("\n");
+    return json(res, 200, { choices: [{ message: { role: "assistant", content: /Tool: .*search/.test(text) ? "ALLOW" : "ASK" } }] });
+  }
   if (url.pathname === "/v1/models") return json(res, 200, { data: [...models.values()] });
   if (url.pathname === "/models" && req.method === "POST") {
     const { model } = await body(req);
     if (!/:[^/]+$/.test(model)) return json(res, 400, { error: { message: "model validation failed, unable to download" } });
     json(res, 200, { success: true });
     const file = `https://huggingface.co/${model}.gguf`;
+    // "Slow" models never finish: they stand for a download cut short.
+    if (model.includes("Slow") || process.env.FAKE_LLAMA_SLOW === "1") {
+      setTimeout(() => send({ model, event: "download_progress", data: { progress: { [file]: { done: 300, total: 1000 } } } }), 30);
+      return;
+    }
     for (const done of [0, 500, 1000]) {
       await new Promise((r) => setTimeout(r, 30));
       send({ model, event: "download_progress", data: { progress: { [file]: { done, total: 1000 } } } });

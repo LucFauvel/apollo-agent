@@ -1,0 +1,6 @@
+<!-- Menu bar / tray icon: the mark in one color. On macOS it is a template image the system tints. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <circle cx="12" cy="12" r="5.5" fill="#000"/>
+  <ellipse cx="12" cy="12" rx="10.5" ry="4" stroke="#000" stroke-width="1.8" transform="rotate(-25 12 12)" opacity=".6"/>
+  <circle cx="20.6" cy="7.6" r="1.6" fill="#000"/>
+</svg>

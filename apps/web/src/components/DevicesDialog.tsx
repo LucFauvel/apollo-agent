@@ -1,8 +1,10 @@
 import type { AuthStatus, PairedClient, PairingToken } from "@apollo/contracts";
+import { Copy, Laptop, Link2, MonitorSmartphone, Smartphone } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { signOut } from "../auth.tsx";
 import { errorMessage, rpc } from "../rpc.ts";
-import { Button, Field, inputClass, Modal } from "./ui.tsx";
+import { PhonePairing } from "./PhonePairing.tsx";
+import { Badge, Button, ErrorText, Field, inputClass, Modal } from "./ui.tsx";
 
 const ago = (ms: number) => {
   const minutes = Math.round((Date.now() - ms) / 60_000);
@@ -54,6 +56,12 @@ export function DevicesDialog({ onClose }: { onClose: () => void }) {
   return (
     <Modal
       title="Devices"
+      description="Devices paired with this Apollo server."
+      icon={
+        <span className="flex size-9 items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900">
+          <MonitorSmartphone className="size-4.5 text-zinc-400" strokeWidth={1.75} />
+        </span>
+      }
       onClose={onClose}
       footer={
         <Button variant="ghost" onClick={onClose}>
@@ -63,11 +71,14 @@ export function DevicesDialog({ onClose }: { onClose: () => void }) {
     >
       <div className="space-y-1.5">
         {clients.map((client) => (
-          <div key={client.id} className="flex items-center gap-3 rounded-md border border-zinc-800 px-3 py-2">
+          <div key={client.id} className="flex items-center gap-3 rounded-xl border border-zinc-800/80 bg-zinc-900/30 px-3 py-2.5">
+            <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-zinc-800/80 text-zinc-400">
+              {/iPhone|iOS|Android/i.test(client.label) ? <Smartphone className="size-4" /> : <Laptop className="size-4" />}
+            </span>
             <div className="min-w-0 flex-1">
-              <div className="truncate text-sm text-zinc-100">
+              <div className="flex items-center gap-2 truncate text-sm text-zinc-100">
                 {client.label}
-                {client.id === current ? <span className="ml-2 text-[10px] text-emerald-400">this device</span> : null}
+                {client.id === current ? <Badge tone="emerald">This device</Badge> : null}
               </div>
               <div className="text-[11px] text-zinc-500">
                 {client.method === "desktop" ? "Desktop app" : "Pairing link"} · active {ago(client.lastSeenAt)}
@@ -80,7 +91,9 @@ export function DevicesDialog({ onClose }: { onClose: () => void }) {
         ))}
       </div>
 
-      <div className="space-y-2 border-t border-zinc-800 pt-4">
+      <PhonePairing onPaired={refresh} />
+
+      <div className="space-y-2 border-t border-zinc-800/80 pt-5">
         <Field label="Pair another device" hint="Creates a one-time link that expires in 10 minutes.">
           <div className="flex gap-2">
             <input
@@ -90,19 +103,19 @@ export function DevicesDialog({ onClose }: { onClose: () => void }) {
               placeholder="Name (optional), e.g. Work laptop"
             />
             <Button className="shrink-0 whitespace-nowrap" onClick={createLink}>
-              Create link
+              <Link2 /> Create link
             </Button>
           </div>
         </Field>
         {link ? (
-          <div className="space-y-1.5 rounded-md border border-zinc-800 bg-zinc-900 p-2.5">
+          <div className="space-y-2 rounded-xl border border-zinc-800 bg-zinc-900 p-3">
             <code className="block font-mono text-[11px] break-all text-zinc-300">{link.url}</code>
             <div className="flex items-center gap-2">
               <Button
                 size="sm"
                 onClick={() => void navigator.clipboard.writeText(link.url).then(() => setCopied(true))}
               >
-                {copied ? "Copied" : "Copy link"}
+                <Copy /> {copied ? "Copied" : "Copy link"}
               </Button>
               <span className="text-[11px] text-zinc-500">
                 Expires at {new Date(link.expiresAt).toLocaleTimeString()}. Anyone with this link can pair once.
@@ -111,7 +124,7 @@ export function DevicesDialog({ onClose }: { onClose: () => void }) {
           </div>
         ) : null}
       </div>
-      {error ? <div className="text-xs text-red-400">{error}</div> : null}
+      <ErrorText>{error}</ErrorText>
     </Modal>
   );
 }

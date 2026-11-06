@@ -1,5 +1,7 @@
-import type { ProviderKind } from "@apollo/contracts";
+import { isDownloaded, type ProviderKind } from "@apollo/contracts";
 import { effectiveModel, useModels } from "../models.ts";
+import { useApp } from "../store.ts";
+import { downloadPercent, splitModelId } from "./LocalModelsDialog.tsx";
 import { cx, inputClass } from "./ui.tsx";
 
 export interface ModelChoice {
@@ -20,14 +22,20 @@ export function ModelPicker({
   provider,
   value,
   onChange,
+  quietErrors = false,
 }: {
   provider: ProviderKind;
   value: ModelChoice;
   onChange: (value: ModelChoice) => void;
+  /** Hide "could not list models" (e.g. when setup is shown right below). */
+  quietErrors?: boolean;
 }) {
   const state = useModels(provider);
+  // Local models still downloading can be picked already; sessions wait for them.
+  const localModels = useApp((s) => (provider === "llamacpp" ? s.localModels : null));
+  const downloading = localModels?.models.filter((m) => !isDownloaded(m)) ?? [];
 
-  if (state.status !== "ready") {
+  if (state.status !== "ready" && downloading.length === 0) {
     return (
       <div className="space-y-1">
         <input
@@ -37,15 +45,16 @@ export function ModelPicker({
           onChange={(e) => onChange({ model: e.target.value.trim() || null, effort: value.effort })}
           placeholder={state.status === "loading" ? "Loading models…" : "Provider default"}
         />
-        {state.status === "error" ? (
+        {state.status === "error" && !quietErrors ? (
           <div className="text-[11px] text-zinc-500">Could not list models ({state.error}). Type a model id, or leave empty.</div>
         ) : null}
       </div>
     );
   }
 
-  const { models } = state;
-  const known = value.model === null || models.some((m) => m.id === value.model);
+  const models = state.status === "ready" ? state.models : [];
+  const pending = downloading.filter((d) => !models.some((m) => m.id === d.id));
+  const known = value.model === null || models.some((m) => m.id === value.model) || pending.some((m) => m.id === value.model);
   const fallback = models.find((m) => m.isDefault);
   const current = effectiveModel(models, value.model);
   const efforts = current?.efforts ?? [];
@@ -73,6 +82,14 @@ export function ModelPicker({
               {m.label}
             </option>
           ))}
+          {pending.map((m) => {
+            const { name, quant } = splitModelId(m.id);
+            return (
+              <option key={m.id} value={m.id}>
+                {name} {quant ?? ""} · downloading {downloadPercent(m)}%
+              </option>
+            );
+          })}
           <option value={CUSTOM}>Other…</option>
         </select>
         {!known ? (

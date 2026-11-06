@@ -1,4 +1,5 @@
 import { mkdtempSync } from "node:fs";
+import * as AppSettings from "../AppSettings.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AgentEvent, type AppChange, DEFAULT_BOT_LIMITS, type ProviderKind, type ScheduleId } from "@apollo/contracts";
@@ -41,6 +42,8 @@ const fakeProvider = (kind: ProviderKind): Provider => ({
         interrupt: Effect.void,
         respondApproval: () => Effect.void,
         respondInput: () => Effect.void,
+        compact: () => Effect.void,
+        commands: Effect.succeed([]),
         reloadSkills: Effect.void,
       };
     }),
@@ -57,6 +60,7 @@ const layer = Scheduler.layerWith({ tickEvery: null, taskTimeout: "5 seconds", h
       llamacpp: fakeProvider("llamacpp"),
     }),
   ),
+  Layer.provideMerge(AppSettings.layer),
   Layer.provideMerge(Store.layer),
   Layer.provideMerge(Database.layerMemory),
   Layer.provideMerge(
@@ -67,6 +71,7 @@ const layer = Scheduler.layerWith({ tickEvery: null, taskTimeout: "5 seconds", h
       webDistDir: null,
       baseUrl: "http://127.0.0.1:0",
       claudeExecutable: undefined,
+      browser: { executable: undefined, headless: true },
       llamaCpp: { baseUrl: "http://127.0.0.1:8080", apiKey: null },
       codexExecutable: undefined,
       allowedOrigins: [],

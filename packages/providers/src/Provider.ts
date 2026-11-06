@@ -1,6 +1,7 @@
 import {
   type AgentEvent,
   type ApprovalDecision,
+  type ConnectorInfo,
   type InputResponse,
   type ModelOption,
   ProviderKind,
@@ -25,6 +26,8 @@ export interface McpEndpoint {
 
 export interface ProviderSessionOptions {
   readonly cwd: string;
+  /** Folders outside `cwd` the agent may read and edit (the user's project folders). */
+  readonly extraDirectories?: ReadonlyArray<string>;
   readonly model: string | null;
   /** Reasoning effort level; `null` uses the model's default. */
   readonly effort: string | null;
@@ -51,8 +54,17 @@ export type ProviderEmission =
    * turns from before a resume, so consumers record the difference.
    */
   | { readonly _tag: "UsageTotals"; readonly totals: Usage }
+  /** How full the model's context window is now (tokens in the last request vs the window). */
+  | { readonly _tag: "ContextUsage"; readonly used: number; readonly window: number }
   /** The underlying process/connection ended; the session must be reopened. */
   | { readonly _tag: "Exited"; readonly reason: string };
+
+/** A slash command the provider's harness offers (Claude Code: built-in, custom and skills). */
+export interface ProviderCommand {
+  readonly name: string;
+  readonly description: string;
+  readonly argumentHint: string;
+}
 
 export type Emit = (emission: ProviderEmission) => Effect.Effect<void>;
 
@@ -60,9 +72,31 @@ export type Emit = (emission: ProviderEmission) => Effect.Effect<void>;
  * A live connection to one provider conversation. Its lifetime is bound to the
  * `Scope` it was opened in: closing the scope stops the underlying process.
  */
+/** A file the user attached to a message, saved on this machine. */
+export interface Attachment {
+  readonly path: string;
+  readonly name: string;
+  readonly mime: string;
+  readonly size: number;
+}
+
+/** Images providers can take as image input (others are passed as file paths). */
+export const isImageAttachment = (a: Attachment) => /^image\/(png|jpe?g|gif|webp)$/.test(a.mime) && a.size <= 5 * 1024 * 1024;
+
+/** A note listing attachments by path, so the agent can read them with its own tools. */
+export const attachmentNote = (attachments: ReadonlyArray<Attachment>) =>
+  attachments.length === 0
+    ? ""
+    : [
+        "",
+        "",
+        `[Attached by the user — ${attachments.some(isImageAttachment) ? "images are included above; " : ""}read files from these paths:]`,
+        ...attachments.map((a) => `- ${a.name} (${a.mime}, ${a.size} bytes): ${a.path}`),
+      ].join("\n");
+
 export interface ProviderSession {
   /** Starts a turn, or steers the running turn if the provider supports it. */
-  readonly send: (text: string) => Effect.Effect<void, ProviderError>;
+  readonly send: (text: string, attachments?: ReadonlyArray<Attachment>) => Effect.Effect<void, ProviderError>;
   readonly interrupt: Effect.Effect<void, ProviderError>;
   readonly respondApproval: (
     requestId: string,
@@ -72,6 +106,10 @@ export interface ProviderSession {
   readonly respondInput: (requestId: string, response: InputResponse) => Effect.Effect<void, ProviderError>;
   /** Re-reads `skillsPluginDir` after Apollo rewrote it. */
   readonly reloadSkills: Effect.Effect<void, ProviderError>;
+  /** Summarizes the conversation so far to free context (optional `instructions` on what to keep). */
+  readonly compact: (instructions: string) => Effect.Effect<void, ProviderError>;
+  /** The harness's own slash commands, sent as messages starting with `/`. */
+  readonly commands: Effect.Effect<ReadonlyArray<ProviderCommand>, ProviderError>;
 }
 
 export interface Provider {
@@ -82,13 +120,18 @@ export interface Provider {
   ) => Effect.Effect<ProviderSession, ProviderError, Scope.Scope>;
   /** Models the provider offers to this user (asks the CLI, so it takes a moment). */
   readonly listModels: Effect.Effect<ReadonlyArray<ModelOption>, ProviderError>;
+  /**
+   * Connectors and MCP servers its sessions load (asks the CLI without starting a
+   * conversation, so it costs no tokens; takes a few seconds).
+   */
+  readonly listConnectors?: Effect.Effect<ReadonlyArray<ConnectorInfo>, ProviderError>;
 }
 
 /** Compact one-line description of a tool input for transcript display. */
 export const summarizeToolInput = (input: unknown): string => {
   if (input === null || typeof input !== "object") return String(input ?? "");
   const record = input as Record<string, unknown>;
-  for (const key of ["command", "file_path", "path", "pattern", "url", "query", "description"]) {
+  for (const key of ["command", "file_path", "path", "pattern", "url", "query", "description", "title", "label"]) {
     const value = record[key];
     if (typeof value === "string" && value.length > 0) return truncate(value, 200);
   }

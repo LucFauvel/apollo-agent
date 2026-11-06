@@ -3,7 +3,9 @@ import type {
   AppSnapshot,
   Bot,
   BotId,
+  BrowserTab,
   LocalModelsState,
+  PullRequest,
   Schedule,
   ScheduleId,
   Session,
@@ -25,6 +27,10 @@ export interface AppState {
   /** llama.cpp engine, server and model library; loaded when first needed. */
   readonly localModels: LocalModelsState | null;
   readonly schedules: ReadonlyMap<ScheduleId, Schedule>;
+  /** Open pages in the built-in browser, by tab id. */
+  readonly browserTabs: ReadonlyMap<string, BrowserTab>;
+  /** Pull requests linked to sessions, keyed `${sessionId} ${url}`. */
+  readonly pullRequests: ReadonlyMap<string, PullRequest>;
 }
 
 export type Notice = Extract<AppChange, { _tag: "Notify" }>;
@@ -44,6 +50,8 @@ let state: AppState = {
   knowledgeVersion: new Map(),
   localModels: null,
   schedules: new Map(),
+  browserTabs: new Map(),
+  pullRequests: new Map(),
 };
 const listeners = new Set<() => void>();
 
@@ -56,6 +64,10 @@ const subscribe = (listener: () => void) => {
   listeners.add(listener);
   return () => listeners.delete(listener);
 };
+
+/** For non-React code: the current state, and a callback on every change. */
+export const getAppState = () => state;
+export const subscribeApp = subscribe;
 
 export const useApp = <T>(select: (state: AppState) => T): T =>
   useSyncExternalStore(subscribe, () => select(state));
@@ -75,7 +87,8 @@ const apply = (change: AppChange) => {
       bots.delete(change.botId);
       const sessions = new Map([...state.sessions].filter(([, s]) => s.botId !== change.botId));
       const schedules = new Map([...state.schedules].filter(([, s]) => s.botId !== change.botId));
-      return setState({ ...state, bots, sessions, schedules });
+      const browserTabs = new Map([...state.browserTabs].filter(([, t]) => t.botId !== change.botId));
+      return setState({ ...state, bots, sessions, schedules, browserTabs });
     }
     case "SessionUpserted":
       return setState({
@@ -100,6 +113,22 @@ const apply = (change: AppChange) => {
       const schedules = new Map(state.schedules);
       schedules.delete(change.scheduleId);
       return setState({ ...state, schedules });
+    }
+    case "BrowserTabUpserted":
+      return setState({ ...state, browserTabs: new Map(state.browserTabs).set(change.tab.id, change.tab) });
+    case "PullRequestUpserted": {
+      const pr = change.pullRequest;
+      return setState({ ...state, pullRequests: new Map(state.pullRequests).set(`${pr.sessionId} ${pr.url}`, pr) });
+    }
+    case "PullRequestRemoved": {
+      const pullRequests = new Map(state.pullRequests);
+      pullRequests.delete(`${change.sessionId} ${change.url}`);
+      return setState({ ...state, pullRequests });
+    }
+    case "BrowserTabClosed": {
+      const browserTabs = new Map(state.browserTabs);
+      browserTabs.delete(change.tabId);
+      return setState({ ...state, browserTabs });
     }
     case "Notify":
       for (const listener of noticeListeners) listener(change);
@@ -131,6 +160,8 @@ export const startSync = () =>
           sessions: new Map(item.sessions.map((s) => [s.id, s])),
           usageToday: new Map(item.usageToday.map((u) => [u.botId, u.usage])),
           schedules: new Map(item.schedules.map((s) => [s.id, s])),
+          browserTabs: new Map(item.browserTabs.map((t) => [t.id, t])),
+          pullRequests: new Map(item.pullRequests.map((p) => [`${p.sessionId} ${p.url}`, p])),
         });
       } else {
         apply(item);

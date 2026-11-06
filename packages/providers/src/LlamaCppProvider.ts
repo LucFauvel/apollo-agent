@@ -23,6 +23,8 @@ export interface LlamaCppProviderConfig {
    * start the server first (Apollo-managed llama.cpp), or fail saying what to set up.
    */
   readonly connection: Effect.Effect<LlamaCppConnection, ProviderError>;
+  /** Reviewer model for auto mode (see ClaudeBackend.review). */
+  readonly review?: ClaudeBackend["review"];
 }
 
 const fail = (message: string) => new ProviderError({ provider: "llamacpp", message });
@@ -186,9 +188,15 @@ export const startProxy = (connection: LlamaCppConnection) =>
           response.writeHead(upstream.status, {
             "content-type": upstream.headers.get("content-type") ?? "application/json",
           });
-          if (upstream.body) Readable.fromWeb(upstream.body as never).pipe(response);
-          else response.end();
+          if (upstream.body) {
+            // Claude Code cancels requests (Stop, interrupts): the stream then fails with an
+            // AbortError, which must not go unhandled (it would take the whole server down).
+            const stream = Readable.fromWeb(upstream.body as never);
+            stream.on("error", () => response.destroy());
+            stream.pipe(response);
+          } else response.end();
         } catch (error) {
+          if (response.destroyed || response.writableEnded) return;
           if (!response.headersSent) response.writeHead(502, { "content-type": "application/json" });
           response.end(JSON.stringify({ error: { type: "api_error", message: `llama-server: ${String(error)}` } }));
         }
@@ -231,8 +239,25 @@ export const llamaCppEnvironment = (
     // Auto-compaction must start before llama-server runs out of context.
     ...(contextSize ? { CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(contextSize) } : {}),
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    // Load every tool definition up front. Loading them on demand (ToolSearch) changes the
+    // start of the prompt mid-conversation, which voids llama-server's prompt cache: a local
+    // model then re-reads the whole prompt (minutes for a large model) after each lookup.
+    ENABLE_TOOL_SEARCH: "false",
   };
 };
+
+/**
+ * Claude Code's own system prompt says it runs on a Claude model. Behind llama.cpp
+ * it does not, and the model should not claim to be Claude when asked.
+ */
+export const identity = (model: string) =>
+  [
+    "# Your model",
+    `You are ${labelOf(model)} (\`${model}\`), an open-weights model running locally on this machine through`,
+    "llama.cpp. You are not Claude and were not made by Anthropic: Claude Code is only the harness you run in (its",
+    "tools and system prompt). Ignore any statement above that names a Claude model as yours. When asked who or what",
+    `you are, say you are ${labelOf(model).split(" · ")[0]} running locally through Apollo.`,
+  ].join("\n");
 
 /**
  * A local model served by llama.cpp's llama-server, driven by the Claude Code
@@ -243,6 +268,7 @@ export const makeLlamaCppProvider = (config: LlamaCppProviderConfig): Provider =
   const backend: ClaudeBackend = {
     kind: "llamacpp",
     free: true,
+    ...(config.review ? { review: config.review } : {}),
     listModels: Effect.flatMap(config.connection, listLlamaCppModels),
     prepare: (requested) =>
       Effect.gen(function* () {
@@ -256,7 +282,7 @@ export const makeLlamaCppProvider = (config: LlamaCppProviderConfig): Provider =
         const contextSize = yield* llamaCppContextSize(connection, model);
         // Lives as long as the session.
         const proxy = yield* startProxy(connection);
-        return { model, env: llamaCppEnvironment(proxy, model, contextSize) };
+        return { model, env: llamaCppEnvironment(proxy, model, contextSize), instructions: identity(model) };
       }),
   };
   return makeClaudeProvider({ executable: config.executable, backend });

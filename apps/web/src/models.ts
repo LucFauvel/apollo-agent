@@ -59,9 +59,12 @@ export const useModels = (provider: ProviderKind): ModelsState => {
 export const effectiveModel = (models: ReadonlyArray<ModelOption>, model: string | null) =>
   models.find((m) => m.id === model) ?? (model === null ? models.find((m) => m.isDefault) : undefined);
 
-/** Short display name for a model id, falling back to the id itself. */
+/**
+ * Short display name for the model a session runs: the chosen id's label, or
+ * the provider's default model when none was chosen (null until it is known).
+ */
 export const useModelLabel = (provider: ProviderKind, model: string | null): string | null => {
   const state = useModels(provider);
-  if (model === null) return null;
-  return state.status === "ready" ? (state.models.find((m) => m.id === model)?.label ?? model) : model;
+  if (state.status !== "ready") return model;
+  return effectiveModel(state.models, model)?.label ?? model;
 };

@@ -1,5 +1,6 @@
 import type { AuthStatus, PairResponse } from "@apollo/contracts";
 import { type ReactNode, useCallback, useEffect, useState } from "react";
+import { ApolloMark } from "./components/icons.tsx";
 import { Button, inputClass } from "./components/ui.tsx";
 
 const fetchStatus = async (): Promise<AuthStatus> => {
@@ -58,8 +59,9 @@ function PairScreen({ initialError, onPaired }: { initialError: string | null; o
 
   return (
     <div className="flex h-screen items-center justify-center bg-zinc-950 p-6 text-zinc-200">
-      <div className="w-full max-w-md space-y-4 rounded-xl border border-zinc-800 bg-zinc-950 p-6">
+      <div className="w-full max-w-md space-y-4 rounded-2xl border border-zinc-800 bg-zinc-900/30 p-6 shadow-2xl shadow-black/40">
         <div>
+          <ApolloMark size={28} className="mb-4 text-zinc-100" />
           <div className="text-lg font-semibold text-zinc-100">Pair this device</div>
           <p className="mt-1 text-sm text-zinc-400">
             Apollo only accepts paired devices. Open a pairing link, or paste one here. To get a link, run{" "}
@@ -142,7 +144,8 @@ export function AuthGate({ children }: { children: ReactNode }) {
       return <div className="h-screen bg-zinc-950" />;
     case "offline":
       return (
-        <div className="flex h-screen items-center justify-center bg-zinc-950 text-sm text-zinc-400">
+        <div className="flex h-screen flex-col items-center justify-center gap-3 bg-zinc-950 text-sm text-zinc-400">
+          <ApolloMark size={28} className="text-zinc-600" />
           Cannot reach the Apollo server: {gate.error}
         </div>
       );

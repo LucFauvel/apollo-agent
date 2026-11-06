@@ -1,0 +1,35 @@
+<!-- The app icon: Apollo's mark on a dark rounded tile (macOS icon grid: 824 px tile on a 1024 px canvas). -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="512" y1="100" x2="512" y2="924" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#23232b"/>
+      <stop offset="1" stop-color="#0b0b0e"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="512" y1="100" x2="512" y2="924" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff" stop-opacity=".16"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity=".04"/>
+    </linearGradient>
+    <linearGradient id="planet" x1="8" y1="7" x2="16" y2="17" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#e0e7ff"/>
+      <stop offset=".55" stop-color="#a5b4fc"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="512" cy="512" r="340" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6366f1" stop-opacity=".28"/>
+      <stop offset="1" stop-color="#6366f1" stop-opacity="0"/>
+    </radialGradient>
+    <clipPath id="front" clipPathUnits="userSpaceOnUse">
+      <rect x="-4" y="12" width="32" height="12" transform="rotate(-25 12 12)"/>
+    </clipPath>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#tile)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="184.5" fill="none" stroke="url(#edge)" stroke-width="3"/>
+  <circle cx="512" cy="512" r="340" fill="url(#glow)"/>
+  <g transform="translate(200 200) scale(26)">
+    <!-- The orbit passes behind the planet at the top and in front of it at the bottom. -->
+    <ellipse cx="12" cy="12" rx="10.5" ry="4" fill="none" stroke="#b4b4c2" stroke-width="1.15" transform="rotate(-25 12 12)"/>
+    <circle cx="12" cy="12" r="5.5" fill="url(#planet)"/>
+    <ellipse cx="12" cy="12" rx="10.5" ry="4" fill="none" stroke="#b4b4c2" stroke-width="1.15" transform="rotate(-25 12 12)" clip-path="url(#front)"/>
+    <circle cx="20.6" cy="7.6" r="1.5" fill="#fef3c7"/>
+  </g>
+</svg>

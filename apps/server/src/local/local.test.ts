@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +14,7 @@ import * as Store from "../Store.ts";
 import { type Release, recommendBackend, selectAssets } from "./Engine.ts";
 import { modelShape, parseGgufHeader } from "./Gguf.ts";
 import { parseCudaVersion, parseListDevices, parseNvidiaSmi } from "./Hardware.ts";
-import { LocalModels, layer as localModelsLayer, toLocalModel } from "./LocalModels.ts";
+import { LocalModels, layer as localModelsLayer, loadProgressOf, reapOrphans, toLocalModel } from "./LocalModels.ts";
 import { bitsOf, fitOf, groupQuants, memoryBudget, memoryNeeded, pickQuant } from "./Lookup.ts";
 
 const GIB = 1024 ** 3;
@@ -273,6 +274,18 @@ describe("engine builds", () => {
 // ---------------------------------------------------------------------------
 
 describe("router models", () => {
+  it("turns llama-server's staged load progress into one number", () => {
+    const stages = ["text_model", "mmproj_model"];
+    expect(loadProgressOf({ stages, current: "text_model", value: 0 })).toBe(0);
+    expect(loadProgressOf({ stages, current: "text_model", value: 0.5 })).toBeCloseTo(0.45);
+    expect(loadProgressOf({ stages, current: "mmproj_model", value: 0.5 })).toBeCloseTo(0.95);
+    expect(loadProgressOf({ stages, current: "mmproj_model", value: 1 })).toBe(1);
+    expect(loadProgressOf({ stages: ["text_model"], current: "text_model", value: 0.3 })).toBeCloseTo(0.27);
+    expect(loadProgressOf({ stage: "mmproj_model" })).toBeNull();
+    const loading = toLocalModel({ id: "a:Q4", status: { value: "loading" } }, undefined, 0.4);
+    expect(loading).toMatchObject({ status: "loading", loadProgress: 0.4 });
+  });
+
   it("reports whether a loaded model spilled into system RAM", () => {
     const measured = (host: number) => ({
       id: "a/b-GGUF:Q4_K_M",
@@ -319,6 +332,38 @@ const waitFor = <A>(check: Effect.Effect<A | undefined>, what: string) =>
     return yield* Effect.die(new Error(`timed out waiting for ${what}`));
   });
 
+describe("orphaned llama-servers", () => {
+  it.live("stops processes left running from Apollo's engines folder, and nothing else", () =>
+    Effect.gen(function* () {
+      const engines = join(mkdtempSync(join(tmpdir(), "apollo-engines-")), "engines");
+      mkdirSync(join(engines, "b1-cpu", "bin"), { recursive: true });
+      const fake = join(engines, "b1-cpu", "bin", "llama-server");
+      // A real binary at that path (a symlink: macOS kills copied system binaries), as `ps`
+      // shows llama-server by its own path.
+      symlinkSync("/bin/sleep", fake);
+      // Orphan-like: started through a shell that exits, so it is not this process's child.
+      const orphan = spawn("/bin/sh", ["-c", `"${fake}" 30 & echo $!`], { stdio: ["ignore", "pipe", "ignore"] });
+      const pid = Number(yield* Effect.promise(() => new Promise<string>((r) => orphan.stdout!.once("data", (d) => r(String(d))))));
+      const bystander = spawn("sleep", ["30"]);
+      yield* Effect.sleep("200 millis");
+
+      expect(reapOrphans(engines)).toBeGreaterThanOrEqual(1);
+      yield* Effect.sleep("300 millis");
+      const alive = (p: number) => {
+        try {
+          process.kill(p, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      expect(alive(pid)).toBe(false);
+      expect(alive(bystander.pid!)).toBe(true);
+      bystander.kill();
+    }),
+  );
+});
+
 describe("managed llama-server", () => {
   it.live(
     "starts the server, downloads a model, and hands sessions a connection",
@@ -361,6 +406,80 @@ describe("managed llama-server", () => {
         expect((yield* local.logs).some((line) => line.includes("fake llama-server listening"))).toBe(true);
       }).pipe(Effect.provide(managedLayer())),
     30_000,
+  );
+
+  it.live("resumes a download cut short when the server starts again", () =>
+    Effect.gen(function* () {
+      const local = yield* LocalModels;
+      const store = yield* Store.Store;
+      const id = "unsloth/Slow-GGUF:Q4_K_M";
+      yield* local.download("unsloth/Slow-GGUF", "Q4_K_M");
+      yield* waitFor(
+        Effect.map(local.state, (s) => s.models.find((m) => m.id === id && m.download?.done === 300)),
+        "download progress",
+      );
+      expect(yield* store.getSetting("llamacpp.pendingDownloads")).toBe(JSON.stringify([id]));
+      // Sessions on that model, or on the default with nothing else downloaded, wait for it.
+      expect(yield* local.downloadBlocking(id)).toBe(id);
+      expect(yield* local.downloadBlocking(null)).toBe(id);
+      expect(yield* local.downloadBlocking("other:Q8_0")).toBeNull();
+
+      // Apollo quits mid-download, then starts again.
+      yield* local.stopServer;
+      yield* local.startServer;
+      const resumed = yield* waitFor(
+        Effect.map(local.state, (s) => s.models.find((m) => m.id === id && m.status === "downloading")),
+        "the download to resume",
+      );
+      expect(resumed.download).not.toBeNull();
+      expect((yield* local.logs).some((line) => line.includes(`Resuming the download of ${id}`))).toBe(true);
+
+      // Cancelling forgets it for good.
+      yield* local.cancelDownload(id);
+      expect(yield* store.getSetting("llamacpp.pendingDownloads")).toBeNull();
+      yield* local.stopServer;
+    }).pipe(Effect.provide(managedLayer())),
+  );
+
+  it.live("resumes a download llama.cpp reports as incomplete", () =>
+    Effect.gen(function* () {
+      const id = "unsloth/Partial-GGUF:Q4_K_M";
+      process.env.FAKE_LLAMA_INCOMPLETE = id;
+      const local = yield* LocalModels;
+      yield* local.startServer;
+      const done = yield* waitFor(
+        Effect.map(local.state, (s) => s.models.find((m) => m.id === id && m.status === "unloaded")),
+        "the incomplete download to resume and finish",
+      );
+      expect(done.download).toBeNull();
+      expect((yield* local.logs).some((line) => line.includes(`Resuming the download of ${id}`))).toBe(true);
+      yield* local.stopServer;
+    }).pipe(
+      Effect.provide(managedLayer()),
+      Effect.ensuring(Effect.sync(() => delete process.env.FAKE_LLAMA_INCOMPLETE)),
+    ),
+  );
+
+  it.live("reviews unclear tool calls with the reviewer model, and asks when there is none", () =>
+    Effect.gen(function* () {
+      const local = yield* LocalModels;
+      const call = (tool: string) => ({ tool, input: {}, cwd: "/tmp/w", task: "check my Slack" });
+      // No reviewer chosen: ask.
+      expect(yield* local.review(call("mcp__claude_ai_Slack__slack_search_public"))).toBe("ask");
+
+      yield* local.download("unsloth/Tiny-GGUF", "Q4_K_M");
+      const id = "unsloth/Tiny-GGUF:Q4_K_M";
+      yield* waitFor(Effect.map(local.state, (s) => s.models.find((m) => m.id === id && m.status === "unloaded")), "the download");
+      yield* local.setReviewer(id);
+      expect((yield* local.state).reviewerModel).toBe(id);
+      expect(yield* local.review(call("mcp__claude_ai_Slack__slack_search_public"))).toBe("allow");
+      expect(yield* local.review(call("mcp__claude_ai_Slack__slack_send_message"))).toBe("ask");
+
+      // Removing the model clears the choice.
+      yield* local.deleteModel(id);
+      expect((yield* local.state).reviewerModel).toBeNull();
+      yield* local.stopServer;
+    }).pipe(Effect.provide(managedLayer())),
   );
 
   it.live("explains a refused download", () =>

@@ -18,6 +18,7 @@ const layer = Store.layer.pipe(Layer.provideMerge(Database.layerMemory));
 const bot = (id: string): Bot => ({
   id: id as BotId,
   name: id,
+  avatar: { shape: "blob", color: "sky" },
   instructions: "",
   cwd: "/tmp",
   main: { provider: "claude" },
@@ -42,6 +43,8 @@ const session = (id: string, botId: string, role: SessionRole = "worker"): Sessi
   effort: null,
   runtimeMode: null,
   cwd: "/tmp",
+  worktree: null,
+  context: null,
   status: "idle",
   resumeId: null,
   lastMessage: null,

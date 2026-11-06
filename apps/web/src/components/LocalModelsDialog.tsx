@@ -1,18 +1,21 @@
-import type {
-  LlamaBackend,
-  LocalModel,
-  LocalModelsState,
-  ModelCandidate,
-  ModelDetails,
-  ModelFit,
-  QuantOption,
-  SuggestedModel,
+import {
+  isDownloaded,
+  type LlamaBackend,
+  type LocalModel,
+  type LocalModelsState,
+  type ModelCandidate,
+  type ModelDetails,
+  type ModelFit,
+  type QuantOption,
+  type SuggestedModel,
 } from "@apollo/contracts";
 import { useEffect, useState } from "react";
 import { forgetModels } from "../models.ts";
 import { errorMessage, rpc } from "../rpc.ts";
 import { setLocalModels, useApp } from "../store.ts";
-import { Button, cx, inputClass, Modal } from "./ui.tsx";
+import { Cpu } from "lucide-react";
+import { LlamaLogo } from "./icons.tsx";
+import { Button, cx, ErrorText, inputClass, Modal } from "./ui.tsx";
 
 const GB = 1024 ** 3;
 export const formatBytes = (bytes: number) =>
@@ -20,6 +23,94 @@ export const formatBytes = (bytes: number) =>
 const formatParams = (n: number | null) => (n === null ? null : n >= 1e9 ? `${(n / 1e9).toFixed(n >= 1e10 ? 0 : 1)}B` : `${Math.round(n / 1e6)}M`);
 const formatCount = (n: number) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
 const formatContext = (n: number) => `${Math.round(n / 1024)}K context`;
+
+/** Starts a stopped download again; llama.cpp continues from the partial files. */
+const resumeDownload = (id: string) => {
+  const [repo, quant] = id.split(/:(?=[^/]+$)/);
+  return rpc((c) => c["localModels.download"]({ repo: repo!, quant: quant ?? "" }));
+};
+
+/** Download progress of a local model, 0-100. */
+export const downloadPercent = (model: LocalModel) =>
+  model.download && model.download.total > 0 ? Math.floor((model.download.done / model.download.total) * 100) : 0;
+
+/**
+ * The download a llama.cpp session must wait for: its model, or (with no model
+ * chosen and none ready yet) the first one downloading. `null` when it can run.
+ */
+export const blockingDownload = (state: LocalModelsState | null, model: string | null): LocalModel | null => {
+  if (!state) return null;
+  const unfinished = state.models.filter((m) => !isDownloaded(m));
+  if (model) return unfinished.find((m) => m.id === model) ?? null;
+  return state.models.some(isDownloaded) ? null : (unfinished.find((m) => m.status === "downloading") ?? unfinished[0] ?? null);
+};
+
+/** Loads the local models state once, if nothing has yet; it stays current through app changes. */
+export const useLocalModels = (enabled = true) => {
+  const state = useApp((s) => s.localModels);
+  useEffect(() => {
+    if (enabled && !state) void rpc((c) => c["localModels.state"]()).then(setLocalModels, () => undefined);
+  }, [enabled, state === null]);
+  return state;
+};
+
+/** A model download in progress, as a card (e.g. in a conversation waiting for it). */
+export function DownloadProgress({ model }: { model: LocalModel }) {
+  const { name, quant } = splitModelId(model.id);
+  const download = model.download;
+  return (
+    <div className="animate-fade-up space-y-2 rounded-xl border border-sky-500/25 bg-gradient-to-b from-sky-950/30 to-zinc-950 p-3.5">
+      <div className="flex items-center gap-2.5 text-xs">
+        <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-sky-500/10">
+          <LlamaLogo size={16} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-medium text-zinc-100">
+            {model.status === "incomplete" ? "Download stopped:" : "Downloading"} {name} {quant ? <span className="font-mono text-[11px] text-zinc-500">{quant}</span> : null}
+          </div>
+          <div className="text-zinc-500">The conversation starts once the model is on this machine.</div>
+        </div>
+        {model.status === "incomplete" ? (
+          <Button size="sm" variant="primary" onClick={() => void resumeDownload(model.id)}>
+            Resume
+          </Button>
+        ) : (
+          <span className="shrink-0 font-mono text-sm text-sky-200 tabular-nums">{downloadPercent(model)}%</span>
+        )}
+      </div>
+      <Bar done={download?.done ?? 0} total={download?.total ?? 0} />
+      <div className="flex justify-between text-[11px] text-zinc-500">
+        <span>
+          {download && download.total > 0 ? `${formatBytes(download.done)} of ${formatBytes(download.total)}` : "Starting…"}
+        </span>
+        <span>If you quit Apollo, it picks up where it left off next time.</span>
+      </div>
+    </div>
+  );
+}
+
+/** A local model being loaded into memory, shown while a conversation waits for it. */
+export function LoadProgress({ model }: { model: LocalModel }) {
+  const { name, quant } = splitModelId(model.id);
+  const percent = Math.floor((model.loadProgress ?? 0) * 100);
+  return (
+    <div className="animate-fade-up flex items-center gap-3 rounded-xl border border-zinc-800/80 bg-zinc-900/40 px-3 py-2.5 text-xs">
+      <span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-zinc-800/80">
+        <LlamaLogo size={14} />
+      </span>
+      <div className="min-w-0 flex-1 space-y-1.5">
+        <div className="flex items-center gap-2">
+          <span className="shimmer-text min-w-0 flex-1 truncate">
+            Loading {name}
+            {quant ? ` ${quant}` : ""} into memory
+          </span>
+          <span className="shrink-0 font-mono text-[11px] text-zinc-400 tabular-nums">{percent}%</span>
+        </div>
+        <Bar done={percent} total={100} />
+      </div>
+    </div>
+  );
+}
 
 /** `unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M` → name and quant. */
 export const splitModelId = (id: string) => {
@@ -45,7 +136,7 @@ const FIT: Record<ModelFit, { label: string; className: string; title: string }>
 function FitBadge({ fit }: { fit: ModelFit }) {
   const { label, className, title } = FIT[fit];
   return (
-    <span title={title} className={cx("shrink-0 rounded px-1.5 py-px text-[10px] ring-1 ring-inset", className)}>
+    <span title={title} className={cx("shrink-0 rounded-md px-1.5 py-px text-[10px] font-medium ring-1 ring-inset", className)}>
       {label}
     </span>
   );
@@ -54,8 +145,8 @@ function FitBadge({ fit }: { fit: ModelFit }) {
 function Bar({ done, total }: { done: number; total: number }) {
   const ratio = total > 0 ? Math.min(done / total, 1) : 0;
   return (
-    <div className="h-1.5 w-full overflow-hidden rounded bg-zinc-800">
-      <div className="h-full bg-sky-500 transition-[width]" style={{ width: `${(ratio * 100).toFixed(1)}%` }} />
+    <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+      <div className="h-full rounded-full bg-gradient-to-r from-sky-500 to-indigo-500 transition-[width]" style={{ width: `${(ratio * 100).toFixed(1)}%` }} />
     </div>
   );
 }
@@ -64,7 +155,7 @@ function Section({ title, children, aside }: { title: string; children: React.Re
   return (
     <section className="space-y-2">
       <div className="flex items-center justify-between">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-400">{title}</h3>
+        <h3 className="text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">{title}</h3>
         {aside}
       </div>
       {children}
@@ -86,7 +177,7 @@ function EngineSection({ state, act }: { state: LocalModelsState; act: (f: () =>
   return (
     <Section title="llama.cpp">
       {engine.installing ? (
-        <div className="space-y-1.5 rounded-md border border-zinc-800 p-3">
+        <div className="space-y-1.5 rounded-xl border border-zinc-800/80 p-3">
           <div className="flex justify-between text-xs text-zinc-300">
             <span className="truncate">{engine.installing.step}</span>
             {engine.installing.progress.total > 0 ? (
@@ -98,7 +189,7 @@ function EngineSection({ state, act }: { state: LocalModelsState; act: (f: () =>
           <Bar {...engine.installing.progress} />
         </div>
       ) : (
-        <div className="flex items-center gap-2 rounded-md border border-zinc-800 p-3">
+        <div className="flex items-center gap-2 rounded-xl border border-zinc-800/80 p-3">
           <div className="min-w-0 flex-1 text-xs">
             {engine.installed ? (
               <>
@@ -165,7 +256,7 @@ function ServerSection({ state, act }: { state: LocalModelsState; act: (f: () =>
         </button>
       }
     >
-      <div className="flex items-center gap-2 rounded-md border border-zinc-800 p-3 text-xs">
+      <div className="flex items-center gap-2 rounded-xl border border-zinc-800/80 p-3 text-xs">
         <span className={cx("size-2 shrink-0 rounded-full", dot)} />
         <span className="min-w-0 flex-1 text-zinc-300">
           {status === "running"
@@ -205,6 +296,7 @@ const STATUS_LABEL: Record<LocalModel["status"], string> = {
   loaded: "Loaded",
   sleeping: "Idle (unloaded)",
   downloading: "Downloading",
+  incomplete: "Download stopped",
   failed: "Failed to load",
 };
 
@@ -231,7 +323,23 @@ function LibraryRow({
         <span className={cx("shrink-0 text-[11px]", model.status === "failed" ? "text-red-400" : "text-zinc-500")}>
           {STATUS_LABEL[model.status]}
         </span>
-        {model.status === "downloading" ? (
+        {model.status === "incomplete" ? (
+          <>
+            <Button size="sm" onClick={() => act(() => resumeDownload(model.id))}>
+              Resume
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() =>
+                confirm(`Delete the partial download of ${name}${quant ? ` (${quant})` : ""}?`) &&
+                act(() => rpc((c) => c["localModels.delete"]({ model: model.id })).then(forgetModels))
+              }
+            >
+              Delete
+            </Button>
+          </>
+        ) : model.status === "downloading" ? (
           <Button size="sm" variant="ghost" onClick={() => act(() => rpc((c) => c["localModels.cancelDownload"]({ model: model.id })))}>
             Cancel
           </Button>
@@ -321,12 +429,14 @@ function CandidateRow({
   recommended = false,
   installed,
   act,
+  onDownload,
 }: {
   candidate: ModelCandidate;
   details?: ModelDetails;
   recommended?: boolean;
   installed: ReadonlySet<string>;
   act: (f: () => Promise<unknown>) => void;
+  onDownload?: ((id: string) => void) | undefined;
 }) {
   const [details, setDetails] = useState<ModelDetails | null>(initial ?? null);
   const [open, setOpen] = useState(false);
@@ -343,7 +453,11 @@ function CandidateRow({
       .finally(() => setLoading(false));
   };
   const download = (quant: string) =>
-    act(() => rpc((c) => c["localModels.download"]({ repo: candidate.repo, quant })));
+    act(() =>
+      rpc((c) => c["localModels.download"]({ repo: candidate.repo, quant })).then(() =>
+        onDownload?.(`${candidate.repo}:${quant}`),
+      ),
+    );
 
   return (
     <div className="space-y-1.5 px-3 py-2">
@@ -387,7 +501,17 @@ function CandidateRow({
   );
 }
 
-function FindModels({ installed, act }: { installed: ReadonlySet<string>; act: (f: () => Promise<unknown>) => void }) {
+function FindModels({
+  installed,
+  act,
+  onDownload,
+  compact = false,
+}: {
+  installed: ReadonlySet<string>;
+  act: (f: () => Promise<unknown>) => void;
+  onDownload?: ((id: string) => void) | undefined;
+  compact?: boolean;
+}) {
   const [suggested, setSuggested] = useState<ReadonlyArray<SuggestedModel> | null>(null);
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<ReadonlyArray<ModelCandidate> | null>(null);
@@ -422,13 +546,13 @@ function FindModels({ installed, act }: { installed: ReadonlySet<string>; act: (
         placeholder="Search all GGUF models on Hugging Face (e.g. qwen coder, gemma)"
       />
       {error ? <p className="text-xs text-red-400">{error}</p> : null}
-      <div className="divide-y divide-zinc-800/70 rounded-md border border-zinc-800">
+      <div className={cx("divide-y divide-zinc-800/70 rounded-xl border border-zinc-800/80", compact && "max-h-72 overflow-y-auto")}>
         {results ? (
           results.length === 0 ? (
             <p className="p-3 text-xs text-zinc-500">{searching ? "Searching…" : "No GGUF chat models match."}</p>
           ) : (
             results.map((candidate) => (
-              <CandidateRow key={candidate.repo} candidate={candidate} installed={installed} act={act} />
+              <CandidateRow key={candidate.repo} candidate={candidate} installed={installed} act={act} onDownload={onDownload} />
             ))
           )
         ) : suggested === null ? (
@@ -444,6 +568,7 @@ function FindModels({ installed, act }: { installed: ReadonlySet<string>; act: (
               recommended={recommended}
               installed={installed}
               act={act}
+              onDownload={onDownload}
             />
           ))
         )}
@@ -464,6 +589,59 @@ const hardwareSummary = (state: LocalModelsState) => {
   return [...(gpus.length ? gpus : ["No GPU found"]), `${formatBytes(hardware.ramBytes)} RAM`].join(" · ");
 };
 
+const RECOMMENDED_REVIEWER = "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M";
+
+/**
+ * The small model that reviews tool calls in auto mode on local models, when Apollo's
+ * rules cannot tell whether a call is safe (connector actions, edits outside the workspace).
+ */
+function ReviewerSection({ state, act }: { state: LocalModelsState; act: (f: () => Promise<unknown>) => void }) {
+  const ready = state.models.filter(isDownloaded);
+  const current = state.models.find((m) => m.id === state.reviewerModel) ?? null;
+  const recommendedPresent = state.models.some((m) => m.id === RECOMMENDED_REVIEWER);
+  return (
+    <Section title="Auto mode reviewer">
+      <div className="space-y-2 rounded-xl border border-zinc-800/80 p-3">
+        <p className="text-xs leading-relaxed text-zinc-500">
+          In auto mode, local models get their tool calls checked by Apollo's rules. Calls the rules cannot settle, such as
+          connector actions that send or change things, or edits outside the workspace, go to this small model, which
+          allows them or asks you. Without one, Apollo asks you.
+        </p>
+        <div className="flex items-center gap-2">
+          <select
+            className={inputClass}
+            value={state.reviewerModel ?? ""}
+            onChange={(e) => act(() => rpc((c) => c["localModels.setReviewer"]({ model: e.target.value || null })))}
+          >
+            <option value="">None: rules only, ask about the rest</option>
+            {ready.map((m) => {
+              const { name, quant } = splitModelId(m.id);
+              return (
+                <option key={m.id} value={m.id}>
+                  {name} {quant ?? ""}
+                </option>
+              );
+            })}
+            {current && !isDownloaded(current) ? (
+              <option value={current.id}>
+                {splitModelId(current.id).name} (downloading {downloadPercent(current)}%)
+              </option>
+            ) : null}
+          </select>
+          {!recommendedPresent ? (
+            <Button className="shrink-0" onClick={() => act(() => rpc((c) => c["localModels.installReviewer"]()))}>
+              Get Qwen3 4B (2.5 GB)
+            </Button>
+          ) : null}
+        </div>
+        {current && !isDownloaded(current) ? (
+          <p className="text-[11px] text-zinc-500">Apollo asks you until the reviewer has finished downloading.</p>
+        ) : null}
+      </div>
+    </Section>
+  );
+}
+
 /** Install llama.cpp, run its server, and find, download and manage local models. */
 export function LocalModelsDialog({ onClose }: { onClose: () => void }) {
   const state = useApp((s) => s.localModels);
@@ -481,7 +659,7 @@ export function LocalModelsDialog({ onClose }: { onClose: () => void }) {
   };
 
   // New models change what the llama.cpp provider offers.
-  const ready = state?.models.filter((m) => m.status !== "downloading").length ?? 0;
+  const ready = state?.models.filter(isDownloaded).length ?? 0;
   useEffect(() => forgetModels(), [ready]);
 
   const installed = new Set(state?.models.map((m) => m.id) ?? []);
@@ -489,6 +667,20 @@ export function LocalModelsDialog({ onClose }: { onClose: () => void }) {
     <Modal
       wide
       title="Local models"
+      description={
+        state ? (
+          <span className="flex items-center gap-1.5">
+            <Cpu className="size-3" /> {hardwareSummary(state)}
+          </span>
+        ) : (
+          "llama.cpp, managed by Apollo"
+        )
+      }
+      icon={
+        <span className="flex size-9 items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900">
+          <LlamaLogo size={20} />
+        </span>
+      }
       onClose={onClose}
       footer={
         <Button variant="ghost" onClick={onClose}>
@@ -498,13 +690,12 @@ export function LocalModelsDialog({ onClose }: { onClose: () => void }) {
     >
       {state ? (
         <>
-          <p className="text-[11px] text-zinc-500">{hardwareSummary(state)}</p>
           <EngineSection state={state} act={act} />
           <ServerSection state={state} act={act} />
           {state.engine.installed ? (
             <>
               <Section title="Your models">
-                <div className="divide-y divide-zinc-800/70 rounded-md border border-zinc-800">
+                <div className="divide-y divide-zinc-800/70 rounded-xl border border-zinc-800/80">
                   {state.models.length === 0 ? (
                     <p className="p-3 text-xs text-zinc-500">No models yet. Pick one below.</p>
                   ) : (
@@ -512,13 +703,14 @@ export function LocalModelsDialog({ onClose }: { onClose: () => void }) {
                       <LibraryRow
                         key={model.id}
                         model={model}
-                        isDefault={model.id === (state.defaultModel ?? state.models.find((m) => m.status !== "downloading")?.id)}
+                        isDefault={model.id === (state.defaultModel ?? state.models.find(isDownloaded)?.id)}
                         act={act}
                       />
                     ))
                   )}
                 </div>
               </Section>
+              <ReviewerSection state={state} act={act} />
               <FindModels installed={installed} act={act} />
             </>
           ) : null}
@@ -526,7 +718,84 @@ export function LocalModelsDialog({ onClose }: { onClose: () => void }) {
       ) : (
         <p className="text-sm text-zinc-500">Loading…</p>
       )}
-      {error ? <p className="text-xs text-red-400">{error}</p> : null}
+      <ErrorText>{error}</ErrorText>
     </Modal>
+  );
+}
+
+/**
+ * Inline llama.cpp setup for pickers (e.g. the new bot dialog): install the engine,
+ * follow downloads, and find models with the same lookup as the Local models dialog.
+ * A model downloaded from here is picked right away (`onSelect`); sessions wait for it.
+ */
+export function LocalModelSetup({ onSelect }: { onSelect: (id: string) => void }) {
+  const state = useApp((s) => s.localModels);
+  const [external, setExternal] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const ready = state?.models.filter(isDownloaded) ?? [];
+  const downloading = state?.models.filter((m) => !isDownloaded(m)) ?? [];
+  const [finding, setFinding] = useState<boolean | null>(null);
+  const showFinder = finding ?? ready.length === 0;
+
+  useEffect(() => {
+    rpc((c) => c["localModels.state"]())
+      .then(setLocalModels)
+      .catch((e) => setError(errorMessage(e)));
+    rpc((c) => c["providers.settings"]())
+      .then((s) => setExternal(s.llamacpp.mode === "external"))
+      .catch(() => undefined);
+  }, []);
+
+  // A finished download (or a new engine) changes what the provider offers.
+  const engineTag = state?.engine.installed?.tag;
+  useEffect(() => forgetModels(), [ready.length, engineTag, state?.server.status]);
+
+  const act = (f: () => Promise<unknown>) => {
+    setError(null);
+    f().catch((e) => setError(errorMessage(e)));
+  };
+
+  if (external) return null;
+  if (!state) return <p className="text-xs text-zinc-500">Checking local models…</p>;
+
+  const installed = new Set(state.models.map((m) => m.id));
+  return (
+    <div className="animate-fade-up space-y-3 rounded-xl border border-zinc-800/80 bg-zinc-900/30 p-3">
+      {!state.engine.installed || state.engine.installing ? (
+        <EngineSection state={state} act={act} />
+      ) : (
+        <>
+          <div className="flex items-center gap-2 text-xs">
+            <LlamaLogo size={14} />
+            <span className="flex-1 text-zinc-400">
+              {ready.length === 0
+                ? "No local models yet. Download one to use llama.cpp."
+                : `${ready.length} local model${ready.length === 1 ? "" : "s"} on this machine.`}
+            </span>
+            {ready.length > 0 ? (
+              <Button size="sm" variant="ghost" onClick={() => setFinding(!showFinder)}>
+                {showFinder ? "Hide" : "Download more"}
+              </Button>
+            ) : null}
+          </div>
+          {downloading.length > 0 ? (
+            <div className="divide-y divide-zinc-800/70 rounded-xl border border-zinc-800/80">
+              {downloading.map((model) => (
+                <LibraryRow key={model.id} model={model} isDefault={false} act={act} />
+              ))}
+            </div>
+          ) : null}
+          {showFinder ? (
+            <FindModels
+              installed={installed}
+              act={act}
+              compact
+              onDownload={onSelect}
+            />
+          ) : null}
+        </>
+      )}
+      <ErrorText>{error}</ErrorText>
+    </div>
   );
 }

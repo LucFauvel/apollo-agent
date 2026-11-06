@@ -2,8 +2,10 @@ import {
   type Bot,
   CORE_MEMORY_LIMITS,
   type CoreMemory,
+  type ConnectorInfo,
   type CoreMemoryTarget,
   coreMemoryUsage,
+  type ProviderKind,
   type Session,
   type SessionEvent,
   type Skill,
@@ -28,13 +30,34 @@ export const buildInstructions = (input: {
   readonly session: Session;
   readonly core: CoreMemory;
   readonly skills: ReadonlyArray<Skill>;
+  /** The user's project folders (app setting). */
+  readonly projectFolders?: ReadonlyArray<string>;
+  /** What each provider's sessions can reach (known so far), for the orchestrator. */
+  readonly connectors?: Partial<Record<ProviderKind, ReadonlyArray<ConnectorInfo>>>;
 }): string => {
-  const { bot, session, core, skills } = input;
+  const { bot, session, core, skills, projectFolders = [], connectors = {} } = input;
   const sections: Array<string> = [];
 
   sections.push(
     `# Apollo\nYou are running inside Apollo as part of the bot "${bot.name}". Apollo's tools are on the "${MCP_SERVER_NAME}" MCP server.`,
   );
+
+  if (session.role !== "reflection") {
+    sections.push(
+      [
+        "## Workspace and projects",
+        `Your workspace is \`${session.cwd}\`.`,
+        projectFolders.length > 0
+          ? [
+              "The user keeps their projects in these folders; you can read and edit them too:",
+              ...projectFolders.map((f) => `- \`${f}\``),
+              "When a request is about one of their projects, find it with `apollo_list_projects` (or by listing these",
+              "folders) and work in it by absolute path, instead of asking where it is.",
+            ].join("\n")
+          : "The user has not set any project folders in Apollo's settings; ask for a path when you need one.",
+      ].join("\n"),
+    );
+  }
 
   if (bot.instructions.trim().length > 0) {
     sections.push(`## Bot instructions\n${bot.instructions.trim()}`);
@@ -54,10 +77,14 @@ export const buildInstructions = (input: {
           "- Workers report back automatically when they finish a turn; you can also use `apollo_wait_session`.",
           "- `apollo_list_sessions`, `apollo_send_to_session` and `apollo_interrupt_session` manage workers.",
           "Give workers complete, self-contained task descriptions: they do not see this conversation.",
+          "- For code changes, especially with several workers on one repository, spawn with `isolation: \"worktree\"`:",
+          "  each worker gets its own git worktree on a new branch. Review with `apollo_worktree_status`, then",
+          "  `apollo_worktree_finish` with merge, keep (a branch, e.g. for a pull request) or discard.",
           `- At most ${bot.limits.maxConcurrentWorkers} workers can run at once. If a spawn is refused for that, wait for one with \`apollo_wait_session\`.`,
           "- Match the model and effort to the task: cheap and fast for simple work, stronger for hard problems.",
           "- If Apollo says the bot is paused, stop delegating and tell the user; only they can resume it.",
           "Summarize worker results for the user instead of pasting them verbatim.",
+          ...connectorLines(connectors),
           "",
           "### Acting on your own",
           "You can schedule work for later or for regular intervals with `apollo_schedule_create`:",
@@ -112,6 +139,47 @@ export const buildInstructions = (input: {
     ].join("\n"),
   );
 
+  if (session.role !== "reflection") {
+    sections.push(
+      [
+        "## Built-in browser",
+        "Apollo has a real Chromium browser; the user can watch its tabs live and take over. Use it to check web",
+        "apps you build (local dev servers too), read pages that need JavaScript, and complete flows in websites.",
+        "1. `apollo_browser_open` opens a page (your tab is reused across calls).",
+        '2. `apollo_browser_snapshot` reads it as text with element refs, like `- button "Save" [ref=e7]`.',
+        "3. `apollo_browser_act` clicks, types, presses keys, selects or scrolls by ref; snapshot again to see the result.",
+        "`apollo_browser_wait_for` waits for text or an element, `apollo_browser_evaluate` runs JavaScript,",
+        "`apollo_browser_screenshot` saves a PNG you can open with your image tool, and `apollo_browser_close` closes a tab.",
+        "`apollo_browser_viewport` switches to phone, tablet or desktop sizes and light or dark mode; `apollo_browser_dialogs`",
+        "sets how alerts, confirms and prompts are answered; `apollo_browser_record_start`/`_stop` records a flow and shows",
+        "it to the user as a clip, a good way to prove a UI change works.",
+        "Prefer snapshots over screenshots for reading. Ask the user before submitting payments, sending messages,",
+        "or changing account settings on their behalf, and never type secrets they did not give you for that purpose.",
+        "",
+        "## Long-running commands",
+        "Start builds, test suites and dev servers with `apollo_job_run` instead of blocking your shell: you get a jobId,",
+        "and Apollo messages you when it ends unless you are waiting on it (`apollo_job_wait`). `apollo_job_status` reads",
+        "its output, `apollo_job_stop` stops it. Use notify: false for servers that keep running.",
+        "",
+        "## Pull requests",
+        "After you open or push to a GitHub pull request, link it with `apollo_pr_link`: the user sees its CI status, and",
+        "Apollo messages you when checks fail or pass, a review or comment arrives, or it is merged, so you can respond",
+        "without polling. `apollo_pr_status` reads it now. Messages may also come with files the user attached; their",
+        "paths are listed at the end of the message.",
+        "",
+        "## Showing things to the user",
+        "`apollo_show_html` puts a self-contained HTML page (a chart, table, diagram or mockup) in the conversation;",
+        "check it first with `apollo_preview_html`, which returns a PNG. Use it when a visual answers better than text.",
+        "`apollo_notify` sends a desktop notification: only for what the user asked to hear about or must act on.",
+        "",
+        "## Secrets",
+        "Never ask for passwords, API keys or tokens in chat. Call `apollo_request_secret`: the user types it or picks it",
+        "from 1Password in a private card, and you get a one-use `secretRef` (for `apollo_browser_act` type) or, with",
+        "`delivery: \"file\"`, a private file to read inside a shell command. Never print, log, save or commit a secret.",
+      ].join("\n"),
+    );
+  }
+
   const active = skills.filter((s) => s.status === "active");
   sections.push(
     [
@@ -128,6 +196,41 @@ export const buildInstructions = (input: {
 
   return sections.join("\n\n");
 };
+
+const PROVIDER_NAMES: Record<ProviderKind, string> = { claude: "Claude", codex: "Codex", llamacpp: "llama.cpp" };
+
+/**
+ * Which outside services each provider's workers can use (connectors, MCP servers), so
+ * the orchestrator sends work that needs e.g. Slack to a provider that has it.
+ */
+const connectorLines = (connectors: Partial<Record<ProviderKind, ReadonlyArray<ConnectorInfo>>>) => {
+  const known = Object.entries(connectors) as Array<[ProviderKind, ReadonlyArray<ConnectorInfo>]>;
+  if (known.length === 0) return [];
+  const lines = ["", "### What each provider can reach"];
+  for (const [kind, list] of known) {
+    const ready = list.filter((c) => c.status === "connected");
+    const label = (c: ConnectorInfo) => `${c.name}${c.tools ? ` (${c.tools} tools)` : ""}`;
+    const hosted = ready.filter((c) => c.kind === "connector").map(label);
+    const mcp = ready.filter((c) => c.kind === "mcp").map(label);
+    const parts = [
+      hosted.length ? `connectors: ${hosted.join(", ")}` : null,
+      mcp.length ? `MCP servers: ${mcp.join(", ")}` : null,
+    ].filter(Boolean);
+    const waiting = list.filter((c) => c.status === "needs-auth").length;
+    lines.push(
+      `- ${PROVIDER_NAMES[kind]} workers: ${parts.length ? parts.join("; ") : "no connectors"}${waiting ? ` (${waiting} more need the user to sign in)` : ""}.`,
+    );
+  }
+  lines.push(
+    "Your own session has its provider's connectors too. When a task needs one of these services, do it yourself if",
+    "your provider has it, or spawn a worker on a provider that does. `apollo_list_connectors` refreshes this list.",
+  );
+  return lines;
+};
+
+/** Drops the messages the user kept out of memory (see `sessions.setMemoryExclusion`). */
+export const withoutExcluded = (events: ReadonlyArray<SessionEvent>, excluded: ReadonlySet<number>) =>
+  excluded.size === 0 ? events : events.filter((e) => !excluded.has(e.seq));
 
 /** Condenses a session log into a transcript for a reflection pass. */
 export const transcriptForReflection = (
