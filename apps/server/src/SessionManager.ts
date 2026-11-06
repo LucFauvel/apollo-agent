@@ -119,6 +119,7 @@ export const layerProviders = Layer.effect(
         executable: config.claudeExecutable,
         // Auto mode's reviewer: a small local model the user picked (asks when there is none).
         review: (call) => localModels.review(call),
+        allowSubagents: Effect.map(settings.read, ({ llamacpp }) => llamacpp.allowSubagents),
         connection: Effect.flatMap(
           settings.read,
           ({ llamacpp }): Effect.Effect<LlamaCppConnection, ProviderError> =>

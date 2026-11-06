@@ -170,6 +170,12 @@ describe("LlamaCppProvider", () => {
           // The local model is told it is not Claude.
           expect(JSON.stringify(call.body?.system ?? "")).toContain("You are not Claude");
         }
+        // Subagents are off by default: no Agent tool, and the model is told to use workers.
+        const tools = calls.flatMap((c) => ((c.body as { tools?: Array<{ name: string }> }).tools ?? []).map((t) => t.name));
+        expect(tools).toContain("Bash");
+        expect(tools).not.toContain("Agent");
+        expect(tools).not.toContain("Task");
+        expect(calls.some((c) => JSON.stringify(c.body?.system ?? "").includes("Subagents are off"))).toBe(true);
         const usage = emissions.find((e) => e._tag === "UsageTotals");
         expect(usage).toMatchObject({ totals: { costUsd: 0 } });
         expect(usage?._tag === "UsageTotals" && usage.totals.outputTokens).toBeGreaterThan(0);

@@ -13,7 +13,12 @@ import { Store } from "./Store.ts";
 /** Provider settings with their secrets, for the server's own use only. */
 export interface ProviderCredentials {
   readonly claude: { readonly auth: ClaudeAuth; readonly apiKey: string | null };
-  readonly llamacpp: { readonly mode: LlamaCppMode; readonly baseUrl: string; readonly apiKey: string | null };
+  readonly llamacpp: {
+    readonly mode: LlamaCppMode;
+    readonly baseUrl: string;
+    readonly apiKey: string | null;
+    readonly allowSubagents: boolean;
+  };
 }
 
 const KEYS = {
@@ -22,6 +27,7 @@ const KEYS = {
   llamaMode: "providers.llamacpp.mode",
   llamaUrl: "providers.llamacpp.baseUrl",
   llamaApiKey: "providers.llamacpp.apiKey",
+  llamaSubagents: "providers.llamacpp.allowSubagents",
 } as const;
 
 /** Empty or whitespace-only input clears a value. */
@@ -43,6 +49,8 @@ const make = Effect.gen(function* () {
         mode: mode === "external" ? "external" : "managed",
         baseUrl: (yield* store.getSetting(KEYS.llamaUrl)) ?? config.llamaCpp.baseUrl,
         apiKey: (yield* store.getSetting(KEYS.llamaApiKey)) ?? config.llamaCpp.apiKey,
+        // Off unless turned on: a subagent is a second model run the machine rarely has room for.
+        allowSubagents: (yield* store.getSetting(KEYS.llamaSubagents)) === "true",
       },
     };
   });
@@ -51,7 +59,12 @@ const make = Effect.gen(function* () {
     read,
     (c): ProviderSettingsView => ({
       claude: { auth: c.claude.auth, apiKeySaved: c.claude.apiKey !== null },
-      llamacpp: { mode: c.llamacpp.mode, baseUrl: c.llamacpp.baseUrl, apiKeySaved: c.llamacpp.apiKey !== null },
+      llamacpp: {
+        mode: c.llamacpp.mode,
+        baseUrl: c.llamacpp.baseUrl,
+        apiKeySaved: c.llamacpp.apiKey !== null,
+        allowSubagents: c.llamacpp.allowSubagents,
+      },
     }),
   );
 
@@ -63,6 +76,9 @@ const make = Effect.gen(function* () {
       if (llamacpp?.mode !== undefined) yield* store.setSetting(KEYS.llamaMode, llamacpp.mode);
       if (llamacpp?.baseUrl !== undefined) yield* store.setSetting(KEYS.llamaUrl, clean(llamacpp.baseUrl));
       if (llamacpp?.apiKey !== undefined) yield* store.setSetting(KEYS.llamaApiKey, clean(llamacpp.apiKey));
+      if (llamacpp?.allowSubagents !== undefined) {
+        yield* store.setSetting(KEYS.llamaSubagents, String(llamacpp.allowSubagents));
+      }
       return yield* view;
     });
 

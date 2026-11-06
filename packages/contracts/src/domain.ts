@@ -537,7 +537,13 @@ export type LlamaCppMode = typeof LlamaCppMode.Type;
 /** Provider settings as the UI sees them. Keys are write-only: only whether one is saved. */
 export const ProviderSettings = Schema.Struct({
   claude: Schema.Struct({ auth: ClaudeAuth, apiKeySaved: Schema.Boolean }),
-  llamacpp: Schema.Struct({ mode: LlamaCppMode, baseUrl: Schema.String, apiKeySaved: Schema.Boolean }),
+  llamacpp: Schema.Struct({
+    mode: LlamaCppMode,
+    baseUrl: Schema.String,
+    apiKeySaved: Schema.Boolean,
+    /** Whether local models may start Claude Code subagents (off: one model at a time is all most machines run). */
+    allowSubagents: Schema.Boolean,
+  }),
 });
 export type ProviderSettings = typeof ProviderSettings.Type;
 
@@ -547,7 +553,12 @@ const KeyUpdate = Schema.optional(Schema.NullOr(Schema.String));
 export const UpdateProviderSettingsInput = Schema.Struct({
   claude: Schema.optional(Schema.Struct({ auth: Schema.optional(ClaudeAuth), apiKey: KeyUpdate })),
   llamacpp: Schema.optional(
-    Schema.Struct({ mode: Schema.optional(LlamaCppMode), baseUrl: Schema.optional(Schema.String), apiKey: KeyUpdate }),
+    Schema.Struct({
+      mode: Schema.optional(LlamaCppMode),
+      baseUrl: Schema.optional(Schema.String),
+      apiKey: KeyUpdate,
+      allowSubagents: Schema.optional(Schema.Boolean),
+    }),
   ),
 });
 export type UpdateProviderSettingsInput = typeof UpdateProviderSettingsInput.Type;

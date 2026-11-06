@@ -22,7 +22,8 @@ describe("provider settings", () => {
       const settings = yield* ProviderSettings;
       expect(yield* settings.view).toEqual({
         claude: { auth: "subscription", apiKeySaved: false },
-        llamacpp: { mode: "managed", baseUrl: "http://127.0.0.1:8080", apiKeySaved: false },
+        // Local models start no subagents unless the user allows it.
+        llamacpp: { mode: "managed", baseUrl: "http://127.0.0.1:8080", apiKeySaved: false, allowSubagents: false },
       });
     }).pipe(Effect.provide(layer)),
   );
@@ -41,8 +42,12 @@ describe("provider settings", () => {
       yield* settings.update({ claude: { apiKey: null }, llamacpp: { baseUrl: "http://gpu-box:8080", apiKey: "k" } });
       expect(yield* settings.read).toEqual({
         claude: { auth: "subscription", apiKey: null },
-        llamacpp: { mode: "managed", baseUrl: "http://gpu-box:8080", apiKey: "k" },
+        llamacpp: { mode: "managed", baseUrl: "http://gpu-box:8080", apiKey: "k", allowSubagents: false },
       });
+
+      const allowed = yield* settings.update({ llamacpp: { allowSubagents: true } });
+      expect(allowed.llamacpp.allowSubagents).toBe(true);
+      expect((yield* settings.read).llamacpp.allowSubagents).toBe(true);
     }).pipe(Effect.provide(layer)),
   );
 });

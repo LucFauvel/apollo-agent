@@ -25,7 +25,20 @@ export interface LlamaCppProviderConfig {
   readonly connection: Effect.Effect<LlamaCppConnection, ProviderError>;
   /** Reviewer model for auto mode (see ClaudeBackend.review). */
   readonly review?: ClaudeBackend["review"];
+  /** Whether sessions may start Claude Code subagents; read as each session opens. Off when absent. */
+  readonly allowSubagents?: Effect.Effect<boolean>;
 }
+
+/** Claude Code's tools that start a subagent (another run of the local model). */
+const SUBAGENT_TOOLS = ["Agent", "Task"];
+
+/** Said to a local model that cannot start subagents. */
+export const NO_SUBAGENTS = [
+  "# Subagents are off",
+  "This machine runs one local model at a time, so the Agent tool (subagents) is turned off. To hand a separate",
+  "piece of work to another agent, start an Apollo worker with `apollo_spawn_session` when you have that tool; a",
+  "worker can run on another provider. Otherwise do the work yourself, one step at a time.",
+].join("\n");
 
 const fail = (message: string) => new ProviderError({ provider: "llamacpp", message });
 
@@ -282,7 +295,13 @@ export const makeLlamaCppProvider = (config: LlamaCppProviderConfig): Provider =
         const contextSize = yield* llamaCppContextSize(connection, model);
         // Lives as long as the session.
         const proxy = yield* startProxy(connection);
-        return { model, env: llamaCppEnvironment(proxy, model, contextSize), instructions: identity(model) };
+        const subagents = config.allowSubagents ? yield* config.allowSubagents : false;
+        return {
+          model,
+          env: llamaCppEnvironment(proxy, model, contextSize),
+          instructions: subagents ? identity(model) : `${identity(model)}\n\n${NO_SUBAGENTS}`,
+          ...(subagents ? {} : { disallowedTools: SUBAGENT_TOOLS }),
+        };
       }),
   };
   return makeClaudeProvider({ executable: config.executable, backend });

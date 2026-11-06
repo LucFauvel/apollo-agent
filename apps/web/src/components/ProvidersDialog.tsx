@@ -14,7 +14,7 @@ import { errorMessage, rpc } from "../rpc.ts";
 import { updateProvider, useProviderVersions } from "../versions.ts";
 import { setLocalModels, useApp } from "../store.ts";
 import { ClaudeLogo, CodexLogo, LlamaLogo } from "./icons.tsx";
-import { Button, cx, ErrorText, Field, inputClass, Modal, OptionCards } from "./ui.tsx";
+import { Button, cx, ErrorText, Field, inputClass, Modal, OptionCards, Toggle } from "./ui.tsx";
 
 type Check = { status: "idle" | "checking" } | { status: "ok"; models: ReadonlyArray<ModelOption> } | { status: "error"; error: string };
 
@@ -307,6 +307,14 @@ export function ProvidersDialog({ onClose, onLocalModels }: { onClose: () => voi
                 },
                 { value: "external", label: "My own server", detail: "A llama-server you run yourself", icon: <Server className={iconClass} /> },
               ]}
+            />
+            <Toggle
+              checked={settings.llamacpp.allowSubagents}
+              onChange={(allowSubagents) =>
+                run(() => rpc((c) => c["providers.updateSettings"]({ llamacpp: { allowSubagents } })).then((next) => setSettings(next)))
+              }
+              label="Let local models start subagents"
+              description="Each subagent is another run of the local model at the same time. Off: they hand work to Apollo workers instead."
             />
             {mode === "managed" ? (
               <div className="flex items-center gap-3 rounded-lg border border-zinc-800 bg-zinc-900/50 py-2 pr-2 pl-3 text-xs">

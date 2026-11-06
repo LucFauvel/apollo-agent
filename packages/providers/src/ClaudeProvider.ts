@@ -77,6 +77,8 @@ export interface ClaudeBackend {
       readonly env: Environment;
       /** Put before Apollo's instructions, e.g. which model actually answers. */
       readonly instructions?: string;
+      /** Claude Code tools the session may not use. */
+      readonly disallowedTools?: ReadonlyArray<string>;
     },
     ProviderError,
     Scope.Scope
@@ -284,7 +286,7 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
   open: Effect.fn("ClaudeProvider.open")(function* (options: ProviderSessionOptions, emit: Emit) {
     const backend = config.backend
       ? yield* config.backend.prepare(options.model)
-      : { model: options.model, env: config.environment ? yield* config.environment : null, instructions: undefined };
+      : { model: options.model, env: config.environment ? yield* config.environment : null, instructions: undefined, disallowedTools: undefined };
     const context = yield* Effect.context<never>();
     const run = Effect.runForkWith(context);
     const agent = (event: AgentEvent) => emit({ _tag: "Event", event });
@@ -434,6 +436,7 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
         append: backend.instructions ? `${backend.instructions}\n\n${options.instructions}` : options.instructions,
       },
       ...(backend.model ? { model: backend.model } : {}),
+      ...(backend.disallowedTools?.length ? { disallowedTools: [...backend.disallowedTools] } : {}),
       ...withEnvironment(backend.env),
       ...(options.effort ? { effort: options.effort as EffortLevel } : {}),
       ...(options.resumeId ? { resume: options.resumeId } : {}),
