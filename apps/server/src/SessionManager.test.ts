@@ -157,6 +157,7 @@ describe("SessionManager", () => {
   it.live("pushes finished turns to paired phones and forgets unregistered ones", () => {
     const pushed: Array<Push.PushMessage> = [];
     const pushLayer = Push.layerWatcher.pipe(
+      Layer.provideMerge(Push.Notices.layer),
       Layer.provideMerge(
         Layer.succeed(Push.PushSender, async (messages) => {
           pushed.push(...messages);
@@ -189,6 +190,10 @@ describe("SessionManager", () => {
       expect(pushed.map((m) => m.to).sort()).toEqual(["ExponentPushToken[gone]", "ExponentPushToken[live]"]);
       expect(pushed[0]).toMatchObject({ title: "Atlas", body: "echo: ship it", data: { sessionId: bot.mainSessionId, kind: "done" } });
       expect(tokens.active()).toEqual(["ExponentPushToken[live]"]);
+      // The desktop app polls the same notifications.
+      const notices = (yield* Push.Notices).since(0);
+      expect(notices).toEqual([{ id: 1, kind: "done", title: "Atlas", body: "echo: ship it", sessionId: bot.mainSessionId }]);
+      expect((yield* Push.Notices).since(1)).toEqual([]);
     }).pipe(Effect.provide(pushLayer));
   });
 
@@ -355,6 +360,43 @@ describe("SessionManager", () => {
       const denied = yield* jobs.status({ botId: other.id, sessionId: other.mainSessionId }, build.jobId).pipe(Effect.flip);
       expect(denied.message).toContain("no background job");
     }).pipe(Effect.provide(Jobs.layer.pipe(Layer.provideMerge(layer)))),
+  );
+
+  it.live("runs one reflection at a time, the others in line", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const reflections = () =>
+        store.listSessions().pipe(Effect.map((all) => all.filter((s) => s.role === "reflection")));
+      const first = yield* createBot(manager);
+      const second = yield* createBot(manager);
+      // "slow" makes the fake agent take a second over each reflection turn too.
+      for (const bot of [first, second]) {
+        yield* manager.send(bot.mainSessionId, "something slow to remember", "user");
+        yield* waitIdle(manager, bot.mainSessionId);
+      }
+      const before = sent.filter((t) => t.startsWith("Review this transcript")).length;
+
+      expect(yield* manager.reflect(first.mainSessionId)).not.toBeNull();
+      expect(yield* manager.reflect(second.mainSessionId)).toBeNull();
+      expect(yield* manager.reflect(second.mainSessionId)).toBeNull(); // already in line
+      expect((yield* reflections()).length).toBe(1);
+      const queued = (yield* store.listEvents(second.mainSessionId, 0)).filter(
+        (e) => e.event._tag === "Notice" && e.event.message.startsWith("Another reflection is running"),
+      );
+      expect(queued.length).toBe(2);
+
+      // The first finishes and is removed; then the second runs, alone, and is removed too.
+      let ran = 0;
+      for (let i = 0; i < 200; i++) {
+        yield* Effect.sleep("25 millis");
+        expect((yield* reflections()).length).toBeLessThanOrEqual(1);
+        ran = sent.filter((t) => t.startsWith("Review this transcript")).length - before;
+        if (ran === 2 && (yield* reflections()).length === 0) break;
+      }
+      expect(ran).toBe(2);
+      expect((yield* reflections()).length).toBe(0);
+    }).pipe(Effect.provide(layer)),
   );
 
   it.live("keeps excluded messages out of memory search and reflection", () =>

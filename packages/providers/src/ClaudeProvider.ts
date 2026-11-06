@@ -32,6 +32,19 @@ import type { ConnectorInfo, InputField } from "@apollo/contracts";
 
 const errorMessage = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
 
+/** Claude Code's tools that start a subagent. */
+const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
+
+/** A tool call's one-line summary; a subagent reads as its type and task. */
+const toolCallSummary = (name: string, input: unknown): string => {
+  if (SUBAGENT_TOOLS.has(name) && input && typeof input === "object") {
+    const { subagent_type, description } = input as { subagent_type?: unknown; description?: unknown };
+    const kind = typeof subagent_type === "string" && subagent_type ? subagent_type : "general-purpose";
+    return typeof description === "string" && description ? `${kind} · ${description}` : kind;
+  }
+  return summarizeToolInput(input);
+};
+
 /** Flattens a tool_result `content` field (string or content blocks) to text. */
 const toolResultText = (content: unknown): string => {
   if (typeof content === "string") return content;
@@ -194,6 +207,28 @@ export const autoDecision = (toolName: string, input: Record<string, unknown>, c
   if (toolName.startsWith("mcp__apollo__")) return "allow";
   if (toolName.startsWith("mcp__")) return RISKY_ACTION.test(toolName.split("__").pop() ?? "") ? "unsure" : "allow";
   return "unsure";
+};
+
+/**
+ * How Claude Code asks permission, per Apollo runtime mode.
+ *
+ * - full access: never asks.
+ * - auto, on Anthropic's models: Claude Code's own auto mode (its hosted classifier).
+ * - auto, behind another backend (llama.cpp): Claude Code's classifier cannot run there and
+ *   would deny everything risky, so Claude Code asks normally and Apollo's rules (and
+ *   reviewer model) answer in canUseTool.
+ * - approve: Claude Code asks for everything that needs permission.
+ *
+ * In auto mode, Apollo's own tools (memory, workers, schedules…) are allowed up front, so
+ * they never depend on a classifier.
+ */
+export const permissionOptions = (runtimeMode: string | undefined, hasBackend: boolean, apolloServer: string | null) => {
+  if (runtimeMode === "full-access") return { permissionMode: "bypassPermissions" as const, allowDangerouslySkipPermissions: true };
+  if (runtimeMode !== "auto") return { permissionMode: "default" as const };
+  return {
+    permissionMode: hasBackend ? ("default" as const) : ("auto" as const),
+    ...(apolloServer ? { allowedTools: [`mcp__${apolloServer}`] } : {}),
+  };
 };
 
 /** Rules only: allowed without asking. */
@@ -403,10 +438,8 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
       ...(options.effort ? { effort: options.effort as EffortLevel } : {}),
       ...(options.resumeId ? { resume: options.resumeId } : {}),
       ...(config.executable ? { pathToClaudeCodeExecutable: config.executable } : {}),
-      ...(options.runtimeMode === "full-access"
-        ? { permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true }
-        : // Auto: Claude Code's classifier decides; what it cannot decide still reaches canUseTool.
-          { permissionMode: options.runtimeMode === "auto" ? "auto" : "default", canUseTool }),
+      ...permissionOptions(options.runtimeMode, config.backend !== undefined, options.mcp?.name ?? null),
+      ...(options.runtimeMode === "full-access" ? {} : { canUseTool }),
       ...(options.skillsPluginDir ? { plugins: [{ type: "local", path: options.skillsPluginDir }] } : {}),
       ...(options.mcp
         ? {
@@ -437,11 +470,43 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
       ),
     );
 
+    /**
+     * Claude Code starts a turn on its own when a background subagent finishes (to read its
+     * result); Apollo has to hear about that turn, or its output lands in an idle session.
+     */
+    const wake = Effect.suspend(() => {
+      if (inTurn) return Effect.void;
+      inTurn = true;
+      return agent({ _tag: "TurnStarted" });
+    });
+    /** Subagents Claude Code started, by task id, to report the ones that ran in the background. */
+    const subagents = new Map<string, { description: string; background: boolean }>();
+
     const handle = (message: SDKMessage): Effect.Effect<void> =>
       Effect.gen(function* () {
         switch (message.type) {
           case "system": {
-            if (message.subtype === "init") {
+            if (message.subtype === "task_started") {
+              if (message.task_type === "local_agent" && !message.skip_transcript) {
+                subagents.set(message.task_id, { description: message.description, background: message.is_backgrounded === true });
+              }
+            } else if (message.subtype === "task_updated") {
+              const task = subagents.get(message.task_id);
+              if (task && message.patch.is_backgrounded !== undefined) task.background = message.patch.is_backgrounded;
+            } else if (message.subtype === "task_notification") {
+              const task = subagents.get(message.task_id);
+              subagents.delete(message.task_id);
+              // A foreground subagent's result is its tool call's output; one in the background
+              // finishes after its call returned, so say so.
+              if (task?.background) {
+                const verb = message.status === "completed" ? "finished" : message.status === "failed" ? "failed" : "was stopped";
+                yield* agent({
+                  _tag: "Notice",
+                  level: message.status === "failed" ? "error" : "info",
+                  message: `Background subagent “${task.description}” ${verb}${message.summary ? `: ${truncate(message.summary, 300)}` : "."}`,
+                });
+              }
+            } else if (message.subtype === "init") {
               yield* emit({ _tag: "ResumeId", resumeId: message.session_id });
             } else if (message.subtype === "compact_boundary") {
               const meta = (message as { compact_metadata?: { trigger?: string; pre_tokens?: number } }).compact_metadata;
@@ -455,6 +520,7 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
           }
           case "stream_event": {
             if (message.parent_tool_use_id !== null) return;
+            yield* wake;
             const ev = message.event;
             if (ev.type === "message_start") {
               currentMessageId = ev.message.id;
@@ -498,7 +564,23 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
             return;
           }
           case "assistant": {
-            if (message.parent_tool_use_id !== null) return;
+            const parent = message.parent_tool_use_id;
+            if (parent !== null) {
+              // A subagent's tool calls, shown under the call that started it.
+              for (const block of message.message.content) {
+                if (block.type === "tool_use" || block.type === "mcp_tool_use") {
+                  yield* agent({
+                    _tag: "ToolStarted",
+                    itemId: block.id,
+                    name: block.name,
+                    summary: toolCallSummary(block.name, block.input),
+                    parentItemId: parent,
+                  });
+                }
+              }
+              return;
+            }
+            yield* wake;
             const streamed = streamedMessageIds.has(message.message.id);
             for (const [index, block] of message.message.content.entries()) {
               if (block.type === "tool_use" || block.type === "mcp_tool_use") {
@@ -506,7 +588,7 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
                   _tag: "ToolStarted",
                   itemId: block.id,
                   name: block.name,
-                  summary: summarizeToolInput(block.input),
+                  summary: toolCallSummary(block.name, block.input),
                 });
               } else if (!streamed && block.type === "text") {
                 // Fallback when partial messages were not streamed for this message.
@@ -520,7 +602,6 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
             return;
           }
           case "user": {
-            if (message.parent_tool_use_id !== null) return;
             const content = message.message.content;
             if (typeof content === "string") return;
             for (const block of content) {

@@ -10,15 +10,17 @@
     "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {
+    "@apollo/client": "workspace:*",
     "@apollo/contracts": "workspace:*",
+    "@huggingface/transformers": "4.3.2",
     "effect": "catalog:",
     "lucide-react": "^1.68.0",
+    "prism-react-renderer": "2.4.1",
     "qrcode": "1.5.4",
     "react": "catalog:",
     "react-dom": "catalog:",
     "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1",
-    "@apollo/client": "workspace:*"
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",

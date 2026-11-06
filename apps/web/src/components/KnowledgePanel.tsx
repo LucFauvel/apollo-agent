@@ -10,9 +10,8 @@ import {
   type StorageReport,
 } from "@apollo/contracts";
 import { BookOpen, Brain, Check, Globe, HardDrive, Lightbulb, Pin, Sparkles, Trash2, User } from "lucide-react";
+import { MarkdownText } from "./Code.tsx";
 import { useEffect, useState } from "react";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { errorMessage, rpc } from "../rpc.ts";
 import { useApp } from "../store.ts";
 import { Badge, Button, cx, EmptyState, IconButton, inputClass, Panel } from "./ui.tsx";
@@ -162,7 +161,7 @@ function SkillCard({ skill }: { skill: Skill }) {
       </button>
       {open ? (
         <div className="markdown mt-2 max-h-64 overflow-auto border-t border-zinc-800 pt-2 text-xs text-zinc-300">
-          <Markdown remarkPlugins={[remarkGfm]}>{skill.body}</Markdown>
+          <MarkdownText>{skill.body}</MarkdownText>
         </div>
       ) : null}
       <div className="mt-2.5 flex gap-1.5">

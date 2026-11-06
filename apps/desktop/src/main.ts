@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { createServer } from "node:net";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, Menu, nativeImage, shell, Tray } from "electron";
+import { app, BrowserWindow, Menu, nativeImage, Notification, shell, Tray } from "electron";
 import { type PanelRow, TrayPanel } from "./trayPanel.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -135,6 +135,8 @@ const waitForHealth = async (url: string, timeoutMs = 20_000) => {
  */
 /** The port the server listens on; a restart after a crash reuses it, so the open window reconnects. */
 let serverPort: number | null = null;
+/** The last notification shown; a new server numbers them from 1 again. */
+let noticeCursor = 0;
 let restarts: Array<number> = [];
 
 const startServer = async (): Promise<string> => {
@@ -142,6 +144,7 @@ const startServer = async (): Promise<string> => {
   serverPort = port;
   const baseUrl = `http://127.0.0.1:${port}`;
   const runtime = process.env.APOLLO_NODE ?? process.execPath;
+  noticeCursor = 0;
   server = spawn(runtime, [layout.serverEntry], {
     cwd: layout.cwd,
     env: {
@@ -265,7 +268,43 @@ interface DesktopStatus {
     readonly loading: ReadonlyArray<{ readonly model: string; readonly percent: number }>;
     readonly downloads: ReadonlyArray<{ readonly model: string; readonly percent: number }>;
   } | null;
+  readonly notifications?: ReadonlyArray<Notice>;
 }
+
+interface Notice {
+  readonly id: number;
+  readonly kind: string;
+  readonly title: string;
+  readonly body: string;
+  readonly sessionId: string;
+}
+
+/** Shown notifications, kept so they are not garbage-collected before they are clicked. */
+const shownNotices = new Set<Notification>();
+
+/**
+ * A turn finished, or a bot needs an approval, an answer or a secret: a system
+ * notification, unless Apollo's window is in front. Clicking it opens that conversation.
+ */
+const showNotice = (notice: Notice) => {
+  const [window] = BrowserWindow.getAllWindows();
+  // (A test from Settings shows anyway: that is where the user is looking.)
+  if (notice.kind !== "test" && window && window.isVisible() && window.isFocused()) return;
+  if (!Notification.isSupported()) return;
+  const notification = new Notification({ title: notice.title, body: notice.body });
+  shownNotices.add(notification);
+  const forget = () => shownNotices.delete(notification);
+  notification.on("click", () => {
+    forget();
+    showWindow();
+    if (!notice.sessionId) return;
+    void BrowserWindow.getAllWindows()[0]
+      ?.webContents.executeJavaScript(`window.apolloOpenSession?.(${JSON.stringify(notice.sessionId)})`)
+      .catch(() => undefined);
+  });
+  notification.on("close", forget);
+  notification.show();
+};
 
 /** `unsloth/Qwen3-4B-GGUF:Q4_K_M` → `Qwen3-4B Q4_K_M`. */
 const modelName = (id: string) => {
@@ -412,12 +451,17 @@ const followStatus = (serverUrl: string) => {
   let last = "";
   const poll = async () => {
     try {
-      const response = await fetch(`${serverUrl}/api/desktop/status`, {
+      const response = await fetch(`${serverUrl}/api/desktop/status?after=${noticeCursor}`, {
         headers: { authorization: `Bearer ${bootstrapToken}` },
         signal: AbortSignal.timeout(3000),
       });
       if (!response.ok) return;
-      const status = (await response.json()) as DesktopStatus;
+      const { notifications = [], ...status } = (await response.json()) as DesktopStatus;
+      for (const notice of notifications) {
+        if (notice.id <= noticeCursor) continue;
+        noticeCursor = notice.id;
+        showNotice(notice);
+      }
       const key = JSON.stringify(status);
       if (key === last || !tray) return;
       last = key;

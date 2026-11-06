@@ -7,14 +7,19 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit -p ."
+    "typecheck": "tsc --noEmit -p .",
+    "test": "vitest run"
   },
   "dependencies": {
     "@apollo/contracts": "workspace:*",
-    "effect": "catalog:"
+    "effect": "catalog:",
+    "prism-react-renderer": "2.4.1",
+    "prismjs": "1.30.0"
   },
   "devDependencies": {
+    "@types/node": "catalog:",
+    "@types/prismjs": "^1.26.6",
     "typescript": "catalog:",
-    "@types/node": "catalog:"
+    "vitest": "catalog:"
   }
 }

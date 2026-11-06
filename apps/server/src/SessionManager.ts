@@ -76,6 +76,9 @@ const APOLLO_COMMANDS: ReadonlyArray<Omit<SlashCommand, "source">> = [
   { name: "reflect", description: "Save what this session learned to memory now", argumentHint: "" },
 ];
 
+/** A reflection still running after this long is given up, so the next in line can run. */
+const REFLECTION_TIMEOUT = "20 minutes";
+
 /** Run a reflection pass after this many completed turns (when the bot has autoLearn). */
 const REFLECT_EVERY_TURNS = 3;
 
@@ -239,6 +242,8 @@ const make = Effect.gen(function* () {
               Effect.gen(function* () {
                 yield* closeLive(id);
                 const session = yield* store.getSession(id);
+                // A reflection whose agent died will not answer: drop it and let the next one run.
+                if (session.role === "reflection") return yield* endReflection(id);
                 if (isBusy(session.status)) {
                   yield* appendEvent(id, { _tag: "Notice", level: "error", message: emission.reason });
                   yield* appendEvent(id, {
@@ -318,7 +323,11 @@ const make = Effect.gen(function* () {
       }
     });
 
-  const ensureOpen = (id: SessionId): Effect.Effect<LiveSession, ApolloError> =>
+  /**
+   * Opens the session's agent process if needed. `forTurn`: the caller already marked the
+   * session as working (a message is being sent), so opening leaves the status alone.
+   */
+  const ensureOpen = (id: SessionId, forTurn = false): Effect.Effect<LiveSession, ApolloError> =>
     Semaphore.withPermit(
       lockFor(id),
       Effect.gen(function* () {
@@ -338,7 +347,7 @@ const make = Effect.gen(function* () {
         generations.set(id, generation);
         const scope = yield* Scope.make();
 
-        yield* updateSession(id, { status: "starting" });
+        if (!forTurn) yield* updateSession(id, { status: "starting" });
         const opened = yield* providers[session.provider]
           .open(
             {
@@ -377,7 +386,7 @@ const make = Effect.gen(function* () {
         const entry: LiveSession = { botId: bot.id, scope, provider: opened.value, token };
         live.set(id, entry);
         tokens.set(token, id);
-        yield* updateSession(id, { status: "idle" });
+        if (!forTurn) yield* updateSession(id, { status: "idle" });
         return entry;
       }),
     );
@@ -482,7 +491,7 @@ const make = Effect.gen(function* () {
         if (event.outcome !== "completed") {
           yield* Effect.logWarning(`reflection ${id} ended ${event.outcome}${event.error ? `: ${event.error}` : ""}`);
         }
-        yield* background(removeSession(id));
+        yield* background(endReflection(id));
         return;
       }
 
@@ -545,7 +554,8 @@ const make = Effect.gen(function* () {
       } else {
         yield* guardAutomated(target);
       }
-      const entry = yield* ensureOpen(id);
+      // The message shows, and the session reads as working, before the agent's process
+      // opens: starting Claude Code or loading a local model can take a while.
       yield* appendEvent(id, {
         _tag: "UserMessage",
         text,
@@ -557,6 +567,8 @@ const make = Effect.gen(function* () {
       // a stale "idle". TurnCompleted flips it back.
       const before = yield* store.getSession(id);
       if (!isBusy(before.status)) yield* updateSession(id, { status: "running" });
+      // A failure to open posts its own notice and marks the session as errored.
+      const entry = yield* ensureOpen(id, true);
       yield* entry.provider.send(text, files.map((f) => ({ path: f!.path, name: f!.name, mime: f!.mime, size: f!.size }))).pipe(
         Effect.mapError((error) => providerFailure(error.message)),
         Effect.tapError(() => updateSession(id, { status: "idle" }).pipe(Effect.ignore)),
@@ -694,6 +706,8 @@ const make = Effect.gen(function* () {
       }
       yield* store.deleteSession(id);
       yield* publish({ _tag: "SessionDeleted", sessionId: id });
+      // However a running reflection goes (answered, stuck, deleted), the next may start.
+      if (reflecting === id) yield* nextReflection;
     });
 
   const closeSession = (id: SessionId) =>
@@ -710,7 +724,15 @@ const make = Effect.gen(function* () {
       return entry ? entry.provider.interrupt.pipe(Effect.mapError((e) => providerFailure(e.message))) : Effect.void;
     });
 
-  const reflect = (id: SessionId): Effect.Effect<Session, ApolloError> =>
+  // --- reflection ---------------------------------------------------------
+  // One reflection runs at a time (they are full agent sessions, and several at once write
+  // to the same memories). Others wait in line, once per source session, and start in turn.
+
+  /** The running reflection: "starting" while it is being created, else its session id. */
+  let reflecting: SessionId | "starting" | null = null;
+  const reflectionQueue: Array<SessionId> = [];
+
+  const transcriptOf = (id: SessionId) =>
     Effect.gen(function* () {
       const source = yield* store.getSession(id);
       if (source.role === "reflection") return yield* invalid("cannot reflect on a reflection");
@@ -718,6 +740,14 @@ const make = Effect.gen(function* () {
         withoutExcluded(yield* store.listEvents(id, 0), yield* store.memoryExclusions(id)),
       );
       if (transcript.length === 0) return yield* invalid("session has no transcript yet");
+      return { source, transcript };
+    });
+
+  /** Starts a reflection on `id`; the caller holds the slot (`reflecting` is "starting"). */
+  const startReflection = (id: SessionId): Effect.Effect<Session, ApolloError> =>
+    Effect.gen(function* () {
+      // Read when it starts, so a queued reflection covers the turns that came in meanwhile.
+      const { source, transcript } = yield* transcriptOf(id);
       yield* store.resetReflectionCounter(id);
       const reflection = yield* createSession({
         botId: source.botId,
@@ -727,8 +757,57 @@ const make = Effect.gen(function* () {
         role: "reflection",
         parentSessionId: source.id,
       });
+      reflecting = reflection.id;
+      // A reflection that never answers must not hold the line forever.
+      yield* background(
+        Effect.sleep(REFLECTION_TIMEOUT).pipe(
+          Effect.andThen(Effect.suspend(() => (reflecting === reflection.id ? endReflection(reflection.id) : Effect.void))),
+        ),
+      );
       yield* send(reflection.id, reflectionPrompt(source, transcript), "system");
       return reflection;
+    }).pipe(Effect.tapError(() => Effect.suspend(() => nextReflection)));
+
+  /** Frees the slot and starts the next reflection in line, if any. */
+  const nextReflection: Effect.Effect<void> = Effect.suspend(() => {
+    reflecting = null;
+    const next = reflectionQueue.shift();
+    if (next === undefined) return Effect.void;
+    reflecting = "starting";
+    // startReflection moves on to the one after when this one cannot start.
+    return background(startReflection(next));
+  });
+
+  /** Removes a finished (or stuck) reflection; removing it lets the next one start. */
+  const endReflection = (id: SessionId): Effect.Effect<void> =>
+    removeSession(id).pipe(
+      Effect.catchCause((cause) => Effect.logWarning(`could not remove reflection ${id}`, cause)),
+      Effect.andThen(Effect.suspend(() => (reflecting === id ? nextReflection : Effect.void))),
+    );
+
+  /** A reflection the user asked for: says so in the session when it has to wait. */
+  const requestReflection = (id: SessionId) =>
+    reflect(id).pipe(
+      Effect.tap((started) =>
+        started === null
+          ? appendEvent(id, { _tag: "Notice", level: "info", message: "Another reflection is running; this one starts when it is done." })
+          : Effect.void,
+      ),
+    );
+
+  /**
+   * Reflects on a session now, or after the running reflection: the new reflection
+   * session, or null when it waits in line.
+   */
+  const reflect = (id: SessionId): Effect.Effect<Session | null, ApolloError> =>
+    Effect.gen(function* () {
+      yield* transcriptOf(id); // Refuse right away what could never run.
+      if (reflecting !== null) {
+        if (!reflectionQueue.includes(id)) reflectionQueue.push(id);
+        return null;
+      }
+      reflecting = "starting";
+      return yield* startReflection(id);
     });
 
   yield* store.resetLiveStatuses;
@@ -893,7 +972,7 @@ const make = Effect.gen(function* () {
           case "stop":
             return yield* interrupt(id);
           case "reflect":
-            yield* reflect(id);
+            yield* requestReflection(id);
             return;
           default:
             return yield* send(id, `/${name}${args.trim() ? ` ${args.trim()}` : ""}`, "user");
@@ -1044,7 +1123,7 @@ const make = Effect.gen(function* () {
         yield* removeSession(id);
       }),
 
-    reflect,
+    reflect: requestReflection,
 
     /** Waits until the session is no longer busy, or the timeout elapses. */
     waitUntilIdle: (id: SessionId, timeout: Duration.Input) =>

@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useMemo, useRef } from "react";
+import { createContext, type ReactNode, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
   Animated,
   Easing,
@@ -182,4 +182,65 @@ export function useKeyboardInset(bottomInset: number, onShow?: () => void) {
     };
   }, [inset, bottomInset]);
   return inset;
+}
+
+/** Lets a row that opens or closes keep the transcript from jumping to the bottom. */
+export const ScrollHold = createContext<() => void>(() => {});
+
+/** Opens or closes a section with an animation, without scrolling the transcript. */
+export const useToggle = () => {
+  const [open, setOpen] = useState(false);
+  const hold = useContext(ScrollHold);
+  return [
+    open,
+    () => {
+      hold();
+      animateLayout();
+      setOpen((o) => !o);
+    },
+  ] as const;
+};
+
+/** Turns its child a quarter turn when open (a chevron pointing right, then down). */
+export function Turn({ open, children, degrees = 90 }: { open: boolean; children: ReactNode; degrees?: number }) {
+  const turn = useRef(new Animated.Value(open ? 1 : 0)).current;
+  useEffect(() => {
+    Animated.timing(turn, { toValue: open ? 1 : 0, duration: 200, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
+  }, [open, turn]);
+  return (
+    <Animated.View style={{ transform: [{ rotate: turn.interpolate({ inputRange: [0, 1], outputRange: ["0deg", `${degrees}deg`] }) }] }}>
+      {children}
+    </Animated.View>
+  );
+}
+
+/** Spins its child forever (a loading ring). */
+export function Spin({ children }: { children: ReactNode }) {
+  const spin = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(Animated.timing(spin, { toValue: 1, duration: 900, easing: Easing.linear, useNativeDriver: true }));
+    loop.start();
+    return () => loop.stop();
+  }, [spin]);
+  return (
+    <Animated.View style={{ transform: [{ rotate: spin.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "360deg"] }) }] }}>
+      {children}
+    </Animated.View>
+  );
+}
+
+/** Gently pulses its child, as the desktop's shimmering "in progress" text. */
+export function Pulse({ children, style }: { children: ReactNode; style?: object }) {
+  const pulse = useRef(new Animated.Value(1)).current;
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, { toValue: 0.45, duration: 800, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 1, duration: 800, easing: Easing.inOut(Easing.ease), useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [pulse]);
+  return <Animated.View style={[style, { opacity: pulse }]}>{children}</Animated.View>;
 }

@@ -16,6 +16,7 @@ import {
 import { ChatScreen } from "./src/screens/ChatScreen.tsx";
 import { HomeScreen } from "./src/screens/HomeScreen.tsx";
 import { PairScreen } from "./src/screens/PairScreen.tsx";
+import { SettingsScreen } from "./src/screens/SettingsScreen.tsx";
 import { SlideIn, SwipeBack } from "./src/motion.tsx";
 import { registerForPush, sessionOf, setViewingSession, unregisterPush } from "./src/push.ts";
 import { colors } from "./src/theme.ts";
@@ -23,6 +24,7 @@ import { colors } from "./src/theme.ts";
 export default function App() {
   const [pairing, setPairing] = useState<Pairing | null | undefined>(undefined);
   const [open, setOpen] = useState<SessionId | null>(null);
+  const [settings, setSettings] = useState(false);
   // Scanning the QR code with the phone's own camera app opens apollo://pair?… here.
   const link = Linking.useURL();
   // A link handled once (paired, or failed) must not reopen the pairing screen.
@@ -96,9 +98,20 @@ export default function App() {
               <SwipeBack key={open} onBack={() => setOpen(null)}>
                 <ChatScreen sessionId={open} onBack={() => setOpen(null)} />
               </SwipeBack>
+            ) : settings ? (
+              <SwipeBack key="settings" onBack={() => setSettings(false)}>
+                <SettingsScreen
+                  pairing={pairing}
+                  onBack={() => setSettings(false)}
+                  onUnpair={() => {
+                    setSettings(false);
+                    unpair();
+                  }}
+                />
+              </SwipeBack>
             ) : (
               <SlideIn key="home" from="left">
-                <HomeScreen onOpen={setOpen} onUnpair={unpair} />
+                <HomeScreen onOpen={setOpen} onSettings={() => setSettings(true)} />
               </SlideIn>
             )}
           </AppStateProvider>

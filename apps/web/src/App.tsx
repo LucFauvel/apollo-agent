@@ -21,6 +21,8 @@ const useDesktopNotifications = (open: (id: SessionId) => void) =>
   useEffect(
     () =>
       onNotify((notice) => {
+        // The desktop app shows these itself (see apolloOpenSession below).
+        if (/Electron\//.test(navigator.userAgent)) return;
         if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
         const notification = new Notification(notice.title, { body: notice.body });
         notification.onclick = () => {
@@ -44,7 +46,13 @@ export function App() {
   // Turn notifications compare against the open session; read it through a ref.
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
-  useEffect(() => watchTurns(() => selectedRef.current, setSelectedId), []);
+  // The desktop app shows notifications itself (from the server, even with the window
+  // closed) and opens a session through this hook; a plain browser tab does its own.
+  useEffect(() => {
+    (window as Window & { apolloOpenSession?: (id: string) => void }).apolloOpenSession = (id) => setSelectedId(id as SessionId);
+    if (/Electron\//.test(navigator.userAgent)) return;
+    return watchTurns(() => selectedRef.current, setSelectedId);
+  }, []);
 
   const session = useApp((s) => (selectedId ? s.sessions.get(selectedId) : undefined));
   const bot = useApp((s) => (session ? s.bots.get(session.botId) : undefined));

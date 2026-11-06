@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { autoApprove, autoDecision } from "../src/ClaudeProvider.ts";
+import { permissionOptions, autoApprove, autoDecision } from "../src/ClaudeProvider.ts";
 
 const cwd = "/Users/me/Apollo/ceres";
 
@@ -32,5 +32,19 @@ describe("auto mode for local models", () => {
     expect(autoDecision("Write", { file_path: "/Users/me/git/app/README.md" }, cwd)).toBe("unsure");
     expect(autoDecision("SomeNewTool", {}, cwd)).toBe("unsure");
     expect(autoDecision("Read", {}, cwd)).toBe("allow");
+  });
+});
+
+describe("permissionOptions", () => {
+  it("uses Claude Code's auto mode only where its classifier runs", () => {
+    expect(permissionOptions("auto", false, "apollo")).toEqual({ permissionMode: "auto", allowedTools: ["mcp__apollo"] });
+    // Behind llama.cpp the classifier cannot run: Claude Code asks, Apollo's rules answer.
+    expect(permissionOptions("auto", true, "apollo")).toEqual({ permissionMode: "default", allowedTools: ["mcp__apollo"] });
+  });
+
+  it("asks for everything in approve mode and nothing in full access", () => {
+    expect(permissionOptions("approve", false, "apollo")).toEqual({ permissionMode: "default" });
+    expect(permissionOptions(undefined, true, null)).toEqual({ permissionMode: "default" });
+    expect(permissionOptions("full-access", true, "apollo")).toEqual({ permissionMode: "bypassPermissions", allowDangerouslySkipPermissions: true });
   });
 });

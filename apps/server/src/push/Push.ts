@@ -23,7 +23,7 @@ export interface PushMessage {
   readonly to: string;
   readonly title: string;
   readonly body: string;
-  readonly data: { readonly sessionId: SessionId; readonly kind: string };
+  readonly data: { readonly sessionId: SessionId | null; readonly kind: string };
   readonly sound: "default";
   readonly priority: "high";
 }
@@ -121,7 +121,7 @@ const deliver = (
   tokens: ReturnType<typeof makePushTokens>,
   send: PushSender["Service"],
   note: { kind: string; title: string; body: string },
-  sessionId: SessionId,
+  sessionId: SessionId | null,
 ) =>
   Effect.gen(function* () {
     const to = tokens.active();
@@ -142,12 +142,39 @@ const deliver = (
     });
   }).pipe(Effect.catchCause((cause) => Effect.logWarning("Push notification failed", cause)));
 
+export interface Notice {
+  readonly id: number;
+  readonly kind: string;
+  readonly title: string;
+  readonly body: string;
+  readonly sessionId: string;
+}
+
+/** The latest notifications, for the desktop app, which polls for the ones it has not shown. */
+export class Notices extends Context.Service<
+  Notices,
+  { readonly record: (note: Omit<Notice, "id">) => void; readonly since: (after: number) => ReadonlyArray<Notice> }
+>()("apollo/push/Notices") {
+  static readonly layer = Layer.sync(Notices, () => {
+    const recent: Array<Notice> = [];
+    let next = 1;
+    return Notices.of({
+      record: (note) => {
+        recent.push({ id: next++, ...note });
+        if (recent.length > 50) recent.shift();
+      },
+      since: (after) => recent.filter((n) => n.id > after),
+    });
+  });
+}
+
 /** Watches every session and pushes the events above. */
 export const layerWatcher = Layer.effectDiscard(
   Effect.gen(function* () {
     const manager = yield* SessionManager;
     const store = yield* Store;
     const send = yield* PushSender;
+    const notices = yield* Notices;
     const tokens = makePushTokens(yield* Database);
     const lastReply = new Map<SessionId, string>();
     yield* manager.liveEvents.pipe(
@@ -155,13 +182,29 @@ export const layerWatcher = Layer.effectDiscard(
         Effect.gen(function* () {
           if (event._tag === "TurnStarted") lastReply.delete(sessionId);
           if (event._tag === "AssistantMessage") lastReply.set(sessionId, event.text);
-          if (!["ApprovalRequested", "InputRequested", "SecretRequested", "TurnCompleted"].includes(event._tag)) return;
+          // (Secret requests arrive as a Notify from the secrets service, handled below.)
+          if (!["ApprovalRequested", "InputRequested", "TurnCompleted"].includes(event._tag)) return;
           const session = yield* store.getSession(sessionId);
           const bot = yield* store.getBot(session.botId).pipe(Effect.option);
           const note = notificationFor(session, bot._tag === "Some" ? bot.value : undefined, event, lastReply.get(sessionId) ?? null);
           if (event._tag === "TurnCompleted") lastReply.delete(sessionId);
-          if (note) yield* Effect.forkDetach(deliver(tokens, send, note, sessionId));
+          if (note) {
+            notices.record({ ...note, sessionId });
+            yield* Effect.forkDetach(deliver(tokens, send, note, sessionId));
+          }
         }).pipe(Effect.ignore),
+      ),
+      Effect.forkScoped,
+    );
+    // Notifications bots send themselves (apollo_notify, scheduled results, secret requests).
+    yield* manager.changes.pipe(
+      Stream.runForEach((change) =>
+        Effect.gen(function* () {
+          if (change._tag !== "Notify") return;
+          const note = { kind: "notify", title: change.title, body: plain(change.body) };
+          notices.record({ ...note, sessionId: change.sessionId ?? "" });
+          yield* Effect.forkDetach(deliver(tokens, send, note, change.sessionId ?? null));
+        }),
       ),
       Effect.forkScoped,
     );
@@ -176,6 +219,21 @@ const UnregisterBody = Schema.Struct({ token: Schema.String });
 
 /** `POST /api/push/register` and `/api/push/unregister`, from a paired phone. */
 export const layerRoutes = Layer.mergeAll(
+  // A test notification to this computer and every paired phone (Settings → Notifications).
+  HttpRouter.add(
+    "POST",
+    "/api/notifications/test",
+    Effect.gen(function* () {
+      const notices = yield* Notices;
+      const send = yield* PushSender;
+      const tokens = makePushTokens(yield* Database);
+      const note = { kind: "test", title: "Apollo", body: "Notifications work. You'll hear from your bots here." };
+      notices.record({ ...note, sessionId: "" });
+      const phones = tokens.active().length;
+      yield* deliver(tokens, send, note, null);
+      return HttpServerResponse.jsonUnsafe({ ok: true, phones });
+    }),
+  ),
   HttpRouter.add(
     "POST",
     "/api/push/register",

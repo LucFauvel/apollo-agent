@@ -9,9 +9,11 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "dev.ocx64.apollo.mobile",
-      "buildNumber": "202611060955",
+      "buildNumber": "202611061611",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSMicrophoneUsageDescription": "Apollo listens when you dictate or talk with your bot.",
+        "NSPhotoLibraryUsageDescription": "Apollo does not read your photos. This permission is only asked for if you choose to attach an image."
       }
     },
     "android": {
@@ -33,7 +35,7 @@
         "expo-camera",
         {
           "cameraPermission": "Apollo uses the camera to scan the pairing QR code shown on your computer.",
-          "microphonePermission": false,
+          "microphonePermission": "Apollo listens when you dictate or talk with your bot.",
           "recordAudioAndroid": false
         }
       ],
@@ -43,6 +45,13 @@
         {
           "mode": "production",
           "color": "#818cf8"
+        }
+      ],
+      [
+        "expo-speech-recognition",
+        {
+          "microphonePermission": "Apollo listens when you dictate or talk with your bot.",
+          "speechRecognitionPermission": "Apollo turns your speech into text, on this iPhone when it can."
         }
       ]
     ],

@@ -243,7 +243,8 @@ export class ApolloRpcs extends RpcGroup.make(
     payload: { sessionId: SessionId, requestId: Schema.String, response: InputResponse },
     error,
   }),
-  Rpc.make("sessions.reflect", { payload: { sessionId: SessionId }, success: Session, error }),
+  /** The reflection started, or null when it waits for the one already running. */
+  Rpc.make("sessions.reflect", { payload: { sessionId: SessionId }, success: Schema.NullOr(Session), error }),
   /** Replays persisted events after `afterSeq`, then follows live events. */
   Rpc.make("sessions.events", {
     payload: { sessionId: SessionId, afterSeq: Schema.Number },

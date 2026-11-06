@@ -1,1 +1,4 @@
 export * from "./transcript.ts";
+export * from "./speech.ts";
+export * from "./highlight.ts";
+export * from "./activity.ts";

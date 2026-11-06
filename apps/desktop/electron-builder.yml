@@ -14,7 +14,7 @@ files:
 extraResources:
   - from: build/server
     to: server
-  - from: ../web/dist
+  - from: build/web
     to: web
   - from: resources/tray
     to: tray
@@ -26,6 +26,9 @@ linux:
 mac:
   target: [dmg]
   category: public.app-category.developer-tools
+  extendInfo:
+    # Dictation and voice conversations (speech is transcribed locally).
+    NSMicrophoneUsageDescription: Apollo listens when you dictate or talk with a bot. Speech is transcribed on this Mac.
 win:
   target: [nsis]
 nsis:

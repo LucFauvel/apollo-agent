@@ -40,6 +40,8 @@ export type TranscriptItem =
       readonly summary: string;
       readonly output: string | null;
       readonly isError: boolean;
+      /** Made by a subagent: the key of the tool call that started it. */
+      readonly parent?: string;
     }
   | {
       readonly kind: "approval";
@@ -184,7 +186,15 @@ export const reduceTranscript = (state: TranscriptState, e: SessionEvent): Trans
       );
       return updated
         ? { ...state, lastSeq, items: updated }
-        : push({ kind: "tool", key: event.itemId, name: event.name, summary: event.summary, output: null, isError: false });
+        : push({
+            kind: "tool",
+            key: event.itemId,
+            name: event.name,
+            summary: event.summary,
+            output: null,
+            isError: false,
+            ...(event.parentItemId ? { parent: event.parentItemId } : {}),
+          });
     }
     case "ToolCompleted": {
       const updated = updateWhere(

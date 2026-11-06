@@ -25,5 +25,20 @@ export const DesktopStatus = Schema.Struct({
       downloads: Schema.Array(Schema.Struct({ model: Schema.String, percent: Schema.Number })),
     }),
   ),
+  /**
+   * Notifications since the `after` id the shell asked for (a turn finished, an approval,
+   * a question, a secret): the same ones paired phones get as push notifications.
+   */
+  notifications: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        id: Schema.Number,
+        kind: Schema.String,
+        title: Schema.String,
+        body: Schema.String,
+        sessionId: Schema.String,
+      }),
+    ),
+  ),
 });
 export type DesktopStatus = typeof DesktopStatus.Type;

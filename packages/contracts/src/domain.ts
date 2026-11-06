@@ -317,6 +317,8 @@ export const AgentEvent = Schema.Union([
     name: Schema.String,
     /** Short human-readable summary of the call (command, file path, ...). */
     summary: Schema.String,
+    /** Set when a subagent made this call: the itemId of the tool call that started the subagent. */
+    parentItemId: Schema.optional(Schema.String),
   }),
   Schema.TaggedStruct("ToolCompleted", {
     itemId: Schema.String,

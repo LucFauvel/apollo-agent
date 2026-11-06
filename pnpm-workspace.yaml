@@ -19,3 +19,7 @@ allowBuilds:
   esbuild: true
   # Squirrel.Windows installer helper; Apollo builds NSIS installers instead.
   electron-winstaller: false
+  # Pulled in by @huggingface/transformers for Node; Apollo only runs it in the browser.
+  onnxruntime-node: false
+  protobufjs: false
+  sharp: false

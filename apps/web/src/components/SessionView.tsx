@@ -1,7 +1,11 @@
-import type { ApprovalDecision, Bot, InputResponse, LocalModel, PullRequest, Session } from "@apollo/contracts";
+import type { ApprovalDecision, AttachmentRef, Bot, InputResponse, LocalModel, PullRequest, Session } from "@apollo/contracts";
 import {
   ArrowUp,
   Ban,
+  Clock,
+  CornerDownLeft,
+  Pencil,
+  X,
   Brain,
   AppWindow,
   CalendarClock,
@@ -23,12 +27,13 @@ import {
   Square,
   Trash2,
 } from "lucide-react";
+import { showWorking, systemMessageParts } from "@apollo/client";
+import { MarkdownText } from "./Code.tsx";
 import { useEffect, useMemo, useRef, useState } from "react";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { formatUsage, usageTitle } from "../format.ts";
 import { useModelLabel } from "../models.ts";
 import { errorMessage, rpc } from "../rpc.ts";
+import { dequeue, enqueue, type QueuedMessage, useQueue } from "../queue.ts";
 import { useApp } from "../store.ts";
 import { type TranscriptItem, useTranscript } from "../transcript.ts";
 import { ActivityGroup, type Block, toBlocks } from "./Activity.tsx";
@@ -48,6 +53,7 @@ import { MessageAttachments, PendingAttachments, useAttachments } from "./Attach
 import { RecordingItem } from "./RecordingItem.tsx";
 import { ContextMeter, parseCommand, SlashMenu, useSlashCommands } from "./SlashCommands.tsx";
 import { VisualItem } from "./VisualItem.tsx";
+import { ConversationBar, ConversationButton, DictateButton, ReadAloudButton, useConversation } from "./Voice.tsx";
 import { BotAvatar } from "./Sidebar.tsx";
 import { Badge, Button, Collapse, cx, IconButton, Menu, ModelChip, providerName, StatusDot, statusLabel, Tooltip } from "./ui.tsx";
 
@@ -178,8 +184,7 @@ function BrainOff() {
  */
 function SystemMessage({ author, text }: { author: string; text: string }) {
   const [open, setOpen] = useState(false);
-  const [first = "", ...rest] = text.replace(/^\[Apollo\]\s*/, "").split("\n");
-  const body = rest.join("\n").trim();
+  const { first, body } = systemMessageParts(text);
   return (
     <div className="animate-fade-up rounded-xl border border-zinc-800/80 bg-zinc-900/40 text-sm">
       <button
@@ -196,7 +201,7 @@ function SystemMessage({ author, text }: { author: string; text: string }) {
       {body ? (
         <Collapse open={open}>
           <div className="markdown border-t border-zinc-800/80 px-3.5 py-2.5 text-sm leading-relaxed text-zinc-300">
-            <Markdown remarkPlugins={[remarkGfm]}>{body}</Markdown>
+            <MarkdownText>{body}</MarkdownText>
           </div>
         </Collapse>
       ) : null}
@@ -242,12 +247,13 @@ function Item({ item, respond, live, sessionId }: { item: Block; respond: Respon
       return (
         <div className="group animate-fade-up">
           <div className={cx("markdown py-1 text-sm leading-relaxed text-zinc-200 transition-opacity", item.excluded && "opacity-45")}>
-            <Markdown remarkPlugins={[remarkGfm]}>{item.text}</Markdown>
+            <MarkdownText>{item.text}</MarkdownText>
             {item.streaming ? <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse rounded-sm bg-zinc-400 align-middle" /> : null}
           </div>
           {!item.streaming && item.seq ? (
-            <div className="-mt-0.5 flex h-6 items-center">
+            <div className="-mt-0.5 flex h-6 items-center gap-0.5">
               <MemoryToggle sessionId={sessionId} seq={item.seq} excluded={item.excluded ?? false} align="start" />
+              <ReadAloudButton text={item.text} />
             </div>
           ) : null}
         </div>
@@ -279,6 +285,66 @@ function Item({ item, respond, live, sessionId }: { item: Block; respond: Respon
 
 const isBusy = (s: Session) => s.status === "running" || s.status === "waiting-approval" || s.status === "starting";
 
+/**
+ * Messages waiting for the running turn to end, each in a dashed box: "Send now" puts it
+ * into the running turn instead (to steer it), the pencil brings it back to edit.
+ */
+function QueuedMessages({
+  queue,
+  busy,
+  status,
+  onSendNow,
+  onEdit,
+  onRemove,
+}: {
+  queue: ReadonlyArray<QueuedMessage>;
+  busy: boolean;
+  status: Session["status"];
+  onSendNow: (id: string) => void;
+  onEdit: (id: string) => void;
+  onRemove: (id: string) => void;
+}) {
+  if (queue.length === 0) return null;
+  return (
+    <div className="space-y-1.5 px-3 pt-3">
+      <div className="flex items-center gap-1.5 px-0.5 text-[11px] text-zinc-500">
+        <Clock className="size-3" />
+        {busy
+          ? `Queued: sends when this turn ends${queue.length > 1 ? ", one per turn" : ""}`
+          : status === "error"
+            ? "Held: the last turn failed. Send now when ready, or remove it."
+            : "Sending…"}
+      </div>
+      {queue.map((m) => (
+        <div
+          key={m.id}
+          className="animate-pop-in group flex items-start gap-2 rounded-xl border border-dashed border-zinc-700 bg-zinc-900/30 py-1.5 pr-1.5 pl-3"
+        >
+          <div className="min-w-0 flex-1 py-0.5">
+            <p className="line-clamp-3 text-sm whitespace-pre-wrap text-zinc-300">{m.text}</p>
+            {m.attachments.length ? (
+              <span className="mt-0.5 flex items-center gap-1 text-[11px] text-zinc-500">
+                <Paperclip className="size-3" /> {m.attachments.length} attachment{m.attachments.length > 1 ? "s" : ""}
+              </span>
+            ) : null}
+          </div>
+          <Tooltip content="Send it into the running turn now, to steer what the agent is doing">
+            <button
+              type="button"
+              onClick={() => onSendNow(m.id)}
+              className="flex shrink-0 items-center gap-1 rounded-lg border border-zinc-700 px-2 py-1 text-[11px] font-medium text-zinc-200 transition-colors hover:border-zinc-500 hover:bg-zinc-800"
+            >
+              <CornerDownLeft className="size-3" /> Send now
+            </button>
+          </Tooltip>
+          <IconButton icon={Pencil} label="Edit" size="sm" onClick={() => onEdit(m.id)} />
+          <IconButton icon={X} label="Remove from queue" size="sm" onClick={() => onRemove(m.id)} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Composer({
   session,
   botName,
@@ -294,6 +360,7 @@ function Composer({
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [tick, setTick] = useState(0);
   const busy = isBusy(session);
   const ref = useRef<HTMLTextAreaElement>(null);
   const picker = useRef<HTMLInputElement>(null);
@@ -322,18 +389,50 @@ function Composer({
     setText("");
     setError(null);
     files.clear();
+    // While the agent works, the message waits for the turn to end (or "Send now" steers).
+    if (busy || queue.length > 0) {
+      enqueue(session.id, value, attachments);
+      return;
+    }
+    deliver(value, attachments);
+  };
+
+  const deliver = (value: string, attachments: ReadonlyArray<AttachmentRef>) =>
     rpc((c) => c["sessions.send"]({ sessionId: session.id, text: value, ...(attachments.length > 0 ? { attachments } : {}) })).catch(
       (e) => {
         setError(errorMessage(e));
         setText(value);
       },
     );
-  };
+
+  // Queued messages go out one per turn, once the session is idle.
+  const queue = useQueue(session.id);
+  const dispatched = useRef<{ at: number; sawBusy: boolean } | null>(null);
+  useEffect(() => {
+    const pending = dispatched.current;
+    if (pending) {
+      // Wait until the message just sent has started (and finished) its turn.
+      if (busy) pending.sawBusy = true;
+      if (!pending.sawBusy && Date.now() - pending.at < 10_000) {
+        const retry = setTimeout(() => setTick((t) => t + 1), 1000);
+        return () => clearTimeout(retry);
+      }
+      if (busy) return;
+      dispatched.current = null;
+    }
+    if (busy || session.status !== "idle" || queue.length === 0) return;
+    const next = dequeue(session.id, queue[0]!.id);
+    if (!next) return;
+    dispatched.current = { at: Date.now(), sawBusy: false };
+    void deliver(next.text, next.attachments);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy, session.status, queue, session.id, tick]);
 
   return (
     <div className="shrink-0 px-4 pb-4">
       <div className="mx-auto max-w-3xl">
         {error ? <div className="mb-2 px-1 text-xs text-red-400">{error}</div> : null}
+        <ConversationBar session={session} />
         <div
           className={cx(
             "relative rounded-2xl border bg-zinc-900/80 shadow-lg shadow-black/20 transition-colors focus-within:border-zinc-600",
@@ -363,6 +462,22 @@ function Composer({
               }}
             />
           ) : null}
+          <QueuedMessages
+            queue={queue}
+            onSendNow={(id) => {
+              const message = dequeue(session.id, id);
+              if (message) void deliver(message.text, message.attachments);
+            }}
+            onEdit={(id) => {
+              const message = dequeue(session.id, id);
+              if (!message) return;
+              setText((current) => (current.trim() ? `${message.text}\n${current}` : message.text));
+              ref.current?.focus();
+            }}
+            onRemove={(id) => dequeue(session.id, id)}
+            busy={busy}
+            status={session.status}
+          />
           <PendingAttachments items={files.items} onRemove={files.remove} />
           <textarea
             onPaste={(e) => {
@@ -398,11 +513,11 @@ function Composer({
             placeholder={
               waitingFor
                 ? `Waiting for ${splitModelId(waitingFor.id).name} to finish downloading (${downloadPercent(waitingFor)}%)…`
-                : session.role === "main"
-                ? `Message ${botName}… (/ for commands)`
                 : busy
-                  ? "Send a follow-up (folded into the running turn)…"
-                  : "Message this session…"
+                  ? "Queue a message for when this turn ends…"
+                  : session.role === "main"
+                    ? `Message ${botName}… (/ for commands)`
+                    : "Message this session…"
             }
             className="block max-h-72 w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm leading-relaxed text-zinc-100 placeholder:text-zinc-600 focus:outline-none disabled:cursor-not-allowed"
           />
@@ -418,6 +533,14 @@ function Composer({
               }}
             />
             <IconButton icon={Paperclip} label="Attach files (or paste / drop them)" size="sm" disabled={waitingFor !== null} onClick={() => picker.current?.click()} />
+            <DictateButton
+              disabled={waitingFor !== null}
+              onText={(spoken) => {
+                setText((current) => (current.trim() ? `${current.trimEnd()} ${spoken}` : spoken));
+                ref.current?.focus();
+              }}
+            />
+            <ConversationButton session={session} disabled={waitingFor !== null} />
             <ModelChip provider={session.provider} model={modelLabel ?? providerName(session.provider)} effort={session.effort} className="px-1.5 text-zinc-500" />
             <span className="flex-1" />
             {session.context && session.context.window > 0 ? <ContextMeter context={session.context} /> : null}
@@ -517,14 +640,7 @@ export function SessionView({
   // Between the user's message and the first streamed output (or a finished step and the
   // next) nothing else shows that the agent is at work: say so.
   const lastBlock = blocks.at(-1);
-  const pending =
-    isBusy(session) &&
-    session.status !== "waiting-approval" &&
-    (lastBlock === undefined ||
-      lastBlock.kind === "user" ||
-      (lastBlock.kind === "assistant" && !lastBlock.streaming) ||
-      lastBlock.kind === "turn-end" ||
-      lastBlock.kind === "notice");
+  const pending = showWorking(isBusy(session), session.status === "waiting-approval", lastBlock);
   const busy = isBusy(session);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -579,6 +695,8 @@ export function SessionView({
     setActionError(null);
     rpc(f).catch((e) => setActionError(errorMessage(e)));
   };
+
+  useConversation(session, items, setActionError);
 
   const respond: Responders = {
     approval: (requestId, decision) => act((c) => c["sessions.respondApproval"]({ sessionId: session.id, requestId, decision })),

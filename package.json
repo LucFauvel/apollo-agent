@@ -14,7 +14,8 @@
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "pair": "APOLLO_DATA_DIR=${APOLLO_DATA_DIR:-.apollo-dev} APOLLO_PUBLIC_URL=${APOLLO_PUBLIC_URL:-http://127.0.0.1:5733} node apps/server/src/bin.ts pair",
-    "package": "pnpm --filter @apollo/desktop package"
+    "package": "pnpm --filter @apollo/desktop package",
+    "install:app": "pnpm --filter @apollo/desktop run install:app"
   },
   "devDependencies": {
     "@types/node": "catalog:",

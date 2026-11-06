@@ -13,6 +13,24 @@ import type { Pairing } from "./connection.ts";
 
 const PUSH_TOKEN_KEY = "apollo.pushToken";
 
+/** Whether this phone gets notifications, and why not; shown on the home screen. */
+export type PushStatus =
+  | { state: "checking" }
+  | { state: "on" }
+  | { state: "denied" }
+  | { state: "error"; message: string };
+let pushStatus: PushStatus = { state: "checking" };
+const pushListeners = new Set<(s: PushStatus) => void>();
+const setPushStatus = (next: PushStatus) => {
+  pushStatus = next;
+  pushListeners.forEach((l) => l(next));
+};
+export const currentPushStatus = () => pushStatus;
+export const subscribePushStatus = (listener: (s: PushStatus) => void) => {
+  pushListeners.add(listener);
+  return () => void pushListeners.delete(listener);
+};
+
 /** The conversation on screen: its notifications are not shown while the app is open. */
 let viewing: SessionId | null = null;
 export const setViewingSession = (id: SessionId | null) => {
@@ -32,6 +50,7 @@ const projectId = (): string | undefined =>
 
 /** Asks for permission (once) and registers this phone with the server. Never throws. */
 export const registerForPush = async (pairing: Pairing): Promise<void> => {
+  setPushStatus({ state: "checking" });
   try {
     if (Platform.OS === "android") {
       await Notifications.setNotificationChannelAsync("default", {
@@ -41,16 +60,23 @@ export const registerForPush = async (pairing: Pairing): Promise<void> => {
     }
     let { status } = await Notifications.getPermissionsAsync();
     if (status !== "granted") status = (await Notifications.requestPermissionsAsync()).status;
-    if (status !== "granted") return;
-    const { data: token } = await Notifications.getExpoPushTokenAsync({ projectId: projectId() });
+    if (status !== "granted") return setPushStatus({ state: "denied" });
+    const id = projectId();
+    if (!id) throw new Error("this build has no EAS project id");
+    const { data: token } = await Notifications.getExpoPushTokenAsync({ projectId: id });
     const response = await fetch(`${pairing.server}/api/push/register`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${pairing.token}` },
       body: JSON.stringify({ token, platform: Platform.OS === "ios" ? "ios" : "android" }),
     });
-    if (response.ok) await SecureStore.setItemAsync(PUSH_TOKEN_KEY, token);
+    if (!response.ok) {
+      const body = (await response.json().catch(() => ({}))) as { error?: string };
+      throw new Error(body.error ?? `Apollo refused the registration (${response.status})`);
+    }
+    await SecureStore.setItemAsync(PUSH_TOKEN_KEY, token);
+    setPushStatus({ state: "on" });
   } catch (error) {
-    console.warn("Push registration failed", error);
+    setPushStatus({ state: "error", message: error instanceof Error ? error.message : String(error) });
   }
 };
 
@@ -68,6 +94,15 @@ export const unregisterPush = async (pairing: Pairing): Promise<void> => {
   } catch {
     // Unpairing goes on: the server drops tokens of revoked or expired phones anyway.
   }
+};
+
+/** Asks Apollo to send a test notification to this phone (and the computer). */
+export const sendTestNotification = async (pairing: Pairing) => {
+  const response = await fetch(`${pairing.server}/api/notifications/test`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${pairing.token}` },
+  });
+  if (!response.ok) throw new Error(`Apollo refused the test (${response.status})`);
 };
 
 /** The session a tapped notification points to. */

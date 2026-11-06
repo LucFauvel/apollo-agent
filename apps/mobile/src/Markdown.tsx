@@ -1,5 +1,6 @@
 import { type ReactNode, useMemo } from "react";
 import { Linking, Platform, ScrollView, StyleSheet, Text, type TextStyle, View } from "react-native";
+import { codePlainColor, highlightCode } from "@apollo/client";
 import { colors } from "./theme.ts";
 
 const mono = Platform.OS === "ios" ? "Menlo" : "monospace";
@@ -7,7 +8,7 @@ const mono = Platform.OS === "ios" ? "Menlo" : "monospace";
 type Block =
   | { type: "heading"; level: number; text: string }
   | { type: "paragraph"; text: string }
-  | { type: "code"; text: string }
+  | { type: "code"; text: string; lang: string | null }
   | { type: "quote"; text: string }
   | { type: "list"; ordered: boolean; items: Array<{ text: string; indent: number; marker: string }> }
   | { type: "table"; rows: Array<Array<string>> }
@@ -29,7 +30,7 @@ const parseBlocks = (source: string): Array<Block> => {
       i++;
       while (i < lines.length && !/^\s*```/.test(lines[i]!)) body.push(lines[i++]!);
       i++; // closing fence (or end while streaming)
-      blocks.push({ type: "code", text: body.join("\n") });
+      blocks.push({ type: "code", text: body.join("\n"), lang: /^\s*```\s*([\w+#.-]*)/.exec(line)?.[1] || null });
       continue;
     }
     if (!line.trim()) {
@@ -137,6 +138,47 @@ const renderInline = (text: string, base: TextStyle, keyPrefix = ""): Array<Reac
   return out;
 };
 
+/** Width of one character of the code font, to size lines so they scroll instead of wrapping. */
+const CODE_FONT_SIZE = 12.5;
+const CODE_CHAR_WIDTH = CODE_FONT_SIZE * 0.61;
+
+/**
+ * A fenced code block: highlighted, its language on top, and long lines that scroll
+ * sideways (sized to the longest line, so nothing wraps).
+ */
+export function CodeBlock({ code, lang }: { code: string; lang: string | null }) {
+  const lines = useMemo(() => highlightCode(code, lang), [code, lang]);
+  const longest = useMemo(() => lines.reduce((n, line) => Math.max(n, line.reduce((m, s) => m + s.text.length, 0)), 0), [lines]);
+  return (
+    <View style={styles.codeBlock}>
+      {lang ? <Text style={styles.codeLang}>{lang}</Text> : null}
+      <ScrollView
+        horizontal
+        nestedScrollEnabled
+        directionalLockEnabled
+        showsHorizontalScrollIndicator={longest * CODE_CHAR_WIDTH > 280}
+        contentContainerStyle={{ paddingHorizontal: 10, paddingTop: lang ? 2 : 10, paddingBottom: 10 }}
+      >
+        <Text style={[styles.codeText, { width: Math.ceil(longest * CODE_CHAR_WIDTH) + 8 }]} selectable>
+          {lines.map((line, i) => (
+            <Text key={i}>
+              {line.map((span, j) => (
+                <Text
+                  key={j}
+                  style={span.color || span.fontStyle || span.fontWeight ? { color: span.color, fontStyle: span.fontStyle, fontWeight: span.fontWeight } : undefined}
+                >
+                  {span.text}
+                </Text>
+              ))}
+              {i < lines.length - 1 ? "\n" : ""}
+            </Text>
+          ))}
+        </Text>
+      </ScrollView>
+    </View>
+  );
+}
+
 /** Renders an agent's markdown reply with native text. */
 export function Markdown({ text, color = colors.textSoft, size = 15 }: { text: string; color?: string; size?: number }) {
   const blocks = useMemo(() => parseBlocks(text), [text]);
@@ -158,13 +200,7 @@ export function Markdown({ text, color = colors.textSoft, size = 15 }: { text: s
               </Text>
             );
           case "code":
-            return (
-              <ScrollView key={i} horizontal style={styles.codeBlock} contentContainerStyle={{ padding: 10 }}>
-                <Text style={styles.codeText} selectable>
-                  {block.text}
-                </Text>
-              </ScrollView>
-            );
+            return <CodeBlock key={i} code={block.text} lang={block.lang} />;
           case "quote":
             return (
               <View key={i} style={styles.quote}>
@@ -216,8 +252,9 @@ const styles = StyleSheet.create({
   strike: { textDecorationLine: "line-through" },
   link: { color: colors.accent, textDecorationLine: "underline" },
   inlineCode: { fontFamily: mono, fontSize: 13, color: "#e4e4e7", backgroundColor: colors.panel },
-  codeBlock: { backgroundColor: "#000", borderRadius: 10, borderWidth: 1, borderColor: colors.border },
-  codeText: { fontFamily: mono, fontSize: 12.5, lineHeight: 18, color: colors.textSoft },
+  codeBlock: { backgroundColor: "#0d0d10", borderRadius: 10, borderWidth: 1, borderColor: colors.border, overflow: "hidden" },
+  codeLang: { color: colors.faint, fontSize: 10.5, fontFamily: mono, paddingHorizontal: 10, paddingTop: 7 },
+  codeText: { fontFamily: mono, fontSize: CODE_FONT_SIZE, lineHeight: 18, color: codePlainColor },
   quote: { borderLeftWidth: 3, borderLeftColor: colors.border, paddingLeft: 10 },
   listItem: { flexDirection: "row", gap: 8 },
   marker: { color: colors.faint, minWidth: 14 },

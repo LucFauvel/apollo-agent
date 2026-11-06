@@ -13,8 +13,9 @@
     "bundle:server": "node scripts/bundle-server.ts",
     "package": "pnpm build:package && electron-builder --publish never",
     "package:dir": "pnpm build:package && electron-builder --dir --publish never",
-    "build:package": "pnpm --filter @apollo/web build && tsc -p . && node scripts/bundle-server.ts",
-    "icons": "pnpm ensure:electron && electron scripts/render-icons.mjs"
+    "build:package": "pnpm --filter @apollo/web exec vite build --outDir ../desktop/build/web --emptyOutDir && tsc -p . && node scripts/bundle-server.ts",
+    "icons": "pnpm ensure:electron && electron scripts/render-icons.mjs",
+    "install:app": "node scripts/install-app.ts"
   },
   "devDependencies": {
     "@types/node": "catalog:",

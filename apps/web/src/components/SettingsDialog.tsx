@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { tildify } from "../appSettings.ts";
 import { errorMessage, rpc } from "../rpc.ts";
 import { Button, cx, ErrorText, Field, FormSection, IconButton, inputClass, Modal } from "./ui.tsx";
+import { NotificationSettings, VoiceSettings } from "./Voice.tsx";
 
 const count = (n: number) => (n === 1 ? "1 project" : `${n} projects`);
 
@@ -151,6 +152,8 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
           </form>
         </Field>
       </FormSection>
+      <NotificationSettings />
+      <VoiceSettings />
       <ErrorText>{error}</ErrorText>
     </Modal>
   );
