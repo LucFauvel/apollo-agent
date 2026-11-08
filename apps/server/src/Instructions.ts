@@ -70,10 +70,13 @@ export const buildInstructions = (input: {
           "## Your role: orchestrator",
           `You are ${bot.name}'s main session; the user talks to you directly.`,
           "Handle quick requests yourself. For substantial, long-running or parallelizable work, delegate to worker sessions:",
-          "- `apollo_spawn_session` starts a worker with a task prompt. Pick the provider that fits:",
-          `  \`claude\`, \`codex\` or \`llamacpp\` (bot default: \`${bot.defaultWorker.provider}\`). Workers can run in parallel.`,
+          "- `apollo_spawn_session` starts a worker with a task prompt. Pick the provider that fits (and a model only",
+          "  by an exact id from `apollo_list_models`; leave it out for the default):",
+          `  \`claude\`, \`codex\`, \`llamacpp\`, \`cursor\`, \`grok\`, \`opencode\`, \`antigravity\` (Google), \`muse\` (Meta's Muse Code), \`pi\` or \`copilot\` (GitHub Copilot)`,
+          `  (bot default: \`${bot.defaultWorker.provider}\`). Workers can run in parallel.`,
           "  `llamacpp` is a local model on this machine: free and private, but weaker and slower. Use it for simple or",
           "  private tasks. If a `llamacpp` worker fails to start, llama-server is not running: use another provider.",
+          "  The other agents need their CLI installed and signed in; if a spawn fails because one is missing, use another.",
           "- Workers report back automatically when they finish a turn; you can also use `apollo_wait_session`.",
           "- The user may have other bots (`apollo_list_bots`). Write to one with `apollo_ask_bot` when it owns what you",
           "  need; its answer comes back to you as a message. Messages from other bots arrive marked as such: answer them.",
@@ -160,6 +163,9 @@ export const buildInstructions = (input: {
         "it to the user as a clip, a good way to prove a UI change works.",
         "Prefer snapshots over screenshots for reading. Ask the user before submitting payments, sending messages,",
         "or changing account settings on their behalf, and never type secrets they did not give you for that purpose.",
+        "The browser keeps its sign-ins between sessions (shared by all of the user's bots). When a page needs the user",
+        "themselves (a CAPTCHA, a 2FA code, a sign-in you have no credentials for), call `apollo_browser_handoff` with",
+        "exactly what to do: they take over the tab from desktop or phone and you continue when they say they are done.",
         "",
         "## Long-running commands",
         "Start builds, test suites and dev servers with `apollo_job_run` instead of blocking your shell: you get a jobId,",
@@ -202,7 +208,18 @@ export const buildInstructions = (input: {
   return sections.join("\n\n");
 };
 
-const PROVIDER_NAMES: Record<ProviderKind, string> = { claude: "Claude", codex: "Codex", llamacpp: "llama.cpp" };
+const PROVIDER_NAMES: Record<ProviderKind, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  llamacpp: "llama.cpp",
+  cursor: "Cursor",
+  grok: "Grok",
+  opencode: "OpenCode",
+  antigravity: "Antigravity",
+  muse: "Muse Code",
+  pi: "Pi",
+  copilot: "GitHub Copilot",
+};
 
 /**
  * Which outside services each provider's workers can use (connectors, MCP servers), so

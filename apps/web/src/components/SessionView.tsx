@@ -48,6 +48,7 @@ import {
   useLocalModels,
 } from "./LocalModelsDialog.tsx";
 import { SecretItem } from "./SecretItem.tsx";
+import { HandoffItem } from "./HandoffItem.tsx";
 import { MessageAttachments, PendingAttachments, useAttachments } from "./Attachments.tsx";
 import { RecordingItem } from "./RecordingItem.tsx";
 import { ContextMeter, parseCommand, SlashMenu, useSlashCommands } from "./SlashCommands.tsx";
@@ -235,6 +236,8 @@ function Item({
       return <RecordingItem item={item} />;
     case "secret":
       return <SecretItem item={item} sessionId={sessionId} />;
+    case "handoff":
+      return <HandoffItem item={item} sessionId={sessionId} />;
     case "activity":
       return <ActivityGroup block={item} live={live} />;
     case "user":

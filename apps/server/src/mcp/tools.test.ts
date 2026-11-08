@@ -1,7 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import { Tool, type Toolkit } from "effect/ai";
-import { ApolloToolkit } from "./ApolloMcp.ts";
+import { ApolloToolkit, unknownModel } from "./ApolloMcp.ts";
 import { BotToolkit } from "./BotTools.ts";
 import { BrowserToolkit } from "./BrowserTools.ts";
 import { ChangeToolkit } from "./ChangeTools.ts";
@@ -42,5 +42,21 @@ describe("MCP tools", () => {
     const empty = Tool.make("example", { parameters: Schema.Struct({}) });
     expect(isObjectSchema(empty)).toBe(false);
     expect(isObjectSchema(Tool.make("example", { parameters: Tool.EmptyParams }))).toBe(true);
+  });
+});
+
+describe("spawning workers", () => {
+  it("accepts only model ids the provider offers, and lists them when refusing", () => {
+    const available = [{ id: "claude-opus-5-5" }, { id: "claude-sonnet-5-5" }];
+    expect(unknownModel("claude-opus-5-5", "claude", available)).toBeNull();
+    expect(unknownModel("opus", "claude", available)).toBe(
+      '"opus" is not a claude model. Available: claude-opus-5-5, claude-sonnet-5-5. Use one of these ids, or omit model for the default.',
+    );
+  });
+
+  it("tells the agent to check model ids before spawning", () => {
+    const spawn = (ApolloToolkit.tools as Record<string, Tool.Any>)["apollo_spawn_session"]!;
+    expect(spawn.description).toContain("apollo_list_models");
+    expect((ApolloToolkit.tools as Record<string, Tool.Any>)["apollo_list_models"]).toBeDefined();
   });
 });

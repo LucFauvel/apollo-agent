@@ -13,12 +13,16 @@ import {
 } from "@apollo/contracts";
 import type { ChildProcess } from "node:child_process";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
+import * as Option from "effect/Option";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 import { ServerConfig } from "../Config.ts";
 import { SessionManager } from "../SessionManager.ts";
+import { Store } from "../Store.ts";
 import { Cdp } from "./Cdp.ts";
 import { findBrowser, launchBrowser, stopBrowser } from "./Chrome.ts";
 import { PAGE_SCRIPT } from "./pageScript.ts";
@@ -77,6 +81,8 @@ const MODIFIER_BITS = { Alt: 1, Control: 2, Meta: 4, Shift: 8 } as const;
 export type Modifier = keyof typeof MODIFIER_BITS;
 
 interface Tab {
+  /** Where the mouse is, so clicks travel there like a hand would. */
+  mouse?: { x: number; y: number };
   readonly id: string;
   readonly botId: BotId;
   readonly sessionId: SessionId;
@@ -301,7 +307,7 @@ export class BrowserCore {
       send("Page.enable"),
       send("Runtime.enable"),
       send("Page.setLifecycleEventsEnabled", { enabled: true }),
-      send("Emulation.setDeviceMetricsOverride", { ...VIEWPORT, deviceScaleFactor: 1, mobile: false }),
+      send("Emulation.setDeviceMetricsOverride", { ...VIEWPORT, deviceScaleFactor: 1, mobile: false, ...this.screen() }),
     ]);
     return tab;
   }
@@ -447,11 +453,35 @@ export class BrowserCore {
     await this.send(tab, "Input.dispatchMouseEvent", { type, x, y, ...extra });
   }
 
+  /**
+   * A headless browser reports an 800×600 screen around a bigger window, which bot checks
+   * notice: report an ordinary desktop screen instead.
+   */
+  private screen() {
+    return this.options.headless ? { screenWidth: 1920, screenHeight: 1080 } : {};
+  }
+
+  /**
+   * Clicks like a hand: the pointer travels from where it was in a few eased steps, and the
+   * button stays down for a moment. Captchas and sign-in pages watch for pointers that
+   * teleport and click in zero time.
+   */
   private async click(tab: Tab, x: number, y: number, button: "left" | "right" | "middle" = "left", clickCount = 1, modifiers = 0) {
-    await this.mouse(tab, "mouseMoved", x, y, { modifiers });
+    const from = tab.mouse ?? { x: x + 40 + Math.random() * 80, y: y + 30 + Math.random() * 60 };
+    const steps = 6 + Math.floor(Math.random() * 5);
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const ease = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
+      const jitter = i < steps ? (Math.random() - 0.5) * 2 : 0;
+      await this.mouse(tab, "mouseMoved", from.x + (x - from.x) * ease + jitter, from.y + (y - from.y) * ease + jitter, { modifiers });
+      await sleep(8 + Math.random() * 10);
+    }
+    tab.mouse = { x, y };
     for (let i = 1; i <= clickCount; i++) {
       await this.mouse(tab, "mousePressed", x, y, { button, clickCount: i, modifiers });
+      await sleep(50 + Math.random() * 60);
       await this.mouse(tab, "mouseReleased", x, y, { button, clickCount: i, modifiers });
+      if (i < clickCount) await sleep(60);
     }
   }
 
@@ -688,7 +718,7 @@ export class BrowserCore {
       const width = Math.round(Math.min(Math.max(input.width ?? VIEWPORT.width, 240), 2560));
       const height = Math.round(Math.min(Math.max(input.height ?? VIEWPORT.height, 240), 2560));
       const mobile = input.mobile ?? width < 768;
-      await this.send(tab, "Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: mobile ? 2 : 1, mobile });
+      await this.send(tab, "Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: mobile ? 2 : 1, mobile, ...(mobile ? {} : this.screen()) });
       await this.send(tab, "Emulation.setTouchEmulationEnabled", mobile ? { enabled: true, maxTouchPoints: 5 } : { enabled: false });
       tab.frameSize = { width, height };
     }
@@ -770,6 +800,11 @@ export class BrowserCore {
       .map((name) => ({ path: join(root, name), at: statSync(join(root, name)).mtimeMs }))
       .sort((a, b) => b.at - a.at);
     for (const old of dirs.slice(RECORDINGS_KEPT - 1)) rmSync(old.path, { recursive: true, force: true });
+  }
+
+  /** The tab an agent means (its current one when `tabId` is left out). */
+  tabForAgent(botId: BotId, sessionId: SessionId, tabId?: string): BrowserTab {
+    return this.toTab(this.pick(botId, sessionId, tabId));
   }
 
   tabsFor(botId: BotId, sessionId: SessionId) {
@@ -935,9 +970,13 @@ const toApolloError = (error: unknown) =>
 
 const attempt = <A>(f: () => Promise<A>) => Effect.tryPromise({ try: f, catch: toApolloError });
 
+/** How long an agent waits for the user to finish in the browser, at most. */
+const HANDOFF_MAX_MS = 30 * 60_000;
+
 const make = Effect.gen(function* () {
   const config = yield* ServerConfig;
   const manager = yield* SessionManager;
+  const store = yield* Store;
   const context = yield* Effect.context<never>();
   const core = new BrowserCore({
     executable: findBrowser(config.browser.executable),
@@ -947,7 +986,62 @@ const make = Effect.gen(function* () {
   });
   yield* Effect.addFinalizer(() => Effect.promise(() => core.shutdown()));
 
+  // --- handoffs: the agent gives the user the browser and waits --------------------
+  const handoffs = new Map<string, { sessionId: SessionId; deferred: Deferred.Deferred<{ outcome: "done" | "cancelled"; note: string | null }> }>();
+  const handoffResolved = (sessionId: SessionId, requestId: string, outcome: "done" | "cancelled" | "expired") =>
+    manager.appendEvent(sessionId, { _tag: "BrowserHandoffResolved", requestId, outcome });
+
+  /** Shows the user the tab with `reason`, notifies them, and waits until they say they are done. */
+  const handoff = (botId: BotId, sessionId: SessionId, tabId: string | undefined, reason: string, timeoutMs: number) =>
+    Effect.gen(function* () {
+      const tab = yield* attempt(async () => core.tabForAgent(botId, sessionId, tabId));
+      const text = reason.trim().slice(0, 600);
+      if (!text) return yield* new ApolloError({ code: "invalid", message: "`reason` is required: tell the user what to do, e.g. \"Solve the CAPTCHA, then click Done\"" });
+      const requestId = `handoff_${randomBytes(12).toString("base64url")}`;
+      const deferred = yield* Deferred.make<{ outcome: "done" | "cancelled"; note: string | null }>();
+      handoffs.set(requestId, { sessionId, deferred });
+      yield* manager.appendEvent(sessionId, { _tag: "BrowserHandoff", requestId, tabId: tab.id, url: tab.url, reason: text });
+      const bot = yield* store.getBot(botId).pipe(Effect.option);
+      yield* manager.publish({
+        _tag: "Notify",
+        botId,
+        sessionId,
+        title: `${Option.isSome(bot) ? bot.value.name : "Your bot"} needs you in the browser`,
+        body: text,
+      });
+      const answer = yield* Deferred.await(deferred).pipe(
+        Effect.timeoutOption(Duration.millis(Math.min(Math.max(timeoutMs, 30_000), HANDOFF_MAX_MS))),
+        Effect.onInterrupt(() => handoffResolved(sessionId, requestId, "expired").pipe(Effect.ignore)),
+        Effect.ensuring(Effect.sync(() => handoffs.delete(requestId))),
+      );
+      if (Option.isNone(answer)) {
+        yield* handoffResolved(sessionId, requestId, "expired");
+        return yield* new ApolloError({ code: "invalid", message: "the user did not take over the browser in time; tell them what is needed and stop" });
+      }
+      if (answer.value.outcome === "cancelled") {
+        return yield* new ApolloError({
+          code: "invalid",
+          message: `the user declined to do this in the browser${answer.value.note ? `: ${answer.value.note}` : ""}; do not ask again unless they say so`,
+        });
+      }
+      // The page may have moved on (signed in, redirected): report where it is now.
+      const now = core.list(botId).find((t) => t.id === tab.id);
+      return { tabId: tab.id, url: now?.url ?? tab.url, title: now?.title ?? tab.title, note: answer.value.note };
+    });
+
+  const respondHandoff = (sessionId: SessionId, requestId: string, outcome: "done" | "cancelled", note: string | null) =>
+    Effect.gen(function* () {
+      const pending = handoffs.get(requestId);
+      if (!pending || pending.sessionId !== sessionId) {
+        return yield* new ApolloError({ code: "invalid", message: "the agent is no longer waiting (it timed out, or Apollo restarted)" });
+      }
+      yield* handoffResolved(sessionId, requestId, outcome);
+      yield* Deferred.succeed(pending.deferred, { outcome, note: note?.trim() || null });
+    });
+
   return {
+    handoff,
+    respondHandoff,
     status: Effect.sync(() => core.status()),
     list: (botId?: BotId) => Effect.sync(() => core.list(botId)),
     open: (botId: BotId, sessionId: SessionId, url: string | undefined, newTab: boolean) =>

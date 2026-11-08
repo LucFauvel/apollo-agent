@@ -112,6 +112,8 @@ export const notificationFor = (
       return { kind: "question", title: `${who} has a question`, body: plain(event.message) || "Open Apollo to answer." };
     case "SecretRequested":
       return { kind: "secret", title: `${who} needs a secret`, body: plain(event.label) };
+    case "BrowserHandoff":
+      return { kind: "handoff", title: `${who} needs you in the browser`, body: plain(event.reason) || "Open Apollo to take over." };
     case "TurnCompleted": {
       if (event.outcome === "interrupted") return null;
       if (event.outcome === "failed") return { kind: "error", title: `${who} stopped with an error`, body: plain(event.error ?? "") };

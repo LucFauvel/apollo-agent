@@ -7,8 +7,10 @@ import { slugify, suggestBotName, tildify, useAppSettings } from "../appSettings
 import { formatUsage, usageTitle } from "../format.ts";
 import { errorMessage, rpc } from "../rpc.ts";
 import { useApp } from "../store.ts";
+import { useProviderVersions } from "../versions.ts";
 import { type ModelChoice, ModelPicker } from "./ModelPicker.tsx";
-import { ProviderLogo } from "./icons.tsx";
+import { ClaudeLogo, ProviderLogo } from "./icons.tsx";
+import { AccountSelect } from "./Accounts.tsx";
 import { LocalModelSetup } from "./LocalModelsDialog.tsx";
 import { BotAvatar } from "./Sidebar.tsx";
 import {
@@ -40,11 +42,23 @@ export function ProviderPicker({
   value: ProviderKind;
   onChange: (provider: ProviderKind) => void;
 }) {
+  // Claude, Codex and llama.cpp always show; the other agents once their CLI is installed
+  // (Antigravity installs itself on first use).
+  const { versions } = useProviderVersions();
+  const shown = PROVIDERS.filter(
+    ({ kind }) =>
+      kind === value ||
+      kind === "claude" ||
+      kind === "codex" ||
+      kind === "llamacpp" ||
+      kind === "antigravity" ||
+      versions.some((v) => v.provider === kind && v.installed !== null),
+  );
   return (
     <OptionCards
       value={value}
       onChange={onChange}
-      options={PROVIDERS.map(({ kind, name, detail }) => ({
+      options={shown.map(({ kind, name, detail }) => ({
         value: kind,
         label: name,
         detail,
@@ -55,23 +69,43 @@ export function ProviderPicker({
 }
 
 /** Provider cards with the model and effort picker underneath. */
+/** The bot's Claude and Codex accounts, picked beside the model for those providers. */
+type AccountChoice = { value: string | null; onChange: (accountId: string | null) => void };
+type AccountChoices = { readonly claude: AccountChoice; readonly codex: AccountChoice };
+
+/** The model picker, with the account dropdown beside it for Claude Code and Codex. */
+function ModelRow({ provider, account, children }: { provider: ProviderKind; account: AccountChoices | undefined; children: React.ReactNode }) {
+  if ((provider !== "claude" && provider !== "codex") || !account) return <>{children}</>;
+  const choice = account[provider];
+  return (
+    <div className="flex items-start gap-2">
+      <AccountSelect provider={provider} value={choice.value} onChange={choice.onChange} />
+      <div className="min-w-0 flex-1">{children}</div>
+    </div>
+  );
+}
+
 function ProviderModelPicker({
   provider,
   onProvider,
   choice,
   onChoice,
+  account,
 }: {
   provider: ProviderKind;
   onProvider: (provider: ProviderKind) => void;
   choice: ModelChoice;
   onChoice: (choice: ModelChoice) => void;
+  account?: AccountChoices;
 }) {
   // A model downloaded from the inline setup becomes the choice straight away.
   const onSelect = useCallback((model: string) => onChoice({ model, effort: null }), [onChoice]);
   return (
     <div className="space-y-2">
       <ProviderPicker value={provider} onChange={onProvider} />
-      <ModelPicker provider={provider} value={choice} onChange={onChoice} quietErrors={provider === "llamacpp"} />
+      <ModelRow provider={provider} account={account}>
+        <ModelPicker provider={provider} value={choice} onChange={onChoice} quietErrors={provider === "llamacpp"} />
+      </ModelRow>
       {provider === "llamacpp" ? <LocalModelSetup onSelect={onSelect} /> : null}
     </div>
   );
@@ -82,10 +116,12 @@ function FixedProviderModel({
   provider,
   choice,
   onChoice,
+  account,
 }: {
   provider: ProviderKind;
   choice: ModelChoice;
   onChoice: (choice: ModelChoice) => void;
+  account?: AccountChoices;
 }) {
   return (
     <div className="space-y-2">
@@ -93,7 +129,9 @@ function FixedProviderModel({
         <ProviderLogo provider={provider} size={16} />
         {providerName(provider)}
       </div>
-      <ModelPicker provider={provider} value={choice} onChange={onChoice} />
+      <ModelRow provider={provider} account={account}>
+        <ModelPicker provider={provider} value={choice} onChange={onChoice} />
+      </ModelRow>
     </div>
   );
 }
@@ -166,6 +204,8 @@ export function NewBotDialog({ onClose, onCreated }: { onClose: () => void; onCr
   const [workerModel, setWorkerModel] = useState<ModelChoice>(NO_CHOICE);
   const [runtimeMode, setRuntimeMode] = useState<RuntimeMode>("auto");
   const [autoLearn, setAutoLearn] = useState(true);
+  const [claudeAccountId, setClaudeAccountId] = useState<string | null>(null);
+  const [codexAccountId, setCodexAccountId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -181,6 +221,8 @@ export function NewBotDialog({ onClose, onCreated }: { onClose: () => void; onCr
         defaultWorker: selection(worker, workerModel),
         runtimeMode,
         autoLearn,
+        ...(claudeAccountId ? { claudeAccountId } : {}),
+        ...(codexAccountId ? { codexAccountId } : {}),
       }),
     )
       .then(onCreated)
@@ -241,7 +283,7 @@ export function NewBotDialog({ onClose, onCreated }: { onClose: () => void; onCr
         </Field>
       </FormSection>
       <FormSection title="Orchestrator" description="The session you talk to. It plans and delegates.">
-        <ProviderModelPicker
+        <ProviderModelPicker account={{ claude: { value: claudeAccountId, onChange: setClaudeAccountId }, codex: { value: codexAccountId, onChange: setCodexAccountId } }}
           provider={main}
           onProvider={(p) => {
             setMain(p);
@@ -252,7 +294,7 @@ export function NewBotDialog({ onClose, onCreated }: { onClose: () => void; onCr
         />
       </FormSection>
       <FormSection title="Default worker" description="The bot can still pick any provider, model and effort per task.">
-        <ProviderModelPicker
+        <ProviderModelPicker account={{ claude: { value: claudeAccountId, onChange: setClaudeAccountId }, codex: { value: codexAccountId, onChange: setCodexAccountId } }}
           provider={worker}
           onProvider={(p) => {
             setWorker(p);
@@ -480,6 +522,8 @@ export function BotSettingsDialog({ bot, onClose }: { bot: Bot; onClose: () => v
   const [instructions, setInstructions] = useState(bot.instructions);
   const [runtimeMode, setRuntimeMode] = useState<RuntimeMode>(bot.runtimeMode);
   const [autoLearn, setAutoLearn] = useState(bot.autoLearn);
+  const [claudeAccountId, setClaudeAccountId] = useState<string | null>(bot.claudeAccountId);
+  const [codexAccountId, setCodexAccountId] = useState<string | null>(bot.codexAccountId);
   const [mainModel, setMainModel] = useState<ModelChoice>({ model: bot.main.model ?? null, effort: bot.main.effort ?? null });
   const [worker, setWorker] = useState<ProviderKind>(bot.defaultWorker.provider);
   const [workerModel, setWorkerModel] = useState<ModelChoice>({
@@ -517,6 +561,8 @@ export function BotSettingsDialog({ bot, onClose }: { bot: Bot; onClose: () => v
         main: selection(bot.main.provider, mainModel),
         defaultWorker: selection(worker, workerModel),
         limits,
+        claudeAccountId,
+        codexAccountId,
       }),
     )
       .then(onClose)
@@ -553,10 +599,10 @@ export function BotSettingsDialog({ bot, onClose }: { bot: Bot; onClose: () => v
         </Field>
       </FormSection>
       <FormSection title="Orchestrator">
-        <FixedProviderModel provider={bot.main.provider} choice={mainModel} onChoice={setMainModel} />
+        <FixedProviderModel provider={bot.main.provider} choice={mainModel} onChoice={setMainModel} account={{ claude: { value: claudeAccountId, onChange: setClaudeAccountId }, codex: { value: codexAccountId, onChange: setCodexAccountId } }} />
       </FormSection>
       <FormSection title="Default worker">
-        <ProviderModelPicker
+        <ProviderModelPicker account={{ claude: { value: claudeAccountId, onChange: setClaudeAccountId }, codex: { value: codexAccountId, onChange: setCodexAccountId } }}
           provider={worker}
           onProvider={(p) => {
             setWorker(p);

@@ -126,6 +126,7 @@ export const handlers = UserToolkit.toLayer(
       apollo_list_connectors: ({ provider, refresh }) =>
         Effect.gen(function* () {
           const kinds: Array<ProviderKind> = provider ? [provider] : ["claude", "codex", "llamacpp"];
+          // The other agents report no connectors; ask for one by name to check it.
           const providers = yield* Effect.forEach(
             kinds,
             (kind) =>

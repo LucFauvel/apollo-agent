@@ -10,3 +10,8 @@ export {
   llamaCppEnvironment,
   makeLlamaCppProvider,
 } from "./LlamaCppProvider.ts";
+export { type AcpAgent, type AcpLaunch, acpModels, makeAcpProvider } from "./AcpProvider.ts";
+export { type AcpAgentsConfig, antigravityPaths, installAntigravity, makeAcpProviders, opencodePermissions } from "./AcpAgents.ts";
+export { autoDecision, findExecutable, skillsNote } from "./AgentSupport.ts";
+export { makeMuseProvider, type MuseProviderConfig } from "./MuseProvider.ts";
+export { makePiProvider, type PiProviderConfig } from "./PiProvider.ts";

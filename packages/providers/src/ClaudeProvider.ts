@@ -301,7 +301,14 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
   open: Effect.fn("ClaudeProvider.open")(function* (options: ProviderSessionOptions, emit: Emit) {
     const backend = config.backend
       ? yield* config.backend.prepare(options.model)
-      : { model: options.model, env: config.environment ? yield* config.environment : null, instructions: undefined, disallowedTools: undefined };
+      : {
+          model: options.model,
+          env: config.environment || options.environment
+            ? { ...(config.environment ? yield* config.environment : {}), ...options.environment }
+            : null,
+          instructions: undefined,
+          disallowedTools: undefined,
+        };
     const context = yield* Effect.context<never>();
     const run = Effect.runForkWith(context);
     const agent = (event: AgentEvent) => emit({ _tag: "Event", event });

@@ -230,12 +230,17 @@ const ListSessions = Tool.make("apollo_list_sessions", {
 
 const SpawnSession = Tool.make("apollo_spawn_session", {
   ...shared,
-  description:
-    "Start a worker session for a task (orchestrator only). It runs in parallel and reports back to you when it finishes a turn. Choose the provider that fits the task.",
+  description: [
+    "Start a worker session for a task (orchestrator only). It runs in parallel and reports back to you when it",
+    "finishes a turn. Choose the provider that fits the task. `model` must be an id from the provider's available",
+    "models: check it with apollo_list_models first, never guess or reuse a name from memory (an unknown id is",
+    "refused). Leave `model` out to use the default.",
+  ].join(" "),
   parameters: Schema.Struct({
     title: Schema.String,
     prompt: Schema.String,
     provider: Schema.optional(ProviderKind),
+    /** An exact id from apollo_list_models for that provider; omit for the default. */
     model: Schema.optional(Schema.String),
     /** Reasoning effort, e.g. `low` for simple tasks or `high` for hard ones. */
     effort: Schema.optional(Schema.String),
@@ -249,6 +254,19 @@ const SpawnSession = Tool.make("apollo_spawn_session", {
   }),
   success: SessionSummary,
 });
+
+const ListModels = Tool.make("apollo_list_models", {
+  ...shared,
+  description:
+    "The models a provider offers right now, with their exact ids, which is the default, and the reasoning efforts each accepts. Use an id from here for apollo_spawn_session's `model`.",
+  parameters: Schema.Struct({ provider: ProviderKind }),
+  success: Schema.Struct({
+    provider: ProviderKind,
+    models: Schema.Array(
+      Schema.Struct({ id: Schema.String, label: Schema.String, isDefault: Schema.Boolean, efforts: Schema.Array(Schema.String) }),
+    ),
+  }),
+}).annotate(Tool.Readonly, true);
 
 const SendToSession = Tool.make("apollo_send_to_session", {
   ...shared,
@@ -380,6 +398,7 @@ export const ApolloToolkit = Toolkit.make(
   SkillArchive,
   ListSessions,
   SpawnSession,
+  ListModels,
   SendToSession,
   WaitSession,
   InterruptSession,
@@ -390,6 +409,12 @@ export const ApolloToolkit = Toolkit.make(
 );
 
 const invalid = (message: string) => new ApolloError({ code: "invalid", message });
+
+/** Why a requested model id cannot be used, or null when the provider offers it. */
+export const unknownModel = (model: string, provider: string, available: ReadonlyArray<{ readonly id: string }>) =>
+  available.some((m) => m.id === model)
+    ? null
+    : `"${model}" is not a ${provider} model. Available: ${available.map((m) => m.id).join(", ") || "none"}. Use one of these ids, or omit model for the default.`;
 
 const handlers = ApolloToolkit.toLayer(
   Effect.gen(function* () {
@@ -621,6 +646,14 @@ const handlers = ApolloToolkit.toLayer(
           return { sessions: sessions.filter((s) => s.role !== "reflection").map(summarize) };
         }),
 
+      apollo_list_models: ({ provider }) =>
+        Effect.gen(function* () {
+          const models = yield* manager.listModels(provider).pipe(
+            Effect.mapError((e) => new ApolloError({ code: "internal", message: `could not list ${provider} models: ${"message" in e ? e.message : String(e)}` })),
+          );
+          return { provider, models: models.map((m) => ({ id: m.id, label: m.label, isDefault: m.isDefault, efforts: m.efforts })) };
+        }),
+
       apollo_spawn_session: ({ title, prompt, provider, model, effort, cwd, isolation, notifyOnCompletion }) =>
         Effect.gen(function* () {
           const caller = yield* McpCaller;
@@ -634,6 +667,12 @@ const handlers = ApolloToolkit.toLayer(
           yield* manager.guardWorkerCapacity(bot.id);
           // A different provider starts from its own defaults; the same one inherits the bot's.
           const base = provider && provider !== bot.defaultWorker.provider ? { provider } : bot.defaultWorker;
+          // Only ids the provider offers: a guessed one would fail later, inside the worker.
+          if (model) {
+            const available = yield* manager.listModels(base.provider).pipe(Effect.orElseSucceed(() => null));
+            const problem = available ? unknownModel(model, base.provider, available) : null;
+            if (problem) return yield* invalid(problem);
+          }
           const selection = { ...base, ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
           const session = yield* manager.createSession({
             botId: bot.id,

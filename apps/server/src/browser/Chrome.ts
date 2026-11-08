@@ -99,6 +99,22 @@ const releaseStaleProfile = async (profileDir: string) => {
   for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) rmSync(join(profileDir, name), { force: true });
 };
 
+/** How the browser's user agent reads, from its version: headless Chrome says "HeadlessChrome", which sites treat as a bot. */
+export const ordinaryUserAgent = (executable: string): string | null => {
+  try {
+    const major = /(\d+)\.\d+\.\d+/.exec(execFileSync(executable, ["--version"], { timeout: 5000, encoding: "utf8" }))?.[1];
+    if (!major) return null;
+    const platform =
+      process.platform === "darwin" ? "Macintosh; Intel Mac OS X 10_15_7" : process.platform === "win32" ? "Windows NT 10.0; Win64; x64" : "X11; Linux x86_64";
+    return `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+  } catch {
+    return null;
+  }
+};
+
+/** Room a real window leaves for tabs and the address bar, so the page is not the whole window. */
+const TOOLBAR_HEIGHT = 87;
+
 /**
  * Starts the browser with its own profile in `profileDir` and a DevTools port
  * the OS picks, then reads the port from the `DevToolsActivePort` file.
@@ -112,6 +128,7 @@ export const launchBrowser = async (
   await releaseStaleProfile(profileDir);
   const portFile = join(profileDir, "DevToolsActivePort");
   rmSync(portFile, { force: true });
+  const userAgent = headless ? ordinaryUserAgent(executable) : null;
 
   const args = [
     `--user-data-dir=${profileDir}`,
@@ -122,8 +139,13 @@ export const launchBrowser = async (
     "--disable-features=Translate,MediaRouter",
     "--disable-session-crashed-bubble",
     "--hide-crash-restore-bubble",
-    `--window-size=${width},${height}`,
+    // Look like the user's own browser rather than an automated one: no navigator.webdriver,
+    // an ordinary user agent, and a window with room for its toolbars. Sign-in pages (and
+    // their captchas) otherwise loop on what they take for a bot.
+    "--disable-blink-features=AutomationControlled",
+    `--window-size=${width},${height + TOOLBAR_HEIGHT}`,
     ...(headless ? ["--headless=new", "--hide-scrollbars", "--mute-audio"] : []),
+    ...(headless && userAgent ? [`--user-agent=${userAgent}`] : []),
     "about:blank",
   ];
   const child = spawn(executable, args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });

@@ -7,13 +7,14 @@ import {
   type ProviderSettings,
   type UpdateProviderSettingsInput,
 } from "@apollo/contracts";
-import { ArrowUpCircle, Blocks, Check, CircleAlert, HardDrive, KeyRound, Loader2, LogIn, Server } from "lucide-react";
+import { ArrowUpCircle, Blocks, Check, CircleAlert, Download, HardDrive, KeyRound, Loader2, LogIn, Server } from "lucide-react";
 import { type ReactNode, useEffect, useState } from "react";
 import { forgetModels } from "../models.ts";
 import { errorMessage, rpc } from "../rpc.ts";
 import { updateProvider, useProviderVersions } from "../versions.ts";
 import { setLocalModels, useApp } from "../store.ts";
-import { ClaudeLogo, CodexLogo, LlamaLogo } from "./icons.tsx";
+import { AccountsSection } from "./Accounts.tsx";
+import { ClaudeLogo, CodexLogo, LlamaLogo, ProviderLogo } from "./icons.tsx";
 import { Button, cx, ErrorText, Field, inputClass, Modal, OptionCards, Toggle } from "./ui.tsx";
 
 type Check = { status: "idle" | "checking" } | { status: "ok"; models: ReadonlyArray<ModelOption> } | { status: "error"; error: string };
@@ -96,8 +97,16 @@ function VersionBadge({ provider }: { provider: ProviderKind }) {
       </span>
     );
   }
+  // Something Apollo installs itself (Antigravity's server): offer it here.
+  if (v.installed === null && v.canUpdate) {
+    return (
+      <Button size="sm" variant="primary" disabled={busy} onClick={() => void updateProvider(provider)} title={v.note ?? undefined}>
+        {busy ? <Loader2 className="animate-spin" /> : <Download />} {busy ? "Installing…" : "Install"}
+      </Button>
+    );
+  }
   return (
-    <span className="shrink-0 text-[11px] text-zinc-500 tabular-nums" title={v.note ?? undefined}>
+    <span className="max-w-40 shrink-0 truncate text-right text-[11px] text-zinc-500 tabular-nums" title={v.note ?? undefined}>
       {v.installed ? `${v.installed} · up to date` : (v.note ?? "")}
     </span>
   );
@@ -132,6 +141,54 @@ function ProviderSection({
 }
 
 const iconClass = "size-4 text-zinc-400";
+
+const mono = (text: string) => <span className="font-mono text-zinc-400">{text}</span>;
+
+/** The agents Apollo drives through their own CLIs, and how to set each one up. */
+const AGENTS: ReadonlyArray<{ kind: ProviderKind; name: string; detail: string; setup: ReactNode }> = [
+  {
+    kind: "cursor",
+    name: "Cursor",
+    detail: "Cursor Agent · cursor-agent acp",
+    setup: <>Install with {mono("curl https://cursor.com/install -fsS | bash")}, then sign in with {mono("cursor-agent login")}.</>,
+  },
+  {
+    kind: "grok",
+    name: "Grok",
+    detail: "xAI · grok agent stdio",
+    setup: <>Install it here (or {mono("npm install -g @xai-official/grok")}), then sign in with {mono("grok login")} (or set {mono("XAI_API_KEY")}).</>,
+  },
+  {
+    kind: "opencode",
+    name: "OpenCode",
+    detail: "Any model provider · opencode acp",
+    setup: <>Install with {mono("curl -fsSL https://opencode.ai/install | bash")}, then connect a model provider with {mono("opencode auth login")}.</>,
+  },
+  {
+    kind: "antigravity",
+    name: "Antigravity",
+    detail: "Google · Gemini models",
+    setup: <>Apollo downloads Google's Antigravity server the first time you use it (separate from the Antigravity app). A browser opens to sign in with your Google account, or set {mono("GEMINI_API_KEY")}.</>,
+  },
+  {
+    kind: "muse",
+    name: "Muse Code",
+    detail: "Meta · muse serve",
+    setup: <>Install Muse Code, then sign in with {mono("muse login")}.</>,
+  },
+  {
+    kind: "pi",
+    name: "Pi",
+    detail: "Any model provider · pi --mode rpc",
+    setup: <>Install it here (or {mono("npm install -g @earendil-works/pi-coding-agent")}), then run {mono("pi")} once to sign in to a model provider.</>,
+  },
+  {
+    kind: "copilot",
+    name: "GitHub Copilot",
+    detail: "GitHub · copilot --acp",
+    setup: <>Install it here (or {mono("npm install -g @github/copilot")}), then sign in with {mono("copilot login")}. Uses your Copilot plan's models.</>,
+  },
+];
 
 /** One line on the managed llama.cpp setup. */
 function ManagedSummary() {
@@ -280,6 +337,7 @@ export function ProvidersDialog({ onClose, onLocalModels }: { onClose: () => voi
                 placeholder="sk-ant-…"
               />
             </Field>
+            <AccountsSection provider="claude" />
           </ProviderSection>
 
           <ProviderSection provider="codex" logo={<CodexLogo size={20} />} name="Codex" detail="OpenAI · runs through codex app-server">
@@ -287,6 +345,7 @@ export function ProvidersDialog({ onClose, onLocalModels }: { onClose: () => voi
               Uses the <span className="font-mono text-zinc-400">codex</span> CLI on this machine and its login. Run{" "}
               <span className="font-mono text-zinc-400">codex login</span> to sign in.
             </p>
+            <AccountsSection provider="codex" />
           </ProviderSection>
 
           <ProviderSection
@@ -376,6 +435,22 @@ export function ProvidersDialog({ onClose, onLocalModels }: { onClose: () => voi
               </>
             )}
           </ProviderSection>
+
+          <div className="pt-2">
+            <h3 className="text-[11px] font-medium tracking-wide text-zinc-500 uppercase">Other agents</h3>
+            <p className="mt-1 text-[11px] text-zinc-500">Apollo runs these through their own CLIs and logins. Install one and it shows up in the pickers.</p>
+          </div>
+          {AGENTS.map((agent) => (
+            <ProviderSection
+              key={agent.kind}
+              provider={agent.kind}
+              logo={<ProviderLogo provider={agent.kind} size={20} />}
+              name={agent.name}
+              detail={agent.detail}
+            >
+              <p className="text-[11px] leading-relaxed text-zinc-500">{agent.setup}</p>
+            </ProviderSection>
+          ))}
         </>
       ) : (
         <p className="text-sm text-zinc-500">Loading…</p>

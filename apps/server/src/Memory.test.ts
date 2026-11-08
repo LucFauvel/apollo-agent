@@ -27,6 +27,8 @@ const bot = (id: string): Bot => ({
   autoLearn: false,
   limits: DEFAULT_BOT_LIMITS,
   pausedReason: null,
+  claudeAccountId: null,
+  codexAccountId: null,
   mainSessionId: `${id}-main` as SessionId,
   createdAt: 0,
   updatedAt: 0,

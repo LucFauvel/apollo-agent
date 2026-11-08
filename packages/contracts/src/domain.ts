@@ -24,8 +24,12 @@ export const Timestamp = Schema.Number;
 // Providers
 // ---------------------------------------------------------------------------
 
-/** `llamacpp`: a local model behind llama.cpp's llama-server, driven by the Claude Code harness. */
-export const ProviderKind = Schema.Literals(["claude", "codex", "llamacpp"]);
+/**
+ * `llamacpp`: a local model behind llama.cpp's llama-server, driven by the Claude Code harness.
+ * `cursor`, `grok`, `opencode`, `antigravity` and `copilot` (GitHub Copilot CLI) speak the Agent Client Protocol; `muse`
+ * (Meta's Muse Code) and `pi` have protocols of their own.
+ */
+export const ProviderKind = Schema.Literals(["claude", "codex", "llamacpp", "cursor", "grok", "opencode", "antigravity", "muse", "pi", "copilot"]);
 export type ProviderKind = typeof ProviderKind.Type;
 
 /**
@@ -158,6 +162,13 @@ export const Bot = Schema.Struct({
   limits: BotLimits,
   /** Why automated work is paused, or `null` when the bot runs freely. */
   pausedReason: Schema.NullOr(Schema.String),
+  /**
+   * The Claude account its Claude sessions use (one added in provider settings), or
+   * `null` for this machine's own Claude login.
+   */
+  claudeAccountId: Schema.NullOr(Schema.String),
+  /** The same for Codex sessions: an added Codex account, or `null` for this machine's login. */
+  codexAccountId: Schema.NullOr(Schema.String),
   mainSessionId: SessionId,
   createdAt: Timestamp,
   updatedAt: Timestamp,
@@ -378,6 +389,20 @@ export const AgentEvent = Schema.Union([
     reason: Schema.String,
     placeholder: Schema.NullOr(Schema.String),
   }),
+  /**
+   * An agent handed the browser to the user (`apollo_browser_handoff`): a CAPTCHA, a 2FA code,
+   * a sign-in to finish. The agent waits until the user says they are done.
+   */
+  Schema.TaggedStruct("BrowserHandoff", {
+    requestId: Schema.String,
+    tabId: Schema.String,
+    url: Schema.String,
+    reason: Schema.String,
+  }),
+  Schema.TaggedStruct("BrowserHandoffResolved", {
+    requestId: Schema.String,
+    outcome: Schema.Literals(["done", "cancelled", "expired"]),
+  }),
   Schema.TaggedStruct("SecretResolved", {
     requestId: Schema.String,
     outcome: Schema.Literals(["provided", "declined", "expired"]),
@@ -568,6 +593,28 @@ export const deviceProofMessage = (method: string, path: string, timestamp: stri
 // ---------------------------------------------------------------------------
 
 /** How Claude Code signs in: the user's own `claude` login (subscription), or an API key saved in Apollo. */
+/** Providers whose CLI can run on more than one account. */
+export const AccountProvider = Schema.Literals(["claude", "codex"]);
+export type AccountProvider = typeof AccountProvider.Type;
+
+/**
+ * Another subscription Apollo can run bots on (e.g. personal next to work): its own Claude
+ * Code or Codex login, with that account's connectors or apps. Settings and skills are shared.
+ */
+export const ProviderAccount = Schema.Struct({
+  id: Schema.String,
+  provider: AccountProvider,
+  name: Schema.String,
+  loggedIn: Schema.Boolean,
+  email: Schema.NullOr(Schema.String),
+  orgName: Schema.NullOr(Schema.String),
+  /** e.g. `pro`, `max`, `team`, `plus`. */
+  plan: Schema.NullOr(Schema.String),
+  /** A sign-in is in progress: the page it opened, and why it stopped if it failed. */
+  signIn: Schema.NullOr(Schema.Struct({ url: Schema.NullOr(Schema.String), error: Schema.NullOr(Schema.String) })),
+});
+export type ProviderAccount = typeof ProviderAccount.Type;
+
 export const ClaudeAuth = Schema.Literals(["subscription", "api-key"]);
 export type ClaudeAuth = typeof ClaudeAuth.Type;
 

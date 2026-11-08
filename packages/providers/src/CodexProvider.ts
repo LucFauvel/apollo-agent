@@ -586,10 +586,15 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
       }
     };
 
+    // Another account: Codex runs from that account's folder (CODEX_HOME).
+    const env = options.environment
+      ? Object.fromEntries(Object.entries({ ...process.env, ...options.environment }).filter(([, v]) => v !== undefined))
+      : undefined;
     const rpc = yield* spawnJsonRpcProcess({
       command: config.executable ?? "codex",
       args: ["app-server"],
       cwd: options.cwd,
+      ...(env ? { env } : {}),
       handlers: {
         onNotification,
         onRequest,

@@ -1,4 +1,5 @@
 import * as Schema from "effect/Schema";
+import { ProviderKind } from "./domain.ts";
 
 /**
  * Something a provider's agents can reach beyond their own tools: a hosted connector
@@ -15,7 +16,7 @@ export type ConnectorInfo = typeof ConnectorInfo.Type;
 
 /** Installed vs latest version of a provider's tool (Claude Code, Codex, llama.cpp). */
 export const ProviderVersion = Schema.Struct({
-  provider: Schema.Literals(["claude", "codex", "llamacpp"]),
+  provider: ProviderKind,
   /** `null` when not installed (or bundled with Apollo, see `note`). */
   installed: Schema.NullOr(Schema.String),
   latest: Schema.NullOr(Schema.String),

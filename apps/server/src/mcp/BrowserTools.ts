@@ -200,7 +200,25 @@ const RecordStop = Tool.make("apollo_browser_record_stop", {
   success: Schema.Struct({ recordingId: Schema.String, frames: Schema.Number, seconds: Schema.Number, dir: Schema.String, shown: Schema.Boolean }),
 });
 
+const Handoff = Tool.make("apollo_browser_handoff", {
+  ...shared,
+  description: [
+    "Hand the browser to the user and wait until they are done, for what only they can do: a CAPTCHA, a 2FA code,",
+    "a \"confirm it's you\" prompt, a sign-in with credentials you were not given, a payment confirmation.",
+    "They get a notification and see this tab live, on desktop or phone. `reason` says exactly what to do",
+    "(\"Sign in to GitHub; I'll continue once you're on the dashboard\"). Returns where the page is now and any",
+    "note they left: snapshot it before going on. For passwords you can type yourself, use apollo_request_secret instead.",
+  ].join(" "),
+  parameters: Schema.Struct({
+    reason: Schema.String,
+    tabId,
+    timeoutMs: Schema.optional(Schema.Number).annotate({ description: "How long to wait, up to 30 minutes (default 15)." }),
+  }),
+  success: Schema.Struct({ tabId: Schema.String, url: Schema.String, title: Schema.String, note: Schema.NullOr(Schema.String) }),
+}).annotate(Tool.OpenWorld, true);
+
 export const BrowserToolkit = Toolkit.make(
+  Handoff,
   Open,
   Navigate,
   Snapshot,
@@ -222,6 +240,8 @@ export const handlers = BrowserToolkit.toLayer(
     const secrets = yield* Secrets;
     const manager = yield* SessionManager;
     return {
+      apollo_browser_handoff: ({ reason, tabId, timeoutMs }) =>
+        Effect.flatMap(McpCaller, (c) => browser.handoff(c.botId, c.sessionId, tabId, reason, timeoutMs ?? 15 * 60_000)),
       apollo_browser_viewport: ({ preset, width, height, colorScheme, tabId }) =>
         Effect.flatMap(McpCaller, (c) => {
           const size = preset ? VIEWPORT_PRESETS[preset] : { width, height, mobile: undefined };

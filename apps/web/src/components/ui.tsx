@@ -85,6 +85,13 @@ export const PROVIDERS: ReadonlyArray<{ kind: ProviderKind; name: string; detail
   { kind: "claude", name: "Claude Code", detail: "Anthropic" },
   { kind: "codex", name: "Codex", detail: "OpenAI" },
   { kind: "llamacpp", name: "llama.cpp", detail: "Local model" },
+  { kind: "cursor", name: "Cursor", detail: "Cursor Agent" },
+  { kind: "grok", name: "Grok", detail: "xAI" },
+  { kind: "opencode", name: "OpenCode", detail: "Any model provider" },
+  { kind: "antigravity", name: "Antigravity", detail: "Google" },
+  { kind: "muse", name: "Muse Code", detail: "Meta" },
+  { kind: "pi", name: "Pi", detail: "Any model provider" },
+  { kind: "copilot", name: "GitHub Copilot", detail: "GitHub" },
 ];
 
 export const providerName = (provider: ProviderKind) => PROVIDERS.find((p) => p.kind === provider)?.name ?? provider;
@@ -502,7 +509,7 @@ export function OptionCards<T extends string>({
   options: ReadonlyArray<OptionCard<T>>;
 }) {
   return (
-    <div className={cx("grid gap-2", options.length === 3 ? "grid-cols-3" : "grid-cols-2")}>
+    <div className={cx("grid gap-2", options.length % 3 === 0 || options.length > 4 ? "grid-cols-3" : "grid-cols-2")}>
       {options.map((option) => {
         const selected = value === option.value;
         return (
@@ -512,7 +519,7 @@ export function OptionCards<T extends string>({
             aria-pressed={selected}
             onClick={() => onChange(option.value)}
             className={cx(
-              "flex items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors",
+              "flex min-w-0 items-start gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-colors",
               selected
                 ? "border-zinc-500 bg-zinc-800/80 ring-1 ring-zinc-500/40"
                 : "border-zinc-800 bg-zinc-900/30 hover:border-zinc-700 hover:bg-zinc-900",
@@ -520,10 +527,10 @@ export function OptionCards<T extends string>({
           >
             {option.icon ? <span className="mt-0.5 shrink-0">{option.icon}</span> : null}
             <span className="min-w-0">
-              <span className={cx("block text-[13px] font-medium", selected ? "text-zinc-100" : "text-zinc-300")}>
+              <span className={cx("block truncate text-[13px] font-medium", selected ? "text-zinc-100" : "text-zinc-300")}>
                 {option.label}
               </span>
-              {option.detail ? <span className="mt-0.5 block text-[11px] leading-snug text-zinc-500">{option.detail}</span> : null}
+              {option.detail ? <span className="mt-0.5 block truncate text-[11px] leading-snug text-zinc-500" title={option.detail}>{option.detail}</span> : null}
             </span>
           </button>
         );

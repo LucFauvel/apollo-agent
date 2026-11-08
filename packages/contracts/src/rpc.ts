@@ -20,6 +20,8 @@ import {
   ApprovalDecision,
   InputResponse,
   Bot,
+  AccountProvider,
+  ProviderAccount,
   BotId,
   BotLimits,
   Usage,
@@ -114,6 +116,8 @@ export const CreateBotInput = Schema.Struct({
   runtimeMode: RuntimeMode,
   autoLearn: Schema.Boolean,
   limits: Schema.optional(BotLimits),
+  claudeAccountId: Schema.optional(Schema.NullOr(Schema.String)),
+  codexAccountId: Schema.optional(Schema.NullOr(Schema.String)),
 });
 export type CreateBotInput = typeof CreateBotInput.Type;
 
@@ -129,6 +133,8 @@ export const UpdateBotInput = Schema.Struct({
   runtimeMode: Schema.optional(RuntimeMode),
   autoLearn: Schema.optional(Schema.Boolean),
   limits: Schema.optional(BotLimits),
+  claudeAccountId: Schema.optional(Schema.NullOr(Schema.String)),
+  codexAccountId: Schema.optional(Schema.NullOr(Schema.String)),
 });
 export type UpdateBotInput = typeof UpdateBotInput.Type;
 
@@ -173,6 +179,16 @@ export class ApolloRpcs extends RpcGroup.make(
   /** Updates a provider's tool (`claude update`, `codex update`, or a new llama.cpp build). */
   Rpc.make("providers.update", { payload: { provider: ProviderKind }, success: ProviderVersion, error }),
   /** Applies to provider processes started afterwards. */
+  /** Other Claude and Codex subscriptions bots can run on (personal vs work), each with its own login. */
+  Rpc.make("accounts.list", { success: Schema.Array(ProviderAccount), error }),
+  Rpc.make("accounts.add", { payload: { provider: AccountProvider, name: Schema.String }, success: ProviderAccount, error }),
+  Rpc.make("accounts.rename", { payload: { accountId: Schema.String, name: Schema.String }, success: ProviderAccount, error }),
+  /** Signs out, deletes its folder, and moves its bots back to this machine's login. */
+  Rpc.make("accounts.remove", { payload: { accountId: Schema.String }, error }),
+  /** Starts the CLI's browser sign-in for it; the account's `signIn` shows progress. */
+  Rpc.make("accounts.signIn", { payload: { accountId: Schema.String }, success: ProviderAccount, error }),
+  /** The code Claude's sign-in page shows, when the browser could not hand it back by itself. */
+  Rpc.make("accounts.submitCode", { payload: { accountId: Schema.String, code: Schema.String }, error }),
   Rpc.make("providers.updateSettings", { payload: UpdateProviderSettingsInput, success: ProviderSettings, error }),
 
   // --- app settings --------------------------------------------------------
@@ -332,6 +348,17 @@ export class ApolloRpcs extends RpcGroup.make(
   Rpc.make("browser.navigate", { payload: { tabId: Schema.String, url: Schema.String }, error }),
   Rpc.make("browser.close", { payload: { tabId: Schema.String }, error }),
   Rpc.make("browser.input", { payload: { tabId: Schema.String, input: BrowserInput }, error }),
+  /** The user finished (or gave up on) what an agent handed them in the browser. */
+  Rpc.make("browser.handoffRespond", {
+    payload: {
+      sessionId: SessionId,
+      requestId: Schema.String,
+      outcome: Schema.Literals(["done", "cancelled"]),
+      /** Anything the agent should know, e.g. "signed in as work account". */
+      note: Schema.optional(Schema.String),
+    },
+    error,
+  }),
   /** Live frames of a tab while the stream is open. */
   Rpc.make("browser.watch", { payload: { tabId: Schema.String }, success: BrowserFrame, error, stream: true }),
 

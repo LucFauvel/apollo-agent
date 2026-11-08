@@ -1,4 +1,4 @@
-import type { AppChange, AppSnapshot, Bot, BotId, PullRequest, Session, SessionId } from "@apollo/contracts";
+import type { AppChange, AppSnapshot, Bot, BotId, BrowserTab, PullRequest, Session, SessionId } from "@apollo/contracts";
 import * as Stream from "effect/Stream";
 import { createContext, type ReactNode, useContext, useEffect, useState } from "react";
 import type { Connection } from "./connection.ts";
@@ -11,9 +11,11 @@ export interface AppState {
   readonly pullRequests: ReadonlyMap<string, PullRequest>;
   /** Bumped when a bot's sessions changed files or explained changes: the Changes screen refetches. */
   readonly changesVersion: ReadonlyMap<BotId, number>;
+  /** Open tabs of Apollo's browser, by id. */
+  readonly browserTabs: ReadonlyMap<string, BrowserTab>;
 }
 
-const empty: AppState = { connected: false, bots: new Map(), sessions: new Map(), pullRequests: new Map(), changesVersion: new Map() };
+const empty: AppState = { connected: false, bots: new Map(), sessions: new Map(), pullRequests: new Map(), changesVersion: new Map(), browserTabs: new Map() };
 
 type Incoming = ({ readonly _tag: "Snapshot" } & AppSnapshot) | AppChange;
 
@@ -27,7 +29,15 @@ const apply = (state: AppState, item: Incoming): AppState => {
         pullRequests: new Map(item.pullRequests.map((pr) => [`${pr.sessionId} ${pr.url}`, pr])),
         // A reconnect may have missed updates: count it as one.
         changesVersion: new Map([...state.changesVersion].map(([botId, v]) => [botId, v + 1])),
+        browserTabs: new Map(item.browserTabs.map((t) => [t.id, t])),
       };
+    case "BrowserTabUpserted":
+      return { ...state, browserTabs: new Map(state.browserTabs).set(item.tab.id, item.tab) };
+    case "BrowserTabClosed": {
+      const browserTabs = new Map(state.browserTabs);
+      browserTabs.delete(item.tabId);
+      return { ...state, browserTabs };
+    }
     case "PullRequestUpserted": {
       const pr = item.pullRequest;
       return { ...state, pullRequests: new Map(state.pullRequests).set(`${pr.sessionId} ${pr.url}`, pr) };
@@ -44,7 +54,12 @@ const apply = (state: AppState, item: Incoming): AppState => {
     case "BotDeleted": {
       const bots = new Map(state.bots);
       bots.delete(item.botId);
-      return { ...state, bots, sessions: new Map([...state.sessions].filter(([, s]) => s.botId !== item.botId)) };
+      return {
+        ...state,
+        bots,
+        sessions: new Map([...state.sessions].filter(([, s]) => s.botId !== item.botId)),
+        browserTabs: new Map([...state.browserTabs].filter(([, t]) => t.botId !== item.botId)),
+      };
     }
     case "SessionUpserted":
       return { ...state, sessions: new Map(state.sessions).set(item.session.id, item.session) };

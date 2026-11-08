@@ -8,6 +8,7 @@ import { HttpRouter, HttpServerResponse, HttpStaticServer } from "effect/http";
 import { RpcSerialization, RpcServer } from "effect/rpc";
 import * as Auth from "./auth/Auth.ts";
 import * as Browser from "./browser/Browser.ts";
+import * as Accounts from "./Accounts.ts";
 import * as Secrets from "./secrets/Secrets.ts";
 import * as Compaction from "./Compaction.ts";
 import * as AuthHttp from "./auth/http.ts";
@@ -62,6 +63,7 @@ const layerCore = Compaction.layer.pipe(
   Layer.provideMerge(PullRequests.layer),
   Layer.provideMerge(Jobs.layer),
   Layer.provideMerge(Secrets.layer),
+  Layer.provideMerge(Accounts.layer),
   Layer.provideMerge(Browser.layer),
   Layer.provideMerge(Scheduler.layer),
   Layer.provideMerge(SessionManager.layer),

@@ -77,6 +77,8 @@ const toBot = (r: Row): Bot => ({
   autoLearn: r.auto_learn === 1,
   limits: r.limits ? { ...DEFAULT_BOT_LIMITS, ...(JSON.parse(r.limits as string) as Partial<BotLimits>) } : DEFAULT_BOT_LIMITS,
   pausedReason: (r.paused_reason as string | null) ?? null,
+  claudeAccountId: (r.claude_account_id as string | null) ?? null,
+  codexAccountId: (r.codex_account_id as string | null) ?? null,
   mainSessionId: r.main_session_id as SessionId,
   createdAt: Number(r.created_at),
   updatedAt: Number(r.updated_at),
@@ -259,8 +261,8 @@ const makeStore = (db: DatabaseSync) => {
         run(
           `insert into bots (id, name, instructions, cwd, main_provider, main_model, main_effort, worker_provider,
              worker_model, worker_effort, runtime_mode, auto_learn, limits, paused_reason, main_session_id,
-             created_at, updated_at, avatar)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             created_at, updated_at, avatar, claude_account_id, codex_account_id)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           bot.id,
           bot.name,
           bot.instructions,
@@ -279,6 +281,8 @@ const makeStore = (db: DatabaseSync) => {
           bot.createdAt,
           bot.updatedAt,
           JSON.stringify(bot.avatar),
+          bot.claudeAccountId,
+          bot.codexAccountId,
         );
         return bot;
       }),
@@ -287,7 +291,7 @@ const makeStore = (db: DatabaseSync) => {
         run(
           `update bots set name = ?, instructions = ?, cwd = ?, main_model = ?, main_effort = ?,
              worker_provider = ?, worker_model = ?, worker_effort = ?,
-             runtime_mode = ?, auto_learn = ?, limits = ?, paused_reason = ?, updated_at = ?, avatar = ? where id = ?`,
+             runtime_mode = ?, auto_learn = ?, limits = ?, paused_reason = ?, updated_at = ?, avatar = ?, claude_account_id = ?, codex_account_id = ? where id = ?`,
           bot.name,
           bot.instructions,
           bot.cwd,
@@ -302,6 +306,8 @@ const makeStore = (db: DatabaseSync) => {
           bot.pausedReason,
           bot.updatedAt,
           JSON.stringify(bot.avatar),
+          bot.claudeAccountId,
+          bot.codexAccountId,
           bot.id,
         );
         return bot;

@@ -16,6 +16,8 @@ export interface JsonRpcProcess {
 
 export class JsonRpcFailure extends Schema.TaggedError<JsonRpcFailure>()("JsonRpcFailure", {
   message: Schema.String,
+  /** The JSON-RPC error code, when the other side answered with an error. */
+  code: Schema.optional(Schema.Number),
 }) {}
 
 export interface JsonRpcHandlers {
@@ -24,6 +26,8 @@ export interface JsonRpcHandlers {
   readonly onRequest: (method: string, params: unknown) => Effect.Effect<unknown, JsonRpcFailure>;
   readonly onExit: (reason: string) => Effect.Effect<void>;
   readonly onStderr?: (line: string) => Effect.Effect<void>;
+  /** Lines on stdout that are not JSON (some agents print sign-in links there). */
+  readonly onStdoutText?: (line: string) => Effect.Effect<void>;
 }
 
 type RequestId = string | number;
@@ -98,7 +102,10 @@ export const spawnJsonRpcProcess = (options: {
         return message.error
           ? Deferred.fail(
               deferred,
-              new JsonRpcFailure({ message: message.error.message ?? `JSON-RPC error ${message.error.code}` }),
+              new JsonRpcFailure({
+                message: message.error.message ?? `JSON-RPC error ${message.error.code}`,
+                ...(typeof message.error.code === "number" ? { code: message.error.code } : {}),
+              }),
             ).pipe(Effect.asVoid)
           : Deferred.succeed(deferred, message.result).pipe(Effect.asVoid);
       }
@@ -111,8 +118,10 @@ export const spawnJsonRpcProcess = (options: {
       try {
         message = JSON.parse(line) as IncomingMessage;
       } catch {
+        if (handlers.onStdoutText) run(handlers.onStdoutText(line));
         return;
       }
+      if (typeof message !== "object" || message === null) return;
       run(dispatch(message));
     });
 

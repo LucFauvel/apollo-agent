@@ -47,6 +47,11 @@ export interface ProviderSessionOptions {
    * anything, edit files or run commands.
    */
   readonly readOnly?: boolean;
+  /**
+   * Extra environment for the agent's process, over the provider's own (e.g. the Claude
+   * account a bot runs on: `CLAUDE_CONFIG_DIR`). `undefined` removes a variable.
+   */
+  readonly environment?: Readonly<Record<string, string | undefined>>;
 }
 
 /** What an adapter reports back to the session manager. */

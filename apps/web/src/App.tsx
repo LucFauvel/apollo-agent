@@ -1,3 +1,4 @@
+import { useBrowserFocus } from "./browserFocus.ts";
 import { showApp, watchTurns } from "./turnNotifications.ts";
 import type { Bot, SessionId } from "@apollo/contracts";
 import { useEffect, useRef, useState } from "react";
@@ -46,6 +47,11 @@ export function App() {
   >(null);
   const [panel, setPanel] = useState<PanelKind | null>(null);
   const togglePanel = (next: PanelKind) => setPanel((current) => (current === next ? null : next));
+  // An agent handed the browser over and the user asked to see the tab.
+  const browserFocus = useBrowserFocus();
+  useEffect(() => {
+    if (browserFocus) setPanel("browser");
+  }, [browserFocus]);
   useDesktopNotifications(setSelectedId);
   // Turn notifications compare against the open session; read it through a ref.
   const selectedRef = useRef(selectedId);

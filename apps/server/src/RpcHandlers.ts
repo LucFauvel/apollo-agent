@@ -7,6 +7,7 @@ import { ProviderVersions } from "./ProviderVersions.ts";
 import { Tailscale } from "./remote/Tailscale.ts";
 import { Auth, PAIRING_TOKEN_TTL_MS, PHONE_PAIRING_TTL_MS } from "./auth/Auth.ts";
 import { Browser } from "./browser/Browser.ts";
+import { Accounts } from "./Accounts.ts";
 import { Secrets } from "./secrets/Secrets.ts";
 import { Compaction } from "./Compaction.ts";
 import { LocalModels } from "./local/LocalModels.ts";
@@ -27,6 +28,7 @@ export const layer = ApolloRpcs.toLayer(
     const localModels = yield* LocalModels;
     const scheduler = yield* Scheduler;
     const browser = yield* Browser;
+    const accounts = yield* Accounts;
     const secrets = yield* Secrets;
     const appSettings = yield* AppSettings;
     const pullRequests = yield* PullRequests;
@@ -83,6 +85,12 @@ export const layer = ApolloRpcs.toLayer(
       "secrets.onePasswordSearch": ({ query }) => secrets.onePasswordSearch(query),
       "secrets.onePasswordFields": ({ itemId, vaultId }) => secrets.onePasswordFields(itemId, vaultId),
 
+      "accounts.list": () => accounts.list,
+      "accounts.add": ({ provider, name }) => accounts.add(provider, name),
+      "accounts.rename": ({ accountId, name }) => accounts.rename(accountId, name),
+      "accounts.remove": ({ accountId }) => accounts.remove(accountId),
+      "accounts.signIn": ({ accountId }) => accounts.signIn(accountId),
+      "accounts.submitCode": ({ accountId, code }) => accounts.submitCode(accountId, code),
       "browser.status": () => browser.status,
       "browser.open": ({ botId, url }) =>
         Effect.flatMap(store.getBot(botId), (bot) => browser.openForUser(bot.id, bot.mainSessionId, url)),
@@ -90,6 +98,7 @@ export const layer = ApolloRpcs.toLayer(
       "browser.close": ({ tabId }) => browser.closeForUser(tabId),
       "browser.input": ({ tabId, input }) => browser.input(tabId, input),
       "browser.watch": ({ tabId }) => browser.watch(tabId),
+      "browser.handoffRespond": ({ sessionId, requestId, outcome, note }) => browser.respondHandoff(sessionId, requestId, outcome, note ?? null),
 
       "storage.report": () => compaction.report,
       "storage.compact": () => compaction.compact,

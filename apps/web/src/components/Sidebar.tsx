@@ -9,7 +9,6 @@ import { ApolloMark, ProviderLogo } from "./icons.tsx";
 import { Collapse, cx, IconButton, providerName, StatusDot, statusLabel } from "./ui.tsx";
 
 const roleOrder = { main: 0, worker: 1, reflection: 2 } as const;
-const PROVIDER_NAMES = { claude: "Claude Code", codex: "Codex", llamacpp: "llama.cpp" } as const;
 
 export function BotAvatar({ avatar, size = "md" }: { avatar: BotAvatarValue; size?: "sm" | "md" | "lg" }) {
   return <BlobAvatar avatar={avatar} size={size} />;
@@ -272,7 +271,7 @@ export function Sidebar({
         <span className="relative">
           <IconButton
             icon={Blocks}
-            label={updates.length > 0 ? `Providers: ${updates.map((u) => PROVIDER_NAMES[u.provider]).join(", ")} can be updated` : "Providers"}
+            label={updates.length > 0 ? `Providers: ${updates.map((u) => providerName(u.provider)).join(", ")} can be updated` : "Providers"}
             size="sm"
             onClick={onProviders}
           />

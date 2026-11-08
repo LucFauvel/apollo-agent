@@ -33,6 +33,7 @@ import { useApollo } from "../AppState.tsx";
 import { BlobAvatar } from "../BlobAvatar.tsx";
 import { Markdown } from "../Markdown.tsx";
 import { ActivityGroup } from "../Activity.tsx";
+import { BrowserScreen, type Handoff } from "./BrowserScreen.tsx";
 import { ChangesScreen } from "./ChangesScreen.tsx";
 import { animateLayout, FadeIn, Pulse, ScrollHold, Spin, SwipeBack, Turn, useKeyboardInset, useToggle } from "../motion.tsx";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -48,6 +49,8 @@ import {
   CircleAlertIcon,
   ClipboardListIcon,
   InfoIcon,
+  AppWindowIcon,
+  HandIcon,
   KeyRoundIcon,
   LoaderIcon,
   LockIcon,
@@ -210,6 +213,13 @@ export function ChatScreen({
     return urls.size;
   }, [state.pullRequests, state.sessions, session]);
   const hasChanges = useMemo(() => items.some((item) => item.kind === "changes"), [items]);
+  // Apollo's browser, live: opened from the header, or from a tab an agent handed over.
+  const [browser, setBrowser] = useState<{ tabId?: string; handoff?: Handoff } | null>(null);
+  const browserTabs = useMemo(() => {
+    let n = 0;
+    for (const tab of state.browserTabs.values()) if (tab.botId === session?.botId) n++;
+    return n;
+  }, [state.browserTabs, session?.botId]);
 
   return (
     <View style={{ flex: 1 }}>
@@ -235,6 +245,16 @@ export function ChatScreen({
                 : (session?.provider ?? "")}
           </Text>
         </View>
+        {browserTabs > 0 ? (
+          <Pressable
+            onPress={() => setBrowser({})}
+            hitSlop={8}
+            accessibilityLabel={`Browser, ${browserTabs} open ${browserTabs === 1 ? "tab" : "tabs"}`}
+            style={({ pressed }) => [styles.headerButton, pressed && { opacity: 0.6 }]}
+          >
+            <AppWindowIcon size={19} color={colors.muted} />
+          </Pressable>
+        ) : null}
         <Pressable
           onPress={() => setChangesOpen(true)}
           hitSlop={8}
@@ -280,6 +300,7 @@ export function ChatScreen({
                 item={item}
                 live={busy && i === blocks.length - 1}
                 onOpenChanges={() => setChangesOpen(true)}
+                onOpenBrowser={(tabId, handoff) => setBrowser({ tabId, ...(handoff ? { handoff: { ...handoff, sessionId } } : {}) })}
                 onApprove={(requestId, decision) =>
                   act((c) =>
                     c["sessions.respondApproval"]({
@@ -380,6 +401,13 @@ export function ChatScreen({
         </Pressable>
       </View>
     </Animated.View>
+      {browser && session ? (
+        <View style={StyleSheet.absoluteFill}>
+          <SwipeBack onBack={() => setBrowser(null)}>
+            <BrowserScreen botId={session.botId} tabId={browser.tabId} handoff={browser.handoff} onBack={() => setBrowser(null)} />
+          </SwipeBack>
+        </View>
+      ) : null}
       {changesOpen && session ? (
         <View style={StyleSheet.absoluteFill}>
           <SwipeBack onBack={() => setChangesOpen(false)}>
@@ -412,7 +440,13 @@ function Item({
   onInput,
   onSecret,
   onOpenChanges,
-}: { item: TranscriptBlock; live: boolean; onOpenChanges: () => void } & Respond) {
+  onOpenBrowser,
+}: {
+  item: TranscriptBlock;
+  live: boolean;
+  onOpenChanges: () => void;
+  onOpenBrowser: (tabId: string, handoff?: { requestId: string; reason: string }) => void;
+} & Respond) {
   switch (item.kind) {
     case "changes":
       return <TurnChanges repos={item.repos} onOpen={onOpenChanges} />;
@@ -461,6 +495,8 @@ function Item({
       return <InputCard item={item} onInput={onInput} />;
     case "secret":
       return <SecretCard item={item} onSecret={onSecret} />;
+    case "handoff":
+      return <HandoffCard item={item} onOpen={() => onOpenBrowser(item.tabId, item.outcome === null ? { requestId: item.requestId, reason: item.reason } : undefined)} />;
     case "visual":
     case "recording":
       return (
@@ -775,6 +811,49 @@ function FieldTitle({ field }: { field: InputField }) {
   );
 }
 
+/** The agent handed the browser over: open the tab, take over, then say Done there. */
+function HandoffCard({ item, onOpen }: { item: Extract<TranscriptItem, { kind: "handoff" }>; onOpen: () => void }) {
+  if (item.outcome !== null) {
+    return (
+      <View style={styles.secretDone}>
+        <HandIcon size={14} strokeWidth={1.75} color={colors.faint} />
+        <Text style={styles.secretDoneText} numberOfLines={1}>
+          Browser handed over: <Text style={{ color: colors.textSoft }}>{item.reason}</Text>
+        </Text>
+        <Badge
+          tone={item.outcome === "done" ? "emerald" : item.outcome === "cancelled" ? "red" : "zinc"}
+          label={item.outcome === "done" ? "Done" : item.outcome === "cancelled" ? "Declined" : "Expired"}
+        />
+      </View>
+    );
+  }
+  let host = item.url;
+  try {
+    host = new URL(item.url).host || item.url;
+  } catch {
+    // keep the raw URL
+  }
+  return (
+    <View style={[styles.card, styles.cardSky]}>
+      <View style={[styles.cardHeader, { alignItems: "flex-start", gap: 12 }]}>
+        <View style={styles.handoffIcon}>
+          <Pulse>
+            <HandIcon size={16} strokeWidth={1.75} color="#7dd3fc" />
+          </Pulse>
+        </View>
+        <View style={{ flex: 1, gap: 2 }}>
+          <Text style={[styles.cardTitle, { color: "#f0f9ff" }]}>Your turn in the browser</Text>
+          <Text style={styles.cardMuted}>{item.reason}</Text>
+          <Text style={[styles.secretHint, { marginTop: 2 }]} numberOfLines={1}>
+            {host} · the agent waits until you are done
+          </Text>
+        </View>
+      </View>
+      <Button label="Take over" variant="primary" icon={(c) => <AppWindowIcon size={14} color={c} />} onPress={onOpen} />
+    </View>
+  );
+}
+
 /** A secret the agent asked for: typed here, never shown in the conversation. */
 function SecretCard({ item, onSecret }: { item: Extract<TranscriptItem, { kind: "secret" }> } & Pick<Respond, "onSecret">) {
   const [value, setValue] = useState("");
@@ -979,6 +1058,7 @@ const styles = StyleSheet.create({
   optionOn: { borderColor: "rgba(125,211,252,0.6)", backgroundColor: "rgba(14,165,233,0.12)" },
   optionLabel: { color: colors.text, fontSize: 14, fontWeight: "500" },
   optionDetail: { color: colors.faint, fontSize: 12, marginTop: 2 },
+  handoffIcon: { width: 32, height: 32, borderRadius: 8, backgroundColor: "rgba(14,165,233,0.15)", alignItems: "center", justifyContent: "center" },
   secretDone: {
     flexDirection: "row",
     alignItems: "center",

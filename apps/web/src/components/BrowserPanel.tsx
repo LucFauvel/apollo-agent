@@ -2,6 +2,7 @@ import type { Bot, BrowserInput, BrowserStatus, BrowserTab } from "@apollo/contr
 import { AppWindow, ArrowLeft, ArrowRight, Globe, Loader2, MousePointerClick, Plus, RotateCw, X } from "lucide-react";
 import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { errorMessage, follow, rpc } from "../rpc.ts";
+import { useBrowserFocus } from "../browserFocus.ts";
 import { useApp } from "../store.ts";
 import { ProviderLogo } from "./icons.tsx";
 import { cx, EmptyState, IconButton, inputClass, Panel } from "./ui.tsx";
@@ -232,6 +233,12 @@ export function BrowserPanel({ bot, onClose }: { bot: Bot; onClose: () => void }
     setSelectedId(newest);
     setAdding(false);
   }, [newest]);
+
+  // Show the tab an agent handed over.
+  const focus = useBrowserFocus();
+  useEffect(() => {
+    if (focus) setSelectedId(focus.tabId);
+  }, [focus]);
 
   const tab = tabs.find((t) => t.id === selectedId) ?? tabs.at(-1) ?? null;
   const owner = tab ? sessions.get(tab.sessionId) : undefined;

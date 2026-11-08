@@ -276,6 +276,14 @@ const MIGRATIONS: ReadonlyArray<string> = [
     primary key (session_id, turn_seq, repo, path, symbol)
   );
   `,
+  // 17: the Claude account a bot's Claude sessions use (null: this machine's own login).
+  `
+  alter table bots add column claude_account_id text;
+  `,
+  // 18: the same for Codex sessions.
+  `
+  alter table bots add column codex_account_id text;
+  `,
 ];
 
 export class Database extends Context.Service<Database, DatabaseSync>()("apollo/Database") {}

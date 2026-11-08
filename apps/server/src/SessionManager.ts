@@ -36,8 +36,11 @@ import {
 } from "@apollo/contracts";
 import {
   makeClaudeProvider,
+  makeAcpProviders,
   makeCodexProvider,
   makeLlamaCppProvider,
+  makeMuseProvider,
+  makePiProvider,
   type Provider,
   type ProviderEmission,
   type Environment,
@@ -60,6 +63,7 @@ import * as Stream from "effect/Stream";
 import { AppSettings } from "./AppSettings.ts";
 import { findAttachment, removeAttachments } from "./attachments.ts";
 import { createWorktree, type FinishAction, finishWorktree, retireWorktree, worktreeStatus } from "./worktrees/Git.ts";
+import { accountEnvironment } from "./Accounts.ts";
 import { ServerConfig } from "./Config.ts";
 import {
   buildInstructions,
@@ -118,6 +122,10 @@ export const layerProviders = Layer.effect(
         }),
       }),
       codex: makeCodexProvider({ executable: config.codexExecutable }),
+      // Third-party agents: their CLIs come from PATH; Antigravity installs into Apollo's data folder.
+      ...makeAcpProviders({ stateDir: join(config.dataDir, "agents") }),
+      muse: makeMuseProvider(),
+      pi: makePiProvider({ stateDir: join(config.dataDir, "agents") }),
       llamacpp: makeLlamaCppProvider({
         executable: config.claudeExecutable,
         // Auto mode's reviewer: a small local model the user picked (asks when there is none).
@@ -381,6 +389,12 @@ const make = Effect.gen(function* () {
           .open(
             {
               cwd: session.cwd,
+              // A bot on another account runs the CLI in that account's folder.
+              ...(session.provider === "claude" && bot.claudeAccountId
+                ? { environment: accountEnvironment(config.dataDir, "claude", bot.claudeAccountId) }
+                : session.provider === "codex" && bot.codexAccountId
+                  ? { environment: accountEnvironment(config.dataDir, "codex", bot.codexAccountId) }
+                  : {}),
               model: session.model,
               effort: session.effort,
               resumeId: session.resumeId,
@@ -390,7 +404,12 @@ const make = Effect.gen(function* () {
                 core,
                 skills,
                 projectFolders,
-                connectors: Object.fromEntries([...connectorCache].map(([kind, { list }]) => [kind, list])),
+                // Lists come from this machine's logins: not this bot's when it runs on another account.
+                connectors: Object.fromEntries(
+                  [...connectorCache]
+                    .filter(([kind]) => !(kind === "claude" && bot.claudeAccountId) && !(kind === "codex" && bot.codexAccountId))
+                    .map(([kind, { list }]) => [kind, list]),
+                ),
               }),
               extraDirectories: projectFolders,
               runtimeMode: session.runtimeMode ?? bot.runtimeMode,
@@ -1070,6 +1089,8 @@ const make = Effect.gen(function* () {
           runtimeMode: input.runtimeMode,
           autoLearn: input.autoLearn,
           limits: input.limits ?? DEFAULT_BOT_LIMITS,
+          claudeAccountId: input.claudeAccountId ?? null,
+          codexAccountId: input.codexAccountId ?? null,
           pausedReason: null,
           mainSessionId: newId<SessionId>("ses"),
           createdAt: now,
@@ -1103,6 +1124,8 @@ const make = Effect.gen(function* () {
           ...(input.runtimeMode !== undefined ? { runtimeMode: input.runtimeMode } : {}),
           ...(input.autoLearn !== undefined ? { autoLearn: input.autoLearn } : {}),
           ...(input.limits !== undefined ? { limits: input.limits } : {}),
+          ...(input.claudeAccountId !== undefined ? { claudeAccountId: input.claudeAccountId } : {}),
+          ...(input.codexAccountId !== undefined ? { codexAccountId: input.codexAccountId } : {}),
           updatedAt: Date.now(),
         };
         yield* store.updateBot(bot);
@@ -1119,6 +1142,16 @@ const make = Effect.gen(function* () {
         if (bot.runtimeMode !== current.runtimeMode) {
           for (const session of yield* store.listSessions(bot.id)) {
             if (session.runtimeMode === null) yield* reopenWithNewSettings(session.id);
+          }
+        }
+        // Claude and Codex sessions move to the other account (their conversations carry over).
+        const moved = new Set([
+          ...(bot.claudeAccountId !== current.claudeAccountId ? ["claude"] : []),
+          ...(bot.codexAccountId !== current.codexAccountId ? ["codex"] : []),
+        ]);
+        if (moved.size > 0) {
+          for (const session of yield* store.listSessions(bot.id)) {
+            if (moved.has(session.provider)) yield* reopenWithNewSettings(session.id);
           }
         }
         return bot;

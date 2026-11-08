@@ -89,6 +89,16 @@ type TranscriptItemKind =
       readonly outcome: "provided" | "declined" | "expired" | null;
       readonly source: "typed" | "1password" | null;
     }
+  /** The agent handed the browser to the user and waits (a CAPTCHA, a sign-in to finish). */
+  | {
+      readonly kind: "handoff";
+      readonly key: string;
+      readonly requestId: string;
+      readonly tabId: string;
+      readonly url: string;
+      readonly reason: string;
+      readonly outcome: "done" | "cancelled" | "expired" | null;
+    }
   | { readonly kind: "turn-end"; readonly key: string; readonly outcome: string; readonly error: string | null }
   /** Files a turn changed in git repositories (detected by Apollo). */
   | { readonly kind: "changes"; readonly key: string; readonly repos: ReadonlyArray<RepoChanges> }
@@ -280,6 +290,16 @@ export const reduceTranscript = (state: TranscriptState, e: SessionEvent): Trans
         items,
         (i) => i.kind === "secret" && i.requestId === event.requestId,
         (i) => (i.kind === "secret" ? { ...i, outcome: event.outcome, source: event.source } : i),
+      );
+      return updated ? { ...state, lastSeq, items: updated } : { ...state, lastSeq };
+    }
+    case "BrowserHandoff":
+      return push({ kind: "handoff", key: `h${e.seq}`, requestId: event.requestId, tabId: event.tabId, url: event.url, reason: event.reason, outcome: null });
+    case "BrowserHandoffResolved": {
+      const updated = updateWhere(
+        items,
+        (i) => i.kind === "handoff" && i.requestId === event.requestId,
+        (i) => (i.kind === "handoff" ? { ...i, outcome: event.outcome } : i),
       );
       return updated ? { ...state, lastSeq, items: updated } : { ...state, lastSeq };
     }
