@@ -1,4 +1,4 @@
-import type { ApprovalDecision, AttachmentRef, Bot, ConversationChanges, InputResponse, LocalModel, RepoChanges, Session } from "@apollo/contracts";
+import type { ApprovalDecision, AttachmentRef, Bot, InputResponse, LocalModel, RepoChanges, Session } from "@apollo/contracts";
 import {
   ArrowUp,
   Ban,
@@ -27,16 +27,19 @@ import {
   Trash2,
 } from "lucide-react";
 import {
+  cardRequestId,
   currentChangesKey,
+  dismissedCards,
+  initialCards,
   isCompacting,
   latestChangesKey,
+  reduceCards,
   showWorking,
   summariesByTurn,
   systemMessageParts,
-  withDismissed,
 } from "@apollo/client";
 import { MarkdownText } from "./Code.tsx";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { formatUsage, usageTitle } from "../format.ts";
 import { useModelLabel } from "../models.ts";
 import { errorMessage, rpc } from "../rpc.ts";
@@ -671,36 +674,39 @@ interface ChangesCards {
  * follow the user across restarts and devices), refetched when its changes move.
  */
 function useChangesCards(session: Session, items: ReadonlyArray<{ kind: string; key: string }>, enabled: boolean): ChangesCards {
+  // Bumped by the server's ChangesUpdated, and by every reconnect (store.ts).
   const version = useApp((s) => s.changesVersion.get(session.botId) ?? 0);
-  const [changes, setChanges] = useState<ConversationChanges | null>(null);
-  const [justCleared, setJustCleared] = useState<ReadonlySet<number>>(new Set());
-  useEffect(() => {
-    setChanges(null);
-    setJustCleared(new Set());
-  }, [session.id]);
+  const [state, dispatch] = useReducer(reduceCards, session.id, initialCards);
+  const shown = useRef(session.id);
+  shown.current = session.id;
+  useEffect(() => dispatch({ type: "reset", sessionId: session.id }), [session.id]);
+  // Refetched when the bot's changes move, and after each request settles (`epoch`).
+  const epoch = state.sessionId === session.id ? state.epoch : 0;
   useEffect(() => {
     if (!enabled) return;
-    let cancelled = false;
-    rpc((c) => c["changes.conversation"]({ sessionId: session.id }))
-      .then((next) => !cancelled && setChanges(next))
+    const sessionId = session.id;
+    rpc((c) => c["changes.conversation"]({ sessionId }))
+      .then((changes) => dispatch({ type: "fetched", sessionId, epoch, changes }))
       .catch(() => {}); // the cards still show, without summaries
-    return () => {
-      cancelled = true;
-    };
-  }, [session.id, version, enabled]);
-  const summaries = useMemo(() => summariesByTurn(changes), [changes]);
-  const dismissed = useMemo(() => new Set(changes?.dismissed ?? []), [changes]);
+  }, [session.id, version, enabled, epoch]);
   const current = useMemo(() => currentChangesKey(items), [items]);
   const generation = useMemo(() => latestChangesKey(items), [items]);
+  const own = state.sessionId === session.id ? state : initialCards(session.id);
+  const summaries = useMemo(() => summariesByTurn(own.server), [own.server]);
+  const dismissed = useMemo(() => dismissedCards(own), [own]);
   const setDismissed = (seq: number, value: boolean) => {
-    setChanges((c) => withDismissed(c, seq, value));
-    setJustCleared((s) => (value ? new Set(s).add(seq) : s));
-    rpc((c) => c["changes.dismiss"]({ sessionId: session.id, seq, dismissed: value })).catch((e) => {
-      setChanges((c) => withDismissed(c, seq, !value));
-      alert(errorMessage(e));
-    });
+    const sessionId = session.id;
+    const id = cardRequestId();
+    dispatch({ type: "requested", sessionId, id, seq, dismissed: value });
+    rpc((c) => c["changes.dismiss"]({ sessionId, seq, dismissed: value })).then(
+      () => dispatch({ type: "settled", sessionId, id, seq, ok: true }),
+      (e) => {
+        dispatch({ type: "settled", sessionId, id, seq, ok: false });
+        if (shown.current === sessionId) alert(errorMessage(e));
+      },
+    );
   };
-  return { current, generation, summaries, dismissed, justCleared, setDismissed };
+  return { current, generation, summaries, dismissed, justCleared: own.justCleared, setDismissed };
 }
 
 /**

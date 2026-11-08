@@ -1,3 +1,4 @@
+import { invalidateChanges } from "@apollo/client";
 import type { AppChange, AppSnapshot, Bot, BotId, BrowserTab, PullRequest, Session, SessionId } from "@apollo/contracts";
 import * as Stream from "effect/Stream";
 import { createContext, type ReactNode, useContext, useEffect, useState } from "react";
@@ -28,7 +29,8 @@ const apply = (state: AppState, item: Incoming): AppState => {
         sessions: new Map(item.sessions.map((s) => [s.id, s])),
         pullRequests: new Map(item.pullRequests.map((pr) => [`${pr.sessionId} ${pr.url}`, pr])),
         // A reconnect may have missed updates: count it as one.
-        changesVersion: new Map([...state.changesVersion].map(([botId, v]) => [botId, v + 1])),
+        // (Bots this phone never heard a ChangesUpdated for included: they start from none.)
+        changesVersion: invalidateChanges(state.changesVersion, item.bots.map((b) => b.id)),
         browserTabs: new Map(item.browserTabs.map((t) => [t.id, t])),
       };
     case "BrowserTabUpserted":

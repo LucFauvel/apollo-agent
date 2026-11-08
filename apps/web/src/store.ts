@@ -12,6 +12,7 @@ import type {
   SessionId,
   Usage,
 } from "@apollo/contracts";
+import { invalidateChanges } from "@apollo/client";
 import * as Stream from "effect/Stream";
 import { useSyncExternalStore } from "react";
 import { follow } from "./rpc.ts";
@@ -167,6 +168,8 @@ export const startSync = () =>
           schedules: new Map(item.schedules.map((s) => [s.id, s])),
           browserTabs: new Map(item.browserTabs.map((t) => [t.id, t])),
           pullRequests: new Map(item.pullRequests.map((p) => [`${p.sessionId} ${p.url}`, p])),
+          // A reconnect may have missed ChangesUpdated: open changes views refetch.
+          changesVersion: invalidateChanges(state.changesVersion, item.bots.map((b) => b.id)),
         });
       } else {
         apply(item);

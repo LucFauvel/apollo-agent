@@ -1,9 +1,12 @@
 import {
+  cardRequestId,
   currentChangesKey,
+  dismissedCards,
+  initialCards,
   latestChangesKey,
+  reduceCards,
   reduceTranscript,
   summariesByTurn,
-  withDismissed,
   isCompacting,
   showWorking,
   systemMessageParts,
@@ -12,7 +15,7 @@ import {
   type TranscriptItem,
   type TranscriptState,
 } from "@apollo/client";
-import type { Bot, ConversationChanges, InputField, InputValue, RepoChanges, SessionId } from "@apollo/contracts";
+import type { Bot, InputField, InputValue, RepoChanges, SessionId } from "@apollo/contracts";
 import {
   type ReactNode,
   useContext,
@@ -222,43 +225,45 @@ export function ChatScreen({
   const hasChanges = useMemo(() => items.some((item) => item.kind === "changes"), [items]);
   // Each turn's changes card: its worker's summary, and whether the user cleared it. Kept by
   // the server, so a card cleared on the desktop is gone here too, and after restarts.
+  // Bumped by the server's ChangesUpdated, and by every reconnect (AppState.tsx).
   const changesVersion = session ? (state.changesVersion.get(session.botId) ?? 0) : 0;
-  const [conversationChanges, setConversationChanges] = useState<ConversationChanges | null>(null);
-  const [justCleared, setJustCleared] = useState<ReadonlySet<number>>(new Set());
-  useEffect(() => {
-    setConversationChanges(null);
-    setJustCleared(new Set());
-  }, [sessionId]);
+  const [cardsState, dispatchCards] = useReducer(reduceCards, sessionId, initialCards);
+  const shownSession = useRef(sessionId);
+  shownSession.current = sessionId;
+  useEffect(() => dispatchCards({ type: "reset", sessionId }), [sessionId]);
+  // Refetched when the bot's changes move, and after each request settles (`epoch`).
+  const cardsEpoch = cardsState.sessionId === sessionId ? cardsState.epoch : 0;
   useEffect(() => {
     if (!hasChanges) return;
-    let cancelled = false;
+    const id = sessionId;
     connection
-      .rpc((c) => c["changes.conversation"]({ sessionId }))
-      .then((next) => !cancelled && setConversationChanges(next))
+      .rpc((c) => c["changes.conversation"]({ sessionId: id }))
+      .then((changes) => dispatchCards({ type: "fetched", sessionId: id, epoch: cardsEpoch, changes }))
       .catch(() => {}); // the cards still show, without summaries
-    return () => {
-      cancelled = true;
-    };
-  }, [connection, sessionId, changesVersion, hasChanges]);
-  const cards = useMemo<ChangesCards>(
-    () => ({
+  }, [connection, sessionId, changesVersion, hasChanges, cardsEpoch]);
+  const cards = useMemo<ChangesCards>(() => {
+    const own = cardsState.sessionId === sessionId ? cardsState : initialCards(sessionId);
+    return {
       current: currentChangesKey(items),
       generation: latestChangesKey(items),
-      summaries: summariesByTurn(conversationChanges),
-      dismissed: new Set(conversationChanges?.dismissed ?? []),
-      justCleared,
+      summaries: summariesByTurn(own.server),
+      dismissed: dismissedCards(own),
+      justCleared: own.justCleared,
       setDismissed: (seq, value) => {
+        const id = cardRequestId();
+        const forSession = sessionId;
         animateLayout();
-        setConversationChanges((c) => withDismissed(c, seq, value));
-        setJustCleared((s) => (value ? new Set(s).add(seq) : s));
-        connection.rpc((c) => c["changes.dismiss"]({ sessionId, seq, dismissed: value })).catch((e) => {
-          setConversationChanges((c) => withDismissed(c, seq, !value));
-          setError(errorMessage(e));
-        });
+        dispatchCards({ type: "requested", sessionId: forSession, id, seq, dismissed: value });
+        connection.rpc((c) => c["changes.dismiss"]({ sessionId: forSession, seq, dismissed: value })).then(
+          () => dispatchCards({ type: "settled", sessionId: forSession, id, seq, ok: true }),
+          (e) => {
+            dispatchCards({ type: "settled", sessionId: forSession, id, seq, ok: false });
+            if (shownSession.current === forSession) setError(errorMessage(e));
+          },
+        );
       },
-    }),
-    [items, conversationChanges, justCleared, connection, sessionId],
-  );
+    };
+  }, [items, cardsState, connection, sessionId]);
   // Apollo's browser, live: opened from the header, or from a tab an agent handed over.
   const [browser, setBrowser] = useState<{ tabId?: string; handoff?: Handoff } | null>(null);
   const browserTabs = useMemo(() => {
