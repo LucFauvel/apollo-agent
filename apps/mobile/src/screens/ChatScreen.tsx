@@ -1,7 +1,6 @@
 import {
   cardsTick,
   currentChangesKey,
-  dismissedCards,
   hasCards,
   initialCards,
   latestChangesKey,
@@ -53,7 +52,6 @@ import { ConversationBar, ConversationToggle, MicButton, useVoiceConversation, u
 import {
   ArrowUpIcon,
   GitCompareArrowsIcon,
-  XIcon,
   BanIcon,
   CheckIcon,
   ChevronDownIcon,
@@ -225,20 +223,14 @@ export function ChatScreen({
     return urls.size;
   }, [state.pullRequests, state.sessions, session]);
   const hasChanges = useMemo(() => items.some((item) => item.kind === "changes" && !item.report), [items]);
-  // Full diffs are not a turn's changes card: they neither fold history nor take its place,
-  // but they clear like one, so any card loads which ones are cleared.
+  // Full diffs are not a turn's changes card: they neither fold history nor take its place.
   const turnItems = useMemo(() => withoutFullDiffs(items), [items]);
-  const anyCards = useMemo(() => hasCards(items), [items]);
-  // Each turn's changes card: its worker's summary, and whether the user cleared it. Kept by
-  // the server, so a card cleared on the desktop is gone here too, and after restarts.
+  const anyCards = useMemo(() => hasCards(turnItems), [turnItems]);
+  // Each turn's changes card shows its worker's summary.
   // Bumped by the server's ChangesUpdated, and by every reconnect (AppState.tsx).
   const changesVersion = session ? (state.changesVersion.get(session.botId) ?? 0) : 0;
   const [cardsState, dispatchCards] = useReducer(reduceCards, sessionId, initialCards);
-  const shownSession = useRef(sessionId);
-  shownSession.current = sessionId;
   useEffect(() => dispatchCards({ type: "reset", sessionId }), [sessionId]);
-  // Refetched when the bot's changes move, and after each request settles (`epoch`).
-  const cardsEpoch = cardsState.sessionId === sessionId ? cardsState.epoch : 0;
   useEffect(() => {
     if (!anyCards) return;
     const id = sessionId;
@@ -249,30 +241,15 @@ export function ChatScreen({
       .rpc((c) => c["changes.conversation"]({ sessionId: id }))
       .then((changes) => dispatchCards({ type: "fetched", sessionId: id, fetchId, changes }))
       .catch(() => {}); // the cards still show, without summaries
-  }, [connection, sessionId, changesVersion, anyCards, cardsEpoch]);
+  }, [connection, sessionId, changesVersion, anyCards]);
   const cards = useMemo<ChangesCards>(() => {
     const own = cardsState.sessionId === sessionId ? cardsState : initialCards(sessionId);
     return {
       current: currentChangesKey(turnItems),
       generation: latestChangesKey(turnItems),
       summaries: summariesByTurn(own.server),
-      dismissed: dismissedCards(own),
-      justCleared: own.justCleared,
-      setDismissed: (seq, value) => {
-        const id = cardsTick();
-        const forSession = sessionId;
-        animateLayout();
-        dispatchCards({ type: "requested", sessionId: forSession, id, seq, dismissed: value });
-        connection.rpc((c) => c["changes.dismiss"]({ sessionId: forSession, seq, dismissed: value })).then(
-          () => dispatchCards({ type: "settled", sessionId: forSession, id, seq, ok: true, tick: cardsTick() }),
-          (e) => {
-            dispatchCards({ type: "settled", sessionId: forSession, id, seq, ok: false, tick: cardsTick() });
-            if (shownSession.current === forSession) setError(errorMessage(e));
-          },
-        );
-      },
     };
-  }, [turnItems, cardsState, connection, sessionId]);
+  }, [turnItems, cardsState, sessionId]);
   // Apollo's browser, live: opened from the header, or from a tab an agent handed over.
   const [browser, setBrowser] = useState<{ tabId?: string; handoff?: Handoff } | null>(null);
   const browserTabs = useMemo(() => {
@@ -530,26 +507,8 @@ function Item({
 } & Respond) {
   switch (item.kind) {
     case "changes":
-      if (cards.dismissed.has(item.seq)) {
-        return cards.justCleared.has(item.seq) ? (
-          <View style={styles.cleared}>
-            <Text style={styles.clearedText}>{item.report ? "Full diff cleared" : "Changes cleared"}</Text>
-            <Pressable onPress={() => cards.setDismissed(item.seq, false)} hitSlop={10}>
-              <Text style={styles.clearedUndo}>Undo</Text>
-            </Pressable>
-          </View>
-        ) : null;
-      }
       if (item.report && item.repos[0]) {
-        return (
-          <FullDiff
-            sessionId={sessionId}
-            seq={item.seq}
-            repo={item.repos[0]}
-            report={item.report}
-            onClear={() => cards.setDismissed(item.seq, true)}
-          />
-        );
+        return <FullDiff sessionId={sessionId} seq={item.seq} repo={item.repos[0]} report={item.report} />;
       }
       return (
         <TurnChanges
@@ -558,7 +517,6 @@ function Item({
           current={cards.current === item.key}
           generation={cards.generation}
           onOpen={onOpenChanges}
-          onClear={() => cards.setDismissed(item.seq, true)}
         />
       );
     case "activity":
@@ -656,16 +614,12 @@ interface ChangesCards {
   /** The latest card: when a new one arrives, cards opened by hand fold again. */
   readonly generation: string | null;
   readonly summaries: ReadonlyMap<number, string>;
-  readonly dismissed: ReadonlySet<number>;
-  /** Cleared while this screen is open: they offer an undo instead of vanishing. */
-  readonly justCleared: ReadonlySet<number>;
-  readonly setDismissed: (seq: number, dismissed: boolean) => void;
 }
 
 /**
  * What a turn changed in git repositories (detected by Apollo). The latest turn's card is
  * open (the worker's summary and the files); earlier ones fold to one line. Tapping it
- * toggles; "Review" opens the Changes screen; the cross clears it from the conversation.
+ * toggles; "Review" opens the Changes screen (where changes are cleared).
  */
 function TurnChanges({
   repos,
@@ -673,14 +627,12 @@ function TurnChanges({
   current,
   generation,
   onOpen,
-  onClear,
 }: {
   repos: ReadonlyArray<RepoChanges>;
   summary: string | null;
   current: boolean;
   generation: string | null;
   onOpen: () => void;
-  onClear: () => void;
 }) {
   // Opened or folded by hand until a newer turn's card arrives; then history folds again.
   const [toggled, setToggled] = useState<boolean | null>(null);
@@ -732,15 +684,6 @@ function TurnChanges({
         </Pressable>
         <Pressable onPress={onOpen} hitSlop={8} style={({ pressed }) => [styles.turnChangesAction, pressed && { opacity: 0.6 }]}>
           <Text style={styles.turnChangesReview}>Review ›</Text>
-        </Pressable>
-        <Pressable
-          onPress={onClear}
-          hitSlop={8}
-          accessibilityRole="button"
-          accessibilityLabel="Clear from the conversation"
-          style={({ pressed }) => [styles.turnChangesAction, pressed && { opacity: 0.6 }]}
-        >
-          <XIcon size={14} color="#52525b" />
         </Pressable>
       </View>
       {open ? (
@@ -1210,9 +1153,6 @@ const styles = StyleSheet.create({
   turnChangesFile: { flexDirection: "row", alignItems: "center", gap: 8 },
   turnChangesPath: { flex: 1, minWidth: 0, fontFamily: MONO, fontSize: 11.5 },
   turnChangesMore: { color: colors.faint, fontSize: 11.5, paddingLeft: 14 },
-  cleared: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 8 },
-  clearedText: { color: "#52525b", fontSize: 12 },
-  clearedUndo: { color: colors.faint, fontSize: 12, textDecorationLine: "underline" },
   turnChangesTitle: { color: colors.textSoft, fontSize: 13 },
   turnChangesMeta: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 4 },
   fileDot: { width: 6, height: 6, borderRadius: 3 },

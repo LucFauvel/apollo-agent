@@ -1,16 +1,17 @@
-import { codeLanguage, codePlainColor, highlightCode } from "@apollo/client";
+import { cardsTick, codeLanguage, codePlainColor, dismissKey, highlightCode, initialPanel, panelView, reducePanel } from "@apollo/client";
 import type {
   ChangeReport,
-  ChangesOverview,
+  ClearedChanges,
   OverviewFile,
   PullRequest,
   RepoChanges,
   SemanticFileDiff,
   SemanticSymbol,
   Session,
+  SessionChanges,
   SessionId,
 } from "@apollo/contracts";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useReducer, useState } from "react";
 import { ActivityIndicator, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useApollo } from "../AppState.tsx";
@@ -64,20 +65,50 @@ export function ChangesScreen({
 }) {
   const { state, connection } = useApollo();
   const version = state.changesVersion.get(session.botId) ?? 0;
-  const [overview, setOverview] = useState<ChangesOverview | null>(null);
+  // The server's overview with this screen's clear requests in flight laid over (see the
+  // desktop's ChangesPanel); refetched when changes move and after each request settles.
+  const [panel, dispatch] = useReducer(reducePanel, session.id, initialPanel);
   const [error, setError] = useState<string | null>(null);
   const insets = useSafeAreaInsets();
+  useEffect(() => dispatch({ type: "reset", sessionId: session.id }), [session.id]);
+  const own = panel.sessionId === session.id ? panel : initialPanel(session.id);
 
   useEffect(() => {
+    const sessionId = session.id;
+    // Issuing it makes every earlier answer for this view stale, whatever started either.
+    const fetchId = cardsTick();
+    dispatch({ type: "fetching", sessionId, fetchId });
     let cancelled = false;
     connection
-      .rpc((c) => c["changes.list"]({ sessionId: session.id }))
-      .then((next) => !cancelled && (setOverview(next), setError(null)))
+      .rpc((c) => c["changes.list"]({ sessionId }))
+      .then((changes) => {
+        dispatch({ type: "fetched", sessionId, fetchId, changes });
+        if (!cancelled) setError(null);
+      })
       .catch((e) => !cancelled && setError(errorMessage(e)));
     return () => {
       cancelled = true;
     };
-  }, [connection, session.id, version]);
+  }, [connection, session.id, version, own.epoch]);
+
+  /** Clears (or brings back) turns of a session from the screen: one request per turn. */
+  const setCleared = (target: string, seqs: ReadonlyArray<number>, dismissed: boolean) => {
+    const sessionId = session.id;
+    animateLayout();
+    for (const seq of seqs) {
+      const id = cardsTick();
+      const key = dismissKey(target, seq);
+      dispatch({ type: "requested", sessionId, id, key, dismissed });
+      connection.rpc((c) => c["changes.dismiss"]({ sessionId: target as SessionId, seq, dismissed })).then(
+        () => dispatch({ type: "settled", sessionId, id, key, ok: true, tick: cardsTick() }),
+        (e) => {
+          dispatch({ type: "settled", sessionId, id, key, ok: false, tick: cardsTick() });
+          setError(errorMessage(e));
+        },
+      );
+    }
+  };
+  const overview = useMemo(() => panelView(own), [own]);
 
   const pullRequests = useMemo(() => {
     const ids = new Set(
@@ -118,7 +149,7 @@ export function ChangesScreen({
             <View style={styles.emptyIcon}>
               <GitCompareArrowsIcon size={22} color={colors.faint} strokeWidth={1.5} />
             </View>
-            <Text style={styles.emptyTitle}>No changes yet</Text>
+            <Text style={styles.emptyTitle}>{overview.cleared.length > 0 ? "Nothing left to review" : "No changes yet"}</Text>
             <Text style={styles.emptyText}>
               Files the agents change in git repositories show up here after each turn, grouped by the functions and types they touch.
             </Text>
@@ -127,15 +158,12 @@ export function ChangesScreen({
         {overview?.sessions.map((changes) => (
           <FadeIn key={changes.sessionId}>
             <View style={styles.section}>
-              {overview.sessions.length > 1 || changes.sessionId !== session.id ? (
-                <Pressable onPress={() => onOpenSession(changes.sessionId as SessionId)} style={styles.sectionTitle} hitSlop={6}>
-                  <LayersIcon size={14} color={colors.faint} />
-                  <Text style={styles.sectionLabel} numberOfLines={1}>
-                    {changes.title}
-                  </Text>
-                  <View style={styles.rule} />
-                </Pressable>
-              ) : null}
+              <SectionHeader
+                changes={changes}
+                titled={overview.sessions.length > 1 || changes.sessionId !== session.id}
+                onOpen={() => onOpenSession(changes.sessionId as SessionId)}
+                onClear={() => setCleared(changes.sessionId, changes.turns ?? [], true)}
+              />
               {changes.summaries.length > 0 ? <Summaries summaries={changes.summaries} /> : null}
               {changes.repos.map((repo) => (
                 <RepoCard key={repo.repo} sessionId={changes.sessionId as SessionId} repo={repo} version={version} />
@@ -143,8 +171,72 @@ export function ChangesScreen({
             </View>
           </FadeIn>
         ))}
+        {overview && overview.cleared.length > 0 ? (
+          <View style={{ gap: 6 }}>
+            {overview.cleared.map((cleared) => (
+              <ClearedLine
+                key={cleared.sessionId}
+                cleared={cleared}
+                titled={overview.cleared.length > 1 || cleared.sessionId !== session.id}
+                onUndo={() => setCleared(cleared.sessionId, cleared.seqs, false)}
+              />
+            ))}
+          </View>
+        ) : null}
         <PullRequests pullRequests={pullRequests} />
       </ScrollView>
+    </View>
+  );
+}
+
+// --- sections and clearing them ------------------------------------------------------
+
+/**
+ * A session's section header: its title (opens it) when the screen shows more than this
+ * session, and a cross that clears the section's turns from the screen.
+ */
+function SectionHeader({ changes, titled, onOpen, onClear }: { changes: SessionChanges; titled: boolean; onOpen: () => void; onClear: () => void }) {
+  const clearable = (changes.turns?.length ?? 0) > 0;
+  if (!titled && !clearable) return null;
+  return (
+    <View style={styles.sectionTitle}>
+      {titled ? (
+        <Pressable onPress={onOpen} style={[styles.sectionTitle, { flexShrink: 1 }]} hitSlop={6}>
+          <LayersIcon size={14} color={colors.faint} />
+          <Text style={[styles.sectionLabel, { flexShrink: 1 }]} numberOfLines={1}>
+            {changes.title}
+          </Text>
+        </Pressable>
+      ) : null}
+      <View style={styles.rule} />
+      {clearable ? (
+        <Pressable
+          onPress={onClear}
+          hitSlop={10}
+          accessibilityRole="button"
+          accessibilityLabel={`Clear ${titled ? changes.title : "these changes"} from the screen`}
+          style={({ pressed }) => pressed && styles.pressed}
+        >
+          <XIcon size={14} color="#52525b" />
+        </Pressable>
+      ) : null}
+    </View>
+  );
+}
+
+/** What was cleared from the screen, per session: a way back. */
+function ClearedLine({ cleared, titled, onUndo }: { cleared: ClearedChanges; titled: boolean; onUndo: () => void }) {
+  const n = cleared.seqs.length;
+  return (
+    <View style={styles.cleared}>
+      <GitCompareArrowsIcon size={12} color="#52525b" />
+      <Text style={styles.clearedText} numberOfLines={1}>
+        {titled ? `${cleared.title}: ` : ""}
+        {n} {n === 1 ? "turn" : "turns"} cleared
+      </Text>
+      <Pressable onPress={onUndo} hitSlop={10}>
+        <Text style={styles.clearedUndo}>Undo</Text>
+      </Pressable>
     </View>
   );
 }
@@ -303,20 +395,7 @@ function FileRow({
  * The full semantic diff of a repository (`apollo_semantic_diff`): every file that differs
  * from its baseline, whichever turn changed it, as of when it was asked (the desktop's FullDiff).
  */
-export function FullDiff({
-  sessionId,
-  seq,
-  repo,
-  report,
-  onClear,
-}: {
-  sessionId: SessionId;
-  seq: number;
-  repo: RepoChanges;
-  report: ChangeReport;
-  /** Clears the card from the conversation (every client); undone from the line left in its place. */
-  onClear: () => void;
-}) {
+export function FullDiff({ sessionId, seq, repo, report }: { sessionId: SessionId; seq: number; repo: RepoChanges; report: ChangeReport }) {
   const [closed, toggle] = useToggle();
   const [commitsOpen, toggleCommits] = useToggle();
   const notes = useMemo(() => new Map(report.notes.map((n) => [n.path, n.text])), [report.notes]);
@@ -326,32 +405,21 @@ export function FullDiff({
   const base = report.base.commit ? `${report.base.ref} @ ${report.base.commit.slice(0, 7)}` : report.base.ref;
   return (
     <View style={styles.card}>
-      <View style={styles.fullDiffHeader}>
-        <Pressable onPress={toggle} style={({ pressed }) => [styles.repoHeader, styles.fullDiffToggle, pressed && styles.pressed]}>
-          <GitCompareArrowsIcon size={16} color={colors.muted} strokeWidth={1.75} />
-          <View style={{ flex: 1, minWidth: 0 }}>
-            <Text style={styles.repoName} numberOfLines={1}>
-              Full diff · {repo.name}
-            </Text>
-            <Text style={styles.faintSmall} numberOfLines={1}>
-              vs {base} · {total} {total === 1 ? "file" : "files"}
-            </Text>
-          </View>
-          <Counts additions={additions} deletions={deletions} />
-          <Turn open={!closed}>
-            <ChevronRightIcon size={14} color={colors.faint} />
-          </Turn>
-        </Pressable>
-        <Pressable
-          onPress={onClear}
-          hitSlop={8}
-          accessibilityRole="button"
-          accessibilityLabel="Clear from the conversation"
-          style={({ pressed }) => [styles.fullDiffClear, pressed && { opacity: 0.6 }]}
-        >
-          <XIcon size={14} color="#52525b" />
-        </Pressable>
-      </View>
+      <Pressable onPress={toggle} style={({ pressed }) => [styles.repoHeader, pressed && styles.pressed]}>
+        <GitCompareArrowsIcon size={16} color={colors.muted} strokeWidth={1.75} />
+        <View style={{ flex: 1, minWidth: 0 }}>
+          <Text style={styles.repoName} numberOfLines={1}>
+            Full diff · {repo.name}
+          </Text>
+          <Text style={styles.faintSmall} numberOfLines={1}>
+            vs {base} · {total} {total === 1 ? "file" : "files"}
+          </Text>
+        </View>
+        <Counts additions={additions} deletions={deletions} />
+        <Turn open={!closed}>
+          <ChevronRightIcon size={14} color={colors.faint} />
+        </Turn>
+      </Pressable>
       {!closed ? (
         <>
           <Pressable onPress={report.commitCount > 0 ? toggleCommits : undefined} style={[styles.indent, { paddingVertical: 6 }]}>
@@ -658,6 +726,9 @@ const styles = StyleSheet.create({
   sectionTitle: { flexDirection: "row", alignItems: "center", gap: 8 },
   sectionLabel: { color: colors.faint, fontSize: 11, fontWeight: "700", letterSpacing: 0.8 },
   rule: { flex: 1, height: 1, backgroundColor: colors.border },
+  cleared: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 4 },
+  clearedText: { color: "#52525b", fontSize: 12, flexShrink: 1 },
+  clearedUndo: { color: colors.faint, fontSize: 12, textDecorationLine: "underline" },
   rowCenter: { flexDirection: "row", alignItems: "center", gap: 6 },
   pressed: { opacity: 0.6 },
   summary: {
@@ -676,9 +747,6 @@ const styles = StyleSheet.create({
   olderToggle: { color: "rgba(196,181,253,0.75)", fontSize: 12, marginTop: 2 },
   card: { borderRadius: 14, borderWidth: 1, borderColor: colors.border, backgroundColor: "rgba(24,24,27,0.4)", overflow: "hidden" },
   repoHeader: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, paddingVertical: 12 },
-  fullDiffHeader: { flexDirection: "row", alignItems: "center" },
-  fullDiffToggle: { flex: 1, minWidth: 0, paddingRight: 4 },
-  fullDiffClear: { paddingLeft: 4, paddingRight: 12, paddingVertical: 12 },
   repoName: { color: colors.text, fontSize: 14, fontWeight: "600", flexShrink: 1 },
   faintSmall: { color: colors.faint, fontSize: 11.5 },
   counts: { fontFamily: MONO, fontSize: 11 },

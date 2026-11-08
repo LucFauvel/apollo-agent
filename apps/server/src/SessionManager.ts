@@ -1241,9 +1241,17 @@ const make = Effect.gen(function* () {
             ? [session, ...(yield* store.listSessions(session.botId)).filter((s) => s.id !== session.id && s.role !== "reflection")]
             : [session];
         const all = yield* Effect.promise(() =>
-          Promise.all(sessions.map((s) => changeTracker.sessionChanges(s.id, s.role === "main" ? "Orchestrator" : s.title))),
+          Promise.all(
+            sessions.map(async (s) => {
+              const title = s.role === "main" ? "Orchestrator" : s.title;
+              return { title, ...(await changeTracker.sessionChanges(s.id, title)) };
+            }),
+          ),
         );
-        return { sessions: all.filter((c) => c !== null) };
+        return {
+          sessions: all.flatMap((c) => (c.section ? [c.section] : [])),
+          cleared: all.flatMap((c, i) => (c.cleared.length > 0 ? [{ sessionId: sessions[i]!.id, title: c.title, seqs: c.cleared }] : [])),
+        };
       }),
 
     /** One changed file of a session as a semantic diff (with `reportSeq`: of the full diff in that event). */
@@ -1270,7 +1278,7 @@ const make = Effect.gen(function* () {
         return changeTracker.conversation(id);
       }),
 
-    /** Clears a turn's changes card from the conversation (every client), or brings it back. */
+    /** Clears a turn's changes from the Changes panel (every client), or brings them back. */
     dismissChanges: (id: SessionId, seq: number, dismissed: boolean) =>
       Effect.gen(function* () {
         const session = yield* store.getSession(id);

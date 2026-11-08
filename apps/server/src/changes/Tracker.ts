@@ -178,14 +178,69 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
       .prepare("select repo, path, symbol, text from change_notes where session_id = ? and turn_seq = ? order by repo, path, symbol")
       .all(sessionId, seq) as Array<{ repo: string; path: string; symbol: string; text: string }>;
 
-  /** The latest note per file and symbol, across the session's turns. */
-  const latestNotes = (sessionId: string) => {
+  /** The latest note per file and symbol, across the session's turns (except `hidden` ones). */
+  const latestNotes = (sessionId: string, hidden: ReadonlySet<number> = new Set()) => {
     const rows = db
-      .prepare("select repo, path, symbol, text from change_notes where session_id = ? and path != '' order by turn_seq, created_at")
-      .all(sessionId) as Array<{ repo: string; path: string; symbol: string; text: string }>;
+      .prepare("select turn_seq, repo, path, symbol, text from change_notes where session_id = ? and path != '' order by turn_seq, created_at")
+      .all(sessionId) as Array<{ turn_seq: number; repo: string; path: string; symbol: string; text: string }>;
     const notes = new Map<string, string>();
-    for (const row of rows) notes.set(`${row.repo}\0${row.path}\0${row.symbol}`, row.text);
+    for (const row of rows) if (!hidden.has(Number(row.turn_seq))) notes.set(`${row.repo}\0${row.path}\0${row.symbol}`, row.text);
     return notes;
+  };
+
+  // --- turns the user cleared from the Changes panel ------------------------------
+
+  /**
+   * The FilesChanged event that shows a turn's changes: the first one after its TurnStarted
+   * (full diffs, which carry a `report`, aside), unless the next turn started first. Fixed
+   * once it exists, so it is remembered; a turn whose event is not stored yet is asked again.
+   */
+  const filesEvents = new Map<string, number>();
+  const filesEventOf = (sessionId: string, turnSeq: number): number | null => {
+    const key = `${sessionId}\0${turnSeq}`;
+    const known = filesEvents.get(key);
+    if (known !== undefined) return known;
+    const row = db
+      .prepare(
+        `select seq, json_extract(event, '$._tag') as tag from session_events
+         where session_id = ? and seq > ? and json_extract(event, '$._tag') in ('FilesChanged', 'TurnStarted')
+           and json_extract(event, '$.report') is null
+         order by seq limit 1`,
+      )
+      .get(sessionId, turnSeq) as { seq: number; tag: string } | undefined;
+    if (row?.tag !== "FilesChanged") return null;
+    if (filesEvents.size > 5000) filesEvents.clear();
+    filesEvents.set(key, Number(row.seq));
+    return Number(row.seq);
+  };
+
+  const dismissedSeqs = (sessionId: string) =>
+    (db.prepare("select seq from dismissed_changes where session_id = ? order by seq").all(sessionId) as Array<{ seq: number }>).map((r) =>
+      Number(r.seq),
+    );
+
+  /**
+   * The session's turns with changes, by whether the user cleared them (`changes.dismiss`
+   * on their FilesChanged event): `shown` and `cleared` are those events' seqs, `hidden` the
+   * cleared turns' own seqs (what turn_changes and change_notes are keyed by).
+   */
+  const clearedTurns = (sessionId: string) => {
+    const dismissed = new Set(dismissedSeqs(sessionId));
+    const shown: Array<number> = [];
+    const cleared: Array<number> = [];
+    const hidden = new Set<number>();
+    const turnSeqs = db.prepare("select distinct turn_seq from turn_changes where session_id = ? order by turn_seq").all(sessionId) as Array<{
+      turn_seq: number;
+    }>;
+    for (const { turn_seq } of turnSeqs) {
+      const seq = filesEventOf(sessionId, Number(turn_seq));
+      if (seq === null) continue;
+      if (dismissed.has(seq)) {
+        cleared.push(seq);
+        hidden.add(Number(turn_seq));
+      } else shown.push(seq);
+    }
+    return { shown, cleared, hidden };
   };
 
   // --- the session's overall changes ------------------------------------------
@@ -195,13 +250,27 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
       ? db.prepare("select * from turn_changes where session_id = ? and repo = ? order by turn_seq").all(sessionId, repo)
       : db.prepare("select * from turn_changes where session_id = ? order by turn_seq").all(sessionId)) as unknown as Array<Row>;
 
-  /** First snapshot to latest, per repository. */
-  const spans = (sessionId: string) => {
-    const byRepo = new Map<string, { gitDir: string; before: string; after: string; rows: Array<Row> }>();
+  type Span = { gitDir: string; before: string; after: string; rows: Array<Row> };
+
+  /**
+   * First snapshot to latest, per repository, leaving out `hidden` turns: a cleared turn
+   * between shown ones splits a repository's span in two, oldest first (one span otherwise).
+   */
+  const spans = (sessionId: string, hidden: ReadonlySet<number> = new Set()) => {
+    const byRepo = new Map<string, Array<Span>>();
+    const broken = new Set<string>();
     for (const row of rowsOf(sessionId)) {
-      const span = byRepo.get(row.repo);
-      if (!span) byRepo.set(row.repo, { gitDir: row.git_dir, before: row.before_tree, after: row.after_tree, rows: [row] });
-      else {
+      if (hidden.has(Number(row.turn_seq))) {
+        broken.add(row.repo);
+        continue;
+      }
+      const list = byRepo.get(row.repo) ?? [];
+      const span = broken.has(row.repo) ? undefined : list.at(-1);
+      broken.delete(row.repo);
+      if (!span) {
+        list.push({ gitDir: row.git_dir, before: row.before_tree, after: row.after_tree, rows: [row] });
+        byRepo.set(row.repo, list);
+      } else {
         span.after = row.after_tree;
         span.rows.push(row);
       }
@@ -218,19 +287,41 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
 
   const overviewCache = new Map<string, Array<ChangedFile>>();
 
-  const sessionChanges = async (sessionId: string, title: string): Promise<SessionChanges | null> => {
-    const notes = latestNotes(sessionId);
+  const spanFiles = async (span: Span) => {
+    const key = `${span.gitDir}\0${span.before}\0${span.after}`;
+    let files = overviewCache.get(key);
+    if (!files) {
+      files = await diffFiles(span.gitDir, span.before, span.after).catch(() => mergedFiles(span.rows));
+      if (overviewCache.size > 500) overviewCache.clear();
+      overviewCache.set(key, files);
+    }
+    return files;
+  };
+
+  /**
+   * A repository's changed files over its spans. With several (a cleared turn in between),
+   * a file changed in more than one shows as of its latest span: what the cleared turn did
+   * to it is never shown.
+   */
+  const repoFiles = async (list: ReadonlyArray<Span>) => {
+    const files = new Map<string, ChangedFile>();
+    for (const span of list) for (const f of await spanFiles(span)) files.set(f.path, f);
+    return [...files.values()].sort((a, b) => a.path.localeCompare(b.path));
+  };
+
+  /**
+   * What a session changed, as the Changes panel shows it: without the turns the user
+   * cleared from it (their files, notes and summaries), which are listed in `cleared` to be
+   * brought back. `section` is null when there is nothing left to show.
+   */
+  const sessionChanges = async (sessionId: string, title: string): Promise<{ section: SessionChanges | null; cleared: Array<number> }> => {
+    const { shown, cleared, hidden } = clearedTurns(sessionId);
+    const notes = latestNotes(sessionId, hidden);
     const repos: Array<{ repo: string; name: string; files: Array<OverviewFile> }> = [];
     let updatedAt = 0;
-    for (const [repo, span] of spans(sessionId)) {
-      updatedAt = Math.max(updatedAt, ...span.rows.map((r) => r.created_at));
-      const key = `${span.gitDir}\0${span.before}\0${span.after}`;
-      let files = overviewCache.get(key);
-      if (!files) {
-        files = await diffFiles(span.gitDir, span.before, span.after).catch(() => mergedFiles(span.rows));
-        if (overviewCache.size > 500) overviewCache.clear();
-        overviewCache.set(key, files);
-      }
+    for (const [repo, list] of spans(sessionId, hidden)) {
+      updatedAt = Math.max(updatedAt, ...list.flatMap((span) => span.rows.map((r) => r.created_at)));
+      const files = await repoFiles(list);
       // Changed, then changed back: nothing to show for this repository.
       if (files.length === 0) continue;
       repos.push({
@@ -241,11 +332,17 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
     }
     const summaries = (
       db
-        .prepare("select text, created_at from change_notes where session_id = ? and path = '' order by created_at desc limit 20")
-        .all(sessionId) as Array<{ text: string; created_at: number }>
-    ).map((r) => ({ text: r.text, at: r.created_at }));
-    if (repos.length === 0 && summaries.length === 0) return null;
-    return { sessionId, title, repos: repos.sort((a, b) => a.name.localeCompare(b.name)), summaries, updatedAt };
+        .prepare("select turn_seq, text, created_at from change_notes where session_id = ? and path = '' order by created_at desc limit 200")
+        .all(sessionId) as Array<{ turn_seq: number; text: string; created_at: number }>
+    )
+      .filter((r) => !hidden.has(Number(r.turn_seq)))
+      .slice(0, 20)
+      .map((r) => ({ text: r.text, at: r.created_at }));
+    if (repos.length === 0 && summaries.length === 0) return { section: null, cleared };
+    return {
+      section: { sessionId, title, repos: repos.sort((a, b) => a.name.localeCompare(b.name)), summaries, updatedAt, turns: shown },
+      cleared,
+    };
   };
 
   /**
@@ -292,14 +389,18 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
     return result;
   };
 
-  /** One file of a session's overall changes, as a semantic diff with the worker's notes. */
+  /**
+   * One file of a session's overall changes (without the turns cleared from the panel), as a
+   * semantic diff with the worker's notes: over the latest span that changed it.
+   */
   const file = async (sessionId: string, repo: string, path: string): Promise<SemanticFileDiff | null> => {
-    const span = spans(sessionId).get(repo);
-    if (!span) return null;
-    const files = await diffFiles(span.gitDir, span.before, span.after).catch(() => mergedFiles(span.rows));
-    const changed = files.find((f) => f.path === path);
-    if (!changed) return null;
-    return semanticFile(span.gitDir, span.before, span.after, changed, notesOfFile(latestNotes(sessionId), repo, path));
+    const { hidden } = clearedTurns(sessionId);
+    for (const span of [...(spans(sessionId, hidden).get(repo) ?? [])].reverse()) {
+      const files = await diffFiles(span.gitDir, span.before, span.after).catch(() => mergedFiles(span.rows));
+      const changed = files.find((f) => f.path === path);
+      if (changed) return semanticFile(span.gitDir, span.before, span.after, changed, notesOfFile(latestNotes(sessionId, hidden), repo, path));
+    }
+    return null;
   };
 
   // --- the full diff of a repository against its baseline (asked for by the user) --------
@@ -391,12 +492,13 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
         .prepare("select turn_seq, text, created_at from change_notes where session_id = ? and path = '' order by created_at desc limit 200")
         .all(sessionId) as Array<{ turn_seq: number; text: string; created_at: number }>
     ).map((r) => ({ turnSeq: Number(r.turn_seq), text: r.text, at: Number(r.created_at) })),
-    dismissed: (db.prepare("select seq from dismissed_changes where session_id = ? order by seq").all(sessionId) as Array<{ seq: number }>).map(
-      (r) => Number(r.seq),
-    ),
+    dismissed: dismissedSeqs(sessionId),
   });
 
-  /** Clears the card of the FilesChanged event at `seq` from the conversation, or brings it back. */
+  /**
+   * Clears the changes of the FilesChanged event at `seq` from the Changes panel, or brings
+   * them back. (Older clients also hide that event's card in the conversation.)
+   */
   const setDismissed = (sessionId: string, seq: number, dismissed: boolean) => {
     if (dismissed) db.prepare("insert or ignore into dismissed_changes (session_id, seq) values (?, ?)").run(sessionId, seq);
     else db.prepare("delete from dismissed_changes where session_id = ? and seq = ?").run(sessionId, seq);

@@ -29,7 +29,6 @@ import {
 import {
   cardsTick,
   currentChangesKey,
-  dismissedCards,
   hasCards,
   initialCards,
   isCompacting,
@@ -243,22 +242,8 @@ function Item({
 }) {
   switch (item.kind) {
     case "changes":
-      if (cards.dismissed.has(item.seq)) {
-        return cards.justCleared.has(item.seq) ? (
-          <ClearedChanges label={item.report ? "Full diff cleared" : "Changes cleared"} onUndo={() => cards.setDismissed(item.seq, false)} />
-        ) : null;
-      }
       if (item.report && item.repos[0]) {
-        return (
-          <FullDiff
-            sessionId={sessionId}
-            seq={item.seq}
-            repo={item.repos[0]}
-            report={item.report}
-            at={item.at}
-            onClear={() => cards.setDismissed(item.seq, true)}
-          />
-        );
+        return <FullDiff sessionId={sessionId} seq={item.seq} repo={item.repos[0]} report={item.report} at={item.at} />;
       }
       return (
         <TurnChanges
@@ -267,7 +252,6 @@ function Item({
           current={cards.current === item.key}
           generation={cards.generation}
           onOpen={onOpenChanges}
-          onClear={() => cards.setDismissed(item.seq, true)}
         />
       );
     case "compacting":
@@ -680,25 +664,14 @@ interface ChangesCards {
   /** The latest card: when a new one arrives, cards opened by hand fold again. */
   readonly generation: string | null;
   readonly summaries: ReadonlyMap<number, string>;
-  readonly dismissed: ReadonlySet<number>;
-  /** Cleared while this view is open: they offer an undo instead of vanishing. */
-  readonly justCleared: ReadonlySet<number>;
-  readonly setDismissed: (seq: number, dismissed: boolean) => void;
 }
 
-/**
- * The summaries and cleared cards of a session's conversation (kept by the server, so they
- * follow the user across restarts and devices), refetched when its changes move.
- */
+/** The summaries of a session's turns' changes cards, refetched when its changes move. */
 function useChangesCards(session: Session, items: ReadonlyArray<{ kind: string; key: string }>, enabled: boolean): ChangesCards {
   // Bumped by the server's ChangesUpdated, and by every reconnect (store.ts).
   const version = useApp((s) => s.changesVersion.get(session.botId) ?? 0);
   const [state, dispatch] = useReducer(reduceCards, session.id, initialCards);
-  const shown = useRef(session.id);
-  shown.current = session.id;
   useEffect(() => dispatch({ type: "reset", sessionId: session.id }), [session.id]);
-  // Refetched when the bot's changes move, and after each request settles (`epoch`).
-  const epoch = state.sessionId === session.id ? state.epoch : 0;
   useEffect(() => {
     if (!enabled) return;
     const sessionId = session.id;
@@ -708,31 +681,18 @@ function useChangesCards(session: Session, items: ReadonlyArray<{ kind: string; 
     rpc((c) => c["changes.conversation"]({ sessionId }))
       .then((changes) => dispatch({ type: "fetched", sessionId, fetchId, changes }))
       .catch(() => {}); // the cards still show, without summaries
-  }, [session.id, version, enabled, epoch]);
+  }, [session.id, version, enabled]);
   const current = useMemo(() => currentChangesKey(items), [items]);
   const generation = useMemo(() => latestChangesKey(items), [items]);
   const own = state.sessionId === session.id ? state : initialCards(session.id);
   const summaries = useMemo(() => summariesByTurn(own.server), [own.server]);
-  const dismissed = useMemo(() => dismissedCards(own), [own]);
-  const setDismissed = (seq: number, value: boolean) => {
-    const sessionId = session.id;
-    const id = cardsTick();
-    dispatch({ type: "requested", sessionId, id, seq, dismissed: value });
-    rpc((c) => c["changes.dismiss"]({ sessionId, seq, dismissed: value })).then(
-      () => dispatch({ type: "settled", sessionId, id, seq, ok: true, tick: cardsTick() }),
-      (e) => {
-        dispatch({ type: "settled", sessionId, id, seq, ok: false, tick: cardsTick() });
-        if (shown.current === sessionId) alert(errorMessage(e));
-      },
-    );
-  };
-  return { current, generation, summaries, dismissed, justCleared: own.justCleared, setDismissed };
+  return { current, generation, summaries };
 }
 
 /**
  * What a turn changed in git repositories (detected by Apollo, not the agent). The latest
  * turn's card is open (the worker's summary and the files); earlier ones fold to one line.
- * "Review" opens the Changes panel; the cross clears the card from the conversation.
+ * "Review" opens the Changes panel (where changes are cleared).
  */
 function TurnChanges({
   repos,
@@ -740,14 +700,12 @@ function TurnChanges({
   current,
   generation,
   onOpen,
-  onClear,
 }: {
   repos: ReadonlyArray<RepoChanges>;
   summary: string | null;
   current: boolean;
   generation: string | null;
   onOpen: () => void;
-  onClear: () => void;
 }) {
   // Opened or folded by hand until a newer turn's card arrives; then history folds again.
   const [toggled, setToggled] = useState<boolean | null>(null);
@@ -789,20 +747,10 @@ function TurnChanges({
         <button
           type="button"
           onClick={onOpen}
-          className="shrink-0 py-2 pr-1.5 pl-2.5 text-[11px] text-zinc-500 transition-colors hover:bg-zinc-900/60 hover:text-zinc-200"
+          className="shrink-0 py-2 pr-3 pl-2.5 text-[11px] text-zinc-500 transition-colors hover:bg-zinc-900/60 hover:text-zinc-200"
         >
           Review →
         </button>
-        <Tooltip align="end" content="Clear from the conversation">
-          <button
-            type="button"
-            onClick={onClear}
-            aria-label="Clear from the conversation"
-            className="mr-1 flex size-6 shrink-0 items-center justify-center rounded-md text-zinc-600 opacity-0 transition-all group-hover:opacity-100 hover:bg-zinc-800 hover:text-zinc-300 focus-visible:opacity-100"
-          >
-            <X className="size-3.5" />
-          </button>
-        </Tooltip>
       </div>
       <Collapse open={open}>
         <div className="space-y-2 border-t border-zinc-800/80 px-3 py-2.5">
@@ -839,19 +787,6 @@ function TurnChanges({
           </div>
         </div>
       </Collapse>
-    </div>
-  );
-}
-
-/** Where a card the user just cleared was, while the view is open: a way back. */
-function ClearedChanges({ label, onUndo }: { label: string; onUndo: () => void }) {
-  return (
-    <div className="animate-fade-up flex items-center gap-2 px-2 text-[11px] text-zinc-600">
-      <GitCompareArrows className="size-3 shrink-0" />
-      <span>{label}</span>
-      <button type="button" onClick={onUndo} className="text-zinc-500 underline-offset-2 hover:text-zinc-300 hover:underline">
-        Undo
-      </button>
     </div>
   );
 }
@@ -930,10 +865,9 @@ export function SessionView({
     });
   // A dot on the Changes button once this conversation changed files.
   const hasChanges = useMemo(() => items.some((item) => item.kind === "changes" && !item.report), [items]);
-  // Full diffs are not a turn's changes card: they neither fold history nor take its place,
-  // but they clear like one, so any card loads which ones are cleared.
+  // Full diffs are not a turn's changes card: they neither fold history nor take its place.
   const turnBlocks = useMemo(() => withoutFullDiffs(blocks), [blocks]);
-  const anyCards = useMemo(() => hasCards(blocks), [blocks]);
+  const anyCards = useMemo(() => hasCards(turnBlocks), [turnBlocks]);
   const cards = useChangesCards(session, turnBlocks, anyCards);
   // Compaction can take minutes on a local model: say so instead of "Working…".
   const compacting = useMemo(() => isCompacting(items), [items]);

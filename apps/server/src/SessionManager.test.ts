@@ -750,11 +750,25 @@ describe("SessionManager", () => {
       const diff = yield* manager.changesFile(worker.id, repo, "answer.ts");
       expect(diff.symbols.map((s) => [s.name, s.change])).toEqual([["answer", "added"]]);
 
-      // The user clears the turn's card from the conversation (kept server-side), and brings it back.
+      // The user clears the worker's turn from the Changes panel (kept server-side, for every
+      // client): its section leaves the overview, listed to be brought back; undo restores it.
       const filesChanged = events.find((e) => e.event._tag === "FilesChanged")!;
+      expect(overview.sessions[0]?.turns).toEqual([filesChanged.seq]);
+      expect(overview.cleared).toEqual([]);
       yield* manager.dismissChanges(worker.id, filesChanged.seq, true);
+      expect(yield* manager.changesList(bot.mainSessionId)).toEqual({
+        sessions: [],
+        cleared: [{ sessionId: worker.id, title: "feature", seqs: [filesChanged.seq] }],
+      });
+      expect((yield* Effect.flip(manager.changesFile(worker.id, repo, "answer.ts"))).message).toContain("not among");
+      // The worker's own view leaves it out too; the conversation still lists it (older clients hide its card).
+      expect((yield* manager.changesList(worker.id)).sessions).toEqual([]);
       expect((yield* manager.changesConversation(worker.id)).dismissed).toEqual([filesChanged.seq]);
       yield* manager.dismissChanges(worker.id, filesChanged.seq, false);
+      expect(yield* manager.changesList(bot.mainSessionId)).toMatchObject({
+        sessions: [{ sessionId: worker.id, repos: [{ files: [{ path: "answer.ts" }] }], turns: [filesChanged.seq] }],
+        cleared: [],
+      });
       expect((yield* manager.changesConversation(worker.id)).dismissed).toEqual([]);
       const message = events.find((e) => e.event._tag === "UserMessage")!;
       const refused = yield* manager.dismissChanges(worker.id, message.seq, true).pipe(Effect.flip);
@@ -806,11 +820,13 @@ describe("SessionManager", () => {
       expect(shown.report).toMatchObject({ commitCount: 0, uncommitted: true, additions: 1, deletions: 0 });
       const event = yield* store.eventAt(worker.id, shown.seq);
       expect(event).toMatchObject({ _tag: "FilesChanged", repos: [{ repo }], report: { uncommitted: true } });
-      // The user can clear the full diff's card like a turn's, and bring it back.
+      // A full diff is no turn of the Changes panel: the panel never offers to clear it, and
+      // an older client clearing its card leaves the panel as it was.
+      const panel = yield* manager.changesList(worker.id);
+      expect(panel.sessions[0]?.turns).not.toContain(shown.seq);
       yield* manager.dismissChanges(worker.id, shown.seq, true);
-      expect((yield* manager.changesConversation(worker.id)).dismissed).toContain(shown.seq);
+      expect(yield* manager.changesList(worker.id)).toEqual(panel);
       yield* manager.dismissChanges(worker.id, shown.seq, false);
-      expect((yield* manager.changesConversation(worker.id)).dismissed).not.toContain(shown.seq);
 
       // A day later, automated turns cannot reuse that request: not a system turn, not a bot's.
       db.prepare("update session_events set at = at - 86400000 where session_id = ?").run(worker.id);

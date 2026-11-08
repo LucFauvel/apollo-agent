@@ -9,14 +9,17 @@ import {
   summariesByTurn,
   type TranscriptState,
   cardsTick,
-  type CardsAction,
-  type CardsState,
-  dismissedCards,
+  dismissKey,
   initialCards,
+  initialPanel,
   invalidateChanges,
+  panelView,
   reduceCards,
+  reducePanel,
+  type PanelAction,
+  type PanelState,
 } from "../src/index.ts";
-import type { AgentEvent, SessionEvent, SessionId } from "@apollo/contracts";
+import type { AgentEvent, ChangesOverview, SessionEvent, SessionId } from "@apollo/contracts";
 
 const sessionId = "s1" as SessionId;
 const at = (seq: number, event: AgentEvent): SessionEvent => ({ sessionId, seq, at: seq * 1000, event }) as SessionEvent;
@@ -53,7 +56,7 @@ describe("conversation changes cards", () => {
     expect(currentChangesKey([])).toBe(null);
   });
 
-  it("keeps full diffs out of the turn cards, but clearable like them", () => {
+  it("keeps full diffs out of the turn cards", () => {
     const report = {
       gitDir: "/r/app/.git",
       base: { ref: "main", commit: "abc", tree: "t0" },
@@ -81,15 +84,19 @@ describe("conversation changes cards", () => {
     const turns = withoutFullDiffs(items);
     expect(currentChangesKey(turns)).toBe(null);
     expect(latestChangesKey(turns)).toBe("c3");
-    // A conversation with only a full diff still loads which cards are cleared.
-    expect(hasCards(items.filter(isFullDiff))).toBe(true);
-    expect(hasCards(withoutFullDiffs(items).filter((i) => i.kind !== "changes"))).toBe(false);
-    // Cleared and brought back by its event's seq, like a turn's card.
-    let s = reduceCards(initialCards(sessionId), { type: "requested", sessionId, id: cardsTick(), seq: 6, dismissed: true });
-    expect([...dismissedCards(s)]).toEqual([6]);
-    expect(s.justCleared.has(6)).toBe(true);
-    s = reduceCards(s, { type: "requested", sessionId, id: cardsTick(), seq: 6, dismissed: false });
-    expect([...dismissedCards(s)]).toEqual([]);
+    // Only turns' cards need their summaries loaded: a full diff alone does not.
+    expect(hasCards(withoutFullDiffs(items))).toBe(true);
+    expect(hasCards(withoutFullDiffs(items.filter(isFullDiff)))).toBe(false);
+  });
+
+  it("shows every card, whatever was cleared from the Changes panel", () => {
+    // The server still lists cleared FilesChanged events (older clients hide their cards); the
+    // cards' state only carries the summaries.
+    const fetchId = cardsTick();
+    let s = reduceCards(initialCards(sessionId), { type: "fetching", sessionId, fetchId });
+    s = reduceCards(s, { type: "fetched", sessionId, fetchId, changes: { summaries: [{ turnSeq: 2, text: "done", at: 1 }], dismissed: [3, 6] } });
+    expect([...summariesByTurn(s.server)]).toEqual([[2, "done"]]);
+    expect(s.pending.size).toBe(0);
   });
 
   it("finds each turn's summary", () => {
@@ -109,113 +116,113 @@ describe("conversation changes cards", () => {
   });
 });
 
-describe("clearing cards", () => {
+describe("clearing turns from the Changes panel", () => {
   const A = "A";
   const B = "B";
-  const server = (...dismissed: Array<number>) => ({ summaries: [], dismissed });
-  const run = (state: CardsState, ...actions: Array<CardsAction>) => actions.reduce(reduceCards, state);
-  const hidden = (state: CardsState) => [...dismissedCards(state)].sort((a, b) => a - b);
-  /** Sends a fetch for `sessionId`: the action to dispatch now, and its answer for later. */
+  /** Worker W's section shows turns 7 and 9 (FilesChanged seqs); `cleared` lists W's cleared ones. */
+  const server = (...cleared: Array<number>): ChangesOverview => {
+    const shown = [7, 9].filter((seq) => !cleared.includes(seq));
+    return {
+      sessions: shown.length
+        ? [
+            {
+              sessionId: "W",
+              title: "worker",
+              repos: [{ repo: "/r", name: "r", files: [{ path: "a.ts", oldPath: null, status: "modified", additions: 1, deletions: 0, note: null }] }],
+              summaries: [],
+              updatedAt: 1,
+              turns: shown,
+            },
+          ]
+        : [],
+      cleared: cleared.length ? [{ sessionId: "W", title: "worker", seqs: cleared }] : [],
+    };
+  };
+  const run = (state: PanelState, ...actions: Array<PanelAction>) => actions.reduce(reducePanel, state);
+  /** What the panel shows: W's section or not, and what it offers to bring back. */
+  const shows = (state: PanelState) => {
+    const view = panelView(state)!;
+    return { section: view.sessions.length > 0, cleared: view.cleared.flatMap((c) => c.seqs).sort((a, b) => a - b) };
+  };
   const fetchFor = (sessionId: string) => {
     const fetchId = cardsTick();
     return {
       sent: { type: "fetching", sessionId, fetchId } as const,
-      answer: (...dismissed: Array<number>) => ({ type: "fetched", sessionId, fetchId, changes: server(...dismissed) }) as const,
+      answer: (...cleared: Array<number>) => ({ type: "fetched", sessionId, fetchId, changes: server(...cleared) }) as const,
     };
   };
-  const settled = (sessionId: string, id: number, seq: number, ok: boolean) =>
-    ({ type: "settled", sessionId, id, seq, ok, tick: cardsTick() }) as const;
-  const loaded = (sessionId: string, ...dismissed: Array<number>) => {
+  const key = (seq: number) => dismissKey("W", seq);
+  const requested = (sessionId: string, id: number, seq: number, dismissed: boolean) => ({ type: "requested", sessionId, id, key: key(seq), dismissed }) as const;
+  const settled = (sessionId: string, id: number, seq: number, ok: boolean) => ({ type: "settled", sessionId, id, key: key(seq), ok, tick: cardsTick() }) as const;
+  const loaded = (sessionId: string, ...cleared: Array<number>) => {
     const f = fetchFor(sessionId);
-    return run(initialCards(sessionId), f.sent, f.answer(...dismissed));
+    return run(initialPanel(sessionId), f.sent, f.answer(...cleared));
+  };
+  /** Clears both of W's turns, as the section's cross does. */
+  const clearSection = (state: PanelState, sessionId: string) => {
+    const ids = [cardsTick(), cardsTick()] as const;
+    return { ids, state: run(state, requested(sessionId, ids[0], 7, true), requested(sessionId, ids[1], 9, true)) };
   };
 
-  it("hides a card at once, and keeps it hidden until a fetch sent after the server accepted it", () => {
+  it("hides a section at once and offers it back, until a fetch sent after the server accepted it", () => {
     let s = loaded(A);
+    expect(shows(s)).toEqual({ section: true, cleared: [] });
     const before = fetchFor(A);
     s = run(s, before.sent);
-    const id = cardsTick();
-    s = run(s, { type: "requested", sessionId: A, id, seq: 7, dismissed: true });
-    expect(hidden(s)).toEqual([7]);
-    expect(s.justCleared.has(7)).toBe(true);
-    s = run(s, settled(A, id, 7, true));
-    // The settle started a fetch; an answer sent before the acceptance must not bring the card back.
+    const { ids, state } = clearSection(s, A);
+    s = state;
+    expect(shows(s)).toEqual({ section: false, cleared: [7, 9] });
+    s = run(s, settled(A, ids[0], 7, true), settled(A, ids[1], 9, true));
+    // An answer sent before the acceptance must not bring the section back.
     const after = fetchFor(A);
     s = run(s, before.answer(), after.sent);
-    expect(hidden(s)).toEqual([7]);
-    s = run(s, after.answer(7));
+    expect(shows(s)).toEqual({ section: false, cleared: [7, 9] });
+    s = run(s, after.answer(7, 9));
     expect(s.pending.size).toBe(0);
-    expect(hidden(s)).toEqual([7]);
+    expect(shows(s)).toEqual({ section: false, cleared: [7, 9] });
   });
 
-  it("keeps the accepted overlay when the newest fetch was sent before the acceptance", () => {
-    // Reviewer race: the only fetch in flight predates the server taking the request.
-    let s = loaded(A);
-    const id = cardsTick();
-    const early = fetchFor(A);
-    s = run(s, { type: "requested", sessionId: A, id, seq: 7, dismissed: true }, early.sent, settled(A, id, 7, true), early.answer());
-    expect(hidden(s)).toEqual([7]);
-    const late = fetchFor(A);
-    s = run(s, late.sent, late.answer(7));
-    expect(s.pending.size).toBe(0);
+  it("keeps a section shown while only some of its turns are being cleared", () => {
+    const s = run(loaded(A), requested(A, cardsTick(), 7, true));
+    expect(shows(s)).toEqual({ section: true, cleared: [7] });
   });
 
-  it("never lets a failed request overwrite what the server said since", () => {
-    // A clears 7; B clears it too, and A learns it from a refetch; then A's request fails.
-    const start = loaded(A);
-    const id = cardsTick();
-    const refetch = fetchFor(A);
-    let s = run(
-      start,
-      { type: "requested", sessionId: A, id, seq: 7, dismissed: true },
-      refetch.sent,
-      refetch.answer(7),
-      settled(A, id, 7, false),
-    );
-    expect(hidden(s)).toEqual([7]);
-    // The same for an undo that fails while the server still has the card cleared.
-    const undo = cardsTick();
-    s = run(s, { type: "requested", sessionId: A, id: undo, seq: 7, dismissed: false });
-    expect(hidden(s)).toEqual([]);
-    s = run(s, settled(A, undo, 7, false));
-    expect(hidden(s)).toEqual([7]);
-    // Every settled request moves the epoch, which refetches.
+  it("takes the undo line away at once, and shows the section again from the server's answer", () => {
+    let s = loaded(A, 7, 9);
+    expect(shows(s)).toEqual({ section: false, cleared: [7, 9] });
+    const ids = [cardsTick(), cardsTick()] as const;
+    s = run(s, requested(A, ids[0], 7, false), requested(A, ids[1], 9, false));
+    expect(shows(s)).toEqual({ section: false, cleared: [] });
+    s = run(s, settled(A, ids[0], 7, true), settled(A, ids[1], 9, true));
+    const f = fetchFor(A);
+    s = run(s, f.sent, f.answer());
+    expect(shows(s)).toEqual({ section: true, cleared: [] });
     expect(s.epoch).toBe(2);
   });
 
-  it("applies only the answer to the newest fetch, whatever started each and in whatever order they return", () => {
-    // Two reads in flight, e.g. one from mount and one from a ChangesUpdated: the newer returns first.
-    const older = fetchFor(A);
-    const newer = fetchFor(A);
-    let s = run(initialCards(A), older.sent, newer.sent, newer.answer(7), older.answer());
-    expect(hidden(s)).toEqual([7]);
-    // And the other way round: the older answer is dropped, the newer applies.
-    const third = fetchFor(A);
-    const fourth = fetchFor(A);
-    s = run(s, third.sent, fourth.sent, third.answer(), fourth.answer(7, 8));
-    expect(hidden(s)).toEqual([7, 8]);
+  it("never lets a failed request overwrite what the server said since", () => {
+    // A clears the section; another device clears it too, and A learns it; then A's requests fail.
+    const { ids, state } = clearSection(loaded(A), A);
+    const refetch = fetchFor(A);
+    let s = run(state, refetch.sent, refetch.answer(7, 9), settled(A, ids[0], 7, false), settled(A, ids[1], 9, false));
+    expect(shows(s)).toEqual({ section: false, cleared: [7, 9] });
+    // The same for an undo that fails while the server still has them cleared.
+    const undo = cardsTick();
+    s = run(s, requested(A, undo, 7, false));
+    expect(shows(s)).toEqual({ section: false, cleared: [9] });
+    s = run(s, settled(A, undo, 7, false));
+    expect(shows(s)).toEqual({ section: false, cleared: [7, 9] });
   });
 
-  it("forgets a previous visit's fetches on returning to a session, and lets the new visit's apply", () => {
-    // A -> B -> A, leaving with a read in flight that would say 7 is cleared.
-    const visit = loaded(A);
-    const id = cardsTick();
-    const leftBehind = fetchFor(A);
-    let s = run(visit, { type: "requested", sessionId: A, id, seq: 7, dismissed: true }, settled(A, id, 7, true), leftBehind.sent);
-    expect(s.latestFetch).toBe(leftBehind.sent.fetchId);
-    s = run(s, { type: "reset", sessionId: B }, { type: "reset", sessionId: A });
-    // Its answer lands before this visit sent anything, and after: dropped both times.
-    s = run(s, leftBehind.answer(7));
-    expect(s.server).toBe(null);
-    const fresh = fetchFor(A);
-    s = run(s, fresh.sent, leftBehind.answer(7));
-    expect(s.server).toBe(null);
-    s = run(s, fresh.answer());
-    expect(hidden(s)).toEqual([]);
-    // A later read (a reconnect, say) still applies: nothing is wedged.
-    const reconnect = fetchFor(A);
-    s = run(s, reconnect.sent, reconnect.answer(9));
-    expect(hidden(s)).toEqual([9]);
+  it("applies only the answer to the newest fetch, whatever order they return in", () => {
+    const older = fetchFor(A);
+    const newer = fetchFor(A);
+    let s = run(initialPanel(A), older.sent, newer.sent, newer.answer(7, 9), older.answer());
+    expect(shows(s)).toEqual({ section: false, cleared: [7, 9] });
+    const third = fetchFor(A);
+    const fourth = fetchFor(A);
+    s = run(s, third.sent, fourth.sent, third.answer(7, 9), fourth.answer());
+    expect(shows(s)).toEqual({ section: true, cleared: [] });
   });
 
   it("converges for two superseding requests under every outcome and order", () => {
@@ -229,11 +236,7 @@ describe("clearing cards", () => {
             const ids = [cardsTick(), cardsTick()] as const;
             let s = loaded(A);
             let serverValue = false;
-            s = run(
-              s,
-              { type: "requested", sessionId: A, id: ids[0], seq: 7, dismissed: firstValue },
-              { type: "requested", sessionId: A, id: ids[1], seq: 7, dismissed: !firstValue },
-            );
+            s = run(s, requested(A, ids[0], 7, firstValue), requested(A, ids[1], 7, !firstValue));
             for (const n of order) {
               const ok = n === 1 ? firstOk : secondOk;
               if (ok) serverValue = n === 1 ? firstValue : !firstValue;
@@ -241,38 +244,57 @@ describe("clearing cards", () => {
             }
             const f = fetchFor(A);
             s = run(s, f.sent, f.answer(...(serverValue ? [7] : [])));
-            expect(dismissedCards(s).has(7)).toBe(serverValue);
+            expect(shows(s).cleared.includes(7)).toBe(serverValue);
             expect(s.pending.size).toBe(0);
           }
   });
 
-  it("drops a request superseded by a newer one for the same card", () => {
-    const first = cardsTick();
-    const second = cardsTick();
-    const s = run(
-      loaded(A, 1),
-      { type: "requested", sessionId: A, id: first, seq: 4, dismissed: true },
-      { type: "requested", sessionId: A, id: second, seq: 4, dismissed: false },
-      settled(A, first, 4, false),
-    );
-    expect(s.pending.get(4)?.id).toBe(second);
-    expect(hidden(s)).toEqual([1]);
-  });
-
-  it("ignores a late answer or request outcome for another session", () => {
-    // Undo started in A; the user switched to B, where card 7 is not cleared; A's request fails.
-    const id = cardsTick();
+  it("forgets another view's fetches and requests: a late answer or outcome for it is ignored", () => {
+    const { ids, state } = clearSection(loaded(A), A);
     const inA = fetchFor(A);
-    let s = run(initialCards(A), { type: "requested", sessionId: A, id, seq: 7, dismissed: false }, inA.sent);
-    s = run(s, { type: "reset", sessionId: B });
+    let s = run(state, inA.sent, { type: "reset", sessionId: B });
     const inB = fetchFor(B);
     s = run(s, inB.sent, inB.answer());
     const before = s;
-    s = run(s, settled(A, id, 7, false), { type: "requested", sessionId: A, id: cardsTick(), seq: 7, dismissed: true }, inA.answer(7));
+    s = run(s, settled(A, ids[0], 7, false), requested(A, cardsTick(), 9, false), inA.answer(7, 9));
     expect(s).toBe(before);
-    expect(hidden(s)).toEqual([]);
+    expect(shows(s)).toEqual({ section: true, cleared: [] });
   });
 
+  it("forgets a previous visit's fetches on returning to a session, and lets the new visit's apply", () => {
+    // A -> B -> A, leaving with a read in flight that would say W's turns are cleared.
+    const leftBehind = fetchFor(A);
+    let s = run(loaded(A), leftBehind.sent, { type: "reset", sessionId: B }, { type: "reset", sessionId: A });
+    s = run(s, leftBehind.answer(7, 9));
+    expect(s.server).toBe(null);
+    const fresh = fetchFor(A);
+    s = run(s, fresh.sent, leftBehind.answer(7, 9));
+    expect(s.server).toBe(null);
+    s = run(s, fresh.answer());
+    expect(shows(s)).toEqual({ section: true, cleared: [] });
+    const reconnect = fetchFor(A);
+    s = run(s, reconnect.sent, reconnect.answer(9));
+    expect(shows(s)).toEqual({ section: true, cleared: [9] });
+  });
+
+  it("keys requests by session: the same seq in two sessions are two things", () => {
+    expect(dismissKey("W", 7)).not.toBe(dismissKey("X", 7));
+    const s = run(loaded(A), { type: "requested", sessionId: A, id: cardsTick(), key: dismissKey("X", 7), dismissed: true });
+    expect(shows(s)).toEqual({ section: true, cleared: [] });
+  });
+
+  it("shows nothing before the first answer, and takes an older server's overview as is", () => {
+    expect(panelView(initialPanel(A))).toBe(null);
+    const f = fetchFor(A);
+    const old = server();
+    const { cleared: _, ...withoutCleared } = old;
+    const legacy = { sessions: old.sessions.map(({ turns: __, ...section }) => section) } satisfies typeof withoutCleared;
+    const s = run(initialPanel(A), f.sent, { type: "fetched", sessionId: A, fetchId: f.sent.fetchId, changes: legacy });
+    expect(panelView(s)).toEqual({ sessions: legacy.sessions, cleared: [] });
+  });
+});
+
+describe("refetching", () => {
   it("counts a reconnect as a change for every bot, even ones never heard from", () => {
     const next = invalidateChanges(new Map([["old", 4]]), ["old", "new"]);
     expect([...next]).toEqual([

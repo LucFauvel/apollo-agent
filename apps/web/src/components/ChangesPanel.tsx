@@ -1,5 +1,5 @@
-import { codeLanguage, codePlainColor, highlightCode } from "@apollo/client";
-import type { Bot, ChangesOverview, OverviewFile, PullRequest, SemanticFileDiff, SemanticSymbol, Session, SessionId } from "@apollo/contracts";
+import { cardsTick, codeLanguage, codePlainColor, dismissKey, highlightCode, initialPanel, panelView, reducePanel } from "@apollo/client";
+import type { Bot, ClearedChanges, OverviewFile, PullRequest, SemanticFileDiff, SemanticSymbol, Session, SessionChanges, SessionId } from "@apollo/contracts";
 import {
   Braces,
   ChevronRight,
@@ -22,8 +22,9 @@ import {
   Sparkles,
   SquareFunction,
   Type,
+  X,
 } from "lucide-react";
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useReducer, useState } from "react";
 import { errorMessage, rpc } from "../rpc.ts";
 import { useApp } from "../store.ts";
 import { Collapse, cx, EmptyState, Panel, Tooltip } from "./ui.tsx";
@@ -44,21 +45,49 @@ export function ChangesPanel({
   onClose: () => void;
   onOpenSession: (id: SessionId) => void;
 }) {
-  // Refetch when the server says this bot's changes moved (a turn ended, a worker explained).
+  // Refetch when the server says this bot's changes moved (a turn ended, a worker explained,
+  // someone cleared changes), and after each of this view's clear requests settles (`epoch`).
   const version = useApp((s) => s.changesVersion.get(bot.id) ?? 0);
-  const [overview, setOverview] = useState<ChangesOverview | null>(null);
+  const [state, dispatch] = useReducer(reducePanel, session.id, initialPanel);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => dispatch({ type: "reset", sessionId: session.id }), [session.id]);
+  const own = state.sessionId === session.id ? state : initialPanel(session.id);
 
   useEffect(() => {
+    const sessionId = session.id;
+    // Issuing it makes every earlier answer for this view stale, whatever started either.
+    const fetchId = cardsTick();
+    dispatch({ type: "fetching", sessionId, fetchId });
     let cancelled = false;
-    rpc((c) => c["changes.list"]({ sessionId: session.id }))
-      .then((next) => !cancelled && (setOverview(next), setError(null)))
+    rpc((c) => c["changes.list"]({ sessionId }))
+      .then((changes) => {
+        dispatch({ type: "fetched", sessionId, fetchId, changes });
+        if (!cancelled) setError(null);
+      })
       .catch((e) => !cancelled && setError(errorMessage(e)));
     return () => {
       cancelled = true;
     };
-  }, [session.id, version]);
+  }, [session.id, version, own.epoch]);
 
+  /** Clears (or brings back) turns of a session from the panel: one request per turn. */
+  const setCleared = (target: string, seqs: ReadonlyArray<number>, dismissed: boolean) => {
+    const sessionId = session.id;
+    for (const seq of seqs) {
+      const id = cardsTick();
+      const key = dismissKey(target, seq);
+      dispatch({ type: "requested", sessionId, id, key, dismissed });
+      rpc((c) => c["changes.dismiss"]({ sessionId: target as SessionId, seq, dismissed })).then(
+        () => dispatch({ type: "settled", sessionId, id, key, ok: true, tick: cardsTick() }),
+        (e) => {
+          dispatch({ type: "settled", sessionId, id, key, ok: false, tick: cardsTick() });
+          setError(errorMessage(e));
+        },
+      );
+    }
+  };
+
+  const overview = useMemo(() => panelView(own), [own]);
   const fileCount = overview?.sessions.reduce((n, s) => n + s.repos.reduce((m, r) => m + r.files.length, 0), 0) ?? 0;
   const pullRequests = useSessionPullRequests(session);
 
@@ -83,33 +112,91 @@ export function ChangesPanel({
         {error ? <div className="rounded-lg border border-red-900/50 bg-red-950/30 px-3 py-2 text-xs text-red-300">{error}</div> : null}
         {overview === null && !error ? <PanelSkeleton /> : null}
         {overview && overview.sessions.length === 0 ? (
-          <EmptyState icon={GitCompareArrows} title="No changes yet">
+          <EmptyState icon={GitCompareArrows} title={overview.cleared.length > 0 ? "Nothing left to review" : "No changes yet"}>
             Files the agents change in git repositories show up here after each turn, grouped by the functions and types
             they touch.
           </EmptyState>
         ) : null}
         {overview?.sessions.map((changes, i) => (
           <section key={changes.sessionId} className="animate-fade-up space-y-3" style={{ animationDelay: `${i * 40}ms` }}>
-            {overview.sessions.length > 1 || changes.sessionId !== session.id ? (
-              <button
-                type="button"
-                onClick={() => onOpenSession(changes.sessionId as SessionId)}
-                className="group flex w-full items-center gap-2 text-left text-[11px] font-semibold tracking-wider text-zinc-500 uppercase hover:text-zinc-300"
-              >
-                <Layers className="size-3.5" />
-                <span className="truncate">{changes.title}</span>
-                <span className="h-px flex-1 bg-zinc-800/80 transition-colors group-hover:bg-zinc-700" />
-              </button>
-            ) : null}
+            <SectionHeader
+              changes={changes}
+              titled={overview.sessions.length > 1 || changes.sessionId !== session.id}
+              onOpen={() => onOpenSession(changes.sessionId as SessionId)}
+              onClear={() => setCleared(changes.sessionId, changes.turns ?? [], true)}
+            />
             {changes.summaries.length > 0 ? <Summaries summaries={changes.summaries} /> : null}
             {changes.repos.map((repo) => (
               <RepoCard key={repo.repo} sessionId={changes.sessionId as SessionId} repo={repo} version={version} />
             ))}
           </section>
         ))}
+        {overview && overview.cleared.length > 0 ? (
+          <div className="space-y-1">
+            {overview.cleared.map((cleared) => (
+              <ClearedLine
+                key={cleared.sessionId}
+                cleared={cleared}
+                titled={overview.cleared.length > 1 || cleared.sessionId !== session.id}
+                onUndo={() => setCleared(cleared.sessionId, cleared.seqs, false)}
+              />
+            ))}
+          </div>
+        ) : null}
         <PullRequests pullRequests={pullRequests} />
       </div>
     </Panel>
+  );
+}
+
+// --- sections and clearing them ------------------------------------------------------
+
+/**
+ * A session's section header: its title (opens it) when the panel shows more than this
+ * session, and on hover, a cross that clears the section's turns from the panel.
+ */
+function SectionHeader({ changes, titled, onOpen, onClear }: { changes: SessionChanges; titled: boolean; onOpen: () => void; onClear: () => void }) {
+  const clearable = (changes.turns?.length ?? 0) > 0;
+  if (!titled && !clearable) return null;
+  return (
+    <div className="group flex min-w-0 items-center gap-2 text-[11px] font-semibold tracking-wider text-zinc-500 uppercase">
+      {titled ? (
+        <button type="button" onClick={onOpen} className="flex min-w-0 items-center gap-2 text-left hover:text-zinc-300">
+          <Layers className="size-3.5 shrink-0" />
+          <span className="truncate">{changes.title}</span>
+        </button>
+      ) : null}
+      <span className="h-px flex-1 bg-zinc-800/80 transition-colors group-hover:bg-zinc-700" />
+      {clearable ? (
+        <Tooltip align="end" content="Clear from the panel">
+          <button
+            type="button"
+            onClick={onClear}
+            aria-label={`Clear ${titled ? changes.title : "these changes"} from the panel`}
+            className="flex size-5 shrink-0 items-center justify-center rounded-md text-zinc-600 opacity-0 transition-all group-hover:opacity-100 hover:bg-zinc-800 hover:text-zinc-300 focus-visible:opacity-100"
+          >
+            <X className="size-3.5" />
+          </button>
+        </Tooltip>
+      ) : null}
+    </div>
+  );
+}
+
+/** What was cleared from the panel, per session: a way back. */
+function ClearedLine({ cleared, titled, onUndo }: { cleared: ClearedChanges; titled: boolean; onUndo: () => void }) {
+  const n = cleared.seqs.length;
+  return (
+    <div className="animate-fade-up flex min-w-0 items-center gap-2 px-1 text-[11px] text-zinc-600">
+      <GitCompareArrows className="size-3 shrink-0" />
+      <span className="min-w-0 truncate">
+        {titled ? `${cleared.title}: ` : ""}
+        {n} {n === 1 ? "turn" : "turns"} cleared
+      </span>
+      <button type="button" onClick={onUndo} className="shrink-0 text-zinc-500 underline-offset-2 hover:text-zinc-300 hover:underline">
+        Undo
+      </button>
+    </div>
   );
 }
 

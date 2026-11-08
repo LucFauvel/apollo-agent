@@ -71,7 +71,7 @@ describe("change tracker", () => {
     expect(explained).toMatchObject({ attached: 1, unknown: ["missing.ts"], changed: ["app/store.ts"] });
     await tracker.turnCompleted("s2");
 
-    const overview = await tracker.sessionChanges("s2", "Worker");
+    const overview = (await tracker.sessionChanges("s2", "Worker")).section;
     expect(overview).toMatchObject({
       title: "Worker",
       repos: [{ name: "app", files: [{ path: "store.ts", status: "modified", note: "Default entry." }] }],
@@ -80,7 +80,7 @@ describe("change tracker", () => {
     const diff = await tracker.file("s2", app.dir, "store.ts");
     expect(diff?.symbols.map((s) => [s.name, s.change, s.note])).toEqual([["Store.list", "modified", "Returns the default."]]);
     expect(tracker.turnNotes("s2", 3).map((n) => n.text)).toEqual(["Lists start with a default.", "Default entry.", "Returns the default."]);
-    // The conversation's card finds the summary by its turn, and can be cleared.
+    // The conversation's card finds the summary by its turn; what is cleared is listed too.
     expect(tracker.conversation("s2")).toMatchObject({ summaries: [{ turnSeq: 3, text: "Lists start with a default." }], dismissed: [] });
     tracker.setDismissed("s2", 12, true);
     tracker.setDismissed("s2", 12, true);
@@ -98,8 +98,114 @@ describe("change tracker", () => {
     await tracker.turnStarted("s3", 2, app.dir);
     writeFileSync(join(app.dir, "b.ts"), "export const b = 2;\n");
     await tracker.turnCompleted("s3");
-    const overview = await tracker.sessionChanges("s3", "Worker");
+    const overview = (await tracker.sessionChanges("s3", "Worker")).section;
     expect(overview?.repos[0]?.files.map((f) => f.path)).toEqual(["a.ts", "b.ts"]);
+  });
+
+  describe("turns cleared from the Changes panel", () => {
+    /** Runs a turn as SessionManager does: TurnStarted at `seq`, then its FilesChanged event. */
+    const turn = async (
+      db: ReturnType<typeof setup>["db"],
+      tracker: ReturnType<typeof setup>["tracker"],
+      sessionId: string,
+      seq: number,
+      dir: string,
+      work: () => void,
+      summary?: string,
+      notes: ReadonlyArray<{ path: string; explanation: string }> = [],
+    ) => {
+      const event = db.prepare("insert into session_events (session_id, seq, at, event) values (?, ?, ?, ?)");
+      event.run(sessionId, seq, seq, JSON.stringify({ _tag: "TurnStarted" }));
+      await tracker.turnStarted(sessionId, seq, dir);
+      work();
+      if (summary || notes.length) await tracker.explain(sessionId, summary ?? "", notes);
+      const done = await tracker.turnCompleted(sessionId);
+      if (done?.repos.length) event.run(sessionId, seq + 5, seq + 5, JSON.stringify({ _tag: "FilesChanged", repos: done.repos }));
+      return seq + 5;
+    };
+    const paths = (section: { repos: ReadonlyArray<{ files: ReadonlyArray<{ path: string }> }> } | null) =>
+      section?.repos.flatMap((r) => r.files.map((f) => f.path)) ?? null;
+
+    it("leaves cleared turns' files and summaries out, lists them, and brings them back", async () => {
+      const { db, tracker } = setup();
+      const app = repo("app");
+      const first = await turn(db, tracker, "p1", 10, app.dir, () => writeFileSync(join(app.dir, "a.ts"), "export const a = 1;\n"), "Adds a.");
+      const second = await turn(db, tracker, "p1", 30, app.dir, () => {
+        writeFileSync(join(app.dir, "b.ts"), "export const b = 2;\n");
+        // A full diff the user asked for during the turn (it carries a report): not the turn's changes.
+        db.prepare("insert into session_events (session_id, seq, at, event) values (?, ?, ?, ?)").run(
+          "p1",
+          32,
+          32,
+          JSON.stringify({ _tag: "FilesChanged", repos: [], report: {} }),
+        );
+      }, "Adds b.");
+      expect([first, second]).toEqual([15, 35]);
+      let changes = await tracker.sessionChanges("p1", "Worker");
+      expect(paths(changes.section)).toEqual(["a.ts", "b.ts"]);
+      expect(changes.section?.turns).toEqual([15, 35]);
+      expect(changes.cleared).toEqual([]);
+
+      // The panel clears the first turn: only the second's file and summary are left.
+      tracker.setDismissed("p1", first, true);
+      changes = await tracker.sessionChanges("p1", "Worker");
+      expect(paths(changes.section)).toEqual(["b.ts"]);
+      expect(changes.section?.summaries.map((s) => s.text)).toEqual(["Adds b."]);
+      expect(changes.section?.turns).toEqual([second]);
+      expect(changes.cleared).toEqual([first]);
+      expect(await tracker.file("p1", app.dir, "a.ts")).toBe(null);
+      expect((await tracker.file("p1", app.dir, "b.ts"))?.status).toBe("added");
+
+      // Both cleared: nothing to show, everything to bring back.
+      tracker.setDismissed("p1", second, true);
+      changes = await tracker.sessionChanges("p1", "Worker");
+      expect(changes).toEqual({ section: null, cleared: [first, second] });
+
+      // Undo brings them back as they were.
+      tracker.setDismissed("p1", first, false);
+      tracker.setDismissed("p1", second, false);
+      changes = await tracker.sessionChanges("p1", "Worker");
+      expect(paths(changes.section)).toEqual(["a.ts", "b.ts"]);
+      expect(changes.section?.summaries.map((s) => s.text)).toEqual(["Adds b.", "Adds a."]);
+      expect(changes.cleared).toEqual([]);
+      // A full diff's seq, cleared by an older client, does not touch the panel.
+      tracker.setDismissed("p1", 32, true);
+      expect((await tracker.sessionChanges("p1", "Worker")).cleared).toEqual([]);
+    });
+
+    it("never shows what a cleared turn between shown ones did", async () => {
+      const { db, tracker } = setup();
+      const app = repo("app");
+      const write = (name: string, text: string) => () => writeFileSync(join(app.dir, name), text);
+      await turn(db, tracker, "p2", 10, app.dir, write("a.ts", "export const a = 1;\n"));
+      const middle = await turn(
+        db,
+        tracker,
+        "p2",
+        20,
+        app.dir,
+        () => {
+          writeFileSync(join(app.dir, "secret.ts"), "export const s = 1;\n");
+          writeFileSync(join(app.dir, "a.ts"), "export const a = 1;\nexport const more = 2;\n");
+        },
+        undefined,
+        [{ path: "a.ts", explanation: "Adds more." }],
+      );
+      await turn(db, tracker, "p2", 30, app.dir, write("c.ts", "export const c = 3;\n"));
+      tracker.setDismissed("p2", middle, true);
+      const { section } = await tracker.sessionChanges("p2", "Worker");
+      expect(paths(section)).toEqual(["a.ts", "c.ts"]);
+      // a.ts as the first turn left it: the cleared turn's line is not in its diff.
+      // Nor the cleared turn's explanation of it.
+      expect(section?.repos[0]?.files.find((f) => f.path === "a.ts")).toMatchObject({ status: "added", additions: 1, note: null });
+      expect(await tracker.file("p2", app.dir, "secret.ts")).toBe(null);
+      const diff = await tracker.file("p2", app.dir, "a.ts");
+      expect(diff?.symbols.flatMap((s) => s.hunks.flatMap((h) => h.lines.map((l) => l.text)))).not.toContain("export const more = 2;");
+      expect(diff?.note).toBe(null);
+      // Brought back, its explanation is too.
+      tracker.setDismissed("p2", middle, false);
+      expect((await tracker.sessionChanges("p2", "Worker")).section?.repos[0]?.files.find((f) => f.path === "a.ts")?.note).toBe("Adds more.");
+    });
   });
 
   describe("full diff against the baseline", () => {

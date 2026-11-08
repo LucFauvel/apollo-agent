@@ -83,11 +83,32 @@ export const SessionChanges = Schema.Struct({
   /** The worker's summaries of its changes, newest first. */
   summaries: Schema.Array(Schema.Struct({ text: Schema.String, at: Schema.Number })),
   updatedAt: Schema.Number,
+  /**
+   * Seqs of the FilesChanged events of the turns shown here: what `changes.dismiss` takes
+   * to clear them from the panel. Absent from servers that predate clearing in the panel.
+   */
+  turns: Schema.optional(Schema.Array(Schema.Number)),
 });
 export type SessionChanges = typeof SessionChanges.Type;
 
-/** For an orchestrator: its own changes and its workers'; for a worker: its own. */
-export const ChangesOverview = Schema.Struct({ sessions: Schema.Array(SessionChanges) });
+/** A session's turns the user cleared from the Changes panel, to be brought back. */
+export const ClearedChanges = Schema.Struct({
+  sessionId: Schema.String,
+  title: Schema.String,
+  /** Seqs of their FilesChanged events. */
+  seqs: Schema.Array(Schema.Number),
+});
+export type ClearedChanges = typeof ClearedChanges.Type;
+
+/**
+ * For an orchestrator: its own changes and its workers'; for a worker: its own. Turns the
+ * user cleared are left out of `sessions` (files, notes and summaries) and listed in
+ * `cleared` (absent from servers that predate clearing in the panel).
+ */
+export const ChangesOverview = Schema.Struct({
+  sessions: Schema.Array(SessionChanges),
+  cleared: Schema.optional(Schema.Array(ClearedChanges)),
+});
 export type ChangesOverview = typeof ChangesOverview.Type;
 
 /** A worker's summary of one turn's changes (`apollo_explain_changes`). */
@@ -101,12 +122,15 @@ export type TurnSummary = typeof TurnSummary.Type;
 
 /**
  * What the conversation shows with each turn's changes card (one session only, unlike the
- * overview): the worker's summaries per turn, and the cards the user cleared.
+ * overview): the worker's summaries per turn.
  */
 export const ConversationChanges = Schema.Struct({
   /** Newest first. */
   summaries: Schema.Array(TurnSummary),
-  /** Seqs of the FilesChanged events whose cards the user cleared from the conversation. */
+  /**
+   * Seqs of the FilesChanged events the user cleared (from the Changes panel now; older
+   * clients cleared cards from the conversation, and still hide the cards listed here).
+   */
   dismissed: Schema.Array(Schema.Number),
 });
 export type ConversationChanges = typeof ConversationChanges.Type;
