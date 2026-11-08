@@ -83,11 +83,21 @@ const log = (line: string) => console.log(line);
 // ---------------------------------------------------------------------------------------
 // Processes
 
-const processes = () =>
-  (spawnSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" }).stdout ?? "").split("\n").flatMap((line) => {
+/**
+ * Every process. Throws when `ps` fails or shows nothing (it always shows at least itself and
+ * this script): a list that could not be read must never pass for "nothing is running".
+ */
+const processes = () => {
+  const r = spawnSync("ps", ["-axo", "pid=,command="], { encoding: "utf8", timeout: 10_000 });
+  if (r.error) throw new Error(`ps failed: ${r.error.message}`);
+  if (r.status !== 0 || r.signal) throw new Error(`ps failed (${r.signal ?? `exit ${r.status}`}): ${(r.stderr ?? "").trim()}`);
+  const list = (r.stdout ?? "").split("\n").flatMap((line) => {
     const match = /^\s*(\d+)\s+(.*)$/.exec(line);
     return match ? [{ pid: Number(match[1]), command: match[2]! }] : [];
   });
+  if (!list.some((p) => p.pid === process.pid)) throw new Error("ps returned an incomplete process list");
+  return list;
+};
 
 const bundlePaths = Object.values(BUNDLES);
 
@@ -105,8 +115,26 @@ const apolloProcesses = (): Array<Proc> =>
     return [];
   });
 
-const commandOf = (pid: number) => spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }).stdout?.trim() ?? "";
-const isInstaller = (pid: number) => commandOf(pid).includes("install-app.ts");
+/** Whether `pid` is a running install:app; throws when that cannot be told (the lock then counts as held). */
+const isInstaller = (pid: number): boolean => {
+  const exists = () => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      // ESRCH: no such process. EPERM: another user's process, so not this user's installer.
+      if (code === "ESRCH" || code === "EPERM") return false;
+      throw error;
+    }
+  };
+  if (!exists()) return false;
+  const r = spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", timeout: 10_000 });
+  if (!r.error && r.status === 0 && !r.signal) return r.stdout.includes("install-app.ts");
+  // ps -p exits 1 for a pid that just went away; anything else is "cannot tell".
+  if (!r.error && r.status === 1 && !exists()) return false;
+  throw new Error(`cannot tell whether pid ${pid} is install:app: ${r.error?.message ?? r.signal ?? `ps exit ${r.status}`}`);
+};
 
 /** Sessions mid-turn (or waiting on the user) in a database. */
 const busySessions = (path: string): Array<string> => {
@@ -162,14 +190,21 @@ if (options.dryRun) {
       if (existsSync(`${dbPath}-wal`)) copyFileSync(`${dbPath}-wal`, `${copy}-wal`);
     }
     const state = realSqliteOps.inspect(copy);
-    const procs = apolloProcesses();
+    const procs = (() => {
+      try {
+        return apolloProcesses();
+      } catch (error) {
+        log(`(${(error as Error).message})`);
+        return null;
+      }
+    })();
     const steps = plan({
       options,
       targetExists: existsSync(target),
       previousExists: existsSync(BUNDLES.previous),
       marker: readMarker(markerPath),
       lock: lockHolder(lockPath, isInstaller),
-      running: procs.map((p) => `${p.kind} ${p.pid}`),
+      running: procs?.map((p) => `${p.kind} ${p.pid}`) ?? null,
       busy: (() => {
         try {
           return busySessions(copy);
@@ -194,9 +229,13 @@ if (options.dryRun) {
 // --detach: start this script again in its own session, and return at once
 
 if (options.detach) {
-  const holder = lockHolder(lockPath, isInstaller);
-  if (holder) {
-    console.error(`Another install:app (pid ${holder.pid}, started ${holder.startedAt}) is running; not starting a second one.`);
+  const held = lockHolder(lockPath, isInstaller);
+  if (held) {
+    console.error(
+      held.state === "alive"
+        ? `Another install:app (pid ${held.holder?.pid}, started ${held.holder?.startedAt}) is running; not starting a second one.`
+        : `The install lock (${lockPath}) is held by pid ${held.holder?.pid ?? "?"} and whether it still runs cannot be told; not starting.`,
+    );
     process.exit(1);
   }
   mkdirSync(logsDir, { recursive: true });

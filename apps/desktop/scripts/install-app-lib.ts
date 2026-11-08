@@ -5,8 +5,8 @@
  * run them against temporary directories (and inject failures). The install itself, the
  * state machine that uses these, is install-app-engine.ts.
  */
-import { createHash } from "node:crypto";
-import { closeSync, constants, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { constants, copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -82,8 +82,11 @@ export interface FileOps {
   readonly list: (dir: string) => Array<string>;
   readonly readText: (path: string) => string;
   readonly writeText: (path: string, text: string) => void;
-  /** Creates the file only if it does not exist; false if it does. */
-  readonly createExclusive: (path: string, text: string) => boolean;
+  /**
+   * Publishes a complete file at `path` only if nothing is there; false if something is.
+   * Atomic: the file is never visible empty or half written.
+   */
+  readonly publishExclusive: (path: string, text: string) => boolean;
   readonly sha256: (path: string) => string;
 }
 
@@ -102,20 +105,20 @@ export const realFileOps: FileOps = {
     writeFileSync(tmp, text);
     renameSync(tmp, path);
   },
-  createExclusive: (path, text) => {
-    let fd: number;
+  publishExclusive: (path, text) => {
+    // Written whole under a private name, then hard-linked into place: link fails if the
+    // name exists, and never shows a partial file.
+    const tmp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+    writeFileSync(tmp, text, { flag: "wx" });
     try {
-      fd = openSync(path, "wx");
+      linkSync(tmp, path);
+      return true;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
       throw error;
-    }
-    try {
-      writeSync(fd, text);
     } finally {
-      closeSync(fd);
+      rmSync(tmp, { force: true });
     }
-    return true;
   },
   sha256: (path) => createHash("sha256").update(readFileSync(path)).digest("hex"),
 };
@@ -414,13 +417,36 @@ export const listSnapshots = (backupsDir: string, files: FileOps = realFileOps):
 
 export type SnapshotCheck = { readonly ok: true; readonly version: number; readonly file: string } | { readonly ok: false; readonly reason: string };
 
-/** A snapshot is usable only if its file matches the recorded SHA-256 and SQLite reads it at the recorded version. */
+/**
+ * A snapshot is usable only if its file matches the recorded SHA-256 and SQLite reads it at
+ * the recorded version. Never throws: a malformed or unreadable snapshot is just not usable.
+ */
 export const validateSnapshot = (dir: string, files: FileOps = realFileOps, sqlite: SqliteOps = realSqliteOps): SnapshotCheck => {
+  try {
+    return checkSnapshot(dir, files, sqlite);
+  } catch (error) {
+    return { ok: false, reason: `could not be checked: ${error instanceof Error ? error.message : String(error)}` };
+  }
+};
+
+const checkSnapshot = (dir: string, files: FileOps, sqlite: SqliteOps): SnapshotCheck => {
   let manifest: SnapshotManifest;
   try {
     manifest = JSON.parse(files.readText(join(dir, "snapshot.json"))) as SnapshotManifest;
   } catch {
     return { ok: false, reason: "no readable snapshot.json" };
+  }
+  if (
+    typeof manifest !== "object" ||
+    manifest === null ||
+    typeof manifest.file !== "string" ||
+    manifest.file === "" ||
+    manifest.file.includes("/") ||
+    typeof manifest.dbVersion !== "number" ||
+    typeof manifest.sha256 !== "object" ||
+    manifest.sha256 === null
+  ) {
+    return { ok: false, reason: "snapshot.json is malformed (an older or damaged snapshot)" };
   }
   const file = join(dir, manifest.file);
   if (!files.exists(file)) return { ok: false, reason: `${manifest.file} is missing` };
@@ -520,49 +546,99 @@ export interface LockHolder {
   readonly startedAt: string;
 }
 
-export const lockHolder = (path: string, isInstaller: (pid: number) => boolean, files: FileOps = realFileOps): LockHolder | null => {
-  if (!files.exists(path)) return null;
-  try {
-    const holder = JSON.parse(files.readText(path)) as LockHolder;
-    return typeof holder.pid === "number" && isInstaller(holder.pid) ? holder : null;
-  } catch {
-    return null;
-  }
-};
+/** "alive": a running installer. "gone": dead, or the pid now belongs to something else. "unknown": could not tell. */
+export type LockState = "alive" | "gone" | "unknown";
 
 /**
- * Takes the lock, or says who has it. A lock whose process is gone (or is no longer an
- * installer: pids get reused) is stale and taken over.
+ * Whether `pid` is a running install:app. Throws when it cannot tell (the process list cannot
+ * be read): an unknown owner is treated as holding the lock, never as gone.
  */
-export const acquireLock = (
-  path: string,
-  me: LockHolder,
-  isInstaller: (pid: number) => boolean,
-  files: FileOps = realFileOps,
-): { readonly ok: true; readonly tookOver: LockHolder | null } | { readonly ok: false; readonly holder: LockHolder } => {
-  files.mkdir(dirname(path));
-  const text = `${JSON.stringify(me)}\n`;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (files.createExclusive(path, text)) return { ok: true, tookOver: null };
-    const holder = lockHolder(path, isInstaller, files);
-    if (holder && holder.pid !== me.pid) return { ok: false, holder };
-    let stale: LockHolder | null = null;
-    try {
-      stale = JSON.parse(files.readText(path)) as LockHolder;
-    } catch {
-      // unreadable: stale
-    }
-    files.remove(path);
-    if (files.createExclusive(path, text)) return { ok: true, tookOver: stale };
+export type IsInstaller = (pid: number) => boolean;
+
+/**
+ * The lock is a directory of numbered generations, `<n>.json`, each published atomically
+ * (whole, and only if that number is free). The highest generation is the current owner,
+ * if it is alive. Taking over never deletes the current lock: the taker publishes the next
+ * number, which only one contender can do, then checks nobody published above it (a slow
+ * contender can only publish below the owner, sees it, and backs off).
+ */
+const GENERATION = /^(\d{12})\.json$/;
+const generationFile = (dir: string, n: number) => join(dir, `${String(n).padStart(12, "0")}.json`);
+const generations = (dir: string, files: FileOps) =>
+  files
+    .list(dir)
+    .flatMap((entry) => {
+      const match = GENERATION.exec(entry);
+      return match ? [Number(match[1])] : [];
+    })
+    .sort((a, b) => a - b);
+
+const inspectGeneration = (dir: string, n: number, isInstaller: IsInstaller, files: FileOps): { readonly holder: LockHolder | null; readonly state: LockState } => {
+  const path = generationFile(dir, n);
+  let holder: LockHolder;
+  try {
+    holder = JSON.parse(files.readText(path)) as LockHolder;
+    if (typeof holder?.pid !== "number") throw new Error("no pid");
+  } catch {
+    // Published whole, so unreadable means released just now, or damaged: then refuse.
+    return { holder: null, state: files.exists(path) ? "unknown" : "gone" };
   }
-  throw new Error(`Could not take the lock ${path}`);
+  try {
+    return { holder, state: isInstaller(holder.pid) ? "alive" : "gone" };
+  } catch {
+    return { holder, state: "unknown" };
+  }
 };
 
-export const releaseLock = (path: string, me: LockHolder, files: FileOps = realFileOps): void => {
+/** The current owner, or null when the lock is free (or its owner is gone). */
+export const lockHolder = (
+  dir: string,
+  isInstaller: IsInstaller,
+  files: FileOps = realFileOps,
+): { readonly holder: LockHolder | null; readonly state: "alive" | "unknown" } | null => {
+  const top = generations(dir, files).at(-1);
+  if (top === undefined) return null;
+  const view = inspectGeneration(dir, top, isInstaller, files);
+  return view.state === "gone" ? null : { holder: view.holder, state: view.state };
+};
+
+export type LockResult =
+  | { readonly ok: true; readonly generation: number; readonly tookOver: LockHolder | null }
+  | { readonly ok: false; readonly holder: LockHolder | null; readonly state: "alive" | "unknown" };
+
+export const acquireLock = (dir: string, me: LockHolder, isInstaller: IsInstaller, files: FileOps = realFileOps): LockResult => {
+  files.mkdir(dir);
+  const text = `${JSON.stringify(me)}\n`;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const seen = generations(dir, files);
+    const top = seen.at(-1) ?? 0;
+    let tookOver: LockHolder | null = null;
+    if (top > 0) {
+      const view = inspectGeneration(dir, top, isInstaller, files);
+      if (view.state !== "gone") return { ok: false, holder: view.holder, state: view.state };
+      tookOver = view.holder;
+    }
+    const mine = top + 1;
+    // Someone else published this number first: look again.
+    if (!files.publishExclusive(generationFile(dir, mine), text)) continue;
+    if (generations(dir, files).some((n) => n > mine)) {
+      // Published below the current owner (a stale view): withdraw.
+      files.remove(generationFile(dir, mine));
+      continue;
+    }
+    // Lower generations belong to owners that are gone; tidy them.
+    for (const n of seen) if (n < mine) files.remove(generationFile(dir, n));
+    return { ok: true, generation: mine, tookOver };
+  }
+  throw new Error(`Could not take the lock in ${dir}: too much contention`);
+};
+
+export const releaseLock = (dir: string, generation: number, me: LockHolder, files: FileOps = realFileOps): void => {
+  const path = generationFile(dir, generation);
   try {
     if ((JSON.parse(files.readText(path)) as LockHolder).pid === me.pid) files.remove(path);
   } catch {
-    // not ours, or gone
+    // gone
   }
 };
 
@@ -610,8 +686,9 @@ export const plan = (s: {
   readonly targetExists: boolean;
   readonly previousExists: boolean;
   readonly marker: Marker | null;
-  readonly lock: LockHolder | null;
-  readonly running: ReadonlyArray<string>;
+  readonly lock: ReturnType<typeof lockHolder>;
+  /** null: the process list could not be read. */
+  readonly running: ReadonlyArray<string> | null;
   readonly busy: ReadonlyArray<string>;
   readonly schema: SchemaCheck;
   readonly bundles: Bundles;
@@ -619,7 +696,9 @@ export const plan = (s: {
   readonly backupsDir: string;
 }): Array<string> => {
   const { options: o, bundles: b } = s;
-  if (s.lock) return [`Refuse: another install:app (pid ${s.lock.pid}, started ${s.lock.startedAt}) is running`];
+  if (s.lock?.state === "alive") return [`Refuse: another install:app (pid ${s.lock.holder?.pid}, started ${s.lock.holder?.startedAt}) is running`];
+  if (s.lock) return [`Refuse: the install lock is held by pid ${s.lock.holder?.pid ?? "?"}, and whether it still runs cannot be told`];
+  if (s.running === null) return ["Refuse: the process list cannot be read, so whether Apollo is running cannot be told; a real run changes nothing"];
   if (s.marker || (!s.targetExists && s.previousExists)) {
     return [
       `Recovery: an install did not finish (${s.marker ? `phase ${s.marker.phase}` : `${b.target} is missing`}). ` +

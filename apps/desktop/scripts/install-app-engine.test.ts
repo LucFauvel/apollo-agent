@@ -175,7 +175,7 @@ const world = (o: {
     running: w.app?.spec.name ?? null,
     db: existsSync(dbPath) ? dbVersion(dbPath) : null,
     marker: existsSync(join(data, "install-app.pending.json")) ? (JSON.parse(readFileSync(join(data, "install-app.pending.json"), "utf8")) as { phase: string }).phase : null,
-    lock: existsSync(join(data, "install-app.lock")),
+    lock: existsSync(join(data, "install-app.lock")) && readdirSync(join(data, "install-app.lock")).some((e) => e.endsWith(".json")),
   });
   const result = () => JSON.parse(readFileSync(join(data, "logs", "install-app-last.result"), "utf8")) as InstallResult;
   return { w, deps, state, result, makeBundle };
@@ -559,7 +559,8 @@ describe("one install at a time (P1-4)", () => {
   it("a live installer's lock refuses a second run, which touches nothing (not even the result file)", async () => {
     const { w, deps, state } = world({});
     w.installers.add(77);
-    writeFileSync(join(w.data, "install-app.lock"), JSON.stringify({ pid: 77, startedAt: "earlier" }));
+    mkdirSync(join(w.data, "install-app.lock"));
+    writeFileSync(join(w.data, "install-app.lock", "000000000001.json"), JSON.stringify({ pid: 77, startedAt: "earlier" }));
     const r = await runInstall(deps());
     expect(r.status).toBe("aborted");
     expect(r.error).toMatch(/pid 77/);
@@ -570,7 +571,8 @@ describe("one install at a time (P1-4)", () => {
 
   it("a stale lock (process gone, or no longer an installer) is taken over", async () => {
     const { w, deps } = world({});
-    writeFileSync(join(w.data, "install-app.lock"), JSON.stringify({ pid: 77, startedAt: "earlier" }));
+    mkdirSync(join(w.data, "install-app.lock"));
+    writeFileSync(join(w.data, "install-app.lock", "000000000001.json"), JSON.stringify({ pid: 77, startedAt: "earlier" }));
     expect((await runInstall(deps())).status).toBe("ok");
     expect(w.logs.some((l) => /stale lock \(pid 77/.test(l))).toBe(true);
   });
@@ -601,5 +603,223 @@ describe("before the swap (snapshot failures)", () => {
     w.faults.push((op, [path]) => op === "writeText" && path!.endsWith("pending.json"));
     expect((await runInstall(deps())).status).toBe("failed");
     expect(state()).toMatchObject({ target: "old", running: "old", marker: null });
+  });
+});
+
+describe("round 3: process list unreadable (ps fails) is never 'nothing runs'", () => {
+  it("ps failing before the stop: nothing is stopped, snapshotted or moved", async () => {
+    const { w, deps, state } = world({});
+    const d = deps();
+    const r = await runInstall({ ...d, apollo: () => { throw new Error("ps failed (exit 1)"); } });
+    expect(r.status).toBe("failed");
+    expect(r.error).toMatch(/process list cannot be read/);
+    expect(state()).toMatchObject({ target: "old", previous: null, staged: false, running: "old", db: 18, marker: null });
+    expect(existsSync(join(w.data, "backups"))).toBe(false);
+  });
+
+  it("ps failing after the quit: the stop is not confirmed, so no snapshot and no swap", async () => {
+    const { w, deps, state } = world({});
+    const d = deps();
+    let asked = false;
+    const r = await runInstall({
+      ...d,
+      requestQuit: (p) => {
+        asked = true;
+        d.requestQuit(p);
+      },
+      apollo: () => {
+        if (asked) throw new Error("ps: EPERM");
+        return d.apollo();
+      },
+    });
+    expect(r.status).toBe("failed");
+    expect(r.error).toMatch(/cannot be confirmed stopped/);
+    expect(state()).toMatchObject({ target: "old", previous: null, staged: false, marker: null });
+    expect(existsSync(join(w.data, "backups"))).toBe(false);
+  });
+
+  it("an unreadable list before the stop counts as running: busy bots are still waited for", async () => {
+    const { w, deps } = world({});
+    w.busy = ["Ceres / work (running)"];
+    w.busyUntil = 60_000;
+    const d = deps();
+    let first = true;
+    const r = await runInstall({
+      ...d,
+      apollo: () => {
+        if (first) {
+          first = false;
+          throw new Error("ps: transient");
+        }
+        return d.apollo();
+      },
+    });
+    expect(r.status).toBe("ok");
+    expect(w.t).toBeGreaterThanOrEqual(60_000);
+  });
+
+  it("a ps failure while polling that clears up is fine: only the final, readable list decides", async () => {
+    const { deps, state } = world({});
+    const d = deps();
+    let asked = false;
+    let fails = 3;
+    const r = await runInstall({
+      ...d,
+      requestQuit: (p) => {
+        asked = true;
+        d.requestQuit(p);
+      },
+      apollo: () => {
+        if (asked && fails-- > 0) throw new Error("ps: transient");
+        return d.apollo();
+      },
+    });
+    expect(r.status).toBe("ok");
+    expect(state()).toMatchObject({ target: "new", running: "new" });
+  });
+
+  it("ps failing during a rollback: nothing is rolled back over possibly live processes", async () => {
+    const { deps, state } = world({ next: { name: "new", schema: 19, health: "bad" } });
+    const d = deps();
+    const r = await runInstall({ ...d, apollo: () => (state().running === "new" ? (() => { throw new Error("ps: gone"); })() : d.apollo()) });
+    expect(r.status).toBe("failed");
+    expect(r.error).toMatch(/cannot be confirmed stopped, so nothing was rolled back/);
+    expect(state()).toMatchObject({ target: "new", previous: "old", marker: "rolling-back" });
+  });
+
+  it("ps failing during recovery: refuses, nothing moved", async () => {
+    const env = world({ installed: null, previous: { name: "old", schema: 18, health: "good" }, db: 18, running: false });
+    const d = env.deps();
+    const r = await runInstall({ ...d, apollo: () => { throw new Error("ps failed"); } });
+    expect(r.status).toBe("failed");
+    expect(r.error).toMatch(/cannot be told/);
+    expect(env.state()).toMatchObject({ target: null, previous: "old" });
+  });
+});
+
+describe("round 3: a pending new build is checked against the database before it opens", () => {
+  /** Swap done, then the installer died before confirming health. */
+  const pending = (o: { db: number | null; snapshot?: number; health?: "good" | "bad"; corruptDb?: boolean }) => {
+    const env = world({ running: false, db: o.snapshot ?? 18 });
+    const { w, makeBundle } = env;
+    const snap = o.snapshot !== undefined ? takeSnapshot({ dbPath: w.dbPath, backupsDir: join(w.data, "backups"), label: "pre", now: 50 })! : null;
+    realFileOps.remove(w.dbPath);
+    if (o.db !== null) makeDb(w.dbPath, o.db);
+    if (o.corruptDb) writeFileSync(w.dbPath, "torn ".repeat(500));
+    const info = makeBundle(w.bundles.staged, { name: "new", schema: 19, health: o.health ?? "good" });
+    realFileOps.rename(w.bundles.target, w.bundles.previous);
+    realFileOps.rename(w.bundles.staged, w.bundles.target);
+    writeFileSync(
+      join(w.data, "install-app.pending.json"),
+      JSON.stringify({ phase: "verifying", startedAt: "x", pid: 9, snapshot: snap?.dir ?? null, previousSchema: 18, newBuild: `${info.commit}@${info.builtAt}` }),
+    );
+    return env;
+  };
+  const rows = (path: string) => {
+    const db = new DatabaseSync(path, { readOnly: true });
+    try {
+      return (db.prepare("select v from t").all() as Array<{ v: number }>).map((r) => r.v);
+    } finally {
+      db.close();
+    }
+  };
+
+  it("database newer than the new build, no snapshot it can read: not opened, marker kept", async () => {
+    const { w, deps, state } = pending({ db: 20 });
+    const r = await runInstall(deps());
+    expect(r.status).toBe("failed");
+    expect(r.error).toMatch(/Nothing was opened/);
+    expect(w.opens).toBe(0);
+    expect(state()).toMatchObject({ target: "new", previous: "old", running: null, db: 20, marker: "verifying" });
+  });
+
+  it("database newer than the new build, with a checked schema-18 snapshot: restored first, then opened", async () => {
+    const { w, deps, state } = pending({ db: 20, snapshot: 18 });
+    const r = await runInstall(deps());
+    expect(r).toMatchObject({ status: "ok", stage: "resumed" });
+    expect(w.logs.some((l) => /Database restored from/.test(l))).toBe(true);
+    expect(state()).toMatchObject({ target: "new", running: "new", db: 19, marker: null });
+  });
+
+  it("database missing, snapshot available: the snapshot is restored, not fresh state", async () => {
+    const { w, deps, state } = pending({ db: null, snapshot: 18 });
+    expect((await runInstall(deps())).status).toBe("ok");
+    expect(rows(w.dbPath)).toContain(18);
+    expect(state()).toMatchObject({ running: "new", db: 19 });
+  });
+
+  it("database unreadable: restored from the snapshot before opening", async () => {
+    const { w, deps } = pending({ db: 18, snapshot: 18, corruptDb: true });
+    expect((await runInstall(deps())).status).toBe("ok");
+    expect(rows(w.dbPath)).toContain(18);
+  });
+
+  it("an older build without build-info in place is not opened over a database without --force", async () => {
+    const env = world({ running: false, db: 18 });
+    const { w, makeBundle } = env;
+    const info = makeBundle(w.bundles.staged, { name: "new", schema: 19, health: "good", info: false });
+    realFileOps.rename(w.bundles.target, w.bundles.previous);
+    realFileOps.rename(w.bundles.staged, w.bundles.target);
+    // Identity from a build-info that is not in the bundle: the marker cannot match, so this is the "old" branch.
+    writeFileSync(join(w.data, "install-app.pending.json"), JSON.stringify({ phase: "verifying", startedAt: "x", pid: 9, snapshot: null, previousSchema: null, newBuild: `${info.commit}@${info.builtAt}` }));
+    const r = await runInstall(env.deps());
+    expect(r.status).toBe("failed");
+    expect(w.opens).toBe(0);
+  });
+});
+
+describe("round 3: marker-less recovery stays resumable", () => {
+  it("records a marker before moving anything; the retry still recovers once a snapshot is there", async () => {
+    const env = world({ installed: null, previous: { name: "old", schema: 18, health: "good" }, db: 19, running: false });
+    const { w, deps, state } = env;
+    const first = await runInstall(deps());
+    expect(first.status).toBe("failed");
+    expect(state()).toMatchObject({ target: "old", running: null, db: 19, marker: "rolling-back" });
+    // A usable snapshot becomes available; the build is broken: the retry must not need it.
+    const src = join(w.root, "src");
+    mkdirSync(src);
+    makeDb(join(src, "apollo.db"), 18);
+    takeSnapshot({ dbPath: join(src, "apollo.db"), backupsDir: join(w.data, "backups"), label: "s", now: 7 });
+    const d = deps(2);
+    const second = await runInstall({ ...d, build: async () => Promise.reject(new Error("no build")) });
+    expect(second.status).toBe("rolled-back");
+    expect(state()).toMatchObject({ target: "old", running: "old", db: 18, marker: null });
+  });
+
+  it("an old bundle without build-info: refused, the marker kept, and --force on the retry finishes the recovery", async () => {
+    const env = world({ installed: null, previous: { name: "old", schema: 18, health: "good", info: false }, db: 18, running: false });
+    expect((await runInstall(env.deps())).status).toBe("failed");
+    expect(env.state()).toMatchObject({ target: "old", marker: "rolling-back" });
+    const forced = await runInstall({ ...env.deps(2), env: { ...env.deps(2).env, options: parseArgs(["--force"]) } });
+    expect(forced.status).toBe("rolled-back");
+    expect(env.w.builds).toBe(0);
+    expect(env.state()).toMatchObject({ running: "old", marker: null });
+  });
+
+  it("a marker that cannot be recorded: nothing is moved", async () => {
+    const env = world({ installed: null, previous: { name: "old", schema: 18, health: "good" }, db: 18, running: false });
+    env.w.faults.push((op, [path]) => op === "writeText" && path!.endsWith("pending.json"));
+    expect((await runInstall(env.deps())).status).toBe("failed");
+    expect(env.state()).toMatchObject({ target: null, previous: "old" });
+  });
+});
+
+describe("round 3: malformed snapshot metadata is skipped, not fatal", () => {
+  it("a newest snapshot with a malformed manifest does not stop older ones being used", async () => {
+    const env = world({ installed: null, previous: { name: "old", schema: 18, health: "good" }, db: 19, running: false });
+    const { w, deps, state } = env;
+    const backups = join(w.data, "backups");
+    for (const [i, version] of [18, 18].entries()) {
+      const src = join(w.root, `m-${i}`);
+      mkdirSync(src);
+      makeDb(join(src, "apollo.db"), version);
+      takeSnapshot({ dbPath: join(src, "apollo.db"), backupsDir: backups, label: `m${i}`, now: 10 + i });
+    }
+    // Newest: valid JSON, no fields (and a round-1 style manifest would lack `file` the same way).
+    writeFileSync(join(listSnapshots(backups)[0]!.dir, "snapshot.json"), "{}");
+    const r = await runInstall(deps());
+    expect(r.status).toBe("rolled-back");
+    expect(w.logs.some((l) => /malformed/.test(l))).toBe(true);
+    expect(state()).toMatchObject({ running: "old", db: 18 });
   });
 });

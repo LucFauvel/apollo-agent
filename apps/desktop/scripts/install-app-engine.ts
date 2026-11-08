@@ -95,13 +95,16 @@ export interface Deps {
   readonly now: () => number;
   readonly sleep: (ms: number) => Promise<void>;
   readonly log: (line: string) => void;
-  /** Every Apollo process right now (installed app, development run, their servers). */
+  /**
+   * Every Apollo process right now (installed app, development run, their servers). Throws
+   * when the process list cannot be read: that is never taken to mean "none".
+   */
   readonly apollo: () => Array<Proc>;
   /** Asks the apps to quit (bounded in time). */
   readonly requestQuit: (procs: ReadonlyArray<Proc>) => void;
   /** SIGKILL. */
   readonly kill: (pid: number) => void;
-  /** Whether a pid is a running install:app (for the lock). */
+  /** Whether a pid is a running install:app (for the lock). Throws when it cannot tell. */
   readonly isInstaller: (pid: number) => boolean;
   /** Sessions mid-turn. */
   readonly busy: () => Array<string>;
@@ -245,12 +248,28 @@ class Run {
 // ---------------------------------------------------------------------------------------
 // Steps
 
-/** Quits every Apollo process and waits until none is left; force-stops stragglers. Returns survivors. */
-const stopApollo = async (run: Run): Promise<Array<number>> => {
+/** The Apollo processes, or null when the process list cannot be read. */
+const listApollo = (d: Deps): Array<Proc> | null => {
+  try {
+    return d.apollo();
+  } catch (e) {
+    d.log(`  (cannot list processes: ${message(e)})`);
+    return null;
+  }
+};
+
+type Stopped = { readonly ok: true } | { readonly ok: false; readonly reason: string; readonly pids: ReadonlyArray<number>; readonly asked: boolean };
+
+/**
+ * Quits every Apollo process and waits until a readable process list shows none; force-stops
+ * stragglers. An unreadable list is never taken as "all stopped".
+ */
+const stopApollo = async (run: Run): Promise<Stopped> => {
   const { d } = run;
   const t = d.env.timing;
-  let procs = d.apollo();
-  if (procs.length === 0) return [];
+  let procs = listApollo(d);
+  if (procs === null) return { ok: false, reason: "the process list cannot be read, so Apollo's processes cannot be confirmed stopped", pids: [], asked: false };
+  if (procs.length === 0) return { ok: true };
   d.log(`  Stopping ${procs.map((p) => `${p.kind} ${p.pid}`).join(", ")}`);
   try {
     d.requestQuit(procs);
@@ -259,9 +278,9 @@ const stopApollo = async (run: Run): Promise<Array<number>> => {
   }
   // The list is read again each time: a server started during shutdown is caught too.
   const deadline = d.now() + t.quitGraceMs;
-  while ((procs = d.apollo()).length > 0 && d.now() < deadline) await d.sleep(t.pollMs);
-  for (let round = 0; round < t.killRounds && (procs = d.apollo()).length > 0; round++) {
-    for (const p of procs) {
+  while (((procs = listApollo(d)) === null || procs.length > 0) && d.now() < deadline) await d.sleep(t.pollMs);
+  for (let round = 0; round < t.killRounds && ((procs = listApollo(d)) === null || procs.length > 0); round++) {
+    for (const p of procs ?? []) {
       d.log(`  ${p.kind} ${p.pid} did not exit: SIGKILL`);
       try {
         d.kill(p.pid);
@@ -271,7 +290,10 @@ const stopApollo = async (run: Run): Promise<Array<number>> => {
     }
     await d.sleep(t.pollMs);
   }
-  return d.apollo().map((p) => p.pid);
+  const left = listApollo(d);
+  if (left === null) return { ok: false, reason: "the process list cannot be read, so Apollo's processes cannot be confirmed stopped", pids: [], asked: true };
+  if (left.length > 0) return { ok: false, reason: `processes ${left.map((p) => p.pid).join(", ")} would not stop`, pids: left.map((p) => p.pid), asked: true };
+  return { ok: true };
 };
 
 const safeHealthy = (d: Deps) => async () => {
@@ -309,15 +331,29 @@ type DbOutcome = { readonly ok: true } | { readonly ok: false; readonly error: s
  * only when the database is newer than `schema`, unreadable, or a restore was interrupted.
  * Every retained snapshot is a candidate, newest first, and each is checked before use.
  */
-const restoreDatabase = (run: Run, schema: number | null, o: { readonly rollback: boolean; readonly interrupted: boolean }): DbOutcome => {
+const restoreDatabase = (
+  run: Run,
+  schema: number | null,
+  o: { readonly rollback: boolean; readonly interrupted: boolean; readonly restoreMissing?: boolean },
+): DbOutcome => {
   const { d } = run;
   const { dbPath, backupsDir } = d.env;
   const current = d.sqlite.inspect(dbPath);
-  const needed = current === null ? o.interrupted : o.interrupted || !current.ok || (schema !== null && current.version > schema);
+  let retained: Array<string> = [];
+  try {
+    retained = listSnapshots(backupsDir, d.files).map((s) => s.dir);
+  } catch (e) {
+    d.log(`  (cannot list snapshots: ${message(e)})`);
+  }
+  // A missing database is only "fresh state" when there is nothing to restore.
+  const needed =
+    current === null
+      ? o.interrupted || (o.restoreMissing === true && (retained.length > 0 || run.snapshot !== null))
+      : o.interrupted || !current.ok || (schema !== null && current.version > schema);
   if (schema === null) d.log("  (the restored build does not say which schema it reads)");
   const candidates = [
     ...(run.snapshot && (o.rollback || needed) ? [run.snapshot] : []),
-    ...(needed ? listSnapshots(backupsDir, d.files).map((s) => s.dir).filter((dir) => dir !== run.snapshot) : []),
+    ...(needed ? retained.filter((dir) => dir !== run.snapshot) : []),
   ];
   for (const dir of candidates) {
     const check = validateSnapshot(dir, d.files, d.sqlite);
@@ -348,6 +384,18 @@ const restoreDatabase = (run: Run, schema: number | null, o: { readonly rollback
   return { ok: false, error: `the database is ${what} and no checked snapshot the build (schema ${schema ?? "unknown"}) can read exists` };
 };
 
+/**
+ * Recovery's rule, for every branch: never open a build over a database it cannot read, and
+ * prefer a checked snapshot over the fresh state a missing database would give.
+ */
+const ensureDatabase = (run: Run, schema: number | null, o: { readonly rollback: boolean; readonly interrupted: boolean }): DbOutcome => {
+  const { d } = run;
+  if (schema === null && d.sqlite.inspect(d.env.dbPath) !== null && !d.env.options.force) {
+    return { ok: false, error: `${run.b.target} does not say which database schema it reads, so it is not opened over the current database (use --force if you know it is compatible)` };
+  }
+  return restoreDatabase(run, schema, { ...o, restoreMissing: true });
+};
+
 /** Before the swap (Apollo stopped, nothing moved): put Apollo back as it was. */
 const reopenUnchanged = async (run: Run, error: string): Promise<InstallResult> => {
   run.removeStaged();
@@ -373,9 +421,13 @@ const rollback = async (run: Run, reason: string, progress: SwapProgress): Promi
     run.at("rollback");
     d.log(`  ${reason}: rolling back`);
     run.tryWriteMarker("rolling-back");
-    const survivors = await stopApollo(run);
-    if (survivors.length > 0) {
-      return run.finish("failed", `${reason}; processes ${survivors.join(", ")} would not stop, so nothing was rolled back`, run.manual(`Stop them: kill -9 ${survivors.join(" ")}.`));
+    const stopped = await stopApollo(run);
+    if (!stopped.ok) {
+      return run.finish(
+        "failed",
+        `${reason}; ${stopped.reason}, so nothing was rolled back`,
+        run.manual(stopped.pids.length > 0 ? `Stop them: kill -9 ${stopped.pids.join(" ")}.` : "Make sure no Apollo process runs (Activity Monitor)."),
+      );
     }
     if (d.files.exists(b.previous)) restorePrevious(d.files, b);
     else if (progress === "staged-moved") {
@@ -410,7 +462,11 @@ const recover = async (run: Run, marker: (Marker & Partial<MarkerData>) | null):
 
   const targetIsNew = marker?.newBuild != null && bundleIdentity(d.files, b.target) === marker.newBuild;
 
-  if (d.apollo().length > 0) {
+  const running = listApollo(d);
+  if (running === null) {
+    return run.finish("failed", "An earlier install did not finish, and whether Apollo is running cannot be told (the process list cannot be read)", "Run install:app again once `ps` works.");
+  }
+  if (running.length > 0) {
     // Nothing is moved under a running Apollo. If what runs is consistent and healthy, the
     // earlier install is simply done.
     const schema = bundleSchema(d.files, b.target);
@@ -440,6 +496,16 @@ const recover = async (run: Run, marker: (Marker & Partial<MarkerData>) | null):
 
   // Bundles and the database may move from here: being interrupted would leave them half done.
   d.holdSignals();
+  if (!marker) {
+    // No marker (an older installer stopped between two renames): record the recovery before
+    // moving anything, so it is resumed until bundle and database agree.
+    run.previousSchema = bundleSchema(d.files, b.previous);
+    try {
+      run.writeMarker("rolling-back");
+    } catch (e) {
+      return run.finish("failed", `Cannot record the recovery (${message(e)}); nothing was moved`, run.manual());
+    }
+  }
   let progress: SwapProgress = "none";
   if (!d.files.exists(b.target)) {
     if (!d.files.exists(b.previous)) return run.finish("failed", `No ${b.target} and no previous build to restore`, run.manual("Reinstall Apollo (install:app from a known-good checkout)."));
@@ -455,6 +521,8 @@ const recover = async (run: Run, marker: (Marker & Partial<MarkerData>) | null):
   if (progress === "staged-moved") {
     // The earlier install's build is in place but was never confirmed: check it now.
     if (options.noOpen) return run.finish("failed", "An earlier install's build is in place but unchecked; run without --no-open to finish it", run.manual());
+    const db = ensureDatabase(run, bundleSchema(d.files, b.target), { rollback: false, interrupted: false });
+    if (!db.ok) return run.finish("failed", `Recovery: ${db.error}. Nothing was opened.`, run.manual());
     run.at("relaunch");
     if (await launchAndVerify(run)) {
       try {
@@ -470,15 +538,7 @@ const recover = async (run: Run, marker: (Marker & Partial<MarkerData>) | null):
   }
 
   const schema = bundleSchema(d.files, b.target) ?? run.previousSchema;
-  const current = d.sqlite.inspect(d.env.dbPath);
-  if (schema === null && current !== null && !options.force) {
-    return run.finish(
-      "failed",
-      `The restored ${b.target} does not say which database schema it reads, so it is not opened over the current database`,
-      run.manual("If you know it is compatible, run install:app --force again."),
-    );
-  }
-  const db = restoreDatabase(run, schema, { rollback: restoring, interrupted: marker?.phase === "restoring-db" });
+  const db = ensureDatabase(run, schema, { rollback: restoring, interrupted: marker?.phase === "restoring-db" });
   if (!db.ok) return run.finish("failed", `Recovery: ${db.error}. Nothing was opened.`, run.manual());
   run.clearMarker();
   run.stage = "recovered";
@@ -515,7 +575,8 @@ const install = async (run: Run): Promise<InstallResult> => {
   }
   if (!d.files.exists(b.staged)) return run.finish("failed", `The build did not stage ${b.staged}`);
 
-  if (d.apollo().length > 0 && !options.now) {
+  // An unreadable process list counts as "running": the wait and the confirmed stop decide.
+  if ((listApollo(d)?.length ?? 1) > 0 && !options.now) {
     run.at("wait-idle");
     const idle = await waitForIdle({ busy: d.busy, sleep: d.sleep, now: d.now, log: d.log, timeoutMs: options.waitTimeoutMs, pollMs: env.timing.idlePollMs });
     if (!idle.idle) {
@@ -533,10 +594,16 @@ const install = async (run: Run): Promise<InstallResult> => {
   // From here Apollo goes down: being interrupted would leave it half done.
   d.holdSignals();
   run.at("quit");
-  const survivors = await stopApollo(run);
-  if (survivors.length > 0) {
+  const stopped = await stopApollo(run);
+  if (!stopped.ok) {
     run.removeStaged();
-    return run.finish("failed", `Apollo processes ${survivors.join(", ")} would not stop; nothing was changed`, `Stop them (kill -9 ${survivors.join(" ")}), then open ${b.target}.`);
+    return run.finish(
+      "failed",
+      `${stopped.reason}; nothing was changed`,
+      stopped.asked
+        ? `${stopped.pids.length > 0 ? `Stop them (kill -9 ${stopped.pids.join(" ")}), then open` : "Check no Apollo process is left, then open"} ${b.target}.`
+        : null,
+    );
   }
 
   try {
@@ -603,7 +670,17 @@ export const runInstall = async (d: Deps): Promise<InstallResult> => {
     return run.finish("aborted", `Could not take the install lock: ${message(e)}`, null, false);
   }
   // The result file belongs to the run holding the lock: leave it alone.
-  if (!lock.ok) return run.finish("aborted", `Another install:app (pid ${lock.holder.pid}, started ${lock.holder.startedAt}) is running; not starting a second one`, null, false);
+  if (!lock.ok) {
+    const who = lock.holder ? `pid ${lock.holder.pid}, started ${lock.holder.startedAt}` : "unreadable owner";
+    return run.finish(
+      "aborted",
+      lock.state === "alive"
+        ? `Another install:app (${who}) is running; not starting a second one`
+        : `The install lock is held (${who}) and whether its owner still runs cannot be told; not starting. If no install:app runs, remove ${d.env.lockPath}`,
+      null,
+      false,
+    );
+  }
   if (lock.tookOver) d.log(`  Took over a stale lock (pid ${lock.tookOver.pid} is gone)`);
   try {
     return await install(run);
@@ -611,6 +688,6 @@ export const runInstall = async (d: Deps): Promise<InstallResult> => {
     // Every stage handles its own failures; this is a backstop.
     return run.finish("failed", `Unexpected error: ${message(e)}`, run.manual());
   } finally {
-    releaseLock(d.env.lockPath, me, d.files);
+    releaseLock(d.env.lockPath, lock.generation, me, d.files);
   }
 };

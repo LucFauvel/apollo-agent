@@ -311,6 +311,24 @@ describe("database snapshots", () => {
     expect(validateSnapshot(d.dir)).toMatchObject({ ok: false, reason: expect.stringMatching(/not a sound SQLite/) });
   });
 
+  it("malformed or unreadable metadata is an unusable snapshot, never an exception", () => {
+    const data = tmp("malformed");
+    const dbPath = join(data, "apollo.db");
+    makeDb(dbPath, 5);
+    const snap = takeSnapshot({ dbPath, backupsDir: join(data, "b"), label: "a", now: 1 })!;
+    const good = readFileSync(join(snap.dir, "snapshot.json"), "utf8");
+    // Pointing outside the snapshot, at the live database itself, with its real hash.
+    const escape = JSON.stringify({ ...JSON.parse(good), file: "../../apollo.db", sha256: { "../../apollo.db": realFileOps.sha256(dbPath) } });
+    for (const manifest of ["{}", "null", "[]", escape, JSON.stringify({ ...JSON.parse(good), file: undefined })]) {
+      writeFileSync(join(snap.dir, "snapshot.json"), manifest);
+      expect(validateSnapshot(snap.dir), manifest).toMatchObject({ ok: false });
+    }
+    writeFileSync(join(snap.dir, "snapshot.json"), good);
+    const hashFails: FileOps = { ...realFileOps, sha256: () => { throw new Error("EIO"); } };
+    expect(validateSnapshot(snap.dir, hashFails)).toMatchObject({ ok: false, reason: expect.stringMatching(/EIO/) });
+    expect(validateSnapshot(snap.dir).ok).toBe(true);
+  });
+
   it("restore: the snapshot in place, the replaced database and its stale -wal/-shm kept aside", () => {
     const data = tmp("restore");
     const dbPath = join(data, "apollo.db");
@@ -413,24 +431,84 @@ describe("database snapshots", () => {
 });
 
 describe("lock", () => {
-  it("one holder at a time; a dead or reused pid is stale", () => {
-    const dir = tmp("lock");
-    const path = join(dir, "install-app.lock");
+  const gen = (dir: string, n: number) => join(dir, `${String(n).padStart(12, "0")}.json`);
+  const owners = (dir: string) => readdirSync(dir).filter((e) => e.endsWith(".json")).sort();
+
+  it("one holder at a time; a dead or reused pid is stale; release frees it", () => {
+    const dir = join(tmp("lock"), "install-app.lock");
     const alive = new Set([1, 2]);
     const isInstaller = (pid: number) => alive.has(pid);
-    expect(acquireLock(path, { pid: 1, startedAt: "a" }, isInstaller)).toEqual({ ok: true, tookOver: null });
-    expect(acquireLock(path, { pid: 2, startedAt: "b" }, isInstaller)).toEqual({ ok: false, holder: { pid: 1, startedAt: "a" } });
-    expect(lockHolder(path, isInstaller)).toEqual({ pid: 1, startedAt: "a" });
-    releaseLock(path, { pid: 2, startedAt: "b" });
-    expect(existsSync(path)).toBe(true);
+    expect(acquireLock(dir, { pid: 1, startedAt: "a" }, isInstaller)).toEqual({ ok: true, generation: 1, tookOver: null });
+    expect(acquireLock(dir, { pid: 2, startedAt: "b" }, isInstaller)).toEqual({ ok: false, holder: { pid: 1, startedAt: "a" }, state: "alive" });
+    expect(lockHolder(dir, isInstaller)).toEqual({ holder: { pid: 1, startedAt: "a" }, state: "alive" });
+    releaseLock(dir, 1, { pid: 2, startedAt: "b" });
+    expect(owners(dir)).toHaveLength(1);
     alive.delete(1);
-    expect(lockHolder(path, isInstaller)).toBeNull();
-    expect(acquireLock(path, { pid: 2, startedAt: "b" }, isInstaller)).toEqual({ ok: true, tookOver: { pid: 1, startedAt: "a" } });
-    releaseLock(path, { pid: 2, startedAt: "b" });
-    expect(existsSync(path)).toBe(false);
-    writeFileSync(path, "garbage");
-    expect(acquireLock(path, { pid: 2, startedAt: "c" }, isInstaller).ok).toBe(true);
+    expect(lockHolder(dir, isInstaller)).toBeNull();
+    expect(acquireLock(dir, { pid: 2, startedAt: "b" }, isInstaller)).toEqual({ ok: true, generation: 2, tookOver: { pid: 1, startedAt: "a" } });
+    // The stale generation is tidied away.
+    expect(owners(dir)).toEqual(["000000000002.json"]);
+    releaseLock(dir, 2, { pid: 2, startedAt: "b" });
+    expect(owners(dir)).toEqual([]);
+    expect(acquireLock(dir, { pid: 1, startedAt: "c" }, () => true)).toMatchObject({ ok: true });
   });
+
+  it("stale takeover race: two contenders that both see the dead owner cannot both win", () => {
+    const dir = join(tmp("lock"), "install-app.lock");
+    mkdirSync(dir);
+    writeFileSync(gen(dir, 1), JSON.stringify({ pid: 9, startedAt: "dead" }));
+    const isInstaller = (pid: number) => pid === 1 || pid === 2;
+    let b: ReturnType<typeof acquireLock> | null = null;
+    // A has decided the owner is stale; right before A publishes, B runs its whole acquire.
+    const hooked: FileOps = {
+      ...realFileOps,
+      publishExclusive: (path, text) => {
+        b ??= acquireLock(dir, { pid: 2, startedAt: "b" }, isInstaller);
+        return realFileOps.publishExclusive(path, text);
+      },
+    };
+    const a = acquireLock(dir, { pid: 1, startedAt: "a" }, isInstaller, hooked);
+    expect(b).toMatchObject({ ok: true });
+    expect(a).toEqual({ ok: false, holder: { pid: 2, startedAt: "b" }, state: "alive" });
+    expect(owners(dir)).toEqual(["000000000002.json"]);
+  });
+
+  it("a slow contender with an old view publishes below the owner, sees it, and withdraws", () => {
+    const dir = join(tmp("lock"), "install-app.lock");
+    mkdirSync(dir);
+    writeFileSync(gen(dir, 3), JSON.stringify({ pid: 9, startedAt: "dead" }));
+    writeFileSync(gen(dir, 5), JSON.stringify({ pid: 5, startedAt: "owner" }));
+    let calls = 0;
+    // Its first look predates the owner's generation 5 (and generation 4 was tidied away).
+    const stale: FileOps = { ...realFileOps, list: (d) => (calls++ === 0 ? ["000000000003.json"] : realFileOps.list(d)) };
+    const r = acquireLock(dir, { pid: 2, startedAt: "slow" }, (pid) => pid === 5 || pid === 2, stale);
+    expect(r).toEqual({ ok: false, holder: { pid: 5, startedAt: "owner" }, state: "alive" });
+    expect(existsSync(gen(dir, 4))).toBe(false);
+  });
+
+  it("an owner that cannot be checked, or a lock file that cannot be read, counts as held", () => {
+    const dir = join(tmp("lock"), "install-app.lock");
+    mkdirSync(dir);
+    writeFileSync(gen(dir, 1), JSON.stringify({ pid: 7, startedAt: "x" }));
+    const cannotTell = () => {
+      throw new Error("ps: EPERM");
+    };
+    expect(acquireLock(dir, { pid: 1, startedAt: "a" }, cannotTell)).toEqual({ ok: false, holder: { pid: 7, startedAt: "x" }, state: "unknown" });
+    expect(lockHolder(dir, cannotTell)).toEqual({ holder: { pid: 7, startedAt: "x" }, state: "unknown" });
+    writeFileSync(gen(dir, 2), "");
+    expect(acquireLock(dir, { pid: 1, startedAt: "a" }, () => false)).toEqual({ ok: false, holder: null, state: "unknown" });
+    expect(owners(dir)).toEqual(["000000000001.json", "000000000002.json"]);
+  });
+
+  it("publishing is atomic and exclusive, and leaves no temporary files", () => {
+    const dir = tmp("publish");
+    const path = join(dir, "x.json");
+    expect(realFileOps.publishExclusive(path, "one")).toBe(true);
+    expect(realFileOps.publishExclusive(path, "two")).toBe(false);
+    expect(readFileSync(path, "utf8")).toBe("one");
+    expect(readdirSync(dir)).toEqual(["x.json"]);
+  });
+
   it("an unreadable marker still counts as an unfinished install", () => {
     const dir = tmp("marker");
     expect(readMarker(join(dir, "none.json"))).toBeNull();
@@ -466,7 +544,9 @@ describe("plan", () => {
     backupsDir: "/data/backups",
   };
   it("a held lock, then recovery, come first", () => {
-    expect(plan({ ...base, lock: { pid: 9, startedAt: "x" } })).toEqual([expect.stringMatching(/^Refuse: another install:app \(pid 9/)]);
+    expect(plan({ ...base, lock: { holder: { pid: 9, startedAt: "x" }, state: "alive" } })).toEqual([expect.stringMatching(/^Refuse: another install:app \(pid 9/)]);
+    expect(plan({ ...base, lock: { holder: { pid: 9, startedAt: "x" }, state: "unknown" } })).toEqual([expect.stringMatching(/^Refuse: the install lock is held by pid 9/)]);
+    expect(plan({ ...base, running: null })).toEqual([expect.stringMatching(/^Refuse: the process list cannot be read/)]);
     expect(plan({ ...base, targetExists: false, previousExists: true })).toEqual([expect.stringMatching(/^Recovery/)]);
     expect(plan({ ...base, marker: { phase: "restoring-db", startedAt: "x", pid: 1, snapshot: null, previousSchema: 18 } })).toEqual([expect.stringMatching(/^Recovery.*phase restoring-db/)]);
   });
@@ -540,6 +620,33 @@ describe("install-app.ts --dry-run (real script, temporary data directory)", () 
     writeFileSync(join(dir, "install-app.pending.json"), JSON.stringify({ phase: "verifying", startedAt: "x", pid: 1, snapshot: null, previousSchema: 18 }));
     expect(dryRun(dir).stdout).toMatch(/Recovery: an install did not finish \(phase verifying\)/);
   });
+  /** --dry-run with a fake `ps` first on PATH. */
+  const withPs = (psScript: string, dataDir = tmp("dry")) => {
+    const bin = tmp("bin");
+    writeFileSync(join(bin, "ps"), `#!/bin/sh\n${psScript}\n`, { mode: 0o755 });
+    return spawnSync(process.execPath, [script, "--dry-run"], {
+      encoding: "utf8",
+      env: { ...process.env, APOLLO_DATA_DIR: dataDir, PATH: `${bin}:${process.env.PATH}` },
+      timeout: 30_000,
+    });
+  };
+  it("a failing ps is reported as 'cannot tell', not as 'Apollo is not running'", () => {
+    // Fails with an error; fails but prints a plausible list (including its caller); succeeds with nothing.
+    for (const ps of ["echo 'ps: operation not permitted' >&2; exit 1", 'echo "$PPID node install-app.ts"; exit 1', "exit 0"]) {
+      const r = withPs(ps);
+      expect(r.status, ps).toBe(0);
+      expect(r.stdout, ps).toMatch(/Refuse: the process list cannot be read/);
+      expect(r.stdout, ps).not.toMatch(/not running/);
+    }
+  });
+  it("a lock whose owner cannot be checked (ps fails) counts as held", () => {
+    const dir = tmp("dry");
+    mkdirSync(join(dir, "install-app.lock"));
+    // This test runner is alive, so only ps can say whether it is install:app; ps fails.
+    writeFileSync(join(dir, "install-app.lock", "000000000001.json"), JSON.stringify({ pid: process.pid, startedAt: "x" }));
+    expect(withPs("exit 1", dir).stdout).toMatch(new RegExp(`Refuse: the install lock is held by pid ${process.pid}, and whether it still runs cannot be told`));
+  });
+
   it("rejects unknown options before doing anything", () => {
     const r = dryRun(tmp("dry"), "--bogus");
     expect(r.status).toBe(2);
