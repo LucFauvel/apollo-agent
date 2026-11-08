@@ -273,7 +273,9 @@ func forward(host string, port int, nodeID, userID string) (map[string]int, erro
 		return nil, errors.New("tailnet is not started")
 	}
 	key := forwardKey{host, port, nodeID, userID}
-	if fwd != nil && fwd.key == key && fwd.srv == srv {
+	// A listener whose accept loop died (iOS reclaims a suspended app's listening
+	// sockets) is replaced rather than handed out again.
+	if fwd != nil && fwd.key == key && fwd.srv == srv && !fwd.closed() {
 		return map[string]int{"localPort": fwd.ln.Addr().(*net.TCPAddr).Port}, nil
 	}
 	if fwd != nil {
@@ -320,10 +322,20 @@ func (f *forwarder) close() {
 	}
 }
 
+func (f *forwarder) closed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.done
+}
+
 func (f *forwarder) serve() {
 	for {
 		c, err := f.ln.Accept()
 		if err != nil {
+			// Nothing will accept on this port again: let forward() replace it.
+			f.mu.Lock()
+			f.done = true
+			f.mu.Unlock()
 			return
 		}
 		go f.handle(c)

@@ -20,6 +20,7 @@ import { ChatScreen } from "./src/screens/ChatScreen.tsx";
 import { HomeScreen } from "./src/screens/HomeScreen.tsx";
 import { PairScreen } from "./src/screens/PairScreen.tsx";
 import { SettingsScreen } from "./src/screens/SettingsScreen.tsx";
+import { resetTailnetRoute } from "./src/tailnet.ts";
 import { SlideIn, SwipeBack } from "./src/motion.tsx";
 import { registerForPush, sessionOf, setViewingSession, unregisterPush } from "./src/push.ts";
 import { colors } from "./src/theme.ts";
@@ -50,15 +51,16 @@ export default function App() {
   }, [tapped]);
   useEffect(() => setViewingSession(open), [open]);
 
-  // iOS kills sockets while the app is in the background. Coming back opens a fresh
-  // connection right away rather than waiting for the old one to time out.
+  // iOS kills sockets while the app is in the background, including the listening socket
+  // of the app's tailnet relay. Coming back reopens the relay (on a new port) and a fresh
+  // connection right away, rather than retrying the old, dead route forever.
   const [generation, setGeneration] = useState(0);
   useEffect(() => {
     let backgroundedAt: number | null = null;
     const sub = AppState.addEventListener("change", (next) => {
       if (next === "background") backgroundedAt = Date.now();
       else if (next === "active" && backgroundedAt !== null) {
-        if (Date.now() - backgroundedAt > 3000) setGeneration((g) => g + 1);
+        if (Date.now() - backgroundedAt > 3000) void resetTailnetRoute().then(() => setGeneration((g) => g + 1));
         backgroundedAt = null;
       }
     });

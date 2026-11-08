@@ -24,6 +24,14 @@ export const startTailnet = (): Promise<TailnetStatus | null> =>
 export const tailnetStatus = (): Promise<TailnetStatus | null> =>
   tailnetAvailable ? Native.tailnetStatus() : Promise.resolve(null);
 
+/**
+ * Drops the loopback relay so the next `routeTo` opens a fresh one. Call it when the app
+ * comes back from the background: iOS may reclaim a suspended app's listening socket
+ * without any error reaching the relay (Apple TN2277), which leaves the old port dead.
+ */
+export const resetTailnetRoute = (): Promise<void> =>
+  tailnetAvailable ? Native.tailnetStopForward().catch(() => undefined) : Promise.resolve();
+
 export const signOutOfTailnet = () => (tailnetAvailable ? Native.tailnetLogout() : Promise.resolve());
 
 /** The computer's tailnet identity, pinned from the pairing QR code. */
