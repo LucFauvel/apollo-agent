@@ -5,7 +5,7 @@ import { AppSettings } from "./AppSettings.ts";
 import { PullRequests } from "./pullRequests/PullRequests.ts";
 import { ProviderVersions } from "./ProviderVersions.ts";
 import { Tailscale } from "./remote/Tailscale.ts";
-import { Auth } from "./auth/Auth.ts";
+import { Auth, PAIRING_TOKEN_TTL_MS, PHONE_PAIRING_TTL_MS } from "./auth/Auth.ts";
 import { Browser } from "./browser/Browser.ts";
 import { Secrets } from "./secrets/Secrets.ts";
 import { Compaction } from "./Compaction.ts";
@@ -163,8 +163,10 @@ export const layer = ApolloRpcs.toLayer(
       "auth.listClients": () => Effect.sync(() => auth.listClients()),
       "remote.status": () => tailscale.read,
       "remote.setTailscale": ({ enabled }) => tailscale.setEnabled(enabled),
+      "remote.signOutTailscale": () => tailscale.signOut,
       "auth.revokeClient": ({ clientId }) => Effect.sync(() => auth.revokeClient(clientId)),
-      "auth.createPairingToken": ({ label }) => Effect.sync(() => auth.createPairingToken(label)),
+      "auth.createPairingToken": ({ label, phone }) =>
+        Effect.sync(() => auth.createPairingToken(label, Date.now(), phone ? PHONE_PAIRING_TTL_MS : PAIRING_TOKEN_TTL_MS)),
     };
   }),
 );

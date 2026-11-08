@@ -81,7 +81,8 @@ export function DevicesDialog({ onClose }: { onClose: () => void }) {
                 {client.id === current ? <Badge tone="emerald">This device</Badge> : null}
               </div>
               <div className="text-[11px] text-zinc-500">
-                {client.method === "desktop" ? "Desktop app" : "Pairing link"} · active {ago(client.lastSeenAt)}
+                {client.method === "desktop" ? "Desktop app" : client.nodeName ? `Only from ${client.nodeName}` : "Pairing link"}
+                {client.deviceKey ? " · device key" : ""} · active {ago(client.lastSeenAt)}
               </div>
             </div>
             <Button size="sm" variant={client.id === current ? "ghost" : "danger"} onClick={() => revoke(client)}>

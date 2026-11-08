@@ -3,6 +3,7 @@ import { Alert, Linking, Pressable, ScrollView, StyleSheet, Text, View } from "r
 import { useApollo } from "../AppState.tsx";
 import type { Pairing } from "../connection.ts";
 import { errorMessage } from "../connection.ts";
+import { tailnetAvailable, type TailnetStatus, tailnetStatus } from "../tailnet.ts";
 import { currentPushStatus, type PushStatus, registerForPush, sendTestNotification, subscribePushStatus } from "../push.ts";
 import { colors } from "../theme.ts";
 
@@ -12,6 +13,14 @@ export function SettingsScreen({ pairing, onBack, onUnpair }: { pairing: Pairing
   const [push, setPush] = useState<PushStatus>(currentPushStatus);
   useEffect(() => subscribePushStatus(setPush), []);
   const [test, setTest] = useState<string | null>(null);
+  const [tailnet, setTailnet] = useState<TailnetStatus | null>(null);
+  useEffect(() => {
+    if (tailnetAvailable && pairing.pin) void tailnetStatus().then(setTailnet, () => setTailnet(null));
+  }, [pairing.pin]);
+  const via =
+    tailnet?.state === "Running"
+      ? `Apollo's own Tailscale (${tailnet.dnsName ?? "this iPhone"}), checked against the paired computer`
+      : "the Tailscale app";
 
   const host = (() => {
     try {
@@ -46,8 +55,8 @@ export function SettingsScreen({ pairing, onBack, onUnpair }: { pairing: Pairing
             <View style={[styles.dot, { backgroundColor: state.connected ? colors.green : colors.amber }]} />
             <View style={{ flex: 1 }}>
               <Text style={styles.rowTitle}>{state.connected ? "Connected" : "Connecting…"}</Text>
-              <Text style={styles.rowDetail} numberOfLines={1}>
-                {host} · over Tailscale
+              <Text style={styles.rowDetail} numberOfLines={2}>
+                {host} · through {via}
               </Text>
             </View>
           </View>

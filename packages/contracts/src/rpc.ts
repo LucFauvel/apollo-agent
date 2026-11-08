@@ -336,9 +336,12 @@ export class ApolloRpcs extends RpcGroup.make(
   /** Reaching Apollo from phones over Tailscale. */
   Rpc.make("remote.status", { success: RemoteAccess, error }),
   Rpc.make("remote.setTailscale", { payload: { enabled: Schema.Boolean }, success: RemoteAccess, error }),
+  /** Signs Apollo's Tailscale node out of the tailnet (publishing turns off). */
+  Rpc.make("remote.signOutTailscale", { success: RemoteAccess, error }),
   Rpc.make("auth.revokeClient", { payload: { clientId: ClientId }, error }),
   Rpc.make("auth.createPairingToken", {
-    payload: { label: Schema.String },
+    /** `phone`: a QR code for the phone app, valid for two minutes instead of ten. */
+    payload: { label: Schema.String, phone: Schema.optional(Schema.Boolean) },
     success: PairingToken,
     error,
   }),

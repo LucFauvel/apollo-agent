@@ -245,6 +245,13 @@ const MIGRATIONS: ReadonlyArray<string> = [
     created_at integer not null
   );
   `,
+  // 15: clients bound to one tailnet device, and device keys that sign every request.
+  `
+  alter table client_sessions add column node_id text;     -- Tailscale StableID
+  alter table client_sessions add column user_id text;     -- Tailscale user ID of that node
+  alter table client_sessions add column node_name text;
+  alter table client_sessions add column device_key text;  -- base64url uncompressed P-256 point
+  `,
 ];
 
 export class Database extends Context.Service<Database, DatabaseSync>()("apollo/Database") {}

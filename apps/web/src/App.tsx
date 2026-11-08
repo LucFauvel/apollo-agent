@@ -15,6 +15,7 @@ import { ClaudeLogo, CodexLogo, LlamaLogo } from "./components/icons.tsx";
 import { Button } from "./components/ui.tsx";
 import { Plus } from "lucide-react";
 import { onNotify, startSync, useApp } from "./store.ts";
+import { useAvatarImages } from "./avatarImages.ts";
 
 /** Shows server notifications (scheduled results, failures) on the desktop; clicking opens the session. */
 const useDesktopNotifications = (open: (id: SessionId) => void) =>
@@ -35,6 +36,8 @@ const useDesktopNotifications = (open: (id: SessionId) => void) =>
 
 export function App() {
   useEffect(() => startSync(), []);
+  // Bot avatars as images for the phone's notifications.
+  useAvatarImages(useApp((s) => s.bots));
 
   const [selectedId, setSelectedId] = useState<SessionId | null>(null);
   const [dialog, setDialog] = useState<

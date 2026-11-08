@@ -14,6 +14,8 @@ export interface ServerConfigShape {
   readonly baseUrl: string;
   readonly claudeExecutable: string | undefined;
   readonly codexExecutable: string | undefined;
+  /** The tailnet addon (apps/server/native/tailnet), loaded to publish Apollo on the tailnet. */
+  readonly tailnetAddon: string | undefined;
   /** Defaults for the llama.cpp provider until changed in the settings. */
   readonly llamaCpp: { readonly baseUrl: string; readonly apiKey: string | null };
   /**
@@ -78,6 +80,7 @@ export const fromEnv = (env: NodeJS.ProcessEnv = process.env): ServerConfigShape
     },
     claudeExecutable: env.APOLLO_CLAUDE_BIN,
     codexExecutable: env.APOLLO_CODEX_BIN,
+    tailnetAddon: env.APOLLO_TAILNET_ADDON || undefined,
     llamaCpp: {
       baseUrl: env.APOLLO_LLAMACPP_URL || "http://127.0.0.1:8080",
       apiKey: env.APOLLO_LLAMACPP_API_KEY || null,

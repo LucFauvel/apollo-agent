@@ -1,7 +1,8 @@
 import { CameraView, useCameraPermissions } from "expo-camera";
 import { useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Linking, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 import { errorMessage, type Pairing, pair, parsePairingCode } from "../connection.ts";
+import { startTailnet, tailnetAvailable, type TailnetStatus, tailnetStatus } from "../tailnet.ts";
 import { colors } from "../theme.ts";
 
 /**
@@ -18,6 +19,34 @@ export function PairScreen({ onPaired, initialCode }: { onPaired: (pairing: Pair
   const tried = useRef(new Set<string>());
   const inFlight = useRef(false);
 
+  // The app's own Tailscale node: sign in once, in the browser, with the same account as the computer.
+  const [tailnet, setTailnet] = useState<TailnetStatus | null>(null);
+  const [tailnetError, setTailnetError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!tailnetAvailable) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = (first: boolean) =>
+      (first ? startTailnet() : tailnetStatus())
+        .then((status) => {
+          if (stopped) return;
+          setTailnet(status);
+          setTailnetError(null);
+          if (status?.state !== "Running") timer = setTimeout(() => void poll(false), 2000);
+        })
+        .catch((e) => {
+          if (stopped) return;
+          setTailnetError(errorMessage(e));
+          timer = setTimeout(() => void poll(true), 5000);
+        });
+    void poll(true);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, []);
+  const tailnetReady = !tailnetAvailable || tailnet?.state === "Running";
+
   const tryCode = (text: string) => {
     const code = parsePairingCode(text);
     if (!code) {
@@ -25,6 +54,10 @@ export function PairScreen({ onPaired, initialCode }: { onPaired: (pairing: Pair
       return;
     }
     if (inFlight.current) return;
+    if (code.pin && !tailnetReady) {
+      setError("Sign in to Tailscale above first, then scan the code again.");
+      return;
+    }
     if (tried.current.has(code.token)) {
       setError("This code was already used. Show a new code on the computer (Devices → Pair a phone).");
       return;
@@ -33,7 +66,7 @@ export function PairScreen({ onPaired, initialCode }: { onPaired: (pairing: Pair
     inFlight.current = true;
     setBusy(true);
     setError(null);
-    pair(code.server, code.token)
+    pair(code)
       .then(onPaired)
       .catch((e) => setError(errorMessage(e)))
       .finally(() => {
@@ -52,9 +85,32 @@ export function PairScreen({ onPaired, initialCode }: { onPaired: (pairing: Pair
     <View style={styles.screen}>
       <Text style={styles.title}>Pair with Apollo</Text>
       <Text style={styles.subtitle}>
-        On your computer, open Apollo → Devices → Pair a phone, then scan the code. Tailscale must be on here and on the
-        computer.
+        On your computer, open Apollo → Devices → Pair a phone, scan the code, then allow this phone on the computer.
       </Text>
+
+      {tailnetAvailable ? (
+        <View style={styles.tailnetCard}>
+          <View style={[styles.dot, { backgroundColor: tailnet?.state === "Running" ? colors.green : colors.amber }]} />
+          <View style={{ flex: 1, gap: 2 }}>
+            <Text style={styles.tailnetTitle}>
+              {tailnet?.state === "Running" ? "Tailscale is connected" : "Sign in to Tailscale"}
+            </Text>
+            <Text style={styles.tailnetDetail}>
+              {tailnet?.state === "Running"
+                ? `${tailnet.loginName ?? "Signed in"} · ${tailnet.dnsName ?? "this iPhone"}`
+                : tailnetError ??
+                  "Apollo has its own Tailscale connection, so the Tailscale app is not needed. Use the same account as on your computer."}
+            </Text>
+          </View>
+          {tailnet?.state !== "Running" && tailnet?.authUrl ? (
+            <Pressable style={[styles.button, styles.small]} onPress={() => void Linking.openURL(tailnet.authUrl!)}>
+              <Text style={styles.buttonText}>Sign in</Text>
+            </Pressable>
+          ) : tailnet?.state !== "Running" ? (
+            <ActivityIndicator color={colors.muted} />
+          ) : null}
+        </View>
+      ) : null}
 
       <View style={styles.cameraBox}>
         {!permission ? null : permission.granted ? (
@@ -81,7 +137,7 @@ export function PairScreen({ onPaired, initialCode }: { onPaired: (pairing: Pair
         {busy ? (
           <View style={styles.overlay}>
             <ActivityIndicator color={colors.text} />
-            <Text style={styles.overlayText}>Pairing…</Text>
+            <Text style={styles.overlayText}>Allow this phone on your computer…</Text>
           </View>
         ) : null}
       </View>
@@ -137,6 +193,19 @@ const styles = StyleSheet.create({
   },
   button: { backgroundColor: colors.text, borderRadius: 12, paddingHorizontal: 16, paddingVertical: 11, alignItems: "center" },
   small: { justifyContent: "center" },
+  tailnetCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    padding: 14,
+    borderRadius: 16,
+    backgroundColor: colors.panel,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  dot: { width: 8, height: 8, borderRadius: 4 },
+  tailnetTitle: { color: colors.text, fontSize: 14, fontWeight: "600" },
+  tailnetDetail: { color: colors.muted, fontSize: 12, lineHeight: 17 },
   buttonText: { color: colors.bg, fontWeight: "600" },
   error: { color: colors.red, fontSize: 13 },
 });

@@ -18,7 +18,12 @@ extraResources:
     to: web
   - from: resources/tray
     to: tray
-# No native modules: the server is a single bundle and node:sqlite is built in.
+  # Apollo's own Tailscale node, a Node-API addon (apps/server/native/tailnet/build.sh).
+  - from: ../server/native/tailnet/build
+    to: native
+    filter: ["apollo_tailnet.node"]
+# No npm native modules: the server is a single bundle, node:sqlite is built in, and the
+# tailnet addon above is built from Go by its own script.
 npmRebuild: false
 linux:
   target: [AppImage]

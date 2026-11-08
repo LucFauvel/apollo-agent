@@ -1,124 +1,206 @@
-import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
+import { hostname } from "node:os";
+import { join } from "node:path";
 import { ApolloError, type RemoteAccess } from "@apollo/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { ServerConfig } from "../Config.ts";
 import { Store } from "../Store.ts";
+import type { TailnetPeer } from "./TailnetPeer.ts";
 
-/** HTTPS port on the tailnet; not 443, so Apollo never replaces something the user serves there. */
-export const TAILNET_PORT = 8443;
+/** HTTPS port on the tailnet; not 443, so it never clashes with anything else on the node. */
+export const TAILNET_PORT = Number(process.env.APOLLO_TAILNET_PORT) || 8443;
 const SETTING = "remote.tailscale";
+/** How often the node's state is re-read while it runs (login finished, reconnects). */
+const REFRESH_INTERVAL = "5 seconds";
 
-const CANDIDATES = [
-  "tailscale",
-  "/usr/local/bin/tailscale",
-  "/opt/homebrew/bin/tailscale",
-  "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-];
+/** The Node-API addon (apps/server/native/tailnet): a Tailscale node inside this process. */
+interface Addon {
+  readonly call: (method: string, args: string) => Promise<string>;
+  readonly callSync: (method: string, args: string) => string;
+}
 
-const findTailscale = () => {
-  const override = process.env.APOLLO_TAILSCALE_BIN;
-  if (override) return override;
-  for (const candidate of CANDIDATES.slice(1)) if (existsSync(candidate)) return candidate;
-  return CANDIDATES[0]!;
+/** What the addon reports about its node. */
+interface NodeStatus {
+  readonly state: string;
+  readonly authUrl: string | null;
+  readonly nodeId: string | null;
+  readonly userId: string | null;
+  readonly loginName: string | null;
+  readonly dnsName: string | null;
+  readonly listening: boolean;
+  readonly error: string | null;
+}
+
+const STOPPED: NodeStatus = {
+  state: "NoState",
+  authUrl: null,
+  nodeId: null,
+  userId: null,
+  loginName: null,
+  dnsName: null,
+  listening: false,
+  error: null,
 };
 
-const run = (bin: string, args: ReadonlyArray<string>) =>
-  new Promise<string>((resolve, reject) => {
-    execFile(bin, [...args], { timeout: 15_000 }, (error, stdout, stderr) => {
-      if (error) reject(new Error(((stderr || stdout || error.message) as string).trim()));
-      else resolve(stdout);
-    });
-  });
+const loadAddon = (path: string | undefined): { addon: Addon | null; problem: string | null } => {
+  if (!path) return { addon: null, problem: "This build of Apollo has no Tailscale support (APOLLO_TAILNET_ADDON is not set)." };
+  if (!existsSync(path)) return { addon: null, problem: `Tailscale support is not built: run apps/server/native/tailnet/build.sh (${path}).` };
+  try {
+    const module = { exports: {} as Addon };
+    process.dlopen(module, path);
+    return { addon: module.exports, problem: null };
+  } catch (error) {
+    return { addon: null, problem: `Could not load Tailscale support: ${(error as Error).message}` };
+  }
+};
+
+const loopback = (address: string | undefined) =>
+  address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+
+/** A tailnet machine name from this computer's name: `Luc's MacBook.local` → `apollo-lucs-macbook`. */
+const nodeHostname = () =>
+  `apollo-${hostname()
+    .replace(/\.local$/, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40) || "desktop"}`;
 
 /**
- * Publishes Apollo to the user's tailnet with `tailscale serve`: HTTPS with the tailnet's
- * certificate, reachable only by the user's own devices, while Apollo itself keeps
- * listening on localhost. Every request still needs a paired device's token.
+ * Publishes Apollo to the user's tailnet through a Tailscale node that runs inside this
+ * process (the `apollo_tailnet` Node-API addon, built from Go's tsnet). It uses
+ * userspace networking: the system Tailscale app does not need to be running, and no
+ * VPN interface is created, so another VPN can stay on.
+ *
+ * The node signs in to the user's tailnet once (a login link shown in the app) and shows
+ * up there as its own machine. Its listener admits only the owner's own devices, checked
+ * before the TLS handshake, and relays them to Apollo's localhost port; `peerFor` maps a
+ * relayed request back to the device it came from.
  */
 const make = Effect.gen(function* () {
   const config = yield* ServerConfig;
   const store = yield* Store;
-  const bin = findTailscale();
+  const { addon, problem } = loadAddon(config.tailnetAddon);
+  const stateDir = join(config.dataDir, "tailnet-node");
+  let node: NodeStatus = STOPPED;
   let lastError: string | null = null;
-  /** The tailnet origin while published, kept for the request guard (no CLI call per request). */
+  /** The tailnet origin while published, kept for the request guard. */
   let tailnetOrigin: string | null = null;
 
-  const status = Effect.promise(async () => {
-    try {
-      const json = JSON.parse(await run(bin, ["status", "--json"])) as {
-        BackendState?: string;
-        Self?: { DNSName?: string };
-      };
-      const dnsName = json.Self?.DNSName?.replace(/\.$/, "") || null;
-      return { state: json.BackendState === "Running" ? ("running" as const) : ("stopped" as const), dnsName };
-    } catch (error) {
-      const missing = /ENOENT|not found/i.test((error as Error).message);
-      return { state: missing ? ("missing" as const) : ("stopped" as const), dnsName: null };
-    }
-  });
+  const invoke = async <A>(method: string, args: object = {}): Promise<A> => {
+    if (!addon) throw new Error(problem ?? "Tailscale support is not available");
+    const parsed = JSON.parse(await addon.call(method, JSON.stringify(args))) as A & { error?: string };
+    if (parsed && typeof parsed === "object" && "error" in parsed && typeof parsed.error === "string") throw new Error(parsed.error);
+    return parsed;
+  };
 
   const urlFor = (dnsName: string) => `https://${dnsName}:${TAILNET_PORT}`;
 
+  const startNode = () =>
+    invoke<NodeStatus>("start", { dir: stateDir, hostname: nodeHostname(), port: TAILNET_PORT, upstreamPort: config.port });
+
+  /** Re-reads the node's state; `null` when the node is not running. */
+  const refresh = async () => {
+    if (!addon) return;
+    try {
+      node = await invoke<NodeStatus>("status");
+      lastError = node.error;
+    } catch (error) {
+      lastError = (error as Error).message;
+    }
+  };
+
+  const enabledSetting = store.getSetting(SETTING).pipe(Effect.map((value) => value === "on"));
+
   const read: Effect.Effect<RemoteAccess> = Effect.gen(function* () {
-    const enabled = (yield* store.getSetting(SETTING)) === "on";
-    const { state, dnsName } = yield* status;
-    tailnetOrigin = enabled && dnsName ? urlFor(dnsName) : null;
+    const enabled = yield* enabledSetting;
+    if (enabled) yield* Effect.promise(refresh);
+    const published = enabled && node.listening && node.dnsName !== null;
+    tailnetOrigin = published ? urlFor(node.dnsName!) : null;
     return {
-      tailscale: state,
-      dnsName,
+      tailscale: !addon
+        ? "missing"
+        : !enabled || node.state === "NoState" || node.state === "Stopped"
+          ? "stopped"
+          : node.state === "NeedsLogin" || node.state === "NeedsMachineAuth"
+            ? "needs-login"
+            : node.state === "Running"
+              ? "running"
+              : "starting",
+      dnsName: node.dnsName,
       enabled,
-      url: enabled && dnsName ? urlFor(dnsName) : null,
-      error: lastError,
+      url: tailnetOrigin,
+      error: !addon ? problem : lastError,
+      nodeId: node.nodeId,
+      userId: node.userId,
+      loginUrl: enabled && node.state === "NeedsLogin" ? node.authUrl : null,
+      loginName: node.loginName,
     };
   });
 
-  const serve = Effect.tryPromise({
-    try: () => run(bin, ["serve", "--bg", `--https=${TAILNET_PORT}`, `http://127.0.0.1:${config.port}`]),
-    catch: (error) => (error as Error).message,
-  });
+  const fail = (message: string) => new ApolloError({ code: "internal", message });
 
   const setEnabled = (enabled: boolean) =>
     Effect.gen(function* () {
       lastError = null;
       if (enabled) {
-        const { state } = yield* status;
-        if (state !== "running") {
-          return yield* new ApolloError({
-            code: "invalid",
-            message: state === "missing" ? "Tailscale is not installed on this computer." : "Tailscale is not connected; open it and sign in.",
-          });
-        }
-        const failure = yield* serve.pipe(Effect.flip, Effect.option);
-        if (failure._tag === "Some") {
-          lastError = failure.value;
-          return yield* new ApolloError({ code: "internal", message: `tailscale serve failed: ${failure.value}` });
-        }
+        if (!addon) return yield* new ApolloError({ code: "invalid", message: problem ?? "Tailscale support is not available" });
+        // Saved first: a node waiting for its first login keeps going, and is started again after a restart.
+        yield* store.setSetting(SETTING, "on");
+        node = yield* Effect.tryPromise({ try: startNode, catch: (e) => fail(`Could not start Tailscale: ${(e as Error).message}`) });
       } else {
-        yield* Effect.tryPromise(() => run(bin, ["serve", `--https=${TAILNET_PORT}`, "off"])).pipe(Effect.ignore);
+        yield* store.setSetting(SETTING, null);
+        if (addon) yield* Effect.promise(() => invoke("stop").catch(() => undefined));
+        node = STOPPED;
       }
-      yield* store.setSetting(SETTING, enabled ? "on" : null);
       return yield* read;
     });
 
-  // Apollo's port can change between launches (the desktop app picks a free one): point the
-  // tailnet address at this run's port.
-  if ((yield* store.getSetting(SETTING)) === "on") {
-    yield* read;
-    yield* serve.pipe(
-      Effect.tapError((error) => Effect.sync(() => void (lastError = error))),
-      Effect.ignore,
-      Effect.forkScoped,
-    );
-  }
+  /** Signs Apollo's node out of the tailnet and forgets it; turning it on again asks for a new login. */
+  const signOut = Effect.gen(function* () {
+    yield* store.setSetting(SETTING, null);
+    if (addon) yield* Effect.tryPromise({ try: () => invoke("logout"), catch: (e) => fail(`Could not sign out: ${(e as Error).message}`) });
+    node = STOPPED;
+    lastError = null;
+    return yield* read;
+  });
+
+  yield* Effect.addFinalizer(() => (addon ? Effect.promise(() => invoke("stop").catch(() => undefined)) : Effect.void));
+
+  // Start the node again at startup, then follow it (login finished, reconnects, sleep).
+  yield* Effect.gen(function* () {
+    if (addon && (yield* enabledSetting)) {
+      if (node.state === "NoState") {
+        node = yield* Effect.promise(() => startNode().catch((error: Error) => ({ ...STOPPED, error: error.message })));
+        lastError = node.error;
+      } else {
+        yield* Effect.promise(refresh);
+      }
+      tailnetOrigin = node.listening && node.dnsName ? urlFor(node.dnsName) : null;
+    }
+    yield* Effect.sleep(REFRESH_INTERVAL);
+  }).pipe(Effect.forever, Effect.forkScoped);
 
   return {
     read,
     setEnabled,
-    /** Requests through the tailnet address carry it as their Origin (the phone app's WebSocket). */
+    signOut,
+    /** Requests through the tailnet address carry it as their Origin (browsers on other devices). */
     isTailnetOrigin: (origin: string) => tailnetOrigin !== null && origin === tailnetOrigin,
+    /**
+     * The tailnet device behind a request's socket, when it came through the tailnet
+     * listener's relay; null for requests made on this computer.
+     */
+    peerFor: (socket: { readonly remoteAddress?: string | undefined; readonly remotePort?: number | undefined }): TailnetPeer | null => {
+      if (!addon || !loopback(socket.remoteAddress) || socket.remotePort === undefined) return null;
+      try {
+        return JSON.parse(addon.callSync("peer", JSON.stringify({ port: socket.remotePort }))) as TailnetPeer | null;
+      } catch {
+        return null;
+      }
+    },
   };
 });
 

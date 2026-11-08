@@ -4,15 +4,31 @@
 #   pnpm --filter @apollo/mobile testflight            # JS-only changes
 #   pnpm --filter @apollo/mobile testflight --prebuild # after adding native modules or plugins
 #
-# The archive is signed with the App Store profile (not left unsigned and signed only at
-# upload): an unsigned archive loses its entitlements, and push notifications then fail
-# with "no valid aps-environment entitlement". Override for another account with
-# APOLLO_TEAM_ID, APOLLO_PROFILE and APOLLO_BUNDLE_ID.
+# Signing: the archive is built unsigned, then signed ad hoc here with the app's
+# entitlements (an archive without them uploads an app whose pushes fail with "no valid
+# aps-environment entitlement"). The export step signs it for the App Store
+# automatically, for the app and its notification service extension: Xcode creates their
+# App Store profiles with the account signed in under Xcode → Settings → Accounts. No
+# development profiles, so the team needs no registered devices. Override the team
+# with APOLLO_TEAM_ID.
 set -euo pipefail
 
 TEAM="${APOLLO_TEAM_ID:-XA3R5NAN2C}"
-PROFILE="${APOLLO_PROFILE:-Apollo Agent App Store}"
-BUNDLE="${APOLLO_BUNDLE_ID:-dev.ocx64.apollo.mobile}"
+
+# Uploading uses an App Store Connect API key when one is set up, else the account signed in
+# to Xcode. Xcode's sign-in only lasts about an hour for command-line uploads (Xcode renews it
+# only while it is open); a key does not expire. Create one in App Store Connect → Users and
+# Access → Integrations → App Store Connect API (role: App Manager), save the .p8 as
+# ~/.appstoreconnect/private_keys/AuthKey_<KEY ID>.p8, and put in ~/.appstoreconnect/apollo.env:
+#   APOLLO_ASC_KEY_ID=<KEY ID>
+#   APOLLO_ASC_ISSUER_ID=<issuer ID>
+[[ -f "$HOME/.appstoreconnect/apollo.env" ]] && source "$HOME/.appstoreconnect/apollo.env"
+AUTH=()
+if [[ -n "${APOLLO_ASC_KEY_ID:-}" && -n "${APOLLO_ASC_ISSUER_ID:-}" ]]; then
+  KEY="${APOLLO_ASC_KEY_PATH:-$HOME/.appstoreconnect/private_keys/AuthKey_${APOLLO_ASC_KEY_ID}.p8}"
+  [[ -f "$KEY" ]] || { echo "App Store Connect key not found: $KEY" >&2; exit 1; }
+  AUTH=(-authenticationKeyPath "$KEY" -authenticationKeyID "$APOLLO_ASC_KEY_ID" -authenticationKeyIssuerID "$APOLLO_ASC_ISSUER_ID")
+fi
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$(mktemp -d)"
 export LANG=en_US.UTF-8 # CocoaPods fails without a UTF-8 locale
@@ -20,6 +36,11 @@ export LANG=en_US.UTF-8 # CocoaPods fails without a UTF-8 locale
 cd "$HERE"
 BUILD="$(date +%Y%m%d%H%M)"
 sed -i '' "s/\"buildNumber\": \"[0-9]*\"/\"buildNumber\": \"$BUILD\"/" app.json
+# The embedded Tailscale node (Go, tsnet) is a gitignored static library; build it once.
+# Delete modules/apollo-tailnet/ios/ApolloTailnet.xcframework to rebuild after Go changes.
+if [[ ! -d modules/apollo-tailnet/ios/ApolloTailnet.xcframework ]]; then
+  bash modules/apollo-tailnet/scripts/build-go.sh
+fi
 if [[ "${1:-}" == "--prebuild" || ! -d ios ]]; then
   CI=1 npx expo prebuild -p ios --no-install
   (cd ios && pod install)
@@ -29,11 +50,16 @@ echo "▸ Build $BUILD"
 
 xcodebuild -workspace ios/Apollo.xcworkspace -scheme Apollo -configuration Release \
   -destination "generic/platform=iOS" -archivePath "$OUT/Apollo.xcarchive" \
-  DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="Apple Distribution" \
-  PROVISIONING_PROFILE_SPECIFIER="$PROFILE" archive | tail -3
+  DEVELOPMENT_TEAM="$TEAM" CODE_SIGNING_ALLOWED=NO CURRENT_PROJECT_VERSION="$BUILD" \
+  archive | grep -E "^\*\* ARCHIVE| error: " | tail -8
 
-codesign -d --entitlements - "$OUT/Apollo.xcarchive/Products/Applications/Apollo.app" 2>/dev/null | grep -q aps-environment \
-  || { echo "The archive has no push entitlement: is the profile right?" >&2; exit 1; }
+APP="$OUT/Apollo.xcarchive/Products/Applications/Apollo.app"
+[[ -d "$APP/PlugIns/NotificationService.appex" ]] \
+  || { echo "The archive has no notification service extension: run with --prebuild" >&2; exit 1; }
+codesign -f -s - --entitlements ios/NotificationService/NotificationService.entitlements "$APP/PlugIns/NotificationService.appex"
+codesign -f -s - --entitlements ios/Apollo/Apollo.entitlements "$APP"
+codesign -d --entitlements - "$APP" 2>/dev/null | grep -q aps-environment \
+  || { echo "The archive has no push entitlement: check ios/Apollo/Apollo.entitlements" >&2; exit 1; }
 
 cat > "$OUT/ExportOptions.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -42,16 +68,14 @@ cat > "$OUT/ExportOptions.plist" <<PLIST
   <key>method</key><string>app-store-connect</string>
   <key>destination</key><string>upload</string>
   <key>teamID</key><string>$TEAM</string>
-  <key>signingStyle</key><string>manual</string>
-  <key>signingCertificate</key><string>Apple Distribution</string>
-  <key>provisioningProfiles</key><dict><key>$BUNDLE</key><string>$PROFILE</string></dict>
+  <key>signingStyle</key><string>automatic</string>
   <key>uploadSymbols</key><true/>
   <key>manageAppVersionAndBuildNumber</key><false/>
 </dict></plist>
 PLIST
 
-echo "▸ Uploading"
+echo "▸ Uploading (with $([[ ${#AUTH[@]} -gt 0 ]] && echo "the App Store Connect API key" || echo "the Xcode account"))"
 xcodebuild -exportArchive -archivePath "$OUT/Apollo.xcarchive" -exportOptionsPlist "$OUT/ExportOptions.plist" \
-  -exportPath "$OUT/export" -allowProvisioningUpdates 2>&1 | grep -E "Uploaded|EXPORT|error:" | grep -v "Upload Symbols"
+  -exportPath "$OUT/export" -allowProvisioningUpdates ${AUTH[@]+"${AUTH[@]}"} 2>&1 | grep -E "Uploaded|EXPORT|error:" | grep -v "Upload Symbols"
 rm -rf "$OUT"
 echo "✓ Build $BUILD uploaded. TestFlight shows it after Apple processes it (usually 10–30 minutes)."

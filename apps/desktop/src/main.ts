@@ -21,6 +21,7 @@ const layout = app.isPackaged
       serverEntry: join(process.resourcesPath, "server", "server.mjs"),
       webDist: join(process.resourcesPath, "web"),
       trayDir: join(process.resourcesPath, "tray"),
+      tailnetAddon: join(process.resourcesPath, "native", "apollo_tailnet.node"),
       appIcon: null,
       cwd: homedir(),
     }
@@ -28,6 +29,8 @@ const layout = app.isPackaged
       serverEntry: join(repoRoot, "apps/server/src/bin.ts"),
       webDist: join(repoRoot, "apps/web/dist"),
       trayDir: join(repoRoot, "apps/desktop/resources/tray"),
+      // Built by apps/server/native/tailnet/build.sh.
+      tailnetAddon: join(repoRoot, "apps/server/native/tailnet/build/apollo_tailnet.node"),
       // Installers embed the icon; a development run sets it on the window and dock.
       appIcon: join(repoRoot, "apps/desktop/resources/icon.png"),
       cwd: repoRoot,
@@ -154,6 +157,7 @@ const startServer = async (): Promise<string> => {
       APOLLO_DESKTOP_BOOTSTRAP_TOKEN: bootstrapToken,
       APOLLO_PORT: String(port),
       APOLLO_HOST: "127.0.0.1",
+      APOLLO_TAILNET_ADDON: process.env.APOLLO_TAILNET_ADDON ?? layout.tailnetAddon,
       ...(devUrl
         ? { APOLLO_ALLOWED_ORIGINS: new URL(devUrl).origin }
         : { APOLLO_WEB_DIST: layout.webDist }),

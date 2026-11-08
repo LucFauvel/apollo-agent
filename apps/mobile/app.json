@@ -9,7 +9,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "dev.ocx64.apollo.mobile",
-      "buildNumber": "202611061627",
+      "buildNumber": "202611071919",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
         "NSMicrophoneUsageDescription": "Apollo listens when you dictate or talk with your bot.",
@@ -52,6 +52,12 @@
         {
           "microphonePermission": "Apollo listens when you dictate or talk with your bot.",
           "speechRecognitionPermission": "Apollo turns your speech into text, on this iPhone when it can."
+        }
+      ],
+      [
+        "./plugins/with-notification-service.js",
+        {
+          "teamId": "XA3R5NAN2C"
         }
       ]
     ],

@@ -5,13 +5,16 @@ import { StatusBar } from "expo-status-bar";
 import { useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, AppState, StyleSheet, View } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
-import { AppStateProvider } from "./src/AppState.tsx";
+import { AppStateProvider, useApollo } from "./src/AppState.tsx";
+import { useAvatarImages } from "./src/avatars.ts";
 import {
   connect,
   forgetPairing,
   loadPairing,
   type Pairing,
   parsePairingCode,
+  prepareRoute,
+  type Route,
 } from "./src/connection.ts";
 import { ChatScreen } from "./src/screens/ChatScreen.tsx";
 import { HomeScreen } from "./src/screens/HomeScreen.tsx";
@@ -62,10 +65,30 @@ export default function App() {
     return () => sub.remove();
   }, []);
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  // The route (the app's own tailnet relay) and a first signed proof take a moment.
+  const [route, setRoute] = useState<{ readonly pairing: Pairing; readonly route: Route } | null>(null);
+  useEffect(() => {
+    if (!pairing) return setRoute(null);
+    let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    prepareRoute(pairing).then(
+      (next) => {
+        if (cancelled) next.proofs.dispose();
+        else setRoute({ pairing, route: next });
+      },
+      // The app's Tailscale node is still starting (or briefly offline): try again shortly.
+      () => {
+        if (!cancelled) retry = setTimeout(() => setGeneration((g) => g + 1), 2000);
+      },
+    );
+    return () => {
+      cancelled = true;
+      if (retry) clearTimeout(retry);
+    };
+  }, [pairing, generation]);
   const connection = useMemo(
-    () => (pairing ? connect(pairing) : null),
-    [pairing, generation],
+    () => (pairing && route?.pairing === pairing ? connect(pairing, route.route) : null),
+    [pairing, route],
   );
   useEffect(() => () => void connection?.dispose(), [connection]);
 
@@ -80,7 +103,7 @@ export default function App() {
     <SafeAreaProvider>
       <StatusBar style="light" />
       <SafeAreaView style={styles.root} edges={["top", "bottom"]}>
-        {pairing === undefined ? (
+        {pairing === undefined || (pairing && !connection && !linkCode) ? (
           <View style={styles.center}>
             <ActivityIndicator color={colors.muted} />
           </View>
@@ -94,6 +117,7 @@ export default function App() {
           />
         ) : (
           <AppStateProvider connection={connection}>
+            <AvatarSync pairing={pairing} />
             {open ? (
               <SwipeBack key={open} onBack={() => setOpen(null)}>
                 <ChatScreen sessionId={open} onBack={() => setOpen(null)} />
@@ -125,3 +149,10 @@ const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.bg },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 });
+
+/** Keeps the bots' avatar images on this phone, for notifications. */
+function AvatarSync({ pairing }: { pairing: Pairing }) {
+  const { state } = useApollo();
+  useAvatarImages(pairing, state.bots, state.connected);
+  return null;
+}

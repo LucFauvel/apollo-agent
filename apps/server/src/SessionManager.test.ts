@@ -129,6 +129,7 @@ const layerWith = (budgetBytes: number) => SessionManager.layer.pipe(
       browser: { executable: undefined, headless: true },
       llamaCpp: { baseUrl: "http://127.0.0.1:8080", apiKey: null },
       codexExecutable: undefined,
+    tailnetAddon: undefined,
       allowedOrigins: [],
       publicUrl: "http://127.0.0.1:0",
       desktopBootstrapToken: undefined,
@@ -188,7 +189,13 @@ describe("SessionManager", () => {
       yield* Effect.sleep("50 millis");
 
       expect(pushed.map((m) => m.to).sort()).toEqual(["ExponentPushToken[gone]", "ExponentPushToken[live]"]);
-      expect(pushed[0]).toMatchObject({ title: "Atlas", body: "echo: ship it", data: { sessionId: bot.mainSessionId, kind: "done" } });
+      expect(pushed[0]).toMatchObject({
+        title: "Atlas",
+        body: "echo: ship it",
+        // The bot's avatar travels with it, for the phone to show as the sender.
+        data: { sessionId: bot.mainSessionId, kind: "done", botId: bot.id, avatar: bot.avatar },
+        mutableContent: true,
+      });
       expect(tokens.active()).toEqual(["ExponentPushToken[live]"]);
       // The desktop app polls the same notifications.
       const notices = (yield* Push.Notices).since(0);

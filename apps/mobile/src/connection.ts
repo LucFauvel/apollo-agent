@@ -10,54 +10,118 @@ import { RpcClient, RpcSerialization } from "effect/rpc";
 import * as Socket from "effect/socket/Socket";
 import * as SecureStore from "expo-secure-store";
 import { Platform } from "react-native";
+import { devicePublicKey, makeProofPool, proofFor, routeTo, type ServerPin } from "./tailnet.ts";
 
-/** Where this phone is paired: the Apollo server (over Tailscale) and its session token. */
+/**
+ * Where this phone is paired: the Apollo server's tailnet URL, its session token, and the
+ * computer's tailnet identity (from the QR code), which the app's own tailnet node checks.
+ */
 export interface Pairing {
   readonly server: string;
   readonly token: string;
+  readonly pin: ServerPin | null;
 }
 
 const SERVER_KEY = "apollo.server";
 const TOKEN_KEY = "apollo.token";
+const PIN_KEY = "apollo.pin";
 
 export const loadPairing = async (): Promise<Pairing | null> => {
-  const [server, token] = await Promise.all([SecureStore.getItemAsync(SERVER_KEY), SecureStore.getItemAsync(TOKEN_KEY)]);
-  return server && token ? { server, token } : null;
+  const [server, token, pin] = await Promise.all([
+    SecureStore.getItemAsync(SERVER_KEY),
+    SecureStore.getItemAsync(TOKEN_KEY),
+    SecureStore.getItemAsync(PIN_KEY),
+  ]);
+  return server && token ? { server, token, pin: pin ? (JSON.parse(pin) as ServerPin) : null } : null;
 };
 
-export const forgetPairing = () => Promise.all([SecureStore.deleteItemAsync(SERVER_KEY), SecureStore.deleteItemAsync(TOKEN_KEY)]);
+export const forgetPairing = () =>
+  Promise.all([SecureStore.deleteItemAsync(SERVER_KEY), SecureStore.deleteItemAsync(TOKEN_KEY), SecureStore.deleteItemAsync(PIN_KEY)]);
 
-/** `apollo://pair?server=<url>&token=<one-time token>` (the QR code on the computer). */
-export const parsePairingCode = (text: string): { server: string; token: string } | null => {
+export interface PairingCode {
+  readonly server: string;
+  readonly token: string;
+  readonly pin: ServerPin | null;
+}
+
+/** `apollo://pair?server=<url>&token=<one-time token>&node=<StableID>&user=<user ID>` (the QR code on the computer). */
+export const parsePairingCode = (text: string): PairingCode | null => {
   try {
     const url = new URL(text.trim());
     if (url.protocol !== "apollo:") return null;
     const server = url.searchParams.get("server");
     const token = url.searchParams.get("token");
     if (!server || !token || !/^https?:\/\//.test(server)) return null;
-    return { server: server.replace(/\/+$/, ""), token };
+    const nodeId = url.searchParams.get("node");
+    const userId = url.searchParams.get("user");
+    return { server: server.replace(/\/+$/, ""), token, pin: nodeId && userId ? { nodeId, userId } : null };
   } catch {
     return null;
   }
 };
 
-/** Trades the one-time pairing token for a long-lived session token, and stores it securely. */
-export const pair = async (server: string, pairingToken: string): Promise<Pairing> => {
-  const response = await fetch(`${server}/api/auth/pair`, {
+/**
+ * Trades the one-time pairing token for a long-lived session token, and stores it securely.
+ * The request registers this phone's device key, signed with it, and waits until someone
+ * allows the phone on the computer.
+ */
+export const pair = async (code: PairingCode): Promise<Pairing> => {
+  const { server, pin } = code;
+  const base = await routeTo(server, pin);
+  const deviceKey = await devicePublicKey();
+  const proof = deviceKey ? await proofFor("POST", "/api/auth/pair") : null;
+  const response = await fetch(`${base}/api/auth/pair`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(proof ? { "x-apollo-proof": proof } : {}) },
     body: JSON.stringify({
-      token: pairingToken,
+      token: code.token,
       label: `${Platform.OS === "ios" ? "iPhone" : "Android phone"} (Apollo app)`,
       bearer: true,
+      ...(deviceKey ? { deviceKey } : {}),
     }),
   }).catch(() => {
-    throw new Error(`Could not reach ${server}. Is Tailscale on, on this phone and on the computer?`);
+    throw new Error(
+      base === server
+        ? `Could not reach ${server}. Sign in to Tailscale in Apollo (or turn on the Tailscale app), and check the computer is online.`
+        : `Could not reach the computer over Tailscale. Is it online, with Apollo running?`,
+    );
   });
   const body = (await response.json().catch(() => ({}))) as { sessionToken?: string | null; error?: string };
   if (!response.ok || !body.sessionToken) throw new Error(body.error ?? `Pairing failed (${response.status})`);
-  await Promise.all([SecureStore.setItemAsync(SERVER_KEY, server), SecureStore.setItemAsync(TOKEN_KEY, body.sessionToken)]);
-  return { server, token: body.sessionToken };
+  await Promise.all([
+    SecureStore.setItemAsync(SERVER_KEY, server),
+    SecureStore.setItemAsync(TOKEN_KEY, body.sessionToken),
+    pin ? SecureStore.setItemAsync(PIN_KEY, JSON.stringify(pin)) : SecureStore.deleteItemAsync(PIN_KEY),
+  ]);
+  return { server, token: body.sessionToken, pin };
+};
+
+/** An authenticated, signed HTTP request to Apollo (`path` starts with `/api/`). */
+export const apiFetch = async (pairing: Pairing, path: string, init: { method: string; headers?: Record<string, string>; body?: string }) => {
+  const base = await routeTo(pairing.server, pairing.pin);
+  const proof = await proofFor(init.method, path);
+  return fetch(`${base}${path}`, {
+    ...init,
+    headers: {
+      ...init.headers,
+      authorization: `Bearer ${pairing.token}`,
+      ...(proof ? { "x-apollo-proof": proof } : {}),
+    },
+  });
+};
+
+/** What `connect` needs that takes a moment: the route (the app's tailnet relay) and a signed proof. */
+export interface Route {
+  readonly base: string;
+  readonly proofs: ReturnType<typeof makeProofPool>;
+}
+
+export const prepareRoute = async (pairing: Pairing): Promise<Route> => {
+  // No fallback to the plain URL: routeTo refuses anything but the pinned computer.
+  const base = await routeTo(pairing.server, pairing.pin);
+  const proofs = makeProofPool("GET", "/rpc");
+  await proofs.fill();
+  return { base, proofs };
 };
 
 const makeClient = RpcClient.make(ApolloRpcs);
@@ -65,15 +129,18 @@ export type ApolloClient = Effect.Success<typeof makeClient>;
 class Client extends Context.Service<Client, ApolloClient>()("apollo/mobile/Client") {}
 
 /**
- * The typed RPC connection to Apollo, over a WebSocket that carries the session token.
- * React Native's WebSocket takes headers as a third argument (browsers' cannot).
+ * The typed RPC connection to Apollo, over a WebSocket that carries the session token and
+ * a device-key proof. React Native's WebSocket takes headers as a third argument
+ * (browsers' cannot).
  */
-export const connect = (pairing: Pairing) => {
-  const url = `${pairing.server.replace(/^http/, "ws")}/rpc`;
-  const WebSocketWithAuth = (wsUrl: string) =>
-    new (WebSocket as unknown as new (u: string, p: undefined, o: { headers: Record<string, string> }) => WebSocket)(wsUrl, undefined, {
-      headers: { Authorization: `Bearer ${pairing.token}` },
+export const connect = (pairing: Pairing, route: Route) => {
+  const url = `${route.base.replace(/^http/, "ws")}/rpc`;
+  const WebSocketWithAuth = (wsUrl: string) => {
+    const proof = route.proofs.take();
+    return new (WebSocket as unknown as new (u: string, p: undefined, o: { headers: Record<string, string> }) => WebSocket)(wsUrl, undefined, {
+      headers: { Authorization: `Bearer ${pairing.token}`, ...(proof ? { "x-apollo-proof": proof } : {}) },
     }) as unknown as Socket.WebSocketLike;
+  };
   const layer = Layer.effect(Client, makeClient).pipe(
     Layer.provide(
       // Phones lose the route often (Tailscale waking up, Wi-Fi to cellular): give up on a
@@ -105,7 +172,14 @@ export const connect = (pairing: Pairing) => {
     return () => void runtime.runFork(Fiber.interrupt(fiber));
   };
 
-  return { rpc, follow, dispose: () => runtime.dispose() };
+  return {
+    rpc,
+    follow,
+    dispose: () => {
+      route.proofs.dispose();
+      return runtime.dispose();
+    },
+  };
 };
 
 export type Connection = ReturnType<typeof connect>;

@@ -1,3 +1,4 @@
+import * as AvatarImages from "./AvatarImages.ts";
 import { createServer } from "node:http";
 import { ApolloRpcs } from "@apollo/contracts";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
@@ -45,7 +46,7 @@ const layerWeb = Layer.unwrap(
   ),
 );
 
-const layerRoutes = Layer.mergeAll(layerRpc, ApolloMcp.layer, layerHealth, layerWeb, AuthHttp.layer, DesktopStatus.layer, Files.layer, Push.layerRoutes);
+const layerRoutes = Layer.mergeAll(layerRpc, ApolloMcp.layer, layerHealth, layerWeb, AuthHttp.layer, DesktopStatus.layer, Files.layer, Push.layerRoutes, AvatarImages.layer);
 
 const layerHttpServer = Layer.unwrap(
   Effect.map(Config.ServerConfig, (config) =>

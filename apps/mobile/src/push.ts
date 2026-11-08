@@ -3,7 +3,7 @@ import Constants from "expo-constants";
 import * as Notifications from "expo-notifications";
 import * as SecureStore from "expo-secure-store";
 import { Platform } from "react-native";
-import type { Pairing } from "./connection.ts";
+import { apiFetch, type Pairing } from "./connection.ts";
 
 /**
  * Push notifications from Apollo (a turn finished, an approval, a question, a secret).
@@ -64,9 +64,9 @@ export const registerForPush = async (pairing: Pairing): Promise<void> => {
     const id = projectId();
     if (!id) throw new Error("this build has no EAS project id");
     const { data: token } = await Notifications.getExpoPushTokenAsync({ projectId: id });
-    const response = await fetch(`${pairing.server}/api/push/register`, {
+    const response = await apiFetch(pairing, "/api/push/register", {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${pairing.token}` },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ token, platform: Platform.OS === "ios" ? "ios" : "android" }),
     });
     if (!response.ok) {
@@ -85,9 +85,9 @@ export const unregisterPush = async (pairing: Pairing): Promise<void> => {
   try {
     const token = await SecureStore.getItemAsync(PUSH_TOKEN_KEY);
     if (!token) return;
-    await fetch(`${pairing.server}/api/push/unregister`, {
+    await apiFetch(pairing, "/api/push/unregister", {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${pairing.token}` },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify({ token }),
     });
     await SecureStore.deleteItemAsync(PUSH_TOKEN_KEY);
@@ -98,10 +98,7 @@ export const unregisterPush = async (pairing: Pairing): Promise<void> => {
 
 /** Asks Apollo to send a test notification to this phone (and the computer). */
 export const sendTestNotification = async (pairing: Pairing) => {
-  const response = await fetch(`${pairing.server}/api/notifications/test`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${pairing.token}` },
-  });
+  const response = await apiFetch(pairing, "/api/notifications/test", { method: "POST" });
   if (!response.ok) throw new Error(`Apollo refused the test (${response.status})`);
 };
 

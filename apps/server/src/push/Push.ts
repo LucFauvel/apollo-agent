@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { AgentEvent, Bot, Session, SessionId } from "@apollo/contracts";
+import type { AgentEvent, Bot, BotAvatar, BotId, Session, SessionId } from "@apollo/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -23,9 +23,17 @@ export interface PushMessage {
   readonly to: string;
   readonly title: string;
   readonly body: string;
-  readonly data: { readonly sessionId: SessionId | null; readonly kind: string };
+  readonly data: {
+    readonly sessionId: SessionId | null;
+    readonly kind: string;
+    /** The bot it is from: the phone shows its avatar as the sender (notification service extension). */
+    readonly botId?: BotId;
+    readonly avatar?: BotAvatar;
+  };
   readonly sound: "default";
   readonly priority: "high";
+  /** Lets the phone's notification service extension restyle it before it shows. */
+  readonly mutableContent: true;
 }
 
 /** Expo's answer per message: `ok`, or an error such as `DeviceNotRegistered`. */
@@ -122,6 +130,7 @@ const deliver = (
   send: PushSender["Service"],
   note: { kind: string; title: string; body: string },
   sessionId: SessionId | null,
+  bot: Pick<Bot, "id" | "avatar"> | undefined,
 ) =>
   Effect.gen(function* () {
     const to = tokens.active();
@@ -131,9 +140,10 @@ const deliver = (
         to: token,
         title: note.title,
         body: note.body,
-        data: { sessionId, kind: note.kind },
+        data: { sessionId, kind: note.kind, ...(bot ? { botId: bot.id, avatar: bot.avatar } : {}) },
         sound: "default",
         priority: "high",
+        mutableContent: true,
       }),
     );
     const tickets = yield* Effect.tryPromise(() => send(messages));
@@ -190,7 +200,7 @@ export const layerWatcher = Layer.effectDiscard(
           if (event._tag === "TurnCompleted") lastReply.delete(sessionId);
           if (note) {
             notices.record({ ...note, sessionId });
-            yield* Effect.forkDetach(deliver(tokens, send, note, sessionId));
+            yield* Effect.forkDetach(deliver(tokens, send, note, sessionId, bot._tag === "Some" ? bot.value : undefined));
           }
         }).pipe(Effect.ignore),
       ),
@@ -203,7 +213,13 @@ export const layerWatcher = Layer.effectDiscard(
           if (change._tag !== "Notify") return;
           const note = { kind: "notify", title: change.title, body: plain(change.body) };
           notices.record({ ...note, sessionId: change.sessionId ?? "" });
-          yield* Effect.forkDetach(deliver(tokens, send, note, change.sessionId ?? null));
+          const bot = change.sessionId
+            ? yield* store.getSession(change.sessionId).pipe(
+                Effect.flatMap((session) => store.getBot(session.botId)),
+                Effect.option,
+              )
+            : undefined;
+          yield* Effect.forkDetach(deliver(tokens, send, note, change.sessionId ?? null, bot?._tag === "Some" ? bot.value : undefined));
         }),
       ),
       Effect.forkScoped,
@@ -227,10 +243,13 @@ export const layerRoutes = Layer.mergeAll(
       const notices = yield* Notices;
       const send = yield* PushSender;
       const tokens = makePushTokens(yield* Database);
-      const note = { kind: "test", title: "Apollo", body: "Notifications work. You'll hear from your bots here." };
+      // Shown as if from your first bot, so the test looks like the real thing.
+      const store = yield* Store;
+      const bot = (yield* store.listBots)[0];
+      const note = { kind: "test", title: bot?.name ?? "Apollo", body: "Notifications work. You'll hear from your bots here." };
       notices.record({ ...note, sessionId: "" });
       const phones = tokens.active().length;
-      yield* deliver(tokens, send, note, null);
+      yield* deliver(tokens, send, note, null, bot);
       return HttpServerResponse.jsonUnsafe({ ok: true, phones });
     }),
   ),

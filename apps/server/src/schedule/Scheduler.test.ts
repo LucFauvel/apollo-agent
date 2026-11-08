@@ -74,6 +74,7 @@ const layer = Scheduler.layerWith({ tickEvery: null, taskTimeout: "5 seconds", h
       browser: { executable: undefined, headless: true },
       llamaCpp: { baseUrl: "http://127.0.0.1:8080", apiKey: null },
       codexExecutable: undefined,
+    tailnetAddon: undefined,
       allowedOrigins: [],
       publicUrl: "http://127.0.0.1:0",
       desktopBootstrapToken: undefined,

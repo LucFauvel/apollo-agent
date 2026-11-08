@@ -489,6 +489,10 @@ export const PairedClient = Schema.Struct({
   createdAt: Timestamp,
   expiresAt: Timestamp,
   lastSeenAt: Timestamp,
+  /** The tailnet device this client is bound to (it may only connect from there), if any. */
+  nodeName: Schema.NullOr(Schema.String),
+  /** Every request must be signed by a key that never leaves the device (Secure Enclave). */
+  deviceKey: Schema.Boolean,
 });
 export type PairedClient = typeof PairedClient.Type;
 
@@ -513,6 +517,11 @@ export const PairRequest = Schema.Struct({
   label: Schema.String,
   /** Return the session token in the body (CLI clients) instead of only setting a cookie. */
   bearer: Schema.optional(Schema.Boolean),
+  /**
+   * The device's public key (base64url of an uncompressed P-256 point). When present, the
+   * request must carry an `x-apollo-proof` signed by it, and so must every later request.
+   */
+  deviceKey: Schema.optional(Schema.String),
 });
 export type PairRequest = typeof PairRequest.Type;
 
@@ -521,6 +530,30 @@ export const PairResponse = Schema.Struct({
   sessionToken: Schema.NullOr(Schema.String),
 });
 export type PairResponse = typeof PairResponse.Type;
+
+/**
+ * A device on the user's tailnet asking to pair. It gets in only once someone at the
+ * computer allows it (`GET /api/auth/pairing/pending`, `POST /api/auth/pairing/decide`).
+ */
+export const PendingPairing = Schema.Struct({
+  id: Schema.String,
+  /** The name the device gave itself. */
+  label: Schema.String,
+  /** Verified by Tailscale: the device's tailnet name, OS and signed-in account. */
+  nodeName: Schema.String,
+  os: Schema.String,
+  loginName: Schema.String,
+  deviceKey: Schema.Boolean,
+  expiresAt: Timestamp,
+});
+export type PendingPairing = typeof PendingPairing.Type;
+
+export const PairingDecision = Schema.Struct({ id: Schema.String, approve: Schema.Boolean });
+export type PairingDecision = typeof PairingDecision.Type;
+
+/** Message a device key signs for `x-apollo-proof: <timestamp ms>.<nonce>.<base64url DER signature>`. */
+export const deviceProofMessage = (method: string, path: string, timestamp: string, nonce: string) =>
+  `apollo-proof-v1\n${method.toUpperCase()}\n${path}\n${timestamp}\n${nonce}`;
 
 // ---------------------------------------------------------------------------
 // Provider settings
