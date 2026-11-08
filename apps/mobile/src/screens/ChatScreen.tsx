@@ -910,7 +910,9 @@ function SecretCard({ item, onSecret }: { item: Extract<TranscriptItem, { kind: 
           // AutoFill > Passwords in the edit menu, iOS 18+) opens the AutoFill
           // provider (1Password, Keychain) to search and pick any item. The value
           // arrives through onChangeText like typed text. The app has no associated
-          // domains, so iOS never offers to save what was entered.
+          // domains, so no automatic save is expected from iOS itself; a third-party
+          // provider (e.g. 1Password's Always Allow) may still offer to save or link
+          // the item.
           textContentType="password"
           autoComplete="current-password"
           value={value}
