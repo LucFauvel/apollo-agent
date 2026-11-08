@@ -220,25 +220,36 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
     );
 
   /**
-   * The session's turns with changes, by whether the user cleared them (`changes.dismiss`
-   * on their FilesChanged event): `shown` and `cleared` are those events' seqs, `hidden` the
-   * cleared turns' own seqs (what turn_changes and change_notes are keyed by).
+   * The session's turns that put anything in the panel (changed files, a summary, notes), by
+   * whether the user cleared them. `dismissed_changes` holds event seqs, one of:
+   *
+   * - a turn's TurnStarted seq: the panel cleared that turn (whatever it has, files or not);
+   * - a turn's FilesChanged seq: an older client cleared its card, which clears the turn too;
+   * - a full diff's FilesChanged seq: an older client cleared that card; no panel effect.
+   *
+   * `shown` are the shown turns' seqs (what the panel clears); `cleared`, one seq per cleared
+   * turn, the one to bring it back with (its TurnStarted seq when that is dismissed); `hidden`
+   * the cleared turns' seqs (what turn_changes and change_notes are keyed by).
    */
   const clearedTurns = (sessionId: string) => {
     const dismissed = new Set(dismissedSeqs(sessionId));
     const shown: Array<number> = [];
     const cleared: Array<number> = [];
     const hidden = new Set<number>();
-    const turnSeqs = db.prepare("select distinct turn_seq from turn_changes where session_id = ? order by turn_seq").all(sessionId) as Array<{
-      turn_seq: number;
-    }>;
-    for (const { turn_seq } of turnSeqs) {
-      const seq = filesEventOf(sessionId, Number(turn_seq));
-      if (seq === null) continue;
-      if (dismissed.has(seq)) {
-        cleared.push(seq);
-        hidden.add(Number(turn_seq));
-      } else shown.push(seq);
+    const turnSeqs = db
+      .prepare(
+        `select turn_seq from turn_changes where session_id = ?
+         union select turn_seq from change_notes where session_id = ?
+         order by turn_seq`,
+      )
+      .all(sessionId, sessionId) as Array<{ turn_seq: number }>;
+    for (const row of turnSeqs) {
+      const turn = Number(row.turn_seq);
+      const files = dismissed.has(turn) ? null : filesEventOf(sessionId, turn);
+      if (dismissed.has(turn) || (files !== null && dismissed.has(files))) {
+        cleared.push(dismissed.has(turn) ? turn : files!);
+        hidden.add(turn);
+      } else shown.push(turn);
     }
     return { shown, cleared, hidden };
   };
@@ -254,7 +265,8 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
 
   /**
    * First snapshot to latest, per repository, leaving out `hidden` turns: a cleared turn
-   * between shown ones splits a repository's span in two, oldest first (one span otherwise).
+   * between shown ones splits a repository's span in two, oldest first (one span otherwise;
+   * `composeFiles` puts them together).
    */
   const spans = (sessionId: string, hidden: ReadonlySet<number> = new Set()) => {
     const byRepo = new Map<string, Array<Span>>();
@@ -298,21 +310,57 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
     return files;
   };
 
+  /** A file of the panel: how it shows (`file`), and the span and entry its diff is read from. */
+  type Composed = { file: ChangedFile; span: Span; changed: ChangedFile };
+
   /**
-   * A repository's changed files over its spans. With several (a cleared turn in between),
-   * a file changed in more than one shows as of its latest span: what the cleared turn did
-   * to it is never shown.
+   * A repository's changed files over its spans, by path. With several spans (a cleared turn
+   * in between), each file's entries are composed oldest first, following it by identity:
+   * a rename moves it (its old path is gone), added then deleted is nothing, added then
+   * renamed or modified stays added, deleted then added is modified, renamed then deleted is
+   * its original path deleted. Its counts and diff are of the latest span that touched it.
+   *
+   * This keeps the cleared turn's entries out (rows, notes, summaries), not every line it
+   * wrote: a diff over a later span shows what that span changed, so a line the cleared turn
+   * wrote shows there as deleted (a later turn deleting it) or as context (a later turn
+   * editing next to it). Hiding those would mean misstating what the shown turns did.
    */
-  const repoFiles = async (list: ReadonlyArray<Span>) => {
-    const files = new Map<string, ChangedFile>();
-    for (const span of list) for (const f of await spanFiles(span)) files.set(f.path, f);
-    return [...files.values()].sort((a, b) => a.path.localeCompare(b.path));
+  const composeFiles = async (list: ReadonlyArray<Span>): Promise<Map<string, Composed>> => {
+    const files = new Map<string, Composed>();
+    for (const span of list) {
+      for (const changed of await spanFiles(span)) {
+        const set = (file: ChangedFile) => files.set(file.path, { file, span, changed });
+        if (changed.status === "renamed" && changed.oldPath !== null) {
+          const before = files.get(changed.oldPath)?.file;
+          files.delete(changed.oldPath);
+          if (before?.status === "added") set({ ...changed, status: "added", oldPath: null });
+          else if (before?.status === "renamed") set({ ...changed, oldPath: before.oldPath });
+          else set(changed);
+        } else if (changed.status === "deleted") {
+          const before = files.get(changed.path)?.file;
+          files.delete(changed.path);
+          if (before?.status === "added") continue;
+          if (before?.status === "renamed" && before.oldPath !== null) set({ ...changed, path: before.oldPath, oldPath: null });
+          else set(changed);
+        } else if (changed.status === "added") {
+          set(files.get(changed.path)?.file.status === "deleted" ? { ...changed, status: "modified" } : changed);
+        } else {
+          const before = files.get(changed.path)?.file;
+          set(before?.status === "added" || before?.status === "renamed" ? { ...changed, status: before.status, oldPath: before.oldPath } : changed);
+        }
+      }
+    }
+    return files;
   };
+
+  const repoFiles = async (list: ReadonlyArray<Span>) =>
+    [...(await composeFiles(list)).values()].map((c) => c.file).sort((a, b) => a.path.localeCompare(b.path));
 
   /**
    * What a session changed, as the Changes panel shows it: without the turns the user
-   * cleared from it (their files, notes and summaries), which are listed in `cleared` to be
-   * brought back. `section` is null when there is nothing left to show.
+   * cleared from it (their file rows, notes and summaries), which are listed in `cleared` to
+   * be brought back. `section.turns` lists every turn with anything in it, so clearing them
+   * all leaves nothing: `section` is null then, and whenever there is nothing to show.
    */
   const sessionChanges = async (sessionId: string, title: string): Promise<{ section: SessionChanges | null; cleared: Array<number> }> => {
     const { shown, cleared, hidden } = clearedTurns(sessionId);
@@ -390,17 +438,16 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
   };
 
   /**
-   * One file of a session's overall changes (without the turns cleared from the panel), as a
-   * semantic diff with the worker's notes: over the latest span that changed it.
+   * One file the panel lists for a session (without the turns cleared from it; see
+   * `composeFiles`), as a semantic diff with the worker's notes: over the latest span that
+   * touched it. A path the panel does not list (a rename moved it, say) has none.
    */
   const file = async (sessionId: string, repo: string, path: string): Promise<SemanticFileDiff | null> => {
     const { hidden } = clearedTurns(sessionId);
-    for (const span of [...(spans(sessionId, hidden).get(repo) ?? [])].reverse()) {
-      const files = await diffFiles(span.gitDir, span.before, span.after).catch(() => mergedFiles(span.rows));
-      const changed = files.find((f) => f.path === path);
-      if (changed) return semanticFile(span.gitDir, span.before, span.after, changed, notesOfFile(latestNotes(sessionId, hidden), repo, path));
-    }
-    return null;
+    const entry = (await composeFiles(spans(sessionId, hidden).get(repo) ?? [])).get(path);
+    if (!entry) return null;
+    const { span, changed } = entry;
+    return semanticFile(span.gitDir, span.before, span.after, changed, notesOfFile(latestNotes(sessionId, hidden), repo, path));
   };
 
   // --- the full diff of a repository against its baseline (asked for by the user) --------
@@ -485,7 +532,12 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
 
   // --- the conversation's changes cards ------------------------------------------
 
-  /** The summary of each turn (newest first), and the cards the user cleared. */
+  /**
+   * The summary of each turn (newest first), and every dismissed seq. Only older clients use
+   * `dismissed` (they hide the cards whose FilesChanged seq is listed; the panel now clears by
+   * TurnStarted seq, which matches no card). Kept for them during the migration window: an
+   * older client's clear still hides that turn from every panel, which is accepted.
+   */
   const conversation = (sessionId: string): ConversationChanges => ({
     summaries: (
       db
@@ -496,12 +548,23 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
   });
 
   /**
-   * Clears the changes of the FilesChanged event at `seq` from the Changes panel, or brings
-   * them back. (Older clients also hide that event's card in the conversation.)
+   * Clears a turn from the Changes panel, or brings it back (see `clearedTurns` for what
+   * each kind of `seq` means). Bringing a turn back by its TurnStarted seq also drops an older
+   * client's clear of its FilesChanged event, so the turn is back whatever cleared it.
    */
   const setDismissed = (sessionId: string, seq: number, dismissed: boolean) => {
-    if (dismissed) db.prepare("insert or ignore into dismissed_changes (session_id, seq) values (?, ?)").run(sessionId, seq);
-    else db.prepare("delete from dismissed_changes where session_id = ? and seq = ?").run(sessionId, seq);
+    if (dismissed) {
+      db.prepare("insert or ignore into dismissed_changes (session_id, seq) values (?, ?)").run(sessionId, seq);
+      return;
+    }
+    const remove = db.prepare("delete from dismissed_changes where session_id = ? and seq = ?");
+    remove.run(sessionId, seq);
+    const event = db.prepare("select json_extract(event, '$._tag') as tag from session_events where session_id = ? and seq = ?").get(sessionId, seq) as
+      | { tag: string }
+      | undefined;
+    if (event?.tag !== "TurnStarted") return;
+    const files = filesEventOf(sessionId, seq);
+    if (files !== null) remove.run(sessionId, files);
   };
 
   return { turnStarted, toolStarted, turnCompleted, currentTurn, explain, turnNotes, sessionChanges, file, report, reportFile, conversation, setDismissed };

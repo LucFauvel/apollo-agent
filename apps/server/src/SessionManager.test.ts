@@ -750,25 +750,32 @@ describe("SessionManager", () => {
       const diff = yield* manager.changesFile(worker.id, repo, "answer.ts");
       expect(diff.symbols.map((s) => [s.name, s.change])).toEqual([["answer", "added"]]);
 
-      // The user clears the worker's turn from the Changes panel (kept server-side, for every
-      // client): its section leaves the overview, listed to be brought back; undo restores it.
+      // The user clears the worker's turn from the Changes panel, by its TurnStarted seq (kept
+      // server-side, for every client): its section leaves the overview, listed to be brought
+      // back; undo restores it. The conversation's card stays (no FilesChanged seq is listed).
       const filesChanged = events.find((e) => e.event._tag === "FilesChanged")!;
-      expect(overview.sessions[0]?.turns).toEqual([filesChanged.seq]);
+      const turnStarted = events.findLast((e) => e.event._tag === "TurnStarted" && e.seq < filesChanged.seq)!;
+      expect(overview.sessions[0]?.turns).toEqual([turnStarted.seq]);
       expect(overview.cleared).toEqual([]);
-      yield* manager.dismissChanges(worker.id, filesChanged.seq, true);
+      yield* manager.dismissChanges(worker.id, turnStarted.seq, true);
       expect(yield* manager.changesList(bot.mainSessionId)).toEqual({
         sessions: [],
-        cleared: [{ sessionId: worker.id, title: "feature", seqs: [filesChanged.seq] }],
+        cleared: [{ sessionId: worker.id, title: "feature", seqs: [turnStarted.seq] }],
       });
       expect((yield* Effect.flip(manager.changesFile(worker.id, repo, "answer.ts"))).message).toContain("not among");
-      // The worker's own view leaves it out too; the conversation still lists it (older clients hide its card).
       expect((yield* manager.changesList(worker.id)).sessions).toEqual([]);
-      expect((yield* manager.changesConversation(worker.id)).dismissed).toEqual([filesChanged.seq]);
-      yield* manager.dismissChanges(worker.id, filesChanged.seq, false);
+      expect((yield* manager.changesConversation(worker.id)).dismissed).not.toContain(filesChanged.seq);
+      yield* manager.dismissChanges(worker.id, turnStarted.seq, false);
       expect(yield* manager.changesList(bot.mainSessionId)).toMatchObject({
-        sessions: [{ sessionId: worker.id, repos: [{ files: [{ path: "answer.ts" }] }], turns: [filesChanged.seq] }],
+        sessions: [{ sessionId: worker.id, repos: [{ files: [{ path: "answer.ts" }] }], turns: [turnStarted.seq] }],
         cleared: [],
       });
+      // An older client clears the card (FilesChanged seq): the turn leaves the panel too, and
+      // is offered back by that seq.
+      yield* manager.dismissChanges(worker.id, filesChanged.seq, true);
+      expect((yield* manager.changesList(bot.mainSessionId)).cleared).toEqual([{ sessionId: worker.id, title: "feature", seqs: [filesChanged.seq] }]);
+      expect((yield* manager.changesConversation(worker.id)).dismissed).toEqual([filesChanged.seq]);
+      yield* manager.dismissChanges(worker.id, filesChanged.seq, false);
       expect((yield* manager.changesConversation(worker.id)).dismissed).toEqual([]);
       const message = events.find((e) => e.event._tag === "UserMessage")!;
       const refused = yield* manager.dismissChanges(worker.id, message.seq, true).pipe(Effect.flip);

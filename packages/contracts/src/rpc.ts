@@ -379,9 +379,11 @@ export class ApolloRpcs extends RpcGroup.make(
   /** The summaries a session's conversation shows with its turns' changes (and what was cleared). */
   Rpc.make("changes.conversation", { payload: { sessionId: SessionId }, success: ConversationChanges, error }),
   /**
-   * Clears (or brings back) the changes of the FilesChanged event at `seq` from the Changes
-   * panel (`changes.list`): its files, notes and summary. The conversation's card stays
-   * (older clients hide it).
+   * Clears (or brings back) a turn from the Changes panel (`changes.list`): its file rows,
+   * notes and summary. `seq` is the turn's TurnStarted seq (the panel), or its FilesChanged
+   * seq (older clients, clearing a card; a full diff's has no effect on the panel). Bringing a
+   * turn back by its TurnStarted seq brings it back whatever cleared it. The conversation's
+   * cards stay (older clients hide the ones cleared by FilesChanged seq).
    */
   Rpc.make("changes.dismiss", {
     payload: { sessionId: SessionId, seq: Schema.Number, dismissed: Schema.Boolean },

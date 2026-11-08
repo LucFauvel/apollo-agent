@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
@@ -103,84 +103,132 @@ describe("change tracker", () => {
   });
 
   describe("turns cleared from the Changes panel", () => {
-    /** Runs a turn as SessionManager does: TurnStarted at `seq`, then its FilesChanged event. */
+    type Setup = ReturnType<typeof setup>;
+    /**
+     * Runs a turn as SessionManager does: TurnStarted at `seq`, then (if it changed files and
+     * `noEvent` is not set, as when storing it timed out) its FilesChanged event at `seq + 5`.
+     */
     const turn = async (
-      db: ReturnType<typeof setup>["db"],
-      tracker: ReturnType<typeof setup>["tracker"],
+      { db, tracker }: Setup,
       sessionId: string,
       seq: number,
       dir: string,
       work: () => void,
-      summary?: string,
-      notes: ReadonlyArray<{ path: string; explanation: string }> = [],
+      options: { summary?: string; notes?: ReadonlyArray<{ path: string; explanation: string }>; noEvent?: boolean } = {},
     ) => {
       const event = db.prepare("insert into session_events (session_id, seq, at, event) values (?, ?, ?, ?)");
       event.run(sessionId, seq, seq, JSON.stringify({ _tag: "TurnStarted" }));
       await tracker.turnStarted(sessionId, seq, dir);
       work();
-      if (summary || notes.length) await tracker.explain(sessionId, summary ?? "", notes);
+      const notes = options.notes ?? [];
+      if (options.summary || notes.length) await tracker.explain(sessionId, options.summary ?? "", notes);
       const done = await tracker.turnCompleted(sessionId);
-      if (done?.repos.length) event.run(sessionId, seq + 5, seq + 5, JSON.stringify({ _tag: "FilesChanged", repos: done.repos }));
-      return seq + 5;
+      if (done?.repos.length && !options.noEvent) {
+        event.run(sessionId, seq + 5, seq + 5, JSON.stringify({ _tag: "FilesChanged", repos: done.repos }));
+        return seq + 5;
+      }
+      return null;
     };
     const paths = (section: { repos: ReadonlyArray<{ files: ReadonlyArray<{ path: string }> }> } | null) =>
       section?.repos.flatMap((r) => r.files.map((f) => f.path)) ?? null;
+    const write = (dir: string, name: string, text: string) => () => writeFileSync(join(dir, name), text);
 
     it("leaves cleared turns' files and summaries out, lists them, and brings them back", async () => {
-      const { db, tracker } = setup();
+      const t = setup();
+      const { db, tracker } = t;
       const app = repo("app");
-      const first = await turn(db, tracker, "p1", 10, app.dir, () => writeFileSync(join(app.dir, "a.ts"), "export const a = 1;\n"), "Adds a.");
-      const second = await turn(db, tracker, "p1", 30, app.dir, () => {
-        writeFileSync(join(app.dir, "b.ts"), "export const b = 2;\n");
-        // A full diff the user asked for during the turn (it carries a report): not the turn's changes.
-        db.prepare("insert into session_events (session_id, seq, at, event) values (?, ?, ?, ?)").run(
-          "p1",
-          32,
-          32,
-          JSON.stringify({ _tag: "FilesChanged", repos: [], report: {} }),
-        );
-      }, "Adds b.");
-      expect([first, second]).toEqual([15, 35]);
+      const first = await turn(t, "p1", 10, app.dir, write(app.dir, "a.ts", "export const a = 1;\n"), { summary: "Adds a." });
+      await turn(
+        t,
+        "p1",
+        30,
+        app.dir,
+        () => {
+          writeFileSync(join(app.dir, "b.ts"), "export const b = 2;\n");
+          // A full diff the user asked for during the turn (it carries a report): not the turn's changes.
+          db.prepare("insert into session_events (session_id, seq, at, event) values (?, ?, ?, ?)").run(
+            "p1",
+            32,
+            32,
+            JSON.stringify({ _tag: "FilesChanged", repos: [], report: {} }),
+          );
+        },
+        { summary: "Adds b." },
+      );
+      expect(first).toBe(15);
       let changes = await tracker.sessionChanges("p1", "Worker");
       expect(paths(changes.section)).toEqual(["a.ts", "b.ts"]);
-      expect(changes.section?.turns).toEqual([15, 35]);
+      // The panel clears turns by their TurnStarted seq.
+      expect(changes.section?.turns).toEqual([10, 30]);
       expect(changes.cleared).toEqual([]);
 
-      // The panel clears the first turn: only the second's file and summary are left.
-      tracker.setDismissed("p1", first, true);
+      tracker.setDismissed("p1", 10, true);
       changes = await tracker.sessionChanges("p1", "Worker");
       expect(paths(changes.section)).toEqual(["b.ts"]);
       expect(changes.section?.summaries.map((s) => s.text)).toEqual(["Adds b."]);
-      expect(changes.section?.turns).toEqual([second]);
-      expect(changes.cleared).toEqual([first]);
+      expect(changes.section?.turns).toEqual([30]);
+      expect(changes.cleared).toEqual([10]);
       expect(await tracker.file("p1", app.dir, "a.ts")).toBe(null);
       expect((await tracker.file("p1", app.dir, "b.ts"))?.status).toBe("added");
 
-      // Both cleared: nothing to show, everything to bring back.
-      tracker.setDismissed("p1", second, true);
-      changes = await tracker.sessionChanges("p1", "Worker");
-      expect(changes).toEqual({ section: null, cleared: [first, second] });
+      tracker.setDismissed("p1", 30, true);
+      expect(await tracker.sessionChanges("p1", "Worker")).toEqual({ section: null, cleared: [10, 30] });
 
-      // Undo brings them back as they were.
-      tracker.setDismissed("p1", first, false);
-      tracker.setDismissed("p1", second, false);
+      tracker.setDismissed("p1", 10, false);
+      tracker.setDismissed("p1", 30, false);
       changes = await tracker.sessionChanges("p1", "Worker");
       expect(paths(changes.section)).toEqual(["a.ts", "b.ts"]);
       expect(changes.section?.summaries.map((s) => s.text)).toEqual(["Adds b.", "Adds a."]);
       expect(changes.cleared).toEqual([]);
+
+      // An older client clears the first turn's card (its FilesChanged seq): the turn is cleared,
+      // offered back by that seq; brought back by its TurnStarted seq, both clears go.
+      tracker.setDismissed("p1", first!, true);
+      changes = await tracker.sessionChanges("p1", "Worker");
+      expect([paths(changes.section), changes.cleared]).toEqual([["b.ts"], [first]]);
+      tracker.setDismissed("p1", 10, true);
+      expect((await tracker.sessionChanges("p1", "Worker")).cleared).toEqual([10]);
+      tracker.setDismissed("p1", 10, false);
+      changes = await tracker.sessionChanges("p1", "Worker");
+      expect([paths(changes.section), changes.cleared, tracker.conversation("p1").dismissed]).toEqual([["a.ts", "b.ts"], [], []]);
       // A full diff's seq, cleared by an older client, does not touch the panel.
       tracker.setDismissed("p1", 32, true);
       expect((await tracker.sessionChanges("p1", "Worker")).cleared).toEqual([]);
     });
 
-    it("never shows what a cleared turn between shown ones did", async () => {
-      const { db, tracker } = setup();
+    it("lets every section be cleared to nothing, whatever its turns left: files, a summary only, no event", async () => {
+      const t = setup();
+      const { tracker } = t;
       const app = repo("app");
-      const write = (name: string, text: string) => () => writeFileSync(join(app.dir, name), text);
-      await turn(db, tracker, "p2", 10, app.dir, write("a.ts", "export const a = 1;\n"));
-      const middle = await turn(
-        db,
-        tracker,
+      await turn(t, "p3", 10, app.dir, write(app.dir, "a.ts", "export const a = 1;\n"));
+      // A turn that changed no file but explained itself, and one whose FilesChanged was never stored.
+      await turn(t, "p3", 20, app.dir, () => {}, { summary: "Only looked around." });
+      await turn(t, "p3", 30, app.dir, write(app.dir, "late.ts", "export const late = 1;\n"), { noEvent: true, summary: "Late." });
+      const all = [10, 20, 30];
+      expect((await tracker.sessionChanges("p3", "Worker")).section?.turns).toEqual(all);
+      // Under every combination of clears: a section shown always has turns to clear, and
+      // clearing them leaves nothing of it.
+      for (let mask = 0; mask < 1 << all.length; mask++) {
+        all.forEach((seq, i) => tracker.setDismissed("p3", seq, (mask & (1 << i)) !== 0));
+        const { section, cleared } = await tracker.sessionChanges("p3", "Worker");
+        expect(cleared).toEqual(all.filter((_, i) => mask & (1 << i)));
+        if (section === null) {
+          expect(cleared).toEqual(all);
+          continue;
+        }
+        expect(section.turns?.length).toBeGreaterThan(0);
+        for (const seq of section.turns!) tracker.setDismissed("p3", seq, true);
+        expect((await tracker.sessionChanges("p3", "Worker")).section).toBe(null);
+      }
+    });
+
+    it("never shows the entries of a cleared turn between shown ones", async () => {
+      const t = setup();
+      const { tracker } = t;
+      const app = repo("app");
+      await turn(t, "p2", 10, app.dir, write(app.dir, "a.ts", "export const a = 1;\n"));
+      await turn(
+        t,
         "p2",
         20,
         app.dir,
@@ -188,23 +236,129 @@ describe("change tracker", () => {
           writeFileSync(join(app.dir, "secret.ts"), "export const s = 1;\n");
           writeFileSync(join(app.dir, "a.ts"), "export const a = 1;\nexport const more = 2;\n");
         },
-        undefined,
-        [{ path: "a.ts", explanation: "Adds more." }],
+        { notes: [{ path: "a.ts", explanation: "Adds more." }] },
       );
-      await turn(db, tracker, "p2", 30, app.dir, write("c.ts", "export const c = 3;\n"));
-      tracker.setDismissed("p2", middle, true);
+      await turn(t, "p2", 30, app.dir, write(app.dir, "c.ts", "export const c = 3;\n"));
+      tracker.setDismissed("p2", 20, true);
       const { section } = await tracker.sessionChanges("p2", "Worker");
       expect(paths(section)).toEqual(["a.ts", "c.ts"]);
-      // a.ts as the first turn left it: the cleared turn's line is not in its diff.
-      // Nor the cleared turn's explanation of it.
+      // a.ts as the first turn left it, without the cleared turn's explanation of it.
       expect(section?.repos[0]?.files.find((f) => f.path === "a.ts")).toMatchObject({ status: "added", additions: 1, note: null });
       expect(await tracker.file("p2", app.dir, "secret.ts")).toBe(null);
       const diff = await tracker.file("p2", app.dir, "a.ts");
       expect(diff?.symbols.flatMap((s) => s.hunks.flatMap((h) => h.lines.map((l) => l.text)))).not.toContain("export const more = 2;");
       expect(diff?.note).toBe(null);
-      // Brought back, its explanation is too.
-      tracker.setDismissed("p2", middle, false);
+      tracker.setDismissed("p2", 20, false);
       expect((await tracker.sessionChanges("p2", "Worker")).section?.repos[0]?.files.find((f) => f.path === "a.ts")?.note).toBe("Adds more.");
+    });
+
+    it(
+      "follows each file by identity across a cleared turn: renames, deletions, recreations",
+      async () => {
+        const STORE = "export class Store {\n  list() {\n    return [];\n  }\n}\n";
+        const V = "export const visible = 1;\nexport const kept = 2;\nexport const also = 3;\n";
+        const cases: Array<{
+          name: string;
+          before: (dir: string) => void;
+          after: (dir: string) => void;
+          files: Array<[string, string, string | null]>;
+          gone: Array<string>;
+        }> = [
+          {
+            name: "added, then renamed",
+            before: (d) => writeFileSync(join(d, "visible.ts"), V),
+            after: (d) => renameSync(join(d, "visible.ts"), join(d, "renamed.ts")),
+            files: [["renamed.ts", "added", null]],
+            gone: ["visible.ts"],
+          },
+          {
+            name: "modified, then renamed",
+            before: (d) => writeFileSync(join(d, "store.ts"), STORE.replace("[]", "[1]")),
+            after: (d) => renameSync(join(d, "store.ts"), join(d, "repo.ts")),
+            files: [["repo.ts", "renamed", "store.ts"]],
+            gone: ["store.ts"],
+          },
+          {
+            name: "renamed, then renamed again",
+            before: (d) => renameSync(join(d, "store.ts"), join(d, "a.ts")),
+            after: (d) => renameSync(join(d, "a.ts"), join(d, "b.ts")),
+            files: [["b.ts", "renamed", "store.ts"]],
+            gone: ["a.ts", "store.ts"],
+          },
+          {
+            name: "added, then deleted",
+            before: (d) => writeFileSync(join(d, "visible.ts"), V),
+            after: (d) => rmSync(join(d, "visible.ts")),
+            files: [],
+            gone: ["visible.ts"],
+          },
+          {
+            name: "renamed, then deleted",
+            before: (d) => renameSync(join(d, "store.ts"), join(d, "a.ts")),
+            after: (d) => rmSync(join(d, "a.ts")),
+            files: [["store.ts", "deleted", null]],
+            gone: ["a.ts"],
+          },
+          {
+            name: "deleted, then recreated",
+            before: (d) => rmSync(join(d, "store.ts")),
+            after: (d) => writeFileSync(join(d, "store.ts"), "export const store = 1;\n"),
+            files: [["store.ts", "modified", null]],
+            gone: [],
+          },
+          {
+            name: "added, then modified",
+            before: (d) => writeFileSync(join(d, "visible.ts"), V),
+            after: (d) => writeFileSync(join(d, "visible.ts"), V.replace("1", "10")),
+            files: [["visible.ts", "added", null]],
+            gone: [],
+          },
+        ];
+        for (const [i, c] of cases.entries()) {
+          const t = setup();
+          const app = repo("app");
+          const id = `r${i}`;
+          await turn(t, id, 10, app.dir, () => c.before(app.dir));
+          await turn(t, id, 20, app.dir, write(app.dir, "other.ts", "export const other = 1;\n"));
+          await turn(t, id, 30, app.dir, () => c.after(app.dir));
+          t.tracker.setDismissed(id, 20, true);
+          const { section } = await t.tracker.sessionChanges(id, "Worker");
+          const files = section?.repos.flatMap((r) => r.files.map((f): [string, string, string | null] => [f.path, f.status, f.oldPath])) ?? [];
+          expect([c.name, files]).toEqual([c.name, c.files]);
+          for (const path of c.gone) expect([c.name, path, await t.tracker.file(id, app.dir, path)]).toEqual([c.name, path, null]);
+          for (const [path] of c.files) expect([c.name, path, (await t.tracker.file(id, app.dir, path)) !== null]).toEqual([c.name, path, true]);
+        }
+      },
+      GIT_HEAVY,
+    );
+
+    // Pinned: clearing a turn removes its entries (file rows, summaries, notes), not every line
+    // it wrote. A later shown turn's diff is the real before/after of that turn, so a line the
+    // cleared turn wrote shows there as deleted or as context. Intended; do not "fix".
+    it("shows a cleared turn's lines where a later shown turn deletes them or edits next to them", async () => {
+      const t = setup();
+      const { tracker } = t;
+      const app = repo("app");
+      const lines = (diff: Awaited<ReturnType<typeof tracker.file>>) => diff?.symbols.flatMap((s) => s.hunks.flatMap((h) => h.lines)) ?? [];
+      await turn(t, "p4", 10, app.dir, write(app.dir, "a.ts", "export const one = 1;\nexport const two = 2;\n"));
+      await turn(t, "p4", 20, app.dir, () => {
+        writeFileSync(join(app.dir, "secret.ts"), "export const secret = 2;\n");
+        writeFileSync(join(app.dir, "a.ts"), "export const one = 1;\nexport const cleared = 9;\nexport const two = 2;\n");
+      });
+      await turn(t, "p4", 30, app.dir, () => {
+        rmSync(join(app.dir, "secret.ts"));
+        writeFileSync(join(app.dir, "a.ts"), "export const one = 1;\nexport const cleared = 9;\nexport const two = 22;\n");
+      });
+      tracker.setDismissed("p4", 20, true);
+      const { section } = await tracker.sessionChanges("p4", "Worker");
+      // The later turn deleted the cleared turn's file: listed as its deletion, the cleared line deleted.
+      expect(section?.repos[0]?.files.map((f) => [f.path, f.status])).toEqual([
+        ["a.ts", "added"],
+        ["secret.ts", "deleted"],
+      ]);
+      expect(lines(await tracker.file("p4", app.dir, "secret.ts"))).toContainEqual(expect.objectContaining({ kind: "del", text: "export const secret = 2;" }));
+      // It edited next to the cleared turn's line: that line is its context.
+      expect(lines(await tracker.file("p4", app.dir, "a.ts"))).toContainEqual(expect.objectContaining({ kind: "ctx", text: "export const cleared = 9;" }));
     });
   });
 

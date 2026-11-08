@@ -1278,12 +1278,15 @@ const make = Effect.gen(function* () {
         return changeTracker.conversation(id);
       }),
 
-    /** Clears a turn's changes from the Changes panel (every client), or brings them back. */
+    /**
+     * Clears a turn from the Changes panel (every client), or brings it back: by its
+     * TurnStarted seq (the panel), or by a FilesChanged seq (older clients' cards).
+     */
     dismissChanges: (id: SessionId, seq: number, dismissed: boolean) =>
       Effect.gen(function* () {
         const session = yield* store.getSession(id);
         const event = yield* store.eventAt(id, seq);
-        if (event?._tag !== "FilesChanged") return yield* invalid("only a turn's changes can be cleared");
+        if (event?._tag !== "FilesChanged" && event?._tag !== "TurnStarted") return yield* invalid("only a turn's changes can be cleared");
         changeTracker.setDismissed(id, seq, dismissed);
         yield* publish({ _tag: "ChangesUpdated", sessionId: id, botId: session.botId });
       }),

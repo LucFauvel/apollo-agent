@@ -84,8 +84,9 @@ export const SessionChanges = Schema.Struct({
   summaries: Schema.Array(Schema.Struct({ text: Schema.String, at: Schema.Number })),
   updatedAt: Schema.Number,
   /**
-   * Seqs of the FilesChanged events of the turns shown here: what `changes.dismiss` takes
-   * to clear them from the panel. Absent from servers that predate clearing in the panel.
+   * The TurnStarted seqs of every turn with anything shown here (files, a summary, notes):
+   * what `changes.dismiss` takes to clear the section from the panel, leaving nothing of it.
+   * Absent from servers that predate clearing in the panel.
    */
   turns: Schema.optional(Schema.Array(Schema.Number)),
 });
@@ -95,7 +96,10 @@ export type SessionChanges = typeof SessionChanges.Type;
 export const ClearedChanges = Schema.Struct({
   sessionId: Schema.String,
   title: Schema.String,
-  /** Seqs of their FilesChanged events. */
+  /**
+   * One seq per cleared turn, what `changes.dismiss` takes to bring it back: its TurnStarted
+   * seq, or its FilesChanged seq when an older client cleared its card.
+   */
   seqs: Schema.Array(Schema.Number),
 });
 export type ClearedChanges = typeof ClearedChanges.Type;
@@ -128,8 +132,8 @@ export const ConversationChanges = Schema.Struct({
   /** Newest first. */
   summaries: Schema.Array(TurnSummary),
   /**
-   * Seqs of the FilesChanged events the user cleared (from the Changes panel now; older
-   * clients cleared cards from the conversation, and still hide the cards listed here).
+   * Every seq dismissed with `changes.dismiss`: only older clients read it, to hide the cards
+   * whose FilesChanged seq is listed (the panel clears by TurnStarted seq, matching no card).
    */
   dismissed: Schema.Array(Schema.Number),
 });
