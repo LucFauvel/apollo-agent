@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -11,13 +11,34 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 
 const MAX_BUFFER = 64 * 1024 * 1024;
 
-const git = (cwd: string, args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv) =>
+/** A failed git command, with its exit code (null when it was killed or did not start). */
+export class GitError extends Error {
+  readonly code: number | null;
+  readonly stderr: string;
+  constructor(message: string, code: number | null, stderr: string) {
+    super(message);
+    this.code = code;
+    this.stderr = stderr;
+  }
+}
+
+/** Runs git; `signal` kills it (and fails the promise) when aborted. */
+const git = (cwd: string, args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv, signal?: AbortSignal) =>
   new Promise<string>((resolvePromise, reject) => {
-    execFile("git", [...args], { cwd, env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: "0" }, maxBuffer: MAX_BUFFER, timeout: 60_000 }, (error, stdout, stderr) => {
-      if (error) reject(new Error((stderr || error.message).trim()));
-      else resolvePromise(stdout);
-    });
+    if (signal?.aborted) return reject(abortError(signal));
+    execFile(
+      "git",
+      [...args],
+      { cwd, env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: "0" }, maxBuffer: MAX_BUFFER, timeout: 60_000, ...(signal ? { signal } : {}) },
+      (error, stdout, stderr) => {
+        if (signal?.aborted) reject(abortError(signal));
+        else if (error) reject(new GitError((stderr || error.message).trim(), typeof error.code === "number" ? error.code : null, stderr.trim()));
+        else resolvePromise(stdout);
+      },
+    );
   });
+
+const abortError = (signal: AbortSignal) => (signal.reason instanceof Error ? signal.reason : new Error("Stopped"));
 
 /** The repository (worktree) a path is in, or null. */
 export const repoRoot = async (path: string): Promise<string | null> => {
@@ -36,23 +57,31 @@ export const repoRoot = async (path: string): Promise<string | null> => {
 };
 
 /** The repository's common git dir (shared by its worktrees), where snapshot trees are written. */
-export const commonGitDir = async (repo: string) =>
-  (await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).trim();
+export const commonGitDir = async (repo: string, signal?: AbortSignal) =>
+  (await git(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"], undefined, signal)).trim();
 
 /** Tree operations run against the git dir, so they work after a worktree is removed. */
-const inGitDir = (gitDir: string, args: ReadonlyArray<string>) => git(tmpdir(), ["--git-dir", gitDir, ...args]);
+const inGitDir = (gitDir: string, args: ReadonlyArray<string>, signal?: AbortSignal) =>
+  git(tmpdir(), ["--git-dir", gitDir, ...args], undefined, signal);
 
 /** A tree object of the working tree as it is now. */
-export const snapshot = async (repo: string): Promise<string> => {
+export const snapshot = async (repo: string, signal?: AbortSignal): Promise<string> => {
   const scratch = mkdtempSync(join(tmpdir(), "apollo-snapshot-"));
   const index = join(scratch, "index");
   try {
     // Starting from the real index keeps its stat cache: only changed files are hashed.
-    const real = (await git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "index"])).trim();
-    if (existsSync(real)) copyFileSync(real, index);
+    const real = (await git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "index"], undefined, signal)).trim();
+    if (existsSync(real)) {
+      copyFileSync(real, index);
+      // Keep the index's own time: git rehashes files changed in the same second as the
+      // index ("racily clean"), judged against it. A copy stamped now would hide an edit made
+      // right after a commit that left the file's size unchanged.
+      const { atime, mtime } = statSync(real);
+      utimesSync(index, atime, mtime);
+    }
     const env = { GIT_INDEX_FILE: index };
-    await git(repo, ["add", "-A", "--", "."], env);
-    return (await git(repo, ["write-tree"], env)).trim();
+    await git(repo, ["add", "-A", "--", "."], env, signal);
+    return (await git(repo, ["write-tree"], env, signal)).trim();
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }
@@ -72,11 +101,11 @@ export interface FileChange {
 const STATUS: Record<string, FileStatus> = { A: "added", M: "modified", D: "deleted", R: "renamed", T: "modified", C: "added" };
 
 /** The files that differ between two snapshots, sorted by path. */
-export const diffFiles = async (gitDir: string, before: string, after: string): Promise<Array<FileChange>> => {
+export const diffFiles = async (gitDir: string, before: string, after: string, signal?: AbortSignal): Promise<Array<FileChange>> => {
   if (before === after) return [];
   const [names, numbers] = await Promise.all([
-    inGitDir(gitDir, ["diff", "--no-ext-diff", "-M", "--name-status", "-z", before, after]),
-    inGitDir(gitDir, ["diff", "--no-ext-diff", "-M", "--numstat", "-z", before, after]),
+    inGitDir(gitDir, ["diff", "--no-ext-diff", "-M", "--name-status", "-z", before, after], signal),
+    inGitDir(gitDir, ["diff", "--no-ext-diff", "-M", "--numstat", "-z", before, after], signal),
   ]);
   const counts = new Map<string, { additions: number | null; deletions: number | null }>();
   const n = numbers.split("\0");
@@ -125,11 +154,32 @@ export const pathsIn = (text: string, home: string, cwd: string): Array<string> 
 
 // --- a repository against its baseline (the user-requested full diff) ----------------
 
-/** git's empty tree: the baseline of a repository with no commits yet. */
-export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/** Refs longer than this are refused (they are shown, and stored with the report). */
+export const MAX_REF_LENGTH = 256;
 
-const verifyCommit = (repo: string, ref: string) =>
-  git(repo, ["rev-parse", "--verify", "-q", `${ref}^{commit}`]).then((s) => s.trim() || null, () => null);
+const verifyCommit = (repo: string, ref: string, signal?: AbortSignal) =>
+  git(repo, ["rev-parse", "--verify", "-q", "--end-of-options", `${ref}^{commit}`], undefined, signal).then(
+    (s) => s.trim() || null,
+    (error) => (signal?.aborted ? Promise.reject(error) : null),
+  );
+
+/**
+ * The empty tree in the repository's own object format (SHA-1 or SHA-256): the baseline
+ * of a repository without commits. Writing it is harmless (git knows it anyway).
+ */
+const emptyTree = async (repo: string, signal?: AbortSignal) =>
+  (await git(repo, ["hash-object", "-w", "-t", "tree", "/dev/null"], undefined, signal)).trim();
+
+/** The merge base of two commits, or null when their histories share no commit. */
+const mergeBase = (repo: string, a: string, b: string, signal?: AbortSignal) =>
+  git(repo, ["merge-base", a, b], undefined, signal).then(
+    (s) => s.trim() || null,
+    (error) => {
+      // Exit code 1 without a message: no common ancestor. Anything else is a real failure.
+      if (error instanceof GitError && error.code === 1 && error.stderr === "") return null;
+      throw error;
+    },
+  );
 
 /** Where a repository's work started: what a full diff compares the working tree against. */
 export interface Baseline {
@@ -140,62 +190,79 @@ export interface Baseline {
   readonly tree: string;
 }
 
+const DEFAULT_BASES = ["origin/main", "origin/master", "@{upstream}", "main", "master"];
+
 /**
- * The baseline of a full diff: the merge base of HEAD with `ref` or, by default, with the
- * first of the origin's default branch (`origin/HEAD`), `origin/main`, `origin/master`,
- * the branch's upstream, `main`, `master` that exists; HEAD itself when none does (only
- * uncommitted work then). The merge base keeps others' later commits on that branch out.
+ * The baseline of a full diff at commit `head` (HEAD, read once by the caller): the merge
+ * base of `head` with `ref` or, by default, with the first of the origin's default branch
+ * (`origin/HEAD`), `origin/main`, `origin/master`, the branch's upstream, `main`, `master`
+ * that exists and shares history with it; `head` itself when none does (only uncommitted
+ * work then, and the ref says "HEAD"). The merge base keeps others' later commits on that
+ * branch out. An explicit `ref` without shared history is refused: there is nothing honest
+ * to compare against.
  */
-export const resolveBaseline = async (repo: string, ref?: string): Promise<Baseline> => {
-  if (ref !== undefined && (ref.trim() === "" || ref.startsWith("-"))) throw new Error(`"${ref}" is not a git ref`);
-  const head = await verifyCommit(repo, "HEAD");
-  let label: string | null = null;
-  let target: string | null = null;
-  if (ref !== undefined) {
-    target = await verifyCommit(repo, ref.trim());
-    if (!target) throw new Error(`Unknown ref "${ref}" in ${repo}`);
-    label = ref.trim();
-  } else {
-    const originHead = await git(repo, ["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"]).then((s) => s.trim(), () => "");
-    for (const candidate of [originHead, "origin/main", "origin/master", "@{upstream}", "main", "master"]) {
-      if (!candidate) continue;
-      target = await verifyCommit(repo, candidate);
-      if (target) {
-        label = candidate;
-        break;
-      }
-    }
+export const resolveBaseline = async (repo: string, head: string | null, ref?: string, signal?: AbortSignal): Promise<Baseline> => {
+  const wanted = ref?.trim();
+  if (ref !== undefined && (!wanted || wanted.startsWith("-") || wanted.length > MAX_REF_LENGTH)) {
+    throw new Error(`"${ref.slice(0, 80)}" is not a git ref`);
   }
-  if (!head) return { ref: label ?? "(no commits)", commit: null, tree: EMPTY_TREE };
-  if (!target) return { ref: "HEAD", commit: head, tree: await treeOf(repo, head) };
-  const base = target === head ? head : (await git(repo, ["merge-base", head, target]).then((s) => s.trim(), () => "")) || target;
-  return { ref: label!, commit: base, tree: await treeOf(repo, base) };
+  if (wanted) {
+    const target = await verifyCommit(repo, wanted, signal);
+    if (!target) throw new Error(`Unknown ref "${wanted}" in ${repo}`);
+    if (!head) throw new Error(`${repo} has no commits yet: there is nothing to compare with "${wanted}"`);
+    const base = target === head ? head : await mergeBase(repo, head, target, signal);
+    if (!base) throw new Error(`"${wanted}" shares no history with HEAD in ${repo}: there is no merge base to compare against`);
+    return { ref: wanted, commit: base, tree: await treeOf(repo, base, signal) };
+  }
+  if (!head) return { ref: "(no commits)", commit: null, tree: await emptyTree(repo, signal) };
+  const originHead = await git(repo, ["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], undefined, signal).then(
+    (s) => s.trim(),
+    (error) => (signal?.aborted ? Promise.reject(error) : ""),
+  );
+  for (const candidate of new Set([originHead, ...DEFAULT_BASES])) {
+    if (!candidate) continue;
+    const target = await verifyCommit(repo, candidate, signal);
+    if (!target) continue;
+    const base = target === head ? head : await mergeBase(repo, head, target, signal);
+    if (base) return { ref: candidate, commit: base, tree: await treeOf(repo, base, signal) };
+  }
+  return { ref: "HEAD", commit: head, tree: await treeOf(repo, head, signal) };
 };
 
-const treeOf = async (repo: string, commit: string) => (await git(repo, ["rev-parse", `${commit}^{tree}`])).trim();
+const treeOf = async (repo: string, commit: string, signal?: AbortSignal) =>
+  (await git(repo, ["rev-parse", `${commit}^{tree}`], undefined, signal)).trim();
 
 /** HEAD's commit and tree, and its branch (null when detached or without commits). */
-export const headOf = async (repo: string) => {
-  const commit = await verifyCommit(repo, "HEAD");
-  const branch = await git(repo, ["symbolic-ref", "-q", "--short", "HEAD"]).then((s) => s.trim() || null, () => null);
-  return { commit, branch, tree: commit ? await treeOf(repo, commit) : EMPTY_TREE };
+export const headOf = async (repo: string, signal?: AbortSignal) => {
+  const commit = await verifyCommit(repo, "HEAD", signal);
+  const branch = await git(repo, ["symbolic-ref", "-q", "--short", "HEAD"], undefined, signal).then(
+    (s) => s.trim() || null,
+    (error) => (signal?.aborted ? Promise.reject(error) : null),
+  );
+  return { commit, branch, tree: commit ? await treeOf(repo, commit, signal) : await emptyTree(repo, signal) };
 };
 
-/** The commits on HEAD since `base` (newest first, at most `limit`), and how many there are. */
-export const commitsSince = async (repo: string, base: string | null, limit: number) => {
-  const range = base ? `${base}..HEAD` : "HEAD";
-  const head = await verifyCommit(repo, "HEAD");
+/** HEAD's commit now (null without commits). */
+export const headCommit = (repo: string, signal?: AbortSignal) => verifyCommit(repo, "HEAD", signal);
+
+/** Commit subjects longer than this are cut (they are stored with the report). */
+export const MAX_SUBJECT_LENGTH = 200;
+
+/** The commits from `base` to `head` (newest first, at most `limit`), and how many there are. */
+export const commitsBetween = async (repo: string, base: string | null, head: string | null, limit: number, signal?: AbortSignal) => {
   if (!head) return { count: 0, commits: [] as Array<{ sha: string; subject: string }> };
+  const range = base ? `${base}..${head}` : head;
   const [count, log] = await Promise.all([
-    git(repo, ["rev-list", "--count", range]),
-    git(repo, ["log", "--no-color", `--max-count=${limit}`, "--format=%h%x09%s", range]),
+    git(repo, ["rev-list", "--count", range], undefined, signal),
+    git(repo, ["log", "--no-color", `--max-count=${limit}`, "--format=%h%x09%s", range], undefined, signal),
   ]);
   const commits = log
     .split("\n")
     .filter(Boolean)
     .map((line) => {
       const tab = line.indexOf("\t");
-      return { sha: line.slice(0, tab), subject: line.slice(tab + 1) };
+      const subject = line.slice(tab + 1);
+      return { sha: line.slice(0, tab), subject: subject.length > MAX_SUBJECT_LENGTH ? `${subject.slice(0, MAX_SUBJECT_LENGTH - 1)}…` : subject };
     });
   return { count: Number(count.trim()) || 0, commits };
 };

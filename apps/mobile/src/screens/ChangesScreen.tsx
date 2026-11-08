@@ -306,8 +306,8 @@ export function FullDiff({ sessionId, seq, repo, report }: { sessionId: SessionI
   const [closed, toggle] = useToggle();
   const [commitsOpen, toggleCommits] = useToggle();
   const notes = useMemo(() => new Map(report.notes.map((n) => [n.path, n.text])), [report.notes]);
-  const additions = repo.files.reduce((n, f) => n + (f.additions ?? 0), 0);
-  const deletions = repo.files.reduce((n, f) => n + (f.deletions ?? 0), 0);
+  // Over every changed file, listed or not, like the file count.
+  const { additions, deletions } = report;
   const total = repo.files.length + report.moreFiles;
   const base = report.base.commit ? `${report.base.ref} @ ${report.base.commit.slice(0, 7)}` : report.base.ref;
   return (

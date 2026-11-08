@@ -1,10 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "@effect/vitest";
 import * as Database from "../Database.ts";
-import { makeChangeTracker } from "./Tracker.ts";
+import { MAX_REF_LENGTH, MAX_SUBJECT_LENGTH, snapshot } from "./git.ts";
+import { makeChangeTracker, MAX_REPORT_FILES } from "./Tracker.ts";
 
 const repo = (name: string) => {
   const dir = join(realpathSync(mkdtempSync(join(tmpdir(), "apollo-tracker-"))), name);
@@ -171,14 +172,137 @@ describe("change tracker", () => {
       expect(local.report.commitCount).toBe(0);
       expect(local.repo.files.map((f) => f.path)).toEqual(["store.ts"]);
 
-      const dir = join(realpathSync(mkdtempSync(join(tmpdir(), "apollo-empty-"))), "empty");
-      mkdirSync(dir);
-      execFileSync("git", ["init", "-q"], { cwd: dir });
-      writeFileSync(join(dir, "first.ts"), "export const first = 1;\n");
-      const empty = await tracker.report(dir);
-      expect(empty.report.base).toMatchObject({ commit: null, tree: "4b825dc642cb6eb9a060e54bf8d69288fbee4904" });
-      expect(empty.repo.files.map((f) => [f.path, f.status])).toEqual([["first.ts", "added"]]);
+      // Without commits, in either object format: the repository's own empty tree.
+      for (const format of ["sha1", "sha256"]) {
+        const dir = join(realpathSync(mkdtempSync(join(tmpdir(), "apollo-empty-"))), "empty");
+        mkdirSync(dir);
+        execFileSync("git", ["init", "-q", `--object-format=${format}`], { cwd: dir });
+        writeFileSync(join(dir, "first.ts"), "export const first = 1;\n");
+        const empty = await tracker.report(dir);
+        const emptyTree = execFileSync("git", ["hash-object", "-t", "tree", "/dev/null"], { cwd: dir, encoding: "utf8" }).trim();
+        expect(emptyTree).toHaveLength(format === "sha1" ? 40 : 64);
+        expect(empty.report.base).toMatchObject({ ref: "(no commits)", commit: null, tree: emptyTree });
+        expect(empty.repo.files.map((f) => [f.path, f.status])).toEqual([["first.ts", "added"]]);
+      }
       await expect(tracker.report(tmpdir())).rejects.toThrow("is not in a git repository");
     }, GIT_HEAVY);
+
+    it("never compares against a history HEAD does not share", async () => {
+      const { tracker } = setup();
+      const work = cloned();
+      // An orphan branch: no common ancestor with origin/main or with HEAD.
+      work.git("checkout", "-q", "--orphan", "other");
+      work.git("rm", "-rqf", ".");
+      writeFileSync(join(work.dir, "other.ts"), "export const other = 1;\n");
+      work.git("add", "-A");
+      work.git("commit", "-qm", "other");
+      work.git("checkout", "-q", "main");
+      await expect(tracker.report(work.dir, "other")).rejects.toThrow('"other" shares no history with HEAD');
+      // By default, an unrelated origin is skipped rather than diffed: HEAD itself, said so.
+      work.git("checkout", "-q", "other");
+      const { repo: changes, report } = await tracker.report(work.dir);
+      expect(report.base.ref).not.toMatch(/origin/);
+      expect([report.commitCount, changes.files.length]).toEqual([0, 0]);
+    }, GIT_HEAVY);
+
+    it("bounds what it stores, and counts lines over every changed file", async () => {
+      const { tracker } = setup();
+      const work = cloned();
+      writeFileSync(join(work.dir, "message.txt"), `${"x".repeat(2 * 1024 * 1024)}\n`);
+      work.git("commit", "-q", "--allow-empty", "-F", "message.txt");
+      rmSync(join(work.dir, "message.txt"));
+      for (let i = 0; i < MAX_REPORT_FILES + 11; i++) writeFileSync(join(work.dir, `f${i}.ts`), "export {};\n");
+      await expect(tracker.report(work.dir, "--x")).rejects.toThrow("is not a git ref");
+      await expect(tracker.report(work.dir, "a".repeat(MAX_REF_LENGTH + 1))).rejects.toThrow("is not a git ref");
+      const { repo: changes, report } = await tracker.report(work.dir);
+      expect(report.commits[0]!.subject.length).toBe(MAX_SUBJECT_LENGTH);
+      expect([changes.files.length, report.moreFiles]).toEqual([MAX_REPORT_FILES, 11]);
+      expect([report.additions, report.deletions]).toEqual([MAX_REPORT_FILES + 11, 0]);
+      expect(JSON.stringify(report).length).toBeLessThan(20_000);
+    }, GIT_HEAVY);
+
+    /** Puts a `git` in front of the real one for the rest of the test; `script` runs before each call. */
+    const shimGit = (script: string) => {
+      const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+      const bin = realpathSync(mkdtempSync(join(tmpdir(), "apollo-git-shim-")));
+      writeFileSync(join(bin, "git"), `#!/bin/sh\nREAL_GIT="${real}"\n${script}\nexec "$REAL_GIT" "$@"\n`, { mode: 0o755 });
+      const path = process.env.PATH;
+      process.env.PATH = `${bin}:${path}`;
+      return { bin, restore: () => void (process.env.PATH = path) };
+    };
+
+    it("describes one state of the repository when a commit lands while it reads", async () => {
+      const { tracker } = setup();
+      const work = cloned();
+      writeFileSync(join(work.dir, "moved.ts"), "export const moved = 1;\n");
+      work.git("add", "moved.ts");
+      // The first snapshot's `git add` commits the staged file first, through the real index.
+      const shim = shimGit(
+        `if [ "$1" = "add" ] && [ -n "$GIT_INDEX_FILE" ] && [ ! -e "$SHIM_DIR/done" ]; then touch "$SHIM_DIR/done"; env -u GIT_INDEX_FILE "$REAL_GIT" -c user.email=t@t -c user.name=t commit -qm moved; fi`,
+      );
+      process.env.SHIM_DIR = shim.bin;
+      try {
+        const { repo: changes, report } = await tracker.report(work.dir);
+        const head = work.git("rev-parse", "HEAD").trim();
+        expect(report.head.commit).toBe(head);
+        expect([report.commitCount, report.commits.map((c) => c.subject)]).toEqual([1, ["moved"]]);
+        expect(report.uncommitted).toBe(false);
+        expect(changes.files.map((f) => f.path)).toEqual(["moved.ts"]);
+        expect(work.git("status", "--porcelain")).toBe("");
+      } finally {
+        shim.restore();
+        delete process.env.SHIM_DIR;
+      }
+    }, GIT_HEAVY);
+
+    it("stops, git processes included, when its signal is aborted", async () => {
+      const { tracker } = setup();
+      const work = cloned();
+      writeFileSync(join(work.dir, "new.ts"), "export {};\n");
+      await expect(tracker.report(work.dir, undefined, AbortSignal.abort(new Error("Stopped early")))).rejects.toThrow("Stopped early");
+
+      // Every git call is logged; the snapshot's `add` takes two seconds.
+      const shim = shimGit(`echo "$1" >> "$SHIM_DIR/calls"; if [ "$1" = "add" ]; then touch "$SHIM_DIR/adding"; sleep 3; fi`);
+      process.env.SHIM_DIR = shim.bin;
+      try {
+        const controller = new AbortController();
+        const running = tracker.report(work.dir, undefined, controller.signal);
+        // Abort once the snapshot's `add` is under way.
+        while (!existsSync(join(shim.bin, "adding"))) await new Promise((resolve) => setTimeout(resolve, 20));
+        const aborted = Date.now();
+        controller.abort(new Error("Timed out"));
+        await expect(running).rejects.toThrow("Timed out");
+        // The three-second `add` was killed, not waited for.
+        expect(Date.now() - aborted).toBeLessThan(2000);
+        // Nothing runs after the abort: no tree is written, no diff is taken.
+        await new Promise((resolve) => setTimeout(resolve, 3500));
+        const calls = readFileSync(join(shim.bin, "calls"), "utf8").split("\n");
+        expect(calls).toContain("add");
+        expect(calls.filter((c) => c === "write-tree" || c === "diff" || c === "--git-dir")).toEqual([]);
+      } finally {
+        shim.restore();
+        delete process.env.SHIM_DIR;
+      }
+    }, GIT_HEAVY);
+  });
+
+  it("sees an edit that leaves a file's size and time as the index recorded them (racily clean)", async () => {
+    // git rehashes an entry as new as the index file itself ("racily clean"), since its stat
+    // cannot tell an edit made in that same instant. A copy of the index stamped later hid
+    // such an edit. Here the timestamps are pinned so only that rule can reveal the edit.
+    const app = repo("app");
+    app.git("config", "core.trustctime", "false");
+    const file = join(app.dir, "value.ts");
+    writeFileSync(file, "export const value = 0;\n");
+    app.git("add", "-A");
+    app.git("commit", "-qm", "value");
+    const past = new Date(Math.floor(Date.now() / 1000) * 1000 - 60_000);
+    utimesSync(file, past, past);
+    app.git("update-index", "--refresh");
+    utimesSync(join(app.dir, ".git", "index"), past, past);
+    writeFileSync(file, "export const value = 2;\n");
+    utimesSync(file, past, past);
+    const tree = await snapshot(app.dir);
+    expect(app.git("cat-file", "blob", `${tree}:value.ts`)).toBe("export const value = 2;\n");
   });
 });

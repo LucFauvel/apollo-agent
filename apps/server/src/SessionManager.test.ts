@@ -758,15 +758,14 @@ describe("SessionManager", () => {
     }).pipe(Effect.provide(layer)),
   );
 
-  it.live("shows the full semantic diff of a repository only when the user asked for it", () =>
+  it.live("shows the full semantic diff of a repository only in a turn the user started by asking", () =>
     Effect.gen(function* () {
       const manager = yield* SessionManager.SessionManager;
       const store = yield* Store.Store;
+      const db = yield* Database.Database;
       const bot = yield* createBot(manager);
       const repo = realpathSync(mkdtempSync(join(tmpdir(), "apollo-report-")));
       execSync("git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", { cwd: repo });
-
-      // An orchestrator's message is not the user's request.
       const worker = yield* manager.createSession({
         botId: bot.id,
         title: "feature",
@@ -777,19 +776,39 @@ describe("SessionManager", () => {
         author: "bot",
       });
       yield* waitIdle(manager, worker.id);
-      const refused = yield* Effect.flip(manager.semanticDiff(worker.id, { request: "write answer.ts" }));
-      expect(refused.message).toContain("the user has not written");
+      /** Sends a slow message (the fake agent takes a second) and waits for its turn to start. */
+      const during = (text: string, author: "user" | "system" | "bot") =>
+        Effect.gen(function* () {
+          yield* manager.send(worker.id, `slow: ${text}`, author);
+          for (let i = 0; i < 100 && !(yield* store.currentTurn(worker.id)).running; i++) yield* Effect.sleep(Duration.millis(10));
+        });
+      const ask = (request: string) => manager.semanticDiff(worker.id, { request });
 
-      // The user asks: the report goes into the conversation as a card.
-      yield* manager.send(worker.id, "Give me the full semantic diff please");
+      // Outside any turn, nothing authorizes it.
+      expect((yield* Effect.flip(ask("write answer.ts"))).message).toContain("no turn the user started");
+
+      // The user asks: in that turn, the report goes into the conversation as a card.
+      yield* during("Give me the full semantic diff please", "user");
+      expect((yield* Effect.flip(ask("review everything"))).message).toContain("not in the user's message for this turn");
+      const shown = yield* ask("full semantic diff");
       yield* waitIdle(manager, worker.id);
-      const wrong = yield* Effect.flip(manager.semanticDiff(worker.id, { request: "review everything" }));
-      expect(wrong.message).toContain("not in the user's latest message");
-      const shown = yield* manager.semanticDiff(worker.id, { request: "full semantic diff" });
       expect(shown.repo.files.map((f) => f.path)).toEqual(["answer.ts"]);
-      expect(shown.report).toMatchObject({ commitCount: 0, uncommitted: true });
+      expect(shown.report).toMatchObject({ commitCount: 0, uncommitted: true, additions: 1, deletions: 0 });
       const event = yield* store.eventAt(worker.id, shown.seq);
       expect(event).toMatchObject({ _tag: "FilesChanged", repos: [{ repo }], report: { uncommitted: true } });
+
+      // A day later, automated turns cannot reuse that request: not a system turn, not a bot's.
+      db.prepare("update session_events set at = at - 86400000 where session_id = ?").run(worker.id);
+      for (const author of ["system", "bot"] as const) {
+        yield* during(`maintenance (${author})`, author);
+        expect((yield* Effect.flip(ask("full semantic diff"))).message).toContain(`a ${author} message`);
+        yield* waitIdle(manager, worker.id);
+      }
+      // Nor a turn the user started that a worker's report then joined.
+      yield* during("full semantic diff again", "user");
+      yield* manager.send(worker.id, "worker report", "system");
+      expect((yield* Effect.flip(ask("full semantic diff"))).message).toContain("a system message");
+      yield* waitIdle(manager, worker.id);
 
       // Its files open as semantic diffs from the snapshot, whatever changed since.
       writeFileSync(join(repo, "answer.ts"), "export const answer = 43;\n");
@@ -799,6 +818,8 @@ describe("SessionManager", () => {
       const missing = yield* Effect.flip(manager.changesFile(worker.id, repo, "answer.ts", shown.seq - 1));
       expect(missing.message).toContain("no full diff");
     }).pipe(Effect.provide(layer)),
+    // Four slow (one-second) turns of the fake agent.
+    30_000,
   );
 
   it.live("reflects automatically after enough turns when autoLearn is on", () =>

@@ -59,7 +59,8 @@ const SemanticDiff = Tool.make("apollo_semantic_diff", {
     "(commits since the merge base with the default/origin branch, or with `base`, plus uncommitted and untracked work),",
     "whichever turn or session made it, grouped by function, class and type with workers' explanations.",
     "The report goes to the user's screen as a card in this conversation; you get only its counts back, not the diff.",
-    "`request`: the user's words asking for it, quoted from their latest message (Apollo checks; otherwise it refuses).",
+    "`request`: the user's words asking for it, quoted from their message that started this turn (Apollo checks, and refuses in turns",
+    "a worker, bot, schedule or system message started or joined).",
     "`repo`: a path in the repository (default: your working directory). `base`: a branch, tag or commit to compare against.",
     "Afterwards just tell the user it is shown; do not restate or summarize it unless they ask.",
   ].join(" "),
@@ -73,6 +74,7 @@ const SemanticDiff = Tool.make("apollo_semantic_diff", {
     repo: Schema.String,
     /** e.g. "origin/main (merge base 1a2b3c4)". */
     base: Schema.String,
+    /** All changed files, listed or not; the line counts cover the same files. */
     files: Schema.Number,
     additions: Schema.Number,
     deletions: Schema.Number,
@@ -115,8 +117,8 @@ export const handlers = ChangeToolkit.toLayer(
             repo: result.repo.repo,
             base: report.base.commit ? `${report.base.ref} (merge base ${report.base.commit.slice(0, 7)})` : report.base.ref,
             files: files.length + report.moreFiles,
-            additions: files.reduce((n, f) => n + (f.additions ?? 0), 0),
-            deletions: files.reduce((n, f) => n + (f.deletions ?? 0), 0),
+            additions: report.additions,
+            deletions: report.deletions,
             commits: report.commitCount,
             uncommitted: report.uncommitted,
           };

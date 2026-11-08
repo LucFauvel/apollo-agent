@@ -154,6 +154,9 @@ interface LiveSession {
 }
 
 const invalid = (message: string) => new ApolloError({ code: "invalid", message });
+
+/** How long a full semantic diff may take before it is stopped. */
+const SEMANTIC_DIFF_TIMEOUT = Duration.seconds(120);
 const providerFailure = (message: string) => new ApolloError({ code: "provider", message });
 
 /** A turn is under way (not just the process starting). */
@@ -1263,19 +1266,24 @@ const make = Effect.gen(function* () {
     /**
      * The full semantic diff of a repository against its baseline, which the user asked for:
      * shown in the conversation as a card (a FilesChanged event with `report`), never sent to
-     * the model. `request` quotes the user's latest message (see changes/requested.ts).
+     * the model. `request` quotes the user's message that started the running turn (see changes/requested.ts).
      */
     semanticDiff: (id: SessionId, input: { readonly repo?: string | undefined; readonly base?: string | undefined; readonly request: string }) =>
       Effect.gen(function* () {
         const session = yield* store.getSession(id);
-        const refused = unrequested(yield* store.lastHumanMessage(id), input.request);
+        const refused = unrequested(yield* store.currentTurn(id), input.request);
         if (refused) return yield* invalid(`Not shown: ${refused}.`);
         const path = input.repo ? (isAbsolute(input.repo) ? input.repo : join(session.cwd, input.repo)) : session.cwd;
+        // Hitting the bound interrupts this, which aborts the signal: the git processes are
+        // killed and no further step starts.
         const result = yield* Effect.tryPromise({
-          try: () => changeTracker.report(path, input.base),
+          try: (signal) => changeTracker.report(path, input.base, signal),
           catch: (error) => invalid((error as Error).message),
         }).pipe(
-          Effect.timeoutOrElse({ duration: "120 seconds", orElse: () => Effect.fail(invalid("The diff took over two minutes; try a closer base ref")) }),
+          Effect.timeoutOrElse({
+            duration: SEMANTIC_DIFF_TIMEOUT,
+            orElse: () => Effect.fail(invalid("The diff took over two minutes and was stopped; try a closer base ref")),
+          }),
         );
         const stored = yield* appendEvent(id, { _tag: "FilesChanged", repos: [result.repo], report: result.report });
         return { seq: stored.seq, ...result };

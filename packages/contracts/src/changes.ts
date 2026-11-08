@@ -58,7 +58,10 @@ export const ChangeReport = Schema.Struct({
   uncommitted: Schema.Boolean,
   /** Changed files left out of the list (it is capped). */
   moreFiles: Schema.Number,
-  /** Explanations workers gave of these files (`apollo_explain_changes`), the latest per file. */
+  /** Changed lines over all the changed files, listed or not (binary files count none). */
+  additions: Schema.Number,
+  deletions: Schema.Number,
+  /** Explanations workers gave of these files (`apollo_explain_changes`), the latest per file, cut to 300 characters. */
   notes: Schema.Array(Schema.Struct({ path: Schema.String, text: Schema.String })),
 });
 export type ChangeReport = typeof ChangeReport.Type;

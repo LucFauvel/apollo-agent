@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import type { ChangedFile, ChangeReport, OverviewFile, RepoChanges, SemanticFileDiff, SessionChanges } from "@apollo/contracts";
-import { commitsSince, commonGitDir, diffFile, diffFiles, fileAt, headOf, pathsIn, repoRoot, resolveBaseline, snapshot } from "./git.ts";
+import { commitsBetween, commonGitDir, diffFile, diffFiles, fileAt, headCommit, headOf, pathsIn, repoRoot, resolveBaseline, snapshot } from "./git.ts";
 import { semanticDiff } from "./semantic.ts";
 
 /**
@@ -22,6 +22,10 @@ const MAX_DIFF_BYTES = 600_000;
 /** A full diff lists at most this many files (the rest are counted) and commits. */
 export const MAX_REPORT_FILES = 500;
 const MAX_REPORT_COMMITS = 50;
+/** File notes stored with a report are cut to this (the file's diff shows them whole). */
+const MAX_REPORT_NOTE = 300;
+/** Snapshots taken before giving up on a repository whose HEAD keeps moving. */
+const MAX_REPORT_ATTEMPTS = 3;
 
 interface Turn {
   readonly seq: number;
@@ -321,32 +325,47 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
   /**
    * Everything that differs in the repository around `path` from its baseline (see
    * `resolveBaseline`): commits since the merge base and the working tree as it is now.
+   * HEAD is read before and after the snapshot; when it moved (a commit or checkout in the
+   * meantime), it starts over, so the history and the files describe one state of the
+   * repository. `signal` stops it, and the git processes it runs.
    */
-  const report = async (path: string, ref?: string): Promise<{ repo: RepoChanges; report: ChangeReport }> => {
+  const report = async (path: string, ref?: string, signal?: AbortSignal): Promise<{ repo: RepoChanges; report: ChangeReport }> => {
     const repo = await repoRoot(path);
     if (!repo) throw new Error(`${path} is not in a git repository`);
-    const gitDir = await commonGitDir(repo);
-    const baseline = await resolveBaseline(repo, ref);
-    const [tree, head, history] = await Promise.all([snapshot(repo), headOf(repo), commitsSince(repo, baseline.commit, MAX_REPORT_COMMITS)]);
-    const files = await diffFiles(gitDir, baseline.tree, tree);
-    const shown = files.slice(0, MAX_REPORT_FILES);
-    const listed = new Set(shown.map((f) => f.path));
-    const notes = [...repoNotes(repo, gitDir)]
-      .filter(([key]) => key.endsWith("\0") && listed.has(key.slice(0, -1)))
-      .map(([key, text]) => ({ path: key.slice(0, -1), text }));
-    return {
-      repo: { repo, name: basename(repo), files: shown },
-      report: {
-        gitDir,
-        base: { ref: baseline.ref, commit: baseline.commit, tree: baseline.tree },
-        head: { branch: head.branch, commit: head.commit, tree },
-        commitCount: history.count,
-        commits: history.commits,
-        uncommitted: tree !== head.tree,
-        moreFiles: files.length - shown.length,
-        notes,
-      },
-    };
+    const gitDir = await commonGitDir(repo, signal);
+    for (let attempt = 1; ; attempt++) {
+      const head = await headOf(repo, signal);
+      const baseline = await resolveBaseline(repo, head.commit, ref, signal);
+      const tree = await snapshot(repo, signal);
+      if ((await headCommit(repo, signal)) !== head.commit) {
+        if (attempt < MAX_REPORT_ATTEMPTS) continue;
+        throw new Error(`HEAD kept moving in ${repo} while reading it; ask again once it settles`);
+      }
+      const [history, files] = await Promise.all([
+        commitsBetween(repo, baseline.commit, head.commit, MAX_REPORT_COMMITS, signal),
+        diffFiles(gitDir, baseline.tree, tree, signal),
+      ]);
+      const shown = files.slice(0, MAX_REPORT_FILES);
+      const listed = new Set(shown.map((f) => f.path));
+      const notes = [...repoNotes(repo, gitDir)]
+        .filter(([key]) => key.endsWith("\0") && listed.has(key.slice(0, -1)))
+        .map(([key, text]) => ({ path: key.slice(0, -1), text: text.length > MAX_REPORT_NOTE ? `${text.slice(0, MAX_REPORT_NOTE - 1)}…` : text }));
+      return {
+        repo: { repo, name: basename(repo), files: shown },
+        report: {
+          gitDir,
+          base: { ref: baseline.ref, commit: baseline.commit, tree: baseline.tree },
+          head: { branch: head.branch, commit: head.commit, tree },
+          commitCount: history.count,
+          commits: history.commits,
+          uncommitted: tree !== head.tree,
+          moreFiles: files.length - shown.length,
+          additions: files.reduce((n, f) => n + (f.additions ?? 0), 0),
+          deletions: files.reduce((n, f) => n + (f.deletions ?? 0), 0),
+          notes,
+        },
+      };
+    }
   };
 
   /** One file of a full diff, as a semantic diff with the latest explanations of it. */
