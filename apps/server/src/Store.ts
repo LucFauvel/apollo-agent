@@ -660,6 +660,19 @@ const makeStore = (db: DatabaseSync) => {
         if (excluded) run("insert or ignore into memory_exclusions (session_id, seq) values (?, ?)", sessionId, seq);
         else run("delete from memory_exclusions where session_id = ? and seq = ?", sessionId, seq);
       }),
+    /** The text of the human user's latest message in a session (since the last /clear), if any. */
+    lastHumanMessage: (sessionId: SessionId) =>
+      Effect.sync(() => {
+        const row = get(
+          `select json_extract(event, '$.text') as text from session_events
+           where session_id = ? and json_extract(event, '$._tag') = 'UserMessage' and json_extract(event, '$.author') = 'user'
+             and seq > coalesce((select max(seq) from session_events where session_id = ? and json_extract(event, '$._tag') = 'ConversationCleared'), 0)
+           order by seq desc limit 1`,
+          sessionId,
+          sessionId,
+        );
+        return row ? String(row.text ?? "") : null;
+      }),
     /** The event at `seq`, if any. */
     eventAt: (sessionId: SessionId, seq: number) =>
       Effect.sync(() => {

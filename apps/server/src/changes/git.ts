@@ -122,3 +122,80 @@ export const pathsIn = (text: string, home: string, cwd: string): Array<string> 
   for (const match of text.matchAll(/\bcd\s+([^\s;&|]+)/g)) found.add(resolve(cwd, match[1]!.replace(/^~/, home)));
   return [...found];
 };
+
+// --- a repository against its baseline (the user-requested full diff) ----------------
+
+/** git's empty tree: the baseline of a repository with no commits yet. */
+export const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+const verifyCommit = (repo: string, ref: string) =>
+  git(repo, ["rev-parse", "--verify", "-q", `${ref}^{commit}`]).then((s) => s.trim() || null, () => null);
+
+/** Where a repository's work started: what a full diff compares the working tree against. */
+export interface Baseline {
+  /** The ref as asked for or picked (`origin/main`), for display. */
+  readonly ref: string;
+  /** The merge base of HEAD and that ref; null for a repository without commits. */
+  readonly commit: string | null;
+  readonly tree: string;
+}
+
+/**
+ * The baseline of a full diff: the merge base of HEAD with `ref` or, by default, with the
+ * first of the origin's default branch (`origin/HEAD`), `origin/main`, `origin/master`,
+ * the branch's upstream, `main`, `master` that exists; HEAD itself when none does (only
+ * uncommitted work then). The merge base keeps others' later commits on that branch out.
+ */
+export const resolveBaseline = async (repo: string, ref?: string): Promise<Baseline> => {
+  if (ref !== undefined && (ref.trim() === "" || ref.startsWith("-"))) throw new Error(`"${ref}" is not a git ref`);
+  const head = await verifyCommit(repo, "HEAD");
+  let label: string | null = null;
+  let target: string | null = null;
+  if (ref !== undefined) {
+    target = await verifyCommit(repo, ref.trim());
+    if (!target) throw new Error(`Unknown ref "${ref}" in ${repo}`);
+    label = ref.trim();
+  } else {
+    const originHead = await git(repo, ["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"]).then((s) => s.trim(), () => "");
+    for (const candidate of [originHead, "origin/main", "origin/master", "@{upstream}", "main", "master"]) {
+      if (!candidate) continue;
+      target = await verifyCommit(repo, candidate);
+      if (target) {
+        label = candidate;
+        break;
+      }
+    }
+  }
+  if (!head) return { ref: label ?? "(no commits)", commit: null, tree: EMPTY_TREE };
+  if (!target) return { ref: "HEAD", commit: head, tree: await treeOf(repo, head) };
+  const base = target === head ? head : (await git(repo, ["merge-base", head, target]).then((s) => s.trim(), () => "")) || target;
+  return { ref: label!, commit: base, tree: await treeOf(repo, base) };
+};
+
+const treeOf = async (repo: string, commit: string) => (await git(repo, ["rev-parse", `${commit}^{tree}`])).trim();
+
+/** HEAD's commit and tree, and its branch (null when detached or without commits). */
+export const headOf = async (repo: string) => {
+  const commit = await verifyCommit(repo, "HEAD");
+  const branch = await git(repo, ["symbolic-ref", "-q", "--short", "HEAD"]).then((s) => s.trim() || null, () => null);
+  return { commit, branch, tree: commit ? await treeOf(repo, commit) : EMPTY_TREE };
+};
+
+/** The commits on HEAD since `base` (newest first, at most `limit`), and how many there are. */
+export const commitsSince = async (repo: string, base: string | null, limit: number) => {
+  const range = base ? `${base}..HEAD` : "HEAD";
+  const head = await verifyCommit(repo, "HEAD");
+  if (!head) return { count: 0, commits: [] as Array<{ sha: string; subject: string }> };
+  const [count, log] = await Promise.all([
+    git(repo, ["rev-list", "--count", range]),
+    git(repo, ["log", "--no-color", `--max-count=${limit}`, "--format=%h%x09%s", range]),
+  ]);
+  const commits = log
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const tab = line.indexOf("\t");
+      return { sha: line.slice(0, tab), subject: line.slice(tab + 1) };
+    });
+  return { count: Number(count.trim()) || 0, commits };
+};

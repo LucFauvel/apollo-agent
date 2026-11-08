@@ -222,7 +222,7 @@ function RepoCard({
   );
 }
 
-function Counts({ additions, deletions, binary = false }: { additions: number; deletions: number; binary?: boolean }) {
+export function Counts({ additions, deletions, binary = false }: { additions: number; deletions: number; binary?: boolean }) {
   if (binary) return <span className="text-[10.5px] text-zinc-500">binary</span>;
   const total = additions + deletions;
   const greens = total === 0 ? 0 : Math.round((additions / total) * 5);
@@ -239,18 +239,21 @@ function Counts({ additions, deletions, binary = false }: { additions: number; d
   );
 }
 
-function FileRow({
+/** One changed file; opens as its semantic diff (with `reportSeq`: a file of that full diff). */
+export function FileRow({
   sessionId,
   repo,
   file,
   version,
   index,
+  reportSeq,
 }: {
   sessionId: SessionId;
   repo: string;
   file: OverviewFile;
   version: number;
   index: number;
+  reportSeq?: number;
 }) {
   const [open, setOpen] = useState(false);
   const slash = file.path.lastIndexOf("/");
@@ -278,25 +281,37 @@ function FileRow({
         <ChevronRight className={cx("size-3.5 shrink-0 text-zinc-600 transition-transform duration-200 group-hover:text-zinc-400", open && "rotate-90")} />
       </button>
       {!open && file.note ? <p className="-mt-1 truncate px-3 pb-2 pl-10 text-[11.5px] text-zinc-500 italic">{file.note}</p> : null}
-      <Collapse open={open}>{open ? <FileDiff sessionId={sessionId} repo={repo} path={file.path} version={version} /> : null}</Collapse>
+      <Collapse open={open}>{open ? <FileDiff sessionId={sessionId} repo={repo} path={file.path} version={version} reportSeq={reportSeq} /> : null}</Collapse>
     </div>
   );
 }
 
 // --- the semantic diff of one file ----------------------------------------------------------
 
-function FileDiff({ sessionId, repo, path, version }: { sessionId: SessionId; repo: string; path: string; version: number }) {
+function FileDiff({
+  sessionId,
+  repo,
+  path,
+  version,
+  reportSeq,
+}: {
+  sessionId: SessionId;
+  repo: string;
+  path: string;
+  version: number;
+  reportSeq?: number | undefined;
+}) {
   const [diff, setDiff] = useState<SemanticFileDiff | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
-    rpc((c) => c["changes.file"]({ sessionId, repo, path }))
+    rpc((c) => c["changes.file"]({ sessionId, repo, path, ...(reportSeq !== undefined ? { reportSeq } : {}) }))
       .then((next) => !cancelled && (setDiff(next), setError(null)))
       .catch((e) => !cancelled && setError(errorMessage(e)));
     return () => {
       cancelled = true;
     };
-  }, [sessionId, repo, path, version]);
+  }, [sessionId, repo, path, version, reportSeq]);
 
   if (error) return <div className="px-3 pb-3 pl-10 text-xs text-red-300">{error}</div>;
   if (!diff) {

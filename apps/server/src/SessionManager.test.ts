@@ -758,6 +758,49 @@ describe("SessionManager", () => {
     }).pipe(Effect.provide(layer)),
   );
 
+  it.live("shows the full semantic diff of a repository only when the user asked for it", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      const repo = realpathSync(mkdtempSync(join(tmpdir(), "apollo-report-")));
+      execSync("git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", { cwd: repo });
+
+      // An orchestrator's message is not the user's request.
+      const worker = yield* manager.createSession({
+        botId: bot.id,
+        title: "feature",
+        provider: bot.defaultWorker,
+        cwd: repo,
+        prompt: "write answer.ts",
+        parentSessionId: bot.mainSessionId,
+        author: "bot",
+      });
+      yield* waitIdle(manager, worker.id);
+      const refused = yield* Effect.flip(manager.semanticDiff(worker.id, { request: "write answer.ts" }));
+      expect(refused.message).toContain("the user has not written");
+
+      // The user asks: the report goes into the conversation as a card.
+      yield* manager.send(worker.id, "Give me the full semantic diff please");
+      yield* waitIdle(manager, worker.id);
+      const wrong = yield* Effect.flip(manager.semanticDiff(worker.id, { request: "review everything" }));
+      expect(wrong.message).toContain("not in the user's latest message");
+      const shown = yield* manager.semanticDiff(worker.id, { request: "full semantic diff" });
+      expect(shown.repo.files.map((f) => f.path)).toEqual(["answer.ts"]);
+      expect(shown.report).toMatchObject({ commitCount: 0, uncommitted: true });
+      const event = yield* store.eventAt(worker.id, shown.seq);
+      expect(event).toMatchObject({ _tag: "FilesChanged", repos: [{ repo }], report: { uncommitted: true } });
+
+      // Its files open as semantic diffs from the snapshot, whatever changed since.
+      writeFileSync(join(repo, "answer.ts"), "export const answer = 43;\n");
+      const diff = yield* manager.changesFile(worker.id, repo, "answer.ts", shown.seq);
+      expect(diff.symbols.map((s) => [s.name, s.change])).toEqual([["answer", "added"]]);
+      expect(diff.symbols[0]?.hunks[0]?.lines.map((l) => l.text)).toEqual(["export const answer = 42;"]);
+      const missing = yield* Effect.flip(manager.changesFile(worker.id, repo, "answer.ts", shown.seq - 1));
+      expect(missing.message).toContain("no full diff");
+    }).pipe(Effect.provide(layer)),
+  );
+
   it.live("reflects automatically after enough turns when autoLearn is on", () =>
     Effect.gen(function* () {
       const manager = yield* SessionManager.SessionManager;

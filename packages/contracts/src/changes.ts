@@ -30,6 +30,39 @@ export const RepoChanges = Schema.Struct({
 });
 export type RepoChanges = typeof RepoChanges.Type;
 
+/**
+ * A full semantic diff of one repository, which the user asked for: everything that differs
+ * from its baseline (committed but unpushed, and uncommitted), whichever turn or session
+ * made it. A snapshot of when it was asked; the files are in the event's `repos`.
+ */
+export const ChangeReport = Schema.Struct({
+  /** The repository's common git dir, where both trees live. */
+  gitDir: Schema.String,
+  base: Schema.Struct({
+    /** As asked for or picked by default (`origin/main`). */
+    ref: Schema.String,
+    /** The merge base with HEAD; null for a repository without commits. */
+    commit: Schema.NullOr(Schema.String),
+    tree: Schema.String,
+  }),
+  head: Schema.Struct({
+    branch: Schema.NullOr(Schema.String),
+    commit: Schema.NullOr(Schema.String),
+    /** A snapshot of the working tree (tracked and untracked files, minus ignored ones). */
+    tree: Schema.String,
+  }),
+  /** Commits on HEAD since the base: how many, and the newest of them. */
+  commitCount: Schema.Number,
+  commits: Schema.Array(Schema.Struct({ sha: Schema.String, subject: Schema.String })),
+  /** The working tree differs from HEAD. */
+  uncommitted: Schema.Boolean,
+  /** Changed files left out of the list (it is capped). */
+  moreFiles: Schema.Number,
+  /** Explanations workers gave of these files (`apollo_explain_changes`), the latest per file. */
+  notes: Schema.Array(Schema.Struct({ path: Schema.String, text: Schema.String })),
+});
+export type ChangeReport = typeof ChangeReport.Type;
+
 /** A changed file in the overview, with the worker's explanation when it gave one. */
 export const OverviewFile = Schema.Struct({
   ...ChangedFile.fields,

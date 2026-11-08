@@ -367,9 +367,12 @@ export class ApolloRpcs extends RpcGroup.make(
   // --- changes -------------------------------------------------------------
   /** What a session changed in git repositories (an orchestrator: with its workers'). */
   Rpc.make("changes.list", { payload: { sessionId: SessionId }, success: ChangesOverview, error }),
-  /** One changed file as a semantic diff, grouped by the declarations it touches. */
+  /**
+   * One changed file as a semantic diff, grouped by the declarations it touches. With
+   * `reportSeq`: a file of the full diff in the session's FilesChanged event at that seq.
+   */
   Rpc.make("changes.file", {
-    payload: { sessionId: SessionId, repo: Schema.String, path: Schema.String },
+    payload: { sessionId: SessionId, repo: Schema.String, path: Schema.String, reportSeq: Schema.optional(Schema.Number) },
     success: SemanticFileDiff,
     error,
   }),

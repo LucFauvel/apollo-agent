@@ -1,6 +1,7 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { type ExplainItem, makeChangeTracker } from "./changes/Tracker.ts";
+import { unrequested } from "./changes/requested.ts";
 import { Database } from "./Database.ts";
 import { isAbsolute, join, relative } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -1242,13 +1243,42 @@ const make = Effect.gen(function* () {
         return { sessions: all.filter((c) => c !== null) };
       }),
 
-    /** One changed file of a session as a semantic diff. */
-    changesFile: (id: SessionId, repo: string, path: string) =>
+    /** One changed file of a session as a semantic diff (with `reportSeq`: of the full diff in that event). */
+    changesFile: (id: SessionId, repo: string, path: string, reportSeq?: number) =>
       Effect.gen(function* () {
         yield* store.getSession(id);
+        if (reportSeq !== undefined) {
+          const event = yield* store.eventAt(id, reportSeq);
+          const report = event?._tag === "FilesChanged" && event.repos[0]?.repo === repo ? event.report : undefined;
+          if (!report) return yield* invalid(`There is no full diff of ${repo} at ${reportSeq} in this session`);
+          const diff = yield* Effect.promise(() => changeTracker.reportFile(repo, report, path).catch(() => null));
+          if (!diff) return yield* invalid(`${path} is not in this diff (or its snapshot is no longer in the repository)`);
+          return diff;
+        }
         const diff = yield* Effect.promise(() => changeTracker.file(id, repo, path));
         if (!diff) return yield* invalid(`${path} is not among this session's changes`);
         return diff;
+      }),
+
+    /**
+     * The full semantic diff of a repository against its baseline, which the user asked for:
+     * shown in the conversation as a card (a FilesChanged event with `report`), never sent to
+     * the model. `request` quotes the user's latest message (see changes/requested.ts).
+     */
+    semanticDiff: (id: SessionId, input: { readonly repo?: string | undefined; readonly base?: string | undefined; readonly request: string }) =>
+      Effect.gen(function* () {
+        const session = yield* store.getSession(id);
+        const refused = unrequested(yield* store.lastHumanMessage(id), input.request);
+        if (refused) return yield* invalid(`Not shown: ${refused}.`);
+        const path = input.repo ? (isAbsolute(input.repo) ? input.repo : join(session.cwd, input.repo)) : session.cwd;
+        const result = yield* Effect.tryPromise({
+          try: () => changeTracker.report(path, input.base),
+          catch: (error) => invalid((error as Error).message),
+        }).pipe(
+          Effect.timeoutOrElse({ duration: "120 seconds", orElse: () => Effect.fail(invalid("The diff took over two minutes; try a closer base ref")) }),
+        );
+        const stored = yield* appendEvent(id, { _tag: "FilesChanged", repos: [result.repo], report: result.report });
+        return { seq: stored.seq, ...result };
       }),
 
     /** A worker's explanation of the changes in its running turn. */

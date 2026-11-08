@@ -1,5 +1,15 @@
 import { codeLanguage, codePlainColor, highlightCode } from "@apollo/client";
-import type { ChangesOverview, OverviewFile, PullRequest, SemanticFileDiff, SemanticSymbol, Session, SessionId } from "@apollo/contracts";
+import type {
+  ChangeReport,
+  ChangesOverview,
+  OverviewFile,
+  PullRequest,
+  RepoChanges,
+  SemanticFileDiff,
+  SemanticSymbol,
+  Session,
+  SessionId,
+} from "@apollo/contracts";
 import { useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -241,7 +251,19 @@ function RepoCard({ sessionId, repo, version }: { sessionId: SessionId; repo: { 
   );
 }
 
-function FileRow({ sessionId, repo, file, version }: { sessionId: SessionId; repo: string; file: OverviewFile; version: number }) {
+function FileRow({
+  sessionId,
+  repo,
+  file,
+  version,
+  reportSeq,
+}: {
+  sessionId: SessionId;
+  repo: string;
+  file: OverviewFile;
+  version: number;
+  reportSeq?: number | undefined;
+}) {
   const [open, toggle] = useToggle();
   const slash = file.path.lastIndexOf("/");
   const dir = slash >= 0 ? file.path.slice(0, slash + 1) : "";
@@ -269,27 +291,110 @@ function FileRow({ sessionId, repo, file, version }: { sessionId: SessionId; rep
         </Text>
       ) : null}
       {/* Outside the tap target, so code inside can scroll sideways without closing the file. */}
-      {open ? <FileDiff sessionId={sessionId} repo={repo} path={file.path} version={version} /> : null}
+      {open ? <FileDiff sessionId={sessionId} repo={repo} path={file.path} version={version} reportSeq={reportSeq} /> : null}
+    </View>
+  );
+}
+
+// --- the full diff of a repository the user asked for (shown in the conversation) -----------
+
+/**
+ * The full semantic diff of a repository (`apollo_semantic_diff`): every file that differs
+ * from its baseline, whichever turn changed it, as of when it was asked (the desktop's FullDiff).
+ */
+export function FullDiff({ sessionId, seq, repo, report }: { sessionId: SessionId; seq: number; repo: RepoChanges; report: ChangeReport }) {
+  const [closed, toggle] = useToggle();
+  const [commitsOpen, toggleCommits] = useToggle();
+  const notes = useMemo(() => new Map(report.notes.map((n) => [n.path, n.text])), [report.notes]);
+  const additions = repo.files.reduce((n, f) => n + (f.additions ?? 0), 0);
+  const deletions = repo.files.reduce((n, f) => n + (f.deletions ?? 0), 0);
+  const total = repo.files.length + report.moreFiles;
+  const base = report.base.commit ? `${report.base.ref} @ ${report.base.commit.slice(0, 7)}` : report.base.ref;
+  return (
+    <View style={styles.card}>
+      <Pressable onPress={toggle} style={({ pressed }) => [styles.repoHeader, pressed && styles.pressed]}>
+        <GitCompareArrowsIcon size={16} color={colors.muted} strokeWidth={1.75} />
+        <View style={{ flex: 1, minWidth: 0 }}>
+          <Text style={styles.repoName} numberOfLines={1}>
+            Full diff · {repo.name}
+          </Text>
+          <Text style={styles.faintSmall} numberOfLines={1}>
+            vs {base} · {total} {total === 1 ? "file" : "files"}
+          </Text>
+        </View>
+        <Counts additions={additions} deletions={deletions} />
+        <Turn open={!closed}>
+          <ChevronRightIcon size={14} color={colors.faint} />
+        </Turn>
+      </Pressable>
+      {!closed ? (
+        <>
+          <Pressable onPress={report.commitCount > 0 ? toggleCommits : undefined} style={[styles.indent, { paddingVertical: 6 }]}>
+            <Text style={styles.faintSmall}>
+              {report.head.branch ? `${report.head.branch} · ` : ""}
+              {report.commitCount > 0
+                ? `${report.commitCount} ${report.commitCount === 1 ? "commit" : "commits"} since the base ${commitsOpen ? "▾" : "▸"}`
+                : "No commits since the base"}
+              {report.uncommitted ? " · + uncommitted changes" : ""}
+            </Text>
+          </Pressable>
+          {commitsOpen
+            ? report.commits.map((c) => (
+                <Text key={c.sha} style={[styles.faintSmall, styles.indent]} numberOfLines={1}>
+                  <Text style={{ fontFamily: MONO }}>{c.sha}</Text> <Text style={{ color: colors.textSoft }}>{c.subject}</Text>
+                </Text>
+              ))
+            : null}
+          {repo.files.length === 0 ? <Text style={[styles.faintSmall, styles.indent, { paddingBottom: 8 }]}>Nothing differs from the base.</Text> : null}
+          {repo.files.map((file) => (
+            <FileRow
+              key={file.path}
+              sessionId={sessionId}
+              repo={repo.repo}
+              file={{ ...file, note: notes.get(file.path) ?? null }}
+              version={0}
+              reportSeq={seq}
+            />
+          ))}
+          {report.moreFiles > 0 ? (
+            <Text style={[styles.omitted, styles.indent, { paddingVertical: 8 }]}>
+              and {report.moreFiles} more {report.moreFiles === 1 ? "file" : "files"}, not listed: ask for a diff against a closer base
+            </Text>
+          ) : null}
+        </>
+      ) : null}
     </View>
   );
 }
 
 // --- the semantic diff of one file ----------------------------------------------------------
 
-function FileDiff({ sessionId, repo, path, version }: { sessionId: SessionId; repo: string; path: string; version: number }) {
+function FileDiff({
+  sessionId,
+  repo,
+  path,
+  version,
+  reportSeq,
+}: {
+  sessionId: SessionId;
+  repo: string;
+  path: string;
+  version: number;
+  reportSeq?: number | undefined;
+}) {
   const { connection } = useApollo();
   const [diff, setDiff] = useState<SemanticFileDiff | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
     connection
-      .rpc((c) => c["changes.file"]({ sessionId, repo, path }))
+      .rpc((c) => c["changes.file"]({ sessionId, repo, path, ...(reportSeq !== undefined ? { reportSeq } : {}) }))
       .then((next) => !cancelled && (setDiff(next), setError(null)))
       .catch((e) => !cancelled && setError(errorMessage(e)));
     return () => {
       cancelled = true;
     };
-  }, [connection, sessionId, repo, path, version]);
+  }, [connection, sessionId, repo, path, version, reportSeq]);
 
   if (error) return <Text style={[styles.error, styles.indent]}>{error}</Text>;
   if (!diff) {

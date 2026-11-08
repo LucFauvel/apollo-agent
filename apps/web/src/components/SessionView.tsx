@@ -51,6 +51,7 @@ import { SecretItem } from "./SecretItem.tsx";
 import { HandoffItem } from "./HandoffItem.tsx";
 import { MessageAttachments, PendingAttachments, useAttachments } from "./Attachments.tsx";
 import { RecordingItem } from "./RecordingItem.tsx";
+import { FullDiff } from "./FullDiff.tsx";
 import { ContextMeter, parseCommand, SlashMenu, useSlashCommands } from "./SlashCommands.tsx";
 import { VisualItem } from "./VisualItem.tsx";
 import { ConversationBar, ConversationButton, DictateButton, ReadAloudButton, useConversation } from "./Voice.tsx";
@@ -227,7 +228,11 @@ function Item({
 }) {
   switch (item.kind) {
     case "changes":
-      return <TurnChanges repos={item.repos} onOpen={onOpenChanges} />;
+      return item.report && item.repos[0] ? (
+        <FullDiff sessionId={sessionId} seq={item.seq} repo={item.repos[0]} report={item.report} at={item.at} />
+      ) : (
+        <TurnChanges repos={item.repos} onOpen={onOpenChanges} />
+      );
     case "compacting":
       return null; // shown as the working row at the end
     case "visual":
@@ -738,7 +743,7 @@ export function SessionView({
       return next;
     });
   // A dot on the Changes button once this conversation changed files.
-  const hasChanges = useMemo(() => items.some((item) => item.kind === "changes"), [items]);
+  const hasChanges = useMemo(() => items.some((item) => item.kind === "changes" && !item.report), [items]);
   // Compaction can take minutes on a local model: say so instead of "Working…".
   const compacting = useMemo(() => isCompacting(items), [items]);
   // Between the user's message and the first streamed output (or a finished step and the
