@@ -9,11 +9,12 @@
     "build": "tsc -p .",
     "dev": "pnpm ensure:electron && tsc -p . && APOLLO_DEV_URL=http://127.0.0.1:5733 electron .",
     "start": "pnpm ensure:electron && pnpm --filter @apollo/web build && tsc -p . && electron .",
-    "typecheck": "tsc --noEmit -p .",
+    "typecheck": "tsc --noEmit -p . && tsc -p tsconfig.scripts.json",
+    "test": "vitest run",
     "bundle:server": "node scripts/bundle-server.ts",
     "package": "pnpm build:package && electron-builder --publish never",
     "package:dir": "pnpm build:package && electron-builder --dir --publish never",
-    "build:package": "pnpm --filter @apollo/web exec vite build --outDir ../desktop/build/web --emptyOutDir && tsc -p . && node scripts/bundle-server.ts && bash ../server/native/tailnet/build.sh",
+    "build:package": "pnpm --filter @apollo/web exec vite build --outDir ../desktop/build/web --emptyOutDir && tsc -p . && node scripts/write-build-info.ts && node scripts/bundle-server.ts && bash ../server/native/tailnet/build.sh",
     "icons": "pnpm ensure:electron && electron scripts/render-icons.mjs",
     "install:app": "node scripts/install-app.ts",
     "package:win": "pnpm --filter @apollo/web exec vite build --outDir ../desktop/build/web --emptyOutDir && tsc -p . && node scripts/bundle-server.ts && electron-builder --win --x64 --publish never --config electron-builder.win.yml && electron-builder --win --arm64 --publish never --config electron-builder.win.yml"
@@ -23,7 +24,8 @@
     "electron": "44.10.1",
     "electron-builder": "^26.18.0",
     "esbuild": "^0.28.2",
-    "typescript": "catalog:"
+    "typescript": "catalog:",
+    "vitest": "catalog:"
   },
   "description": "Apollo desktop app"
 }
