@@ -23,14 +23,22 @@ export class GitError extends Error {
 }
 
 const GIT_TIMEOUT_MS = 60_000;
+/** After git exits: how long to wait for its output to drain (a descendant may hold the pipe). */
+export const EXIT_DRAIN_MS = 250;
+/** After stopping git: how long it may take to go before the call fails anyway, naming its group. */
+export const STOP_DEADLINE_MS = 2_000;
 
 /**
- * Runs git. It leads its own process group, so stopping it (when `signal` aborts, or after
- * a minute) kills what it started too: clean/smudge filters, hooks, credential helpers.
+ * Runs git. It leads its own process group, so stopping it (when `signal` aborts, after a
+ * minute, or past the output limit) kills what it started too: clean/smudge filters, hooks,
+ * credential helpers. The call always settles in bounded time: once git itself exits (output
+ * a descendant still holds open is not waited for), or within STOP_DEADLINE_MS of stopping it
+ * even if it cannot be confirmed gone; a kill that fails is reported, not ignored.
  */
 const git = (cwd: string, args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv, signal?: AbortSignal) =>
   new Promise<string>((resolvePromise, reject) => {
     if (signal?.aborted) return reject(abortError(signal));
+    const command = `git ${args[0] ?? ""}`;
     const child = spawn("git", [...args], {
       cwd,
       env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: "0" },
@@ -40,43 +48,76 @@ const git = (cwd: string, args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv, 
     const out: Array<Buffer> = [];
     const err: Array<Buffer> = [];
     let size = 0;
+    let settled = false;
     let stopped: Error | null = null;
+    const timers: Array<NodeJS.Timeout> = [];
+    const later = (ms: number, fn: () => void) => void timers.push(setTimeout(fn, ms));
+
+    const settle = (outcome: { readonly value: string } | { readonly error: Error }) => {
+      if (settled) return;
+      settled = true;
+      for (const timer of timers) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      // Nothing more is read: a pipe a descendant kept open must not keep this call alive.
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if ("value" in outcome) resolvePromise(outcome.value);
+      else reject(outcome.error);
+    };
+
     const stop = (reason: Error) => {
-      if (stopped) return;
+      if (stopped || settled) return;
       stopped = reason;
-      killGroup(child);
+      const failure = killGroup(child);
+      if (failure) {
+        settle({ error: new GitError(`${reason.message}; and ${command} (process group ${child.pid}) could not be stopped: ${failure.message}`, null, "") });
+        return;
+      }
+      later(STOP_DEADLINE_MS, () =>
+        settle({ error: new GitError(`${reason.message}; and ${command} (process group ${child.pid}) was not confirmed stopped`, null, "") }),
+      );
     };
     const onAbort = () => stop(abortError(signal!));
-    const timer = setTimeout(() => stop(new GitError(`git ${args[0] ?? ""} took over a minute and was stopped`, null, "")), GIT_TIMEOUT_MS);
+    later(GIT_TIMEOUT_MS, () => stop(new GitError(`${command} took over a minute and was stopped`, null, "")));
     signal?.addEventListener("abort", onAbort, { once: true });
+
     const collect = (into: Array<Buffer>) => (chunk: Buffer) => {
       size += chunk.length;
-      if (size > MAX_BUFFER) stop(new GitError(`git ${args[0] ?? ""} wrote more than ${MAX_BUFFER} bytes`, null, ""));
+      if (size > MAX_BUFFER) stop(new GitError(`${command} wrote more than ${MAX_BUFFER} bytes`, null, ""));
       else into.push(chunk);
     };
     child.stdout.on("data", collect(out));
     child.stderr.on("data", collect(err));
-    const finish = (code: number | null, error?: Error) => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
+
+    const finish = (code: number | null) => {
       const stdout = Buffer.concat(out).toString("utf8");
       const stderr = Buffer.concat(err).toString("utf8").trim();
-      if (stopped) reject(stopped);
-      else if (error) reject(new GitError(error.message, null, stderr));
-      else if (code !== 0) reject(new GitError(stderr || `git ${args[0] ?? ""} exited with ${code}`, code, stderr));
-      else resolvePromise(stdout);
+      if (stopped) settle({ error: stopped });
+      else if (code !== 0) settle({ error: new GitError(stderr || `${command} exited with ${code}`, code, stderr) });
+      else settle({ value: stdout });
     };
-    child.once("error", (error) => finish(null, error));
+    child.once("error", (error) => settle({ error: stopped ?? new GitError(error.message, null, "") }));
+    // Normally the pipes close right after git exits; when something else holds them, settle anyway.
+    child.once("exit", (code) => later(EXIT_DRAIN_MS, () => finish(code)));
     child.once("close", (code) => finish(code));
   });
 
-/** Kills a process and, outside Windows, every process in its group. */
-const killGroup = (child: ChildProcess) => {
+/**
+ * Kills a process and, outside Windows, every process in its group. Returns why it could
+ * not (a group that is already gone is not a failure), or null.
+ */
+const killGroup = (child: ChildProcess): Error | null => {
   try {
     if (child.pid !== undefined && process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
     else child.kill("SIGKILL");
-  } catch {
-    // Already gone.
+    return null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") return null;
+    // Still try git itself, so at least the direct process goes.
+    try {
+      child.kill("SIGKILL");
+    } catch {}
+    return error as Error;
   }
 };
 
