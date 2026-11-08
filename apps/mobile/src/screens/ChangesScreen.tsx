@@ -35,6 +35,7 @@ import {
   SparklesIcon,
   SquareFunctionIcon,
   TypeIcon,
+  XIcon,
 } from "../icons.tsx";
 import { animateLayout, FadeIn, Turn, useToggle } from "../motion.tsx";
 import { colors } from "../theme.ts";
@@ -302,7 +303,20 @@ function FileRow({
  * The full semantic diff of a repository (`apollo_semantic_diff`): every file that differs
  * from its baseline, whichever turn changed it, as of when it was asked (the desktop's FullDiff).
  */
-export function FullDiff({ sessionId, seq, repo, report }: { sessionId: SessionId; seq: number; repo: RepoChanges; report: ChangeReport }) {
+export function FullDiff({
+  sessionId,
+  seq,
+  repo,
+  report,
+  onClear,
+}: {
+  sessionId: SessionId;
+  seq: number;
+  repo: RepoChanges;
+  report: ChangeReport;
+  /** Clears the card from the conversation (every client); undone from the line left in its place. */
+  onClear: () => void;
+}) {
   const [closed, toggle] = useToggle();
   const [commitsOpen, toggleCommits] = useToggle();
   const notes = useMemo(() => new Map(report.notes.map((n) => [n.path, n.text])), [report.notes]);
@@ -312,21 +326,32 @@ export function FullDiff({ sessionId, seq, repo, report }: { sessionId: SessionI
   const base = report.base.commit ? `${report.base.ref} @ ${report.base.commit.slice(0, 7)}` : report.base.ref;
   return (
     <View style={styles.card}>
-      <Pressable onPress={toggle} style={({ pressed }) => [styles.repoHeader, pressed && styles.pressed]}>
-        <GitCompareArrowsIcon size={16} color={colors.muted} strokeWidth={1.75} />
-        <View style={{ flex: 1, minWidth: 0 }}>
-          <Text style={styles.repoName} numberOfLines={1}>
-            Full diff · {repo.name}
-          </Text>
-          <Text style={styles.faintSmall} numberOfLines={1}>
-            vs {base} · {total} {total === 1 ? "file" : "files"}
-          </Text>
-        </View>
-        <Counts additions={additions} deletions={deletions} />
-        <Turn open={!closed}>
-          <ChevronRightIcon size={14} color={colors.faint} />
-        </Turn>
-      </Pressable>
+      <View style={styles.fullDiffHeader}>
+        <Pressable onPress={toggle} style={({ pressed }) => [styles.repoHeader, styles.fullDiffToggle, pressed && styles.pressed]}>
+          <GitCompareArrowsIcon size={16} color={colors.muted} strokeWidth={1.75} />
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={styles.repoName} numberOfLines={1}>
+              Full diff · {repo.name}
+            </Text>
+            <Text style={styles.faintSmall} numberOfLines={1}>
+              vs {base} · {total} {total === 1 ? "file" : "files"}
+            </Text>
+          </View>
+          <Counts additions={additions} deletions={deletions} />
+          <Turn open={!closed}>
+            <ChevronRightIcon size={14} color={colors.faint} />
+          </Turn>
+        </Pressable>
+        <Pressable
+          onPress={onClear}
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityLabel="Clear from the conversation"
+          style={({ pressed }) => [styles.fullDiffClear, pressed && { opacity: 0.6 }]}
+        >
+          <XIcon size={14} color="#52525b" />
+        </Pressable>
+      </View>
       {!closed ? (
         <>
           <Pressable onPress={report.commitCount > 0 ? toggleCommits : undefined} style={[styles.indent, { paddingVertical: 6 }]}>
@@ -651,6 +676,9 @@ const styles = StyleSheet.create({
   olderToggle: { color: "rgba(196,181,253,0.75)", fontSize: 12, marginTop: 2 },
   card: { borderRadius: 14, borderWidth: 1, borderColor: colors.border, backgroundColor: "rgba(24,24,27,0.4)", overflow: "hidden" },
   repoHeader: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, paddingVertical: 12 },
+  fullDiffHeader: { flexDirection: "row", alignItems: "center" },
+  fullDiffToggle: { flex: 1, minWidth: 0, paddingRight: 4 },
+  fullDiffClear: { paddingLeft: 4, paddingRight: 12, paddingVertical: 12 },
   repoName: { color: colors.text, fontSize: 14, fontWeight: "600", flexShrink: 1 },
   faintSmall: { color: colors.faint, fontSize: 11.5 },
   counts: { fontFamily: MONO, fontSize: 11 },

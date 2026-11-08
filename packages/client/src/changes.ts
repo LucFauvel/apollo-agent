@@ -23,6 +23,21 @@ export const latestChangesKey = (items: ReadonlyArray<{ readonly kind: string; r
   return null;
 };
 
+/** A conversation item as the cards logic sees it: changes items may carry a full-diff `report`. */
+type CardItem = { readonly kind: string; readonly key: string; readonly report?: unknown };
+
+/** A full diff the user asked for (`apollo_semantic_diff`): clearable, but not a turn's changes card. */
+export const isFullDiff = (item: CardItem): boolean => item.kind === "changes" && !!item.report;
+
+/**
+ * The items without full diffs, for `currentChangesKey` and `latestChangesKey`: a full diff
+ * neither takes the place of the latest turn's card nor folds history again.
+ */
+export const withoutFullDiffs = <T extends CardItem>(items: ReadonlyArray<T>): ReadonlyArray<T> => items.filter((item) => !isFullDiff(item));
+
+/** Whether the conversation shows any clearable card (a turn's changes or a full diff). */
+export const hasCards = (items: ReadonlyArray<CardItem>): boolean => items.some((item) => item.kind === "changes");
+
 /** Each turn's summary by turn seq (the newest if there are several). */
 export const summariesByTurn = (changes: ConversationChanges | null): ReadonlyMap<number, string> => {
   const byTurn = new Map<number, string>();

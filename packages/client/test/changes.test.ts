@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   currentChangesKey,
+  hasCards,
+  isFullDiff,
+  withoutFullDiffs,
   latestChangesKey,
   reduceTranscript,
   summariesByTurn,
@@ -48,6 +51,45 @@ describe("conversation changes cards", () => {
     expect(currentChangesKey([user("u1"), card("c1"), said("a1"), user("u2"), said("a2")])).toBe(null);
     expect(latestChangesKey([user("u1"), card("c1"), user("u2"), said("a2")])).toBe("c1");
     expect(currentChangesKey([])).toBe(null);
+  });
+
+  it("keeps full diffs out of the turn cards, but clearable like them", () => {
+    const report = {
+      gitDir: "/r/app/.git",
+      base: { ref: "main", commit: "abc", tree: "t0" },
+      head: { branch: "feature", commit: "def", tree: "t1" },
+      commitCount: 0,
+      commits: [],
+      uncommitted: true,
+      moreFiles: 0,
+      additions: 1,
+      deletions: 0,
+      notes: [],
+    };
+    const items = replay([
+      at(1, { _tag: "UserMessage", text: "do it", author: "user" }),
+      at(2, { _tag: "TurnStarted" }),
+      at(3, { _tag: "FilesChanged", repos }),
+      at(4, { _tag: "UserMessage", text: "full semantic diff", author: "user" }),
+      at(5, { _tag: "TurnStarted" }),
+      at(6, { _tag: "FilesChanged", repos, report }),
+    ]);
+    const full = items.find((i) => i.kind === "changes" && i.seq === 6)!;
+    expect(isFullDiff(full)).toBe(true);
+    expect(items.filter(isFullDiff).map((i) => i.key)).toEqual(["c6"]);
+    // The full diff takes neither the latest turn's place nor the folding generation.
+    const turns = withoutFullDiffs(items);
+    expect(currentChangesKey(turns)).toBe(null);
+    expect(latestChangesKey(turns)).toBe("c3");
+    // A conversation with only a full diff still loads which cards are cleared.
+    expect(hasCards(items.filter(isFullDiff))).toBe(true);
+    expect(hasCards(withoutFullDiffs(items).filter((i) => i.kind !== "changes"))).toBe(false);
+    // Cleared and brought back by its event's seq, like a turn's card.
+    let s = reduceCards(initialCards(sessionId), { type: "requested", sessionId, id: cardsTick(), seq: 6, dismissed: true });
+    expect([...dismissedCards(s)]).toEqual([6]);
+    expect(s.justCleared.has(6)).toBe(true);
+    s = reduceCards(s, { type: "requested", sessionId, id: cardsTick(), seq: 6, dismissed: false });
+    expect([...dismissedCards(s)]).toEqual([]);
   });
 
   it("finds each turn's summary", () => {

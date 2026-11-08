@@ -806,6 +806,11 @@ describe("SessionManager", () => {
       expect(shown.report).toMatchObject({ commitCount: 0, uncommitted: true, additions: 1, deletions: 0 });
       const event = yield* store.eventAt(worker.id, shown.seq);
       expect(event).toMatchObject({ _tag: "FilesChanged", repos: [{ repo }], report: { uncommitted: true } });
+      // The user can clear the full diff's card like a turn's, and bring it back.
+      yield* manager.dismissChanges(worker.id, shown.seq, true);
+      expect((yield* manager.changesConversation(worker.id)).dismissed).toContain(shown.seq);
+      yield* manager.dismissChanges(worker.id, shown.seq, false);
+      expect((yield* manager.changesConversation(worker.id)).dismissed).not.toContain(shown.seq);
 
       // A day later, automated turns cannot reuse that request: not a system turn, not a bot's.
       db.prepare("update session_events set at = at - 86400000 where session_id = ?").run(worker.id);

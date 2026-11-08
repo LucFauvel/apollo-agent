@@ -2,11 +2,13 @@ import {
   cardsTick,
   currentChangesKey,
   dismissedCards,
+  hasCards,
   initialCards,
   latestChangesKey,
   reduceCards,
   reduceTranscript,
   summariesByTurn,
+  withoutFullDiffs,
   isCompacting,
   showWorking,
   systemMessageParts,
@@ -223,8 +225,10 @@ export function ChatScreen({
     return urls.size;
   }, [state.pullRequests, state.sessions, session]);
   const hasChanges = useMemo(() => items.some((item) => item.kind === "changes" && !item.report), [items]);
-  // Full-diff reports are not a turn's changes card: they neither fold history nor take its place.
-  const turnItems = useMemo(() => items.filter((item) => !(item.kind === "changes" && item.report)), [items]);
+  // Full diffs are not a turn's changes card: they neither fold history nor take its place,
+  // but they clear like one, so any card loads which ones are cleared.
+  const turnItems = useMemo(() => withoutFullDiffs(items), [items]);
+  const anyCards = useMemo(() => hasCards(items), [items]);
   // Each turn's changes card: its worker's summary, and whether the user cleared it. Kept by
   // the server, so a card cleared on the desktop is gone here too, and after restarts.
   // Bumped by the server's ChangesUpdated, and by every reconnect (AppState.tsx).
@@ -236,7 +240,7 @@ export function ChatScreen({
   // Refetched when the bot's changes move, and after each request settles (`epoch`).
   const cardsEpoch = cardsState.sessionId === sessionId ? cardsState.epoch : 0;
   useEffect(() => {
-    if (!hasChanges) return;
+    if (!anyCards) return;
     const id = sessionId;
     // Issuing it makes every earlier answer for this view stale, whatever started either.
     const fetchId = cardsTick();
@@ -245,7 +249,7 @@ export function ChatScreen({
       .rpc((c) => c["changes.conversation"]({ sessionId: id }))
       .then((changes) => dispatchCards({ type: "fetched", sessionId: id, fetchId, changes }))
       .catch(() => {}); // the cards still show, without summaries
-  }, [connection, sessionId, changesVersion, hasChanges, cardsEpoch]);
+  }, [connection, sessionId, changesVersion, anyCards, cardsEpoch]);
   const cards = useMemo<ChangesCards>(() => {
     const own = cardsState.sessionId === sessionId ? cardsState : initialCards(sessionId);
     return {
@@ -526,18 +530,26 @@ function Item({
 } & Respond) {
   switch (item.kind) {
     case "changes":
-      if (item.report && item.repos[0]) {
-        return <FullDiff sessionId={sessionId} seq={item.seq} repo={item.repos[0]} report={item.report} />;
-      }
       if (cards.dismissed.has(item.seq)) {
         return cards.justCleared.has(item.seq) ? (
           <View style={styles.cleared}>
-            <Text style={styles.clearedText}>Changes cleared</Text>
+            <Text style={styles.clearedText}>{item.report ? "Full diff cleared" : "Changes cleared"}</Text>
             <Pressable onPress={() => cards.setDismissed(item.seq, false)} hitSlop={10}>
               <Text style={styles.clearedUndo}>Undo</Text>
             </Pressable>
           </View>
         ) : null;
+      }
+      if (item.report && item.repos[0]) {
+        return (
+          <FullDiff
+            sessionId={sessionId}
+            seq={item.seq}
+            repo={item.repos[0]}
+            report={item.report}
+            onClear={() => cards.setDismissed(item.seq, true)}
+          />
+        );
       }
       return (
         <TurnChanges

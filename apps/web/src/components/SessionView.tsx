@@ -30,6 +30,7 @@ import {
   cardsTick,
   currentChangesKey,
   dismissedCards,
+  hasCards,
   initialCards,
   isCompacting,
   latestChangesKey,
@@ -37,6 +38,7 @@ import {
   showWorking,
   summariesByTurn,
   systemMessageParts,
+  withoutFullDiffs,
 } from "@apollo/client";
 import { MarkdownText } from "./Code.tsx";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
@@ -241,11 +243,22 @@ function Item({
 }) {
   switch (item.kind) {
     case "changes":
-      if (item.report && item.repos[0]) {
-        return <FullDiff sessionId={sessionId} seq={item.seq} repo={item.repos[0]} report={item.report} at={item.at} />;
-      }
       if (cards.dismissed.has(item.seq)) {
-        return cards.justCleared.has(item.seq) ? <ClearedChanges onUndo={() => cards.setDismissed(item.seq, false)} /> : null;
+        return cards.justCleared.has(item.seq) ? (
+          <ClearedChanges label={item.report ? "Full diff cleared" : "Changes cleared"} onUndo={() => cards.setDismissed(item.seq, false)} />
+        ) : null;
+      }
+      if (item.report && item.repos[0]) {
+        return (
+          <FullDiff
+            sessionId={sessionId}
+            seq={item.seq}
+            repo={item.repos[0]}
+            report={item.report}
+            at={item.at}
+            onClear={() => cards.setDismissed(item.seq, true)}
+          />
+        );
       }
       return (
         <TurnChanges
@@ -831,11 +844,11 @@ function TurnChanges({
 }
 
 /** Where a card the user just cleared was, while the view is open: a way back. */
-function ClearedChanges({ onUndo }: { onUndo: () => void }) {
+function ClearedChanges({ label, onUndo }: { label: string; onUndo: () => void }) {
   return (
     <div className="animate-fade-up flex items-center gap-2 px-2 text-[11px] text-zinc-600">
       <GitCompareArrows className="size-3 shrink-0" />
-      <span>Changes cleared</span>
+      <span>{label}</span>
       <button type="button" onClick={onUndo} className="text-zinc-500 underline-offset-2 hover:text-zinc-300 hover:underline">
         Undo
       </button>
@@ -917,9 +930,11 @@ export function SessionView({
     });
   // A dot on the Changes button once this conversation changed files.
   const hasChanges = useMemo(() => items.some((item) => item.kind === "changes" && !item.report), [items]);
-  // Full-diff reports are not a turn's changes card: they neither fold history nor take its place.
-  const turnBlocks = useMemo(() => blocks.filter((b) => !(b.kind === "changes" && b.report)), [blocks]);
-  const cards = useChangesCards(session, turnBlocks, hasChanges);
+  // Full diffs are not a turn's changes card: they neither fold history nor take its place,
+  // but they clear like one, so any card loads which ones are cleared.
+  const turnBlocks = useMemo(() => withoutFullDiffs(blocks), [blocks]);
+  const anyCards = useMemo(() => hasCards(blocks), [blocks]);
+  const cards = useChangesCards(session, turnBlocks, anyCards);
   // Compaction can take minutes on a local model: say so instead of "Working…".
   const compacting = useMemo(() => isCompacting(items), [items]);
   // Between the user's message and the first streamed output (or a finished step and the
