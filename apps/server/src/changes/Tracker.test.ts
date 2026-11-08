@@ -74,6 +74,13 @@ describe("change tracker", () => {
     const diff = await tracker.file("s2", app.dir, "store.ts");
     expect(diff?.symbols.map((s) => [s.name, s.change, s.note])).toEqual([["Store.list", "modified", "Returns the default."]]);
     expect(tracker.turnNotes("s2", 3).map((n) => n.text)).toEqual(["Lists start with a default.", "Default entry.", "Returns the default."]);
+    // The conversation's card finds the summary by its turn, and can be cleared.
+    expect(tracker.conversation("s2")).toMatchObject({ summaries: [{ turnSeq: 3, text: "Lists start with a default." }], dismissed: [] });
+    tracker.setDismissed("s2", 12, true);
+    tracker.setDismissed("s2", 12, true);
+    expect(tracker.conversation("s2").dismissed).toEqual([12]);
+    tracker.setDismissed("s2", 12, false);
+    expect(tracker.conversation("s2").dismissed).toEqual([]);
   });
 
   it("spans several turns, from the first snapshot to the latest", async () => {

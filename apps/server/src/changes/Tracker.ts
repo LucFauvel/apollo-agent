@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { basename, isAbsolute, relative, resolve } from "node:path";
-import type { ChangedFile, OverviewFile, RepoChanges, SemanticFileDiff, SessionChanges } from "@apollo/contracts";
+import type { ChangedFile, ConversationChanges, OverviewFile, RepoChanges, SemanticFileDiff, SessionChanges } from "@apollo/contracts";
 import { commonGitDir, diffFile, diffFiles, fileAt, pathsIn, repoRoot, snapshot } from "./git.ts";
 import { semanticDiff } from "./semantic.ts";
 
@@ -273,7 +273,27 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
     return { ...base, symbols, omitted: null };
   };
 
-  return { turnStarted, toolStarted, turnCompleted, currentTurn, explain, turnNotes, sessionChanges, file };
+  // --- the conversation's changes cards ------------------------------------------
+
+  /** The summary of each turn (newest first), and the cards the user cleared. */
+  const conversation = (sessionId: string): ConversationChanges => ({
+    summaries: (
+      db
+        .prepare("select turn_seq, text, created_at from change_notes where session_id = ? and path = '' order by created_at desc limit 200")
+        .all(sessionId) as Array<{ turn_seq: number; text: string; created_at: number }>
+    ).map((r) => ({ turnSeq: Number(r.turn_seq), text: r.text, at: Number(r.created_at) })),
+    dismissed: (db.prepare("select seq from dismissed_changes where session_id = ? order by seq").all(sessionId) as Array<{ seq: number }>).map(
+      (r) => Number(r.seq),
+    ),
+  });
+
+  /** Clears the card of the FilesChanged event at `seq` from the conversation, or brings it back. */
+  const setDismissed = (sessionId: string, seq: number, dismissed: boolean) => {
+    if (dismissed) db.prepare("insert or ignore into dismissed_changes (session_id, seq) values (?, ?)").run(sessionId, seq);
+    else db.prepare("delete from dismissed_changes where session_id = ? and seq = ?").run(sessionId, seq);
+  };
+
+  return { turnStarted, toolStarted, turnCompleted, currentTurn, explain, turnNotes, sessionChanges, file, conversation, setDismissed };
 };
 
 export type ChangeTracker = ReturnType<typeof makeChangeTracker>;

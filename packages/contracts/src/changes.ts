@@ -54,6 +54,27 @@ export type SessionChanges = typeof SessionChanges.Type;
 export const ChangesOverview = Schema.Struct({ sessions: Schema.Array(SessionChanges) });
 export type ChangesOverview = typeof ChangesOverview.Type;
 
+/** A worker's summary of one turn's changes (`apollo_explain_changes`). */
+export const TurnSummary = Schema.Struct({
+  /** The turn: seq of its TurnStarted event. */
+  turnSeq: Schema.Number,
+  text: Schema.String,
+  at: Schema.Number,
+});
+export type TurnSummary = typeof TurnSummary.Type;
+
+/**
+ * What the conversation shows with each turn's changes card (one session only, unlike the
+ * overview): the worker's summaries per turn, and the cards the user cleared.
+ */
+export const ConversationChanges = Schema.Struct({
+  /** Newest first. */
+  summaries: Schema.Array(TurnSummary),
+  /** Seqs of the FilesChanged events whose cards the user cleared from the conversation. */
+  dismissed: Schema.Array(Schema.Number),
+});
+export type ConversationChanges = typeof ConversationChanges.Type;
+
 export const DiffLine = Schema.Struct({
   kind: Schema.Literals(["add", "del", "ctx"]),
   text: Schema.String,

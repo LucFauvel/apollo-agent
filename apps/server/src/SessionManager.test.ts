@@ -750,6 +750,16 @@ describe("SessionManager", () => {
       const diff = yield* manager.changesFile(worker.id, repo, "answer.ts");
       expect(diff.symbols.map((s) => [s.name, s.change])).toEqual([["answer", "added"]]);
 
+      // The user clears the turn's card from the conversation (kept server-side), and brings it back.
+      const filesChanged = events.find((e) => e.event._tag === "FilesChanged")!;
+      yield* manager.dismissChanges(worker.id, filesChanged.seq, true);
+      expect((yield* manager.changesConversation(worker.id)).dismissed).toEqual([filesChanged.seq]);
+      yield* manager.dismissChanges(worker.id, filesChanged.seq, false);
+      expect((yield* manager.changesConversation(worker.id)).dismissed).toEqual([]);
+      const message = events.find((e) => e.event._tag === "UserMessage")!;
+      const refused = yield* manager.dismissChanges(worker.id, message.seq, true).pipe(Effect.flip);
+      expect(refused.message).toContain("only a turn's changes");
+
       // And the report to the orchestrator lists the file.
       yield* Effect.sleep(Duration.millis(50));
       yield* waitIdle(manager, bot.mainSessionId);

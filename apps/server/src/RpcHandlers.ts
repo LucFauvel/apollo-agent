@@ -180,6 +180,8 @@ export const layer = ApolloRpcs.toLayer(
       "auth.listClients": () => Effect.sync(() => auth.listClients()),
       "changes.list": ({ sessionId }) => manager.changesList(sessionId),
       "changes.file": ({ sessionId, repo, path }) => manager.changesFile(sessionId, repo, path),
+      "changes.conversation": ({ sessionId }) => manager.changesConversation(sessionId),
+      "changes.dismiss": ({ sessionId, seq, dismissed }) => manager.dismissChanges(sessionId, seq, dismissed),
       "remote.status": () => tailscale.read,
       "remote.setTailscale": ({ enabled }) => tailscale.setEnabled(enabled),
       "remote.signOutTailscale": () => tailscale.signOut,

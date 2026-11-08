@@ -101,7 +101,15 @@ type TranscriptItemKind =
     }
   | { readonly kind: "turn-end"; readonly key: string; readonly outcome: string; readonly error: string | null }
   /** Files a turn changed in git repositories (detected by Apollo). */
-  | { readonly kind: "changes"; readonly key: string; readonly repos: ReadonlyArray<RepoChanges> }
+  | {
+      readonly kind: "changes";
+      readonly key: string;
+      readonly repos: ReadonlyArray<RepoChanges>;
+      /** The FilesChanged event's seq (what `changes.dismiss` takes). */
+      readonly seq: number;
+      /** The turn it ended (its TurnStarted seq), to find the worker's summary; null if not seen. */
+      readonly turnSeq: number | null;
+    }
   /** Live only, while the agent compacts its context; clients show it instead of "Working…". */
   | { readonly kind: "compacting"; readonly key: string };
 
@@ -109,6 +117,8 @@ export interface TranscriptState {
   readonly sessionId: SessionId;
   readonly lastSeq: number;
   readonly items: ReadonlyArray<TranscriptItem>;
+  /** Seq of the latest TurnStarted event, for the turn's changes card. */
+  readonly turnSeq?: number;
 }
 
 const updateWhere = (
@@ -306,7 +316,7 @@ export const reduceTranscript = (state: TranscriptState, e: SessionEvent): Trans
     case "Notice":
       return push({ kind: "notice", key: `n${e.seq}`, level: event.level, message: event.message });
     case "FilesChanged":
-      return push({ kind: "changes", key: `c${e.seq}`, repos: event.repos });
+      return push({ kind: "changes", key: `c${e.seq}`, repos: event.repos, seq: e.seq, turnSeq: state.turnSeq ?? null });
     case "Compacting": {
       const rest = items.filter((i) => i.kind !== "compacting");
       return { ...state, items: event.active ? [...rest, { kind: "compacting", key: "compacting" }] : rest };
@@ -319,7 +329,7 @@ export const reduceTranscript = (state: TranscriptState, e: SessionEvent): Trans
         : { ...ended, lastSeq, items: [...ended.items, { kind: "turn-end", key: `t${e.seq}`, outcome: event.outcome, error: event.error }] };
     }
     case "TurnStarted":
-      return { ...state, lastSeq };
+      return e.seq === 0 ? { ...state, lastSeq } : { ...state, lastSeq, turnSeq: e.seq };
   }
 };
 

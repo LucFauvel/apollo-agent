@@ -1251,6 +1251,23 @@ const make = Effect.gen(function* () {
         return diff;
       }),
 
+    /** The summaries and cleared cards shown with the conversation's changes cards. */
+    changesConversation: (id: SessionId) =>
+      Effect.gen(function* () {
+        yield* store.getSession(id);
+        return changeTracker.conversation(id);
+      }),
+
+    /** Clears a turn's changes card from the conversation (every client), or brings it back. */
+    dismissChanges: (id: SessionId, seq: number, dismissed: boolean) =>
+      Effect.gen(function* () {
+        const session = yield* store.getSession(id);
+        const event = yield* store.eventAt(id, seq);
+        if (event?._tag !== "FilesChanged") return yield* invalid("only a turn's changes can be cleared");
+        changeTracker.setDismissed(id, seq, dismissed);
+        yield* publish({ _tag: "ChangesUpdated", sessionId: id, botId: session.botId });
+      }),
+
     /** A worker's explanation of the changes in its running turn. */
     explainChanges: (id: SessionId, summary: string, items: ReadonlyArray<ExplainItem>) =>
       Effect.gen(function* () {

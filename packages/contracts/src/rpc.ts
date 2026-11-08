@@ -1,6 +1,6 @@
 import { AppSettings, ProjectInfo, UpdateAppSettingsInput } from "./appSettings.ts";
 import { PullRequest } from "./pullRequests.ts";
-import { ChangesOverview, SemanticFileDiff } from "./changes.ts";
+import { ChangesOverview, ConversationChanges, SemanticFileDiff } from "./changes.ts";
 import { RemoteAccess } from "./remote.ts";
 import { ProviderVersion } from "./connectors.ts";
 import * as Schema from "effect/Schema";
@@ -371,6 +371,16 @@ export class ApolloRpcs extends RpcGroup.make(
   Rpc.make("changes.file", {
     payload: { sessionId: SessionId, repo: Schema.String, path: Schema.String },
     success: SemanticFileDiff,
+    error,
+  }),
+  /** The summaries and cleared cards a session's conversation shows with its turns' changes. */
+  Rpc.make("changes.conversation", { payload: { sessionId: SessionId }, success: ConversationChanges, error }),
+  /**
+   * Clears (or brings back) the changes card of the FilesChanged event at `seq` from the
+   * conversation. The changes themselves and their explanations stay in the Changes panel.
+   */
+  Rpc.make("changes.dismiss", {
+    payload: { sessionId: SessionId, seq: Schema.Number, dismissed: Schema.Boolean },
     error,
   }),
   Rpc.make("remote.status", { success: RemoteAccess, error }),

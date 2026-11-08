@@ -1,4 +1,4 @@
-import type { ApprovalDecision, AttachmentRef, Bot, InputResponse, LocalModel, RepoChanges, Session } from "@apollo/contracts";
+import type { ApprovalDecision, AttachmentRef, Bot, ConversationChanges, InputResponse, LocalModel, RepoChanges, Session } from "@apollo/contracts";
 import {
   ArrowUp,
   Ban,
@@ -26,7 +26,15 @@ import {
   Square,
   Trash2,
 } from "lucide-react";
-import { isCompacting, showWorking, systemMessageParts } from "@apollo/client";
+import {
+  currentChangesKey,
+  isCompacting,
+  latestChangesKey,
+  showWorking,
+  summariesByTurn,
+  systemMessageParts,
+  withDismissed,
+} from "@apollo/client";
 import { MarkdownText } from "./Code.tsx";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { formatUsage, usageTitle } from "../format.ts";
@@ -218,16 +226,30 @@ function Item({
   live,
   sessionId,
   onOpenChanges,
+  cards,
 }: {
   item: Block;
   respond: Responders;
   live: boolean;
   sessionId: Session["id"];
   onOpenChanges: () => void;
+  cards: ChangesCards;
 }) {
   switch (item.kind) {
     case "changes":
-      return <TurnChanges repos={item.repos} onOpen={onOpenChanges} />;
+      if (cards.dismissed.has(item.seq)) {
+        return cards.justCleared.has(item.seq) ? <ClearedChanges onUndo={() => cards.setDismissed(item.seq, false)} /> : null;
+      }
+      return (
+        <TurnChanges
+          repos={item.repos}
+          summary={item.turnSeq === null ? null : (cards.summaries.get(item.turnSeq) ?? null)}
+          current={cards.current === item.key}
+          generation={cards.generation}
+          onOpen={onOpenChanges}
+          onClear={() => cards.setDismissed(item.seq, true)}
+        />
+      );
     case "compacting":
       return null; // shown as the working row at the end
     case "visual":
@@ -631,37 +653,180 @@ function Composer({
   );
 }
 
+/** What the conversation's changes cards need besides the item itself. */
+interface ChangesCards {
+  /** The latest turn's card: open without interaction. */
+  readonly current: string | null;
+  /** The latest card: when a new one arrives, cards opened by hand fold again. */
+  readonly generation: string | null;
+  readonly summaries: ReadonlyMap<number, string>;
+  readonly dismissed: ReadonlySet<number>;
+  /** Cleared while this view is open: they offer an undo instead of vanishing. */
+  readonly justCleared: ReadonlySet<number>;
+  readonly setDismissed: (seq: number, dismissed: boolean) => void;
+}
+
 /**
- * What a turn changed in git repositories (detected by Apollo, not the agent): a compact
- * line per repository; opens the Changes panel.
+ * The summaries and cleared cards of a session's conversation (kept by the server, so they
+ * follow the user across restarts and devices), refetched when its changes move.
  */
-function TurnChanges({ repos, onOpen }: { repos: ReadonlyArray<RepoChanges>; onOpen: () => void }) {
-  const files = repos.flatMap((r) => r.files);
+function useChangesCards(session: Session, items: ReadonlyArray<{ kind: string; key: string }>, enabled: boolean): ChangesCards {
+  const version = useApp((s) => s.changesVersion.get(session.botId) ?? 0);
+  const [changes, setChanges] = useState<ConversationChanges | null>(null);
+  const [justCleared, setJustCleared] = useState<ReadonlySet<number>>(new Set());
+  useEffect(() => {
+    setChanges(null);
+    setJustCleared(new Set());
+  }, [session.id]);
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    rpc((c) => c["changes.conversation"]({ sessionId: session.id }))
+      .then((next) => !cancelled && setChanges(next))
+      .catch(() => {}); // the cards still show, without summaries
+    return () => {
+      cancelled = true;
+    };
+  }, [session.id, version, enabled]);
+  const summaries = useMemo(() => summariesByTurn(changes), [changes]);
+  const dismissed = useMemo(() => new Set(changes?.dismissed ?? []), [changes]);
+  const current = useMemo(() => currentChangesKey(items), [items]);
+  const generation = useMemo(() => latestChangesKey(items), [items]);
+  const setDismissed = (seq: number, value: boolean) => {
+    setChanges((c) => withDismissed(c, seq, value));
+    setJustCleared((s) => (value ? new Set(s).add(seq) : s));
+    rpc((c) => c["changes.dismiss"]({ sessionId: session.id, seq, dismissed: value })).catch((e) => {
+      setChanges((c) => withDismissed(c, seq, !value));
+      alert(errorMessage(e));
+    });
+  };
+  return { current, generation, summaries, dismissed, justCleared, setDismissed };
+}
+
+/**
+ * What a turn changed in git repositories (detected by Apollo, not the agent). The latest
+ * turn's card is open (the worker's summary and the files); earlier ones fold to one line.
+ * "Review" opens the Changes panel; the cross clears the card from the conversation.
+ */
+function TurnChanges({
+  repos,
+  summary,
+  current,
+  generation,
+  onOpen,
+  onClear,
+}: {
+  repos: ReadonlyArray<RepoChanges>;
+  summary: string | null;
+  current: boolean;
+  generation: string | null;
+  onOpen: () => void;
+  onClear: () => void;
+}) {
+  // Opened or folded by hand until a newer turn's card arrives; then history folds again.
+  const [toggled, setToggled] = useState<boolean | null>(null);
+  useEffect(() => setToggled(null), [generation]);
+  const open = toggled ?? current;
+  const files = repos.flatMap((r) => r.files.map((f) => ({ ...f, repo: r.name })));
   const additions = files.reduce((n, f) => n + (f.additions ?? 0), 0);
   const deletions = files.reduce((n, f) => n + (f.deletions ?? 0), 0);
   const dot = { added: "bg-emerald-400", modified: "bg-amber-400", deleted: "bg-red-400", renamed: "bg-sky-400" } as const;
+  const shown = files.slice(0, 12);
   return (
-    <button
-      type="button"
-      onClick={onOpen}
-      className="animate-fade-up group flex w-full min-w-0 items-center gap-2.5 rounded-xl border border-zinc-800/80 bg-zinc-900/30 px-3 py-2 text-left text-xs transition-all hover:border-zinc-700 hover:bg-zinc-900/60"
-    >
-      <GitCompareArrows className="size-3.5 shrink-0 text-zinc-500 transition-colors group-hover:text-zinc-300" />
-      <span className="shrink-0 text-zinc-300">
-        Changed {files.length} {files.length === 1 ? "file" : "files"}
-      </span>
-      <span className="min-w-0 truncate text-zinc-500">in {repos.map((r) => r.name).join(", ")}</span>
-      <span className="flex shrink-0 -space-x-0.5">
-        {files.slice(0, 12).map((f) => (
-          <span key={`${f.path}`} title={`${f.path} (${f.status})`} className={cx("size-1.5 rounded-full ring-2 ring-zinc-950", dot[f.status])} />
-        ))}
-      </span>
-      <span className="flex-1" />
-      <span className="shrink-0 font-mono text-[10.5px] tabular-nums">
-        <span className="text-emerald-400">+{additions}</span> <span className="text-red-400">−{deletions}</span>
-      </span>
-      <span className="shrink-0 text-[11px] text-zinc-500 transition-colors group-hover:text-zinc-200">Review →</span>
-    </button>
+    <div className="animate-fade-up group overflow-hidden rounded-xl border border-zinc-800/80 bg-zinc-900/30 text-xs transition-colors hover:border-zinc-700">
+      <div className="flex min-w-0 items-center">
+        <button
+          type="button"
+          onClick={() => setToggled(!open)}
+          aria-expanded={open}
+          className="flex min-w-0 flex-1 items-center gap-2.5 py-2 pl-3 text-left transition-colors hover:bg-zinc-900/60"
+        >
+          <GitCompareArrows className="size-3.5 shrink-0 text-zinc-500 transition-colors group-hover:text-zinc-300" />
+          <span className="shrink-0 text-zinc-300">
+            Changed {files.length} {files.length === 1 ? "file" : "files"}
+          </span>
+          <span className="min-w-0 truncate text-zinc-500">in {repos.map((r) => r.name).join(", ")}</span>
+          {!open ? (
+            <span className="flex shrink-0 -space-x-0.5">
+              {shown.map((f) => (
+                <span key={`${f.repo}/${f.path}`} title={`${f.path} (${f.status})`} className={cx("size-1.5 rounded-full ring-2 ring-zinc-950", dot[f.status])} />
+              ))}
+            </span>
+          ) : null}
+          {!open && summary ? <Sparkles className="size-3 shrink-0 text-violet-300/80" /> : null}
+          <span className="flex-1" />
+          <span className="shrink-0 font-mono text-[10.5px] tabular-nums">
+            <span className="text-emerald-400">+{additions}</span> <span className="text-red-400">−{deletions}</span>
+          </span>
+          <ChevronDown className={cx("size-3.5 shrink-0 text-zinc-500 transition-transform duration-200", open && "rotate-180")} />
+        </button>
+        <button
+          type="button"
+          onClick={onOpen}
+          className="shrink-0 py-2 pr-1.5 pl-2.5 text-[11px] text-zinc-500 transition-colors hover:bg-zinc-900/60 hover:text-zinc-200"
+        >
+          Review →
+        </button>
+        <Tooltip align="end" content="Clear from the conversation">
+          <button
+            type="button"
+            onClick={onClear}
+            aria-label="Clear from the conversation"
+            className="mr-1 flex size-6 shrink-0 items-center justify-center rounded-md text-zinc-600 opacity-0 transition-all group-hover:opacity-100 hover:bg-zinc-800 hover:text-zinc-300 focus-visible:opacity-100"
+          >
+            <X className="size-3.5" />
+          </button>
+        </Tooltip>
+      </div>
+      <Collapse open={open}>
+        <div className="space-y-2 border-t border-zinc-800/80 px-3 py-2.5">
+          {summary ? (
+            <div className="flex gap-2 text-[12.5px] leading-relaxed text-zinc-300">
+              <Sparkles className="mt-0.5 size-3 shrink-0 text-violet-300/90" />
+              <span className="min-w-0 whitespace-pre-wrap">{summary}</span>
+            </div>
+          ) : null}
+          <div className="space-y-0.5">
+            {shown.map((f) => {
+              const slash = f.path.lastIndexOf("/");
+              return (
+                <div key={`${f.repo}/${f.path}`} className="flex min-w-0 items-center gap-2" title={`${f.path} (${f.status})`}>
+                  <span className={cx("size-1.5 shrink-0 rounded-full", dot[f.status])} />
+                  <span className="min-w-0 flex-1 truncate font-mono text-[11.5px]">
+                    {repos.length > 1 ? <span className="text-zinc-600">{f.repo}/</span> : null}
+                    <span className="text-zinc-500">{f.path.slice(0, slash + 1)}</span>
+                    <span className={cx("text-zinc-300", f.status === "deleted" && "line-through decoration-zinc-600")}>{f.path.slice(slash + 1)}</span>
+                  </span>
+                  <span className="shrink-0 font-mono text-[10.5px] tabular-nums">
+                    {f.additions === null ? (
+                      <span className="text-zinc-500">binary</span>
+                    ) : (
+                      <>
+                        <span className="text-emerald-400">+{f.additions}</span> <span className="text-red-400">−{f.deletions ?? 0}</span>
+                      </>
+                    )}
+                  </span>
+                </div>
+              );
+            })}
+            {files.length > shown.length ? <div className="pl-3.5 text-[11px] text-zinc-500">and {files.length - shown.length} more</div> : null}
+          </div>
+        </div>
+      </Collapse>
+    </div>
+  );
+}
+
+/** Where a card the user just cleared was, while the view is open: a way back. */
+function ClearedChanges({ onUndo }: { onUndo: () => void }) {
+  return (
+    <div className="animate-fade-up flex items-center gap-2 px-2 text-[11px] text-zinc-600">
+      <GitCompareArrows className="size-3 shrink-0" />
+      <span>Changes cleared</span>
+      <button type="button" onClick={onUndo} className="text-zinc-500 underline-offset-2 hover:text-zinc-300 hover:underline">
+        Undo
+      </button>
+    </div>
   );
 }
 
@@ -739,6 +904,7 @@ export function SessionView({
     });
   // A dot on the Changes button once this conversation changed files.
   const hasChanges = useMemo(() => items.some((item) => item.kind === "changes"), [items]);
+  const cards = useChangesCards(session, blocks, hasChanges);
   // Compaction can take minutes on a local model: say so instead of "Working…".
   const compacting = useMemo(() => isCompacting(items), [items]);
   // Between the user's message and the first streamed output (or a finished step and the
@@ -1011,6 +1177,7 @@ export function SessionView({
                   live={busy && i === blocks.length - 1}
                   sessionId={session.id}
                   onOpenChanges={() => panel !== "changes" && onTogglePanel("changes")}
+                  cards={cards}
                 />
               );
               // One day: no dividers. Several: a divider per day, earlier days folded when the chat is long.

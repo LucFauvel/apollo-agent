@@ -284,6 +284,14 @@ const MIGRATIONS: ReadonlyArray<string> = [
   `
   alter table bots add column codex_account_id text;
   `,
+  // 19: turns' changes cards the user cleared from the conversation (the changes stay).
+  `
+  create table dismissed_changes (
+    session_id text not null references sessions(id) on delete cascade,
+    seq integer not null,               -- the FilesChanged event
+    primary key (session_id, seq)
+  );
+  `,
 ];
 
 export class Database extends Context.Service<Database, DatabaseSync>()("apollo/Database") {}

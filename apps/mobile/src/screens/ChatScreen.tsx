@@ -1,5 +1,9 @@
 import {
+  currentChangesKey,
+  latestChangesKey,
   reduceTranscript,
+  summariesByTurn,
+  withDismissed,
   isCompacting,
   showWorking,
   systemMessageParts,
@@ -8,9 +12,10 @@ import {
   type TranscriptItem,
   type TranscriptState,
 } from "@apollo/client";
-import type { Bot, InputField, InputValue, RepoChanges, SessionId } from "@apollo/contracts";
+import type { Bot, ConversationChanges, InputField, InputValue, RepoChanges, SessionId } from "@apollo/contracts";
 import {
   type ReactNode,
+  useContext,
   useEffect,
   useMemo,
   useReducer,
@@ -43,6 +48,7 @@ import { ConversationBar, ConversationToggle, MicButton, useVoiceConversation, u
 import {
   ArrowUpIcon,
   GitCompareArrowsIcon,
+  XIcon,
   BanIcon,
   CheckIcon,
   ChevronDownIcon,
@@ -57,6 +63,7 @@ import {
   NetworkIcon,
   ShieldAlertIcon,
   ShieldCheckIcon,
+  SparklesIcon,
   SpeakerIcon,
   SquareIcon,
 } from "../icons.tsx";
@@ -213,6 +220,45 @@ export function ChatScreen({
     return urls.size;
   }, [state.pullRequests, state.sessions, session]);
   const hasChanges = useMemo(() => items.some((item) => item.kind === "changes"), [items]);
+  // Each turn's changes card: its worker's summary, and whether the user cleared it. Kept by
+  // the server, so a card cleared on the desktop is gone here too, and after restarts.
+  const changesVersion = session ? (state.changesVersion.get(session.botId) ?? 0) : 0;
+  const [conversationChanges, setConversationChanges] = useState<ConversationChanges | null>(null);
+  const [justCleared, setJustCleared] = useState<ReadonlySet<number>>(new Set());
+  useEffect(() => {
+    setConversationChanges(null);
+    setJustCleared(new Set());
+  }, [sessionId]);
+  useEffect(() => {
+    if (!hasChanges) return;
+    let cancelled = false;
+    connection
+      .rpc((c) => c["changes.conversation"]({ sessionId }))
+      .then((next) => !cancelled && setConversationChanges(next))
+      .catch(() => {}); // the cards still show, without summaries
+    return () => {
+      cancelled = true;
+    };
+  }, [connection, sessionId, changesVersion, hasChanges]);
+  const cards = useMemo<ChangesCards>(
+    () => ({
+      current: currentChangesKey(items),
+      generation: latestChangesKey(items),
+      summaries: summariesByTurn(conversationChanges),
+      dismissed: new Set(conversationChanges?.dismissed ?? []),
+      justCleared,
+      setDismissed: (seq, value) => {
+        animateLayout();
+        setConversationChanges((c) => withDismissed(c, seq, value));
+        setJustCleared((s) => (value ? new Set(s).add(seq) : s));
+        connection.rpc((c) => c["changes.dismiss"]({ sessionId, seq, dismissed: value })).catch((e) => {
+          setConversationChanges((c) => withDismissed(c, seq, !value));
+          setError(errorMessage(e));
+        });
+      },
+    }),
+    [items, conversationChanges, justCleared, connection, sessionId],
+  );
   // Apollo's browser, live: opened from the header, or from a tab an agent handed over.
   const [browser, setBrowser] = useState<{ tabId?: string; handoff?: Handoff } | null>(null);
   const browserTabs = useMemo(() => {
@@ -300,6 +346,7 @@ export function ChatScreen({
                 item={item}
                 live={busy && i === blocks.length - 1}
                 onOpenChanges={() => setChangesOpen(true)}
+                cards={cards}
                 onOpenBrowser={(tabId, handoff) => setBrowser({ tabId, ...(handoff ? { handoff: { ...handoff, sessionId } } : {}) })}
                 onApprove={(requestId, decision) =>
                   act((c) =>
@@ -455,16 +502,37 @@ function Item({
   onInput,
   onSecret,
   onOpenChanges,
+  cards,
   onOpenBrowser,
 }: {
   item: TranscriptBlock;
   live: boolean;
   onOpenChanges: () => void;
+  cards: ChangesCards;
   onOpenBrowser: (tabId: string, handoff?: { requestId: string; reason: string }) => void;
 } & Respond) {
   switch (item.kind) {
     case "changes":
-      return <TurnChanges repos={item.repos} onOpen={onOpenChanges} />;
+      if (cards.dismissed.has(item.seq)) {
+        return cards.justCleared.has(item.seq) ? (
+          <View style={styles.cleared}>
+            <Text style={styles.clearedText}>Changes cleared</Text>
+            <Pressable onPress={() => cards.setDismissed(item.seq, false)} hitSlop={10}>
+              <Text style={styles.clearedUndo}>Undo</Text>
+            </Pressable>
+          </View>
+        ) : null;
+      }
+      return (
+        <TurnChanges
+          repos={item.repos}
+          summary={item.turnSeq === null ? null : (cards.summaries.get(item.turnSeq) ?? null)}
+          current={cards.current === item.key}
+          generation={cards.generation}
+          onOpen={onOpenChanges}
+          onClear={() => cards.setDismissed(item.seq, true)}
+        />
+      );
     case "activity":
       return <ActivityGroup block={item} live={live} />;
     case "user":
@@ -553,33 +621,134 @@ function PeerMessage({ botId, text }: { botId: string | undefined; text: string 
   );
 }
 
-/** What a turn changed in git repositories (detected by Apollo); opens the Changes screen. */
-function TurnChanges({ repos, onOpen }: { repos: ReadonlyArray<RepoChanges>; onOpen: () => void }) {
-  const files = repos.flatMap((r) => r.files);
+/** What the conversation's changes cards need besides the item (see apps/web SessionView.tsx). */
+interface ChangesCards {
+  /** The latest turn's card: open without interaction. */
+  readonly current: string | null;
+  /** The latest card: when a new one arrives, cards opened by hand fold again. */
+  readonly generation: string | null;
+  readonly summaries: ReadonlyMap<number, string>;
+  readonly dismissed: ReadonlySet<number>;
+  /** Cleared while this screen is open: they offer an undo instead of vanishing. */
+  readonly justCleared: ReadonlySet<number>;
+  readonly setDismissed: (seq: number, dismissed: boolean) => void;
+}
+
+/**
+ * What a turn changed in git repositories (detected by Apollo). The latest turn's card is
+ * open (the worker's summary and the files); earlier ones fold to one line. Tapping it
+ * toggles; "Review" opens the Changes screen; the cross clears it from the conversation.
+ */
+function TurnChanges({
+  repos,
+  summary,
+  current,
+  generation,
+  onOpen,
+  onClear,
+}: {
+  repos: ReadonlyArray<RepoChanges>;
+  summary: string | null;
+  current: boolean;
+  generation: string | null;
+  onOpen: () => void;
+  onClear: () => void;
+}) {
+  // Opened or folded by hand until a newer turn's card arrives; then history folds again.
+  const [toggled, setToggled] = useState<boolean | null>(null);
+  useEffect(() => setToggled(null), [generation]);
+  const open = toggled ?? current;
+  // Opening a card by hand must not scroll the conversation to the end.
+  const hold = useContext(ScrollHold);
+  const files = repos.flatMap((r) => r.files.map((f) => ({ ...f, repo: r.name })));
   const additions = files.reduce((n, f) => n + (f.additions ?? 0), 0);
   const deletions = files.reduce((n, f) => n + (f.deletions ?? 0), 0);
   const dot = { added: "#34d399", modified: "#fbbf24", deleted: "#f87171", renamed: "#38bdf8" } as const;
+  const shown = files.slice(0, 12);
   return (
-    <Pressable onPress={onOpen} style={({ pressed }) => [styles.turnChanges, pressed && { opacity: 0.6 }]}>
-      <GitCompareArrowsIcon size={15} color={colors.faint} />
-      <View style={{ flex: 1, minWidth: 0 }}>
-        <Text style={styles.turnChangesTitle} numberOfLines={1}>
-          Changed {files.length} {files.length === 1 ? "file" : "files"}
-          <Text style={{ color: colors.faint }}> in {repos.map((r) => r.name).join(", ")}</Text>
-        </Text>
-        <View style={styles.turnChangesMeta}>
-          <View style={{ flexDirection: "row", gap: 3 }}>
-            {files.slice(0, 14).map((f) => (
-              <View key={f.path} style={[styles.fileDot, { backgroundColor: dot[f.status] }]} />
-            ))}
+    <View style={styles.turnChanges}>
+      <View style={styles.turnChangesHead}>
+        <Pressable
+          onPress={() => {
+            hold();
+            animateLayout();
+            setToggled(!open);
+          }}
+          accessibilityRole="button"
+          accessibilityState={{ expanded: open }}
+          style={({ pressed }) => [styles.turnChangesToggle, pressed && { opacity: 0.6 }]}
+        >
+          <GitCompareArrowsIcon size={15} color={colors.faint} />
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={styles.turnChangesTitle} numberOfLines={1}>
+              Changed {files.length} {files.length === 1 ? "file" : "files"}
+              <Text style={{ color: colors.faint }}> in {repos.map((r) => r.name).join(", ")}</Text>
+            </Text>
+            <View style={styles.turnChangesMeta}>
+              {!open ? (
+                <View style={{ flexDirection: "row", gap: 3 }}>
+                  {files.slice(0, 14).map((f) => (
+                    <View key={`${f.repo}/${f.path}`} style={[styles.fileDot, { backgroundColor: dot[f.status] }]} />
+                  ))}
+                </View>
+              ) : null}
+              <Text style={styles.turnChangesCounts}>
+                <Text style={{ color: "#34d399" }}>+{additions}</Text> <Text style={{ color: "#f87171" }}>−{deletions}</Text>
+              </Text>
+              {!open && summary ? <SparklesIcon size={11} color="rgba(196,181,253,0.8)" /> : null}
+            </View>
           </View>
-          <Text style={styles.turnChangesCounts}>
-            <Text style={{ color: "#34d399" }}>+{additions}</Text> <Text style={{ color: "#f87171" }}>−{deletions}</Text>
-          </Text>
-        </View>
+          <Turn open={open} degrees={180}>
+            <ChevronDownIcon size={15} color={colors.faint} />
+          </Turn>
+        </Pressable>
+        <Pressable onPress={onOpen} hitSlop={8} style={({ pressed }) => [styles.turnChangesAction, pressed && { opacity: 0.6 }]}>
+          <Text style={styles.turnChangesReview}>Review ›</Text>
+        </Pressable>
+        <Pressable
+          onPress={onClear}
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityLabel="Clear from the conversation"
+          style={({ pressed }) => [styles.turnChangesAction, pressed && { opacity: 0.6 }]}
+        >
+          <XIcon size={14} color="#52525b" />
+        </Pressable>
       </View>
-      <Text style={styles.turnChangesReview}>Review ›</Text>
-    </Pressable>
+      {open ? (
+        <View style={styles.turnChangesBody}>
+          {summary ? (
+            <View style={styles.turnChangesSummary}>
+              <SparklesIcon size={12} color="rgba(196,181,253,0.9)" />
+              <Text style={styles.turnChangesSummaryText}>{summary}</Text>
+            </View>
+          ) : null}
+          {shown.map((f) => {
+            const slash = f.path.lastIndexOf("/");
+            return (
+              <View key={`${f.repo}/${f.path}`} style={styles.turnChangesFile}>
+                <View style={[styles.fileDot, { backgroundColor: dot[f.status] }]} />
+                <Text style={styles.turnChangesPath} numberOfLines={1} ellipsizeMode="head">
+                  {repos.length > 1 ? <Text style={{ color: "#52525b" }}>{f.repo}/</Text> : null}
+                  <Text style={{ color: colors.faint }}>{f.path.slice(0, slash + 1)}</Text>
+                  <Text style={[{ color: colors.textSoft }, f.status === "deleted" && { textDecorationLine: "line-through" }]}>{f.path.slice(slash + 1)}</Text>
+                </Text>
+                <Text style={styles.turnChangesCounts}>
+                  {f.additions === null ? (
+                    <Text style={{ color: colors.faint }}>binary</Text>
+                  ) : (
+                    <>
+                      <Text style={{ color: "#34d399" }}>+{f.additions}</Text> <Text style={{ color: "#f87171" }}>−{f.deletions ?? 0}</Text>
+                    </>
+                  )}
+                </Text>
+              </View>
+            );
+          })}
+          {files.length > shown.length ? <Text style={styles.turnChangesMore}>and {files.length - shown.length} more</Text> : null}
+        </View>
+      ) : null}
+    </View>
   );
 }
 
@@ -998,16 +1167,24 @@ const styles = StyleSheet.create({
   mentionDetail: { color: colors.faint, fontSize: 12, marginTop: 1 },
   mentionHandle: { color: "#52525b", fontSize: 12 },
   turnChanges: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
     borderRadius: 12,
     borderWidth: 1,
     borderColor: "rgba(39,39,42,0.9)",
     backgroundColor: "rgba(24,24,27,0.35)",
-    paddingHorizontal: 12,
-    paddingVertical: 9,
+    overflow: "hidden",
   },
+  turnChangesHead: { flexDirection: "row", alignItems: "center", paddingRight: 4 },
+  turnChangesToggle: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 10, paddingLeft: 12, paddingRight: 4, paddingVertical: 9 },
+  turnChangesAction: { paddingHorizontal: 6, paddingVertical: 9 },
+  turnChangesBody: { borderTopWidth: 1, borderTopColor: "rgba(39,39,42,0.9)", paddingHorizontal: 12, paddingVertical: 9, gap: 4 },
+  turnChangesSummary: { flexDirection: "row", gap: 8, marginBottom: 4 },
+  turnChangesSummaryText: { flex: 1, color: colors.textSoft, fontSize: 13, lineHeight: 19 },
+  turnChangesFile: { flexDirection: "row", alignItems: "center", gap: 8 },
+  turnChangesPath: { flex: 1, minWidth: 0, fontFamily: MONO, fontSize: 11.5 },
+  turnChangesMore: { color: colors.faint, fontSize: 11.5, paddingLeft: 14 },
+  cleared: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 8 },
+  clearedText: { color: "#52525b", fontSize: 12 },
+  clearedUndo: { color: colors.faint, fontSize: 12, textDecorationLine: "underline" },
   turnChangesTitle: { color: colors.textSoft, fontSize: 13 },
   turnChangesMeta: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 4 },
   fileDot: { width: 6, height: 6, borderRadius: 3 },
