@@ -330,7 +330,7 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
    * repository. `signal` stops it, and the git processes it runs.
    */
   const report = async (path: string, ref?: string, signal?: AbortSignal): Promise<{ repo: RepoChanges; report: ChangeReport }> => {
-    const repo = await repoRoot(path);
+    const repo = await repoRoot(path, signal);
     if (!repo) throw new Error(`${path} is not in a git repository`);
     const gitDir = await commonGitDir(repo, signal);
     for (let attempt = 1; ; attempt++) {

@@ -1,5 +1,5 @@
-import { execFile } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, rmSync, statSync, utimesSync } from "node:fs";
+import { type ChildProcess, spawn } from "node:child_process";
+import { closeSync, existsSync, fstatSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -22,26 +22,69 @@ export class GitError extends Error {
   }
 }
 
-/** Runs git; `signal` kills it (and fails the promise) when aborted. */
+const GIT_TIMEOUT_MS = 60_000;
+
+/**
+ * Runs git. It leads its own process group, so stopping it (when `signal` aborts, or after
+ * a minute) kills what it started too: clean/smudge filters, hooks, credential helpers.
+ */
 const git = (cwd: string, args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv, signal?: AbortSignal) =>
   new Promise<string>((resolvePromise, reject) => {
     if (signal?.aborted) return reject(abortError(signal));
-    execFile(
-      "git",
-      [...args],
-      { cwd, env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: "0" }, maxBuffer: MAX_BUFFER, timeout: 60_000, ...(signal ? { signal } : {}) },
-      (error, stdout, stderr) => {
-        if (signal?.aborted) reject(abortError(signal));
-        else if (error) reject(new GitError((stderr || error.message).trim(), typeof error.code === "number" ? error.code : null, stderr.trim()));
-        else resolvePromise(stdout);
-      },
-    );
+    const child = spawn("git", [...args], {
+      cwd,
+      env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: "0" },
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32",
+    });
+    const out: Array<Buffer> = [];
+    const err: Array<Buffer> = [];
+    let size = 0;
+    let stopped: Error | null = null;
+    const stop = (reason: Error) => {
+      if (stopped) return;
+      stopped = reason;
+      killGroup(child);
+    };
+    const onAbort = () => stop(abortError(signal!));
+    const timer = setTimeout(() => stop(new GitError(`git ${args[0] ?? ""} took over a minute and was stopped`, null, "")), GIT_TIMEOUT_MS);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const collect = (into: Array<Buffer>) => (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > MAX_BUFFER) stop(new GitError(`git ${args[0] ?? ""} wrote more than ${MAX_BUFFER} bytes`, null, ""));
+      else into.push(chunk);
+    };
+    child.stdout.on("data", collect(out));
+    child.stderr.on("data", collect(err));
+    const finish = (code: number | null, error?: Error) => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      const stdout = Buffer.concat(out).toString("utf8");
+      const stderr = Buffer.concat(err).toString("utf8").trim();
+      if (stopped) reject(stopped);
+      else if (error) reject(new GitError(error.message, null, stderr));
+      else if (code !== 0) reject(new GitError(stderr || `git ${args[0] ?? ""} exited with ${code}`, code, stderr));
+      else resolvePromise(stdout);
+    };
+    child.once("error", (error) => finish(null, error));
+    child.once("close", (code) => finish(code));
   });
+
+/** Kills a process and, outside Windows, every process in its group. */
+const killGroup = (child: ChildProcess) => {
+  try {
+    if (child.pid !== undefined && process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
+    else child.kill("SIGKILL");
+  } catch {
+    // Already gone.
+  }
+};
 
 const abortError = (signal: AbortSignal) => (signal.reason instanceof Error ? signal.reason : new Error("Stopped"));
 
 /** The repository (worktree) a path is in, or null. */
-export const repoRoot = async (path: string): Promise<string | null> => {
+export const repoRoot = async (path: string, signal?: AbortSignal): Promise<string | null> => {
+  if (signal?.aborted) throw abortError(signal);
   let dir = resolve(path);
   try {
     if (!statSync(dir).isDirectory()) dir = dirname(dir);
@@ -50,8 +93,9 @@ export const repoRoot = async (path: string): Promise<string | null> => {
     while (!existsSync(dir) && dir !== dirname(dir)) dir = dirname(dir);
   }
   try {
-    return (await git(dir, ["rev-parse", "--show-toplevel"])).trim() || null;
-  } catch {
+    return (await git(dir, ["rev-parse", "--show-toplevel"], undefined, signal)).trim() || null;
+  } catch (error) {
+    if (signal?.aborted) throw error;
     return null;
   }
 };
@@ -72,12 +116,19 @@ export const snapshot = async (repo: string, signal?: AbortSignal): Promise<stri
     // Starting from the real index keeps its stat cache: only changed files are hashed.
     const real = (await git(repo, ["rev-parse", "--path-format=absolute", "--git-path", "index"], undefined, signal)).trim();
     if (existsSync(real)) {
-      copyFileSync(real, index);
-      // Keep the index's own time: git rehashes files changed in the same second as the
+      // Keep the index's own time: git rehashes files changed in the same instant as the
       // index ("racily clean"), judged against it. A copy stamped now would hide an edit made
-      // right after a commit that left the file's size unchanged.
-      const { atime, mtime } = statSync(real);
-      utimesSync(index, atime, mtime);
+      // right after a commit that left the file's size unchanged. Content and time come from
+      // one open file: git replaces the index by renaming a new one over it, so both describe
+      // the same version even when it is replaced meanwhile.
+      const fd = openSync(real, "r");
+      try {
+        const { atime, mtime } = fstatSync(fd);
+        writeFileSync(index, readFileSync(fd));
+        utimesSync(index, atime, mtime);
+      } finally {
+        closeSync(fd);
+      }
     }
     const env = { GIT_INDEX_FILE: index };
     await git(repo, ["add", "-A", "--", "."], env, signal);

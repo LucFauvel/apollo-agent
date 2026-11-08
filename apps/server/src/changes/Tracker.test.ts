@@ -1,5 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "@effect/vitest";
@@ -255,6 +257,48 @@ describe("change tracker", () => {
       }
     }, GIT_HEAVY);
 
+    it("starts nothing once aborted, not even looking for the repository", async () => {
+      const { tracker } = setup();
+      const work = cloned();
+      const shim = shimGit(`echo "$1" >> "$SHIM_DIR/calls"`);
+      process.env.SHIM_DIR = shim.bin;
+      try {
+        await expect(tracker.report(work.dir, undefined, AbortSignal.abort(new Error("Stopped early")))).rejects.toThrow("Stopped early");
+        expect(existsSync(join(shim.bin, "calls"))).toBe(false);
+      } finally {
+        shim.restore();
+        delete process.env.SHIM_DIR;
+      }
+    }, GIT_HEAVY);
+
+    it("kills what git started (a clean filter) when aborted", async () => {
+      const { tracker } = setup();
+      const work = cloned();
+      const marks = realpathSync(mkdtempSync(join(tmpdir(), "apollo-filter-")));
+      // A slow clean filter: says it started, then finishes after 1.5 s unless killed.
+      writeFileSync(
+        join(marks, "clean.cjs"),
+        `const fs = require("fs");
+fs.writeFileSync(${JSON.stringify(join(marks, "started"))}, String(process.pid));
+let data = "";
+process.stdin.on("data", (d) => (data += d));
+process.stdin.on("end", () => setTimeout(() => { fs.writeFileSync(${JSON.stringify(join(marks, "finished"))}, "done"); process.stdout.write(data); }, 1500));`,
+      );
+      writeFileSync(join(work.dir, ".gitattributes"), "*.txt filter=slow\n");
+      work.git("config", "filter.slow.clean", `"${process.execPath}" "${join(marks, "clean.cjs")}"`);
+      work.git("config", "filter.slow.required", "true");
+      writeFileSync(join(work.dir, "a.txt"), "text\n");
+      const controller = new AbortController();
+      const running = tracker.report(work.dir, undefined, controller.signal);
+      while (!existsSync(join(marks, "started"))) await new Promise((resolve) => setTimeout(resolve, 10));
+      const pid = Number(readFileSync(join(marks, "started"), "utf8"));
+      controller.abort(new Error("Stopped"));
+      await expect(running).rejects.toThrow("Stopped");
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      expect(existsSync(join(marks, "finished"))).toBe(false);
+      expect(() => process.kill(pid, 0)).toThrow();
+    }, GIT_HEAVY);
+
     it("stops, git processes included, when its signal is aborted", async () => {
       const { tracker } = setup();
       const work = cloned();
@@ -284,6 +328,43 @@ describe("change tracker", () => {
         delete process.env.SHIM_DIR;
       }
     }, GIT_HEAVY);
+  });
+
+  it("reads the index's entries and its time from one version, even when git replaces it meanwhile", async () => {
+    // Same pinned setup as below; then `git add` replaces the index right after the snapshot
+    // opens it. The entries copied and the time kept must both be the old index's.
+    const app = repo("app");
+    app.git("config", "core.trustctime", "false");
+    const file = join(app.dir, "value.ts");
+    writeFileSync(file, "export const value = 1;\n");
+    app.git("add", "-A");
+    app.git("commit", "-qm", "value");
+    const past = new Date(Math.floor(Date.now() / 1000) * 1000 - 60_000);
+    utimesSync(file, past, past);
+    app.git("update-index", "--refresh");
+    const realIndex = join(app.dir, ".git", "index");
+    utimesSync(realIndex, past, past);
+    writeFileSync(file, "export const value = 2;\n");
+    utimesSync(file, past, past);
+    const original = fs.openSync;
+    let injected = false;
+    fs.openSync = ((path: fs.PathLike, ...rest: Array<never>) => {
+      const fd = (original as (...args: Array<unknown>) => number)(path, ...rest);
+      if (String(path) === realIndex && !injected) {
+        injected = true;
+        app.git("add", "value.ts");
+      }
+      return fd;
+    }) as typeof fs.openSync;
+    syncBuiltinESMExports();
+    try {
+      const tree = await snapshot(app.dir);
+      expect(injected).toBe(true);
+      expect(app.git("cat-file", "blob", `${tree}:value.ts`)).toBe("export const value = 2;\n");
+    } finally {
+      fs.openSync = original;
+      syncBuiltinESMExports();
+    }
   });
 
   it("sees an edit that leaves a file's size and time as the index recorded them (racily clean)", async () => {
