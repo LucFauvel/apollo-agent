@@ -357,18 +357,33 @@ export function ChatScreen({
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {talking ? <ConversationBar session={session} onEnd={() => setTalking(false)} /> : null}
       {mentionMatches.length > 0 ? (
-        <ScrollView horizontal keyboardShouldPersistTaps="always" showsHorizontalScrollIndicator={false} contentContainerStyle={styles.mentions}>
-          {mentionMatches.map((b) => (
-            <Pressable
-              key={b.id}
-              onPress={() => setText((t) => t.replace(/@([^\s@]*)$/, `@${b.name} `))}
-              style={({ pressed }) => [styles.mentionChip, pressed && { opacity: 0.6 }]}
-            >
-              <BlobAvatar avatar={b.avatar} size={18} />
-              <Text style={styles.mentionName}>{b.name}</Text>
-            </Pressable>
-          ))}
-        </ScrollView>
+        // Like Discord: a list above the composer, the best match first.
+        <FadeIn>
+          <View style={styles.mentions}>
+            <Text style={styles.mentionsHeader} numberOfLines={1}>
+              {mentionQuery ? `Bots matching @${mentionQuery}` : "Bots"}
+            </Text>
+            {mentionMatches.map((b, i) => (
+              <Pressable
+                key={b.id}
+                onPress={() => setText((t) => t.replace(/@([^\s@]*)$/, `@${b.name} `))}
+                style={({ pressed }) => [styles.mentionRow, (pressed || i === 0) && styles.mentionRowActive]}
+              >
+                <BlobAvatar avatar={b.avatar} size={30} />
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text style={styles.mentionName} numberOfLines={1}>
+                    <Text style={{ color: colors.text }}>{b.name.slice(0, mentionQuery?.length ?? 0)}</Text>
+                    {b.name.slice(mentionQuery?.length ?? 0)}
+                  </Text>
+                  <Text style={styles.mentionDetail} numberOfLines={1}>
+                    {b.instructions.trim().split("\n")[0] || "Another of your bots"}
+                  </Text>
+                </View>
+                <Text style={styles.mentionHandle}>@{b.name.toLowerCase()}</Text>
+              </Pressable>
+            ))}
+          </View>
+        </FadeIn>
       ) : null}
       <View style={styles.composer}>
         <MicButton
@@ -944,20 +959,35 @@ const styles = StyleSheet.create({
   peerName: { color: colors.textSoft, fontSize: 12.5, fontWeight: "600" },
   peerFirst: { flex: 1, color: colors.faint, fontSize: 12.5 },
   peerBody: { borderTopWidth: 1, borderTopColor: "rgba(39,39,42,0.8)", paddingHorizontal: 12, paddingVertical: 8 },
-  mentions: { gap: 8, paddingHorizontal: 10, paddingTop: 8 },
-  mentionChip: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
-    borderRadius: 16,
+  mentions: {
+    marginHorizontal: 10,
+    marginBottom: 6,
+    paddingVertical: 6,
+    paddingHorizontal: 6,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: "rgba(139,92,246,0.35)",
-    backgroundColor: "rgba(139,92,246,0.12)",
-    paddingLeft: 5,
-    paddingRight: 11,
-    paddingVertical: 4,
+    borderColor: "#27272a",
+    backgroundColor: "#111113",
+    shadowColor: "#000",
+    shadowOpacity: 0.5,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 6 },
   },
-  mentionName: { color: "#ddd6fe", fontSize: 13, fontWeight: "600" },
+  mentionsHeader: {
+    color: colors.faint,
+    fontSize: 11,
+    fontWeight: "700",
+    letterSpacing: 0.6,
+    textTransform: "uppercase",
+    paddingHorizontal: 8,
+    paddingTop: 4,
+    paddingBottom: 6,
+  },
+  mentionRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 8, paddingVertical: 7, borderRadius: 9 },
+  mentionRowActive: { backgroundColor: "#27272a" },
+  mentionName: { color: colors.textSoft, fontSize: 15, fontWeight: "600" },
+  mentionDetail: { color: colors.faint, fontSize: 12, marginTop: 1 },
+  mentionHandle: { color: "#52525b", fontSize: 12 },
   turnChanges: {
     flexDirection: "row",
     alignItems: "center",
