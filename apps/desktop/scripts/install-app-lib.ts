@@ -3,8 +3,8 @@
  * tested: every filesystem, process and network action goes through the deps passed in.
  * install-app.ts wires these to the real /Applications, `open`, `ps` and the app's /health.
  */
-import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { constants, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 // ---------------------------------------------------------------------------------------
@@ -249,10 +249,15 @@ export const swapAndVerify = async (deps: {
   readonly relaunch: () => Promise<boolean>;
   /** Stop whatever is running from the target bundle (the unhealthy new app). */
   readonly stopApp: () => Promise<void>;
+  /** Copy the database aside; runs with Apollo stopped, before anything moves. */
+  readonly snapshotData: () => void;
+  /** Put that copy back: the new build may have migrated the database before failing. */
+  readonly restoreData: () => void;
   readonly log: (line: string) => void;
   readonly open: boolean;
 }): Promise<InstallOutcome> => {
   const { fs, bundles: b } = deps;
+  deps.snapshotData();
   swap(fs, b);
   deps.log(`  ${b.target} is the new build; the previous one is kept at ${b.previous}`);
   if (!deps.open) return { status: "ok", stage: "installed-not-opened" };
@@ -265,8 +270,111 @@ export const swapAndVerify = async (deps: {
   deps.log(`  ${error}: rolling back`);
   await deps.stopApp();
   if (!restorePrevious(fs, b)) return { status: "failed", stage: "no-previous", error: `${error}, and there is no previous build to restore` };
+  deps.restoreData();
   if (await deps.relaunch()) return { status: "rolled-back", stage: "rollback-healthy", error };
   return { status: "failed", stage: "rollback-unhealthy", error: `${error}; the previous build was restored but is not healthy either` };
+};
+
+// ---------------------------------------------------------------------------------------
+// Database snapshots
+
+/** The database and its write-ahead log files. After a clean quit only the first exists. */
+const DB_FILES = ["", "-wal", "-shm"] as const;
+const SNAPSHOT_PREFIX = "pre-update-";
+export const SNAPSHOTS_KEPT = 2;
+
+export interface Snapshot {
+  readonly dir: string;
+  readonly createdAt: number;
+  /** `pragma user_version` of the database when it was copied. */
+  readonly dbVersion: number | null;
+}
+
+/**
+ * Copies the database (with any -wal/-shm) to `<backupsDir>/pre-update-<epoch>-<label>/`.
+ * Apollo must be stopped. APFS clones make the copy instant whatever the size.
+ */
+export const snapshotDb = (o: { readonly dbPath: string; readonly backupsDir: string; readonly label: string; readonly now: number }): Snapshot | null => {
+  if (!existsSync(o.dbPath)) return null;
+  const dir = join(o.backupsDir, `${SNAPSHOT_PREFIX}${o.now}-${o.label.replace(/[^\w.-]+/g, "_")}`);
+  mkdirSync(dir, { recursive: true });
+  const name = o.dbPath.split("/").at(-1)!;
+  for (const suffix of DB_FILES) {
+    if (existsSync(o.dbPath + suffix)) copyFileSync(o.dbPath + suffix, join(dir, name + suffix), constants.COPYFILE_FICLONE);
+  }
+  const snapshot: Snapshot = { dir, createdAt: o.now, dbVersion: readDbVersion(join(dir, name)) };
+  writeFileSync(join(dir, "snapshot.json"), `${JSON.stringify({ ...snapshot, source: o.dbPath, label: o.label }, null, 2)}\n`);
+  return snapshot;
+};
+
+/** Snapshots in `backupsDir`, newest first. */
+export const listSnapshots = (backupsDir: string): Array<Snapshot> => {
+  if (!existsSync(backupsDir)) return [];
+  return readdirSync(backupsDir)
+    .flatMap((entry): Array<Snapshot> => {
+      const match = new RegExp(`^${SNAPSHOT_PREFIX}(\\d+)-`).exec(entry);
+      if (!match) return [];
+      const dir = join(backupsDir, entry);
+      let dbVersion: number | null = null;
+      try {
+        dbVersion = (JSON.parse(readFileSync(join(dir, "snapshot.json"), "utf8")) as Snapshot).dbVersion;
+      } catch {
+        // an incomplete snapshot: listed (so it gets pruned), never restored
+        return [{ dir, createdAt: Number(match[1]), dbVersion: null }];
+      }
+      return [{ dir, createdAt: Number(match[1]), dbVersion }];
+    })
+    .sort((a, b) => b.createdAt - a.createdAt);
+};
+
+/** Keeps the newest `keep` snapshots (always including `protect`), deletes the rest. */
+export const pruneSnapshots = (backupsDir: string, keep: number, protect: string | null): Array<string> => {
+  const all = listSnapshots(backupsDir);
+  const newestFirst = [...new Set([...(protect ? [protect] : []), ...all.map((s) => s.dir)])];
+  const kept = new Set(newestFirst.slice(0, Math.max(keep, protect ? 1 : 0)));
+  const removed = all.filter((s) => !kept.has(s.dir)).map((s) => s.dir);
+  for (const dir of removed) rmSync(dir, { recursive: true, force: true });
+  return removed;
+};
+
+/**
+ * Puts a snapshot back in place of the database. Apollo must be stopped. The current files
+ * (including a -wal that belongs to them and would corrupt the restored copy) are moved
+ * into the snapshot directory first, so nothing is lost.
+ */
+export const restoreDbSnapshot = (o: { readonly snapshotDir: string; readonly dbPath: string; readonly now: number }): string => {
+  const name = o.dbPath.split("/").at(-1)!;
+  if (!existsSync(join(o.snapshotDir, name))) throw new Error(`No database in ${o.snapshotDir}`);
+  // Copy next to the database first: if that fails, nothing has changed yet.
+  const copies = DB_FILES.filter((suffix) => existsSync(join(o.snapshotDir, name + suffix)));
+  for (const suffix of copies) copyFileSync(join(o.snapshotDir, name + suffix), `${o.dbPath}${suffix}.restoring`, constants.COPYFILE_FICLONE);
+  const aside = join(o.snapshotDir, `replaced-${o.now}`);
+  mkdirSync(aside, { recursive: true });
+  for (const suffix of DB_FILES) {
+    if (existsSync(o.dbPath + suffix)) renameSync(o.dbPath + suffix, join(aside, name + suffix));
+  }
+  // Renames only from here: the old files are out of the way and never mixed with the copy.
+  for (const suffix of ["-shm", "-wal", ""].filter((s) => copies.includes(s as (typeof DB_FILES)[number]))) {
+    renameSync(`${o.dbPath}${suffix}.restoring`, o.dbPath + suffix);
+  }
+  return aside;
+};
+
+/**
+ * After recovery put an older bundle back: should the database go back too? Only when the
+ * database is newer than that bundle's code, and a snapshot exists that it can read.
+ */
+export const recoveryDbAction = (
+  dbVersion: number | null,
+  bundleSchema: number,
+  latest: Snapshot | null,
+): { readonly action: "none" } | { readonly action: "restore"; readonly snapshot: Snapshot } | { readonly action: "stuck"; readonly message: string } => {
+  if (checkSchema(dbVersion, bundleSchema, false).ok) return { action: "none" };
+  if (latest && latest.dbVersion !== null && checkSchema(latest.dbVersion, bundleSchema, false).ok) return { action: "restore", snapshot: latest };
+  return {
+    action: "stuck",
+    message: `The database (schema ${dbVersion}) is newer than the restored app (schema ${bundleSchema}) and no snapshot it can read exists`,
+  };
 };
 
 // ---------------------------------------------------------------------------------------
@@ -291,6 +399,8 @@ export interface InstallResult {
   readonly finishedAt: string | null;
   readonly error: string | null;
   readonly log: string | null;
+  /** The database copy taken before the swap (restored on rollback). */
+  readonly snapshot: string | null;
   readonly pid: number;
 }
 
@@ -314,10 +424,14 @@ export const plan = (s: {
   readonly busy: ReadonlyArray<string>;
   readonly schema: SchemaCheck;
   readonly bundles: Bundles;
+  readonly hasDb: boolean;
+  readonly backupsDir: string;
 }): Array<string> => {
   const { options: o, bundles: b } = s;
   if (!s.targetExists && s.previousExists) {
-    return [`Recovery: ${b.target} is missing; move ${b.previous} → ${b.target}, open it, and stop.`];
+    return [
+      `Recovery: ${b.target} is missing; move ${b.previous} → ${b.target}, restore the latest database snapshot if the database is newer than that app, open it, and stop.`,
+    ];
   }
   if (!s.schema.ok) return [`Refuse: ${s.schema.message}`];
   const steps = [`Database: ${s.schema.note}`, "Build web UI, shell, server bundle and tailnet addon; write build-info.json", "Package with electron-builder (--dir)", `Stage it at ${b.staged}`];
@@ -332,13 +446,16 @@ export const plan = (s: {
       );
     steps.push(`Quit Apollo (${s.running.join(", ")}), ignoring SIGTERM/SIGHUP from here; force-stop after 30 s`);
   }
-  steps.push(`Swap: ${b.target} → ${b.previous}, ${b.staged} → ${b.target}`);
+  steps.push(
+    s.hasDb ? `Snapshot the database to ${s.backupsDir}/pre-update-…, keeping the last ${SNAPSHOTS_KEPT}` : "No database yet: no snapshot",
+    `Swap: ${b.target} → ${b.previous}, ${b.staged} → ${b.target}`,
+  );
   if (o.noOpen) steps.push(`--no-open: don't open; keep ${b.previous}`);
   else
     steps.push(
       "Open until /health answers (up to 2 min)",
       `Healthy: delete ${b.previous}`,
-      `Not healthy: stop it, ${b.target} → ${b.failed}, ${b.previous} → ${b.target}, open that until healthy`,
+      `Not healthy: stop it, ${b.target} → ${b.failed}, ${b.previous} → ${b.target}, ${s.hasDb ? "restore the database snapshot, " : ""}open that until healthy`,
     );
   return steps;
 };

@@ -4,7 +4,7 @@
  * --dry-run against a temporary data directory.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -14,14 +14,19 @@ import {
   checkSchema,
   childArgs,
   isHealthyResponse,
+  listSnapshots,
   parseArgs,
   plan,
   portFromPsEnv,
   portsFromLsof,
+  pruneSnapshots,
   readDbVersion,
   recoverIfNeeded,
+  recoveryDbAction,
   relaunchUntilHealthy,
+  restoreDbSnapshot,
   restorePrevious,
+  snapshotDb,
   swap,
   swapAndVerify,
   waitForIdle,
@@ -229,6 +234,9 @@ describe("swapAndVerify", () => {
         return health.shift() ?? false;
       },
       stopApp: async () => void events.push(`stop ${files.get(B.target)}`),
+      // Each records which app is in place when it runs.
+      snapshotData: () => void events.push(`snapshot ${files.get(B.target) ?? "none"} staged=${files.get(B.staged)}`),
+      restoreData: () => void events.push(`restore-db ${files.get(B.target)}`),
       log: () => {},
       open,
     });
@@ -239,14 +247,15 @@ describe("swapAndVerify", () => {
     const r = await run({ [B.target]: "old", [B.staged]: "new" }, [true]);
     expect(r.outcome).toEqual({ status: "ok", stage: "healthy" });
     expect(r.files).toEqual({ [B.target]: "new" });
-    expect(r.events).toEqual(["relaunch new"]);
+    expect(r.events).toEqual(["snapshot old staged=new", "relaunch new"]);
     expect(r.ops.at(-1)).toBe(`rm ${B.previous}`);
   });
   it("unhealthy: stops the new app, restores the previous one and relaunches it", async () => {
     const r = await run({ [B.target]: "old", [B.staged]: "new" }, [false, true]);
     expect(r.outcome.status).toBe("rolled-back");
     expect(r.files).toEqual({ [B.target]: "old", [B.failed]: "new" });
-    expect(r.events).toEqual(["relaunch new", "stop new", "relaunch old"]);
+    // The database goes back after the new app is stopped and the old one is in place, before it opens.
+    expect(r.events).toEqual(["snapshot old staged=new", "relaunch new", "stop new", "restore-db old", "relaunch old"]);
   });
   it("rollback that is not healthy either is a failure, with the old app still in place", async () => {
     const r = await run({ [B.target]: "old", [B.staged]: "new" }, [false, false]);
@@ -257,12 +266,93 @@ describe("swapAndVerify", () => {
     const r = await run({ [B.staged]: "new" }, [false]);
     expect(r.outcome).toMatchObject({ status: "failed", stage: "no-previous" });
     expect(r.files).toEqual({ [B.target]: "new" });
+    expect(r.events).not.toContain("restore-db new");
   });
   it("--no-open keeps the previous app (its health is unknown)", async () => {
     const r = await run({ [B.target]: "old", [B.staged]: "new" }, [], false);
     expect(r.outcome).toEqual({ status: "ok", stage: "installed-not-opened" });
     expect(r.files).toEqual({ [B.target]: "new", [B.previous]: "old" });
-    expect(r.events).toEqual([]);
+    expect(r.events).toEqual(["snapshot old staged=new"]);
+  });
+});
+
+const tmp = (name: string) => mkdtempSync(join(tmpdir(), `install-app-${name}-`));
+const makeDb = (path: string, version: number) => {
+  const db = new DatabaseSync(path);
+  db.exec(`create table if not exists t (v integer); insert into t values (${version}); pragma user_version = ${version}`);
+  db.close();
+};
+
+describe("database snapshots", () => {
+  it("copies the database with its -wal and records the schema", () => {
+    const data = tmp("snap");
+    const dbPath = join(data, "apollo.db");
+    makeDb(dbPath, 5);
+    writeFileSync(`${dbPath}-wal`, "");
+    const snap = snapshotDb({ dbPath, backupsDir: join(data, "backups"), label: "abc123/dirty", now: 1000 });
+    expect(snap).toEqual({ dir: join(data, "backups", "pre-update-1000-abc123_dirty"), createdAt: 1000, dbVersion: 5 });
+    expect(readdirSync(snap!.dir).sort()).toEqual(["apollo.db", "apollo.db-wal", "snapshot.json"]);
+    expect(listSnapshots(join(data, "backups"))).toEqual([snap]);
+    expect(snapshotDb({ dbPath: join(data, "none.db"), backupsDir: join(data, "backups"), label: "x", now: 2 })).toBeNull();
+  });
+
+  it("restore puts the snapshot back, moving the newer database and its stale -wal/-shm aside", () => {
+    const data = tmp("restore");
+    const dbPath = join(data, "apollo.db");
+    makeDb(dbPath, 5);
+    const snap = snapshotDb({ dbPath, backupsDir: join(data, "backups"), label: "c", now: 1 })!;
+    // The new build migrated, and was killed with a write-ahead log in place.
+    const db = new DatabaseSync(dbPath);
+    db.exec("pragma user_version = 7");
+    db.close();
+    writeFileSync(`${dbPath}-wal`, "new build's wal");
+    writeFileSync(`${dbPath}-shm`, "new build's shm");
+    const aside = restoreDbSnapshot({ snapshotDir: snap.dir, dbPath, now: 2 });
+    expect(readDbVersion(dbPath)).toBe(5);
+    expect(existsSync(`${dbPath}-wal`)).toBe(false);
+    expect(existsSync(`${dbPath}-shm`)).toBe(false);
+    expect(readdirSync(data).sort()).toEqual(["apollo.db", "backups"]);
+    expect(readdirSync(aside).sort()).toEqual(["apollo.db", "apollo.db-shm", "apollo.db-wal"]);
+    expect(readDbVersion(join(aside, "apollo.db"))).toBe(7);
+    // The snapshot itself is still there, to restore again.
+    expect(readDbVersion(join(snap.dir, "apollo.db"))).toBe(5);
+  });
+
+  it("a snapshot without a database leaves the current one alone", () => {
+    const data = tmp("restore-bad");
+    const dbPath = join(data, "apollo.db");
+    makeDb(dbPath, 7);
+    const empty = join(data, "backups", "pre-update-1-x");
+    mkdirSync(empty, { recursive: true });
+    expect(() => restoreDbSnapshot({ snapshotDir: empty, dbPath, now: 2 })).toThrow(/No database/);
+    expect(readDbVersion(dbPath)).toBe(7);
+  });
+
+  it("prune keeps the newest, and always the one just taken", () => {
+    const data = tmp("prune");
+    const dbPath = join(data, "apollo.db");
+    makeDb(dbPath, 1);
+    const backups = join(data, "backups");
+    const snaps = [10, 40, 20, 30].map((now) => snapshotDb({ dbPath, backupsDir: backups, label: "c", now })!);
+    mkdirSync(join(backups, "pre-update-5-incomplete"));
+    mkdirSync(join(backups, "unrelated"));
+    expect(listSnapshots(backups).map((s) => s.createdAt)).toEqual([40, 30, 20, 10, 5]);
+    const removed = pruneSnapshots(backups, 2, snaps[2]!.dir);
+    expect(removed.sort()).toEqual([snaps[0]!.dir, snaps[3]!.dir, join(backups, "pre-update-5-incomplete")].sort());
+    expect(listSnapshots(backups).map((s) => s.createdAt)).toEqual([40, 20]);
+    expect(existsSync(join(backups, "unrelated"))).toBe(true);
+    pruneSnapshots(backups, 2, null);
+    expect(listSnapshots(backups).map((s) => s.createdAt)).toEqual([40, 20]);
+  });
+
+  it("recovery restores the database only when it is newer than the restored app and a readable snapshot exists", () => {
+    const snap = (dbVersion: number | null) => ({ dir: "/b/pre-update-1-x", createdAt: 1, dbVersion });
+    expect(recoveryDbAction(19, 19, snap(19))).toEqual({ action: "none" });
+    expect(recoveryDbAction(null, 19, snap(19))).toEqual({ action: "none" });
+    expect(recoveryDbAction(20, 19, snap(19))).toEqual({ action: "restore", snapshot: snap(19) });
+    expect(recoveryDbAction(20, 19, snap(20)).action).toBe("stuck");
+    expect(recoveryDbAction(20, 19, snap(null)).action).toBe("stuck");
+    expect(recoveryDbAction(20, 19, null).action).toBe("stuck");
   });
 });
 
@@ -279,6 +369,7 @@ describe("writeResult", () => {
       error: null,
       log: null,
       pid: 1,
+      snapshot: null,
     };
     writeResult(path, result);
     writeResult(path, { ...result, status: "rolled-back", stage: "rollback-healthy", error: "boom", finishedAt: "2026-11-08T00:01:00.000Z" });
@@ -296,6 +387,8 @@ describe("plan", () => {
     busy: [],
     schema: checkSchema(19, 19, false),
     bundles: B,
+    hasDb: true,
+    backupsDir: "/data/backups",
   };
   it("recovery comes first, and is all that happens", () => {
     expect(plan({ ...base, targetExists: false, previousExists: true })).toEqual([expect.stringMatching(/^Recovery/)]);
@@ -306,7 +399,8 @@ describe("plan", () => {
   it("waits for busy bots, with the timeout", () => {
     const steps = plan({ ...base, busy: ["Ceres / x (running)"], options: parseArgs(["--wait-timeout", "15"]) }).join("\n");
     expect(steps).toMatch(/Wait up to 15 min for: Ceres \/ x.*abort/);
-    expect(steps).toMatch(/Not healthy: stop it/);
+    expect(steps).toMatch(/Snapshot the database to \/data\/backups\/pre-update-…, keeping the last 2\nSwap:/);
+    expect(steps).toMatch(/Not healthy: stop it.*restore the database snapshot, open/);
   });
   it("--now and --no-open", () => {
     const steps = plan({ ...base, busy: ["Ceres / x (running)"], options: parseArgs(["--now", "--no-open"]) }).join("\n");

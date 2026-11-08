@@ -19,6 +19,10 @@
  *   --dry-run           print what would happen; build, quit and move nothing
  *   --no-open           don't open Apollo afterwards (the previous app is then kept)
  *
+ * With Apollo stopped and before the swap, the database is copied to ~/.apollo/backups/
+ * (the last two copies are kept): a new build migrates the database when it starts, so a
+ * rollback puts that copy back along with the previous app.
+ *
  * The outcome is always written to ~/.apollo/logs/install-app-last.result (JSON), so it
  * can be checked after Apollo restarts. If an interrupted install left no Apollo.app but a
  * .Apollo-previous.app, the next run puts that back first and stops there.
@@ -39,13 +43,19 @@ import {
   checkSchema,
   childArgs,
   isHealthyResponse,
+  listSnapshots,
   parseArgs,
   plan,
   portFromPsEnv,
   portsFromLsof,
+  pruneSnapshots,
   readDbVersion,
   recoverIfNeeded,
+  recoveryDbAction,
   relaunchUntilHealthy,
+  restoreDbSnapshot,
+  snapshotDb,
+  SNAPSHOTS_KEPT,
   swapAndVerify,
   waitForIdle,
   writeResult,
@@ -53,6 +63,7 @@ import {
   type BundleFs,
   type InstallResult,
   type ResultStatus,
+  type Snapshot,
 } from "./install-app-lib.ts";
 import { describe } from "./write-build-info.ts";
 
@@ -76,6 +87,7 @@ const { target, staged, previous } = BUNDLES;
 const dataDir = process.env.APOLLO_DATA_DIR ?? join(homedir(), ".apollo");
 const dbPath = join(dataDir, "apollo.db");
 const logsDir = join(dataDir, "logs");
+const backupsDir = join(dataDir, "backups");
 const resultPath = join(logsDir, "install-app-last.result");
 const BUNDLE_ID = "dev.apollo.desktop";
 const RELAUNCH_TIMEOUT_MS = 2 * 60_000;
@@ -258,6 +270,7 @@ const holdSignals = () => {
 const startedAt = new Date().toISOString();
 let stage = "start";
 let build: BuildInfo | null = null;
+let snapshot: Snapshot | null = null;
 const record = (status: ResultStatus, error: string | null = null) => {
   const result: InstallResult = {
     status,
@@ -268,6 +281,7 @@ const record = (status: ResultStatus, error: string | null = null) => {
     error,
     log: process.env.APOLLO_INSTALL_LOG ?? null,
     pid: process.pid,
+    snapshot: snapshot?.dir ?? null,
   };
   if (!options.dryRun) writeResult(resultPath, result);
 };
@@ -300,10 +314,35 @@ if (options.dryRun) {
     })(),
     schema,
     bundles: BUNDLES,
+    hasDb: existsSync(dbPath),
+    backupsDir,
   });
   steps.forEach((line, i) => log(`  ${i + 1}. ${line}`));
   process.exit(0);
 }
+
+/**
+ * Recovery put an older app back. If the database was migrated past what that app knows,
+ * put back the snapshot taken before the update too (the newer files are kept aside).
+ */
+const recoverDatabase = () => {
+  const latest = listSnapshots(backupsDir)[0] ?? null;
+  let bundleSchema: number | null = null;
+  try {
+    bundleSchema = (JSON.parse(readFileSync(join(target, "Contents", "Resources", "build-info.json"), "utf8")) as BuildInfo).schemaVersion;
+  } catch {
+    // Built before build-info.json existed: the snapshot was taken with that app, so it can read it.
+    bundleSchema = latest?.dbVersion ?? null;
+  }
+  if (bundleSchema === null) return log("  Database: no schema version known for the restored app; left as it is");
+  const decision = recoveryDbAction(readDbVersion(dbPath), bundleSchema, latest);
+  if (decision.action === "none") return log("  Database: the restored app can read it; left as it is");
+  if (decision.action === "stuck") return log(`  Database: ${decision.message}; left as it is`);
+  if (runningApollo().length > 0 || serverPids().length > 0) return log("  Database: Apollo is running, so the snapshot is not restored; quit it and run install:app again");
+  snapshot = decision.snapshot;
+  const aside = restoreDbSnapshot({ snapshotDir: decision.snapshot.dir, dbPath, now: Date.now() });
+  log(`  Database restored from ${decision.snapshot.dir} (schema ${decision.snapshot.dbVersion}); the newer one is in ${aside}`);
+};
 
 // ---------------------------------------------------------------------------------------
 // The install
@@ -315,6 +354,7 @@ try {
   if (recoverIfNeeded(realFs, BUNDLES)) {
     stage = "recovery";
     step(`Recovery: ${target} was missing; restored it from ${previous}`);
+    recoverDatabase();
     const ok = options.noOpen || (await relaunch());
     finish(ok ? "rolled-back" : "failed", ok ? "Restored the previous app after an interrupted install; run install:app again to update" : "Restored the previous app, but it does not answer /health");
   }
@@ -409,6 +449,21 @@ try {
       step(`Opening Apollo until it answers /health (up to ${RELAUNCH_TIMEOUT_MS / 60_000} min)`);
       return relaunch();
     },
+    snapshotData: () => {
+      stage = "snapshot";
+      snapshot = snapshotDb({ dbPath, backupsDir, label: build ? `${build.commit.slice(0, 10)}${build.dirty ? "-dirty" : ""}` : "unknown", now: Date.now() });
+      if (snapshot) {
+        log(`  Database (schema ${snapshot.dbVersion}) copied to ${snapshot.dir}`);
+        for (const dir of pruneSnapshots(backupsDir, SNAPSHOTS_KEPT, snapshot.dir)) log(`  Removed an older snapshot: ${dir}`);
+      } else log("  No database yet: nothing to snapshot");
+      stage = "swap";
+      record("running");
+    },
+    restoreData: () => {
+      if (!snapshot) return;
+      const aside = restoreDbSnapshot({ snapshotDir: snapshot.dir, dbPath, now: Date.now() });
+      log(`  Database restored from ${snapshot.dir} (the one the new build used is in ${aside})`);
+    },
     stopApp: async () => {
       stage = "rollback";
       record("running");
@@ -427,6 +482,11 @@ try {
     if (recoverIfNeeded(realFs, BUNDLES)) log(`  Put ${previous} back as ${target}`);
   } catch (restoreError) {
     log(`  Could not restore ${previous}: ${String(restoreError)}`);
+  }
+  // Apollo was already quit: don't leave it down.
+  if (["quit", "snapshot", "swap", "relaunch", "rollback"].includes(stage) && !options.noOpen && existsSync(target)) {
+    log("  Opening Apollo again");
+    await relaunch().catch(() => false);
   }
   finish("failed", error instanceof Error ? error.message : String(error));
 }
