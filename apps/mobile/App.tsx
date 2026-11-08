@@ -53,7 +53,8 @@ export default function App() {
 
   // iOS kills sockets while the app is in the background, including the listening socket
   // of the app's tailnet relay. Coming back reopens the relay (on a new port) and a fresh
-  // connection right away, rather than retrying the old, dead route forever.
+  // connection right away, rather than retrying the old, dead route forever. A pairing
+  // request in flight finishes first (see holdRoute).
   const [generation, setGeneration] = useState(0);
   useEffect(() => {
     let backgroundedAt: number | null = null;

@@ -24,13 +24,46 @@ export const startTailnet = (): Promise<TailnetStatus | null> =>
 export const tailnetStatus = (): Promise<TailnetStatus | null> =>
   tailnetAvailable ? Native.tailnetStatus() : Promise.resolve(null);
 
+// Requests that must not lose the relay under them (a pairing request: its token works
+// once, and the server spends it on arrival).
+let routeHolds = 0;
+let pendingReset: { promise: Promise<void>; resolve: () => void } | null = null;
+
+const stopRelay = (): Promise<void> => (tailnetAvailable ? Native.tailnetStopForward().catch(() => undefined) : Promise.resolve());
+
 /**
  * Drops the loopback relay so the next `routeTo` opens a fresh one. Call it when the app
  * comes back from the background: iOS may reclaim a suspended app's listening socket
  * without any error reaching the relay (Apple TN2277), which leaves the old port dead.
+ * While a held request is in flight the reset waits for it, so this resolves only once
+ * the relay was actually dropped.
  */
-export const resetTailnetRoute = (): Promise<void> =>
-  tailnetAvailable ? Native.tailnetStopForward().catch(() => undefined) : Promise.resolve();
+export const resetTailnetRoute = (): Promise<void> => {
+  if (routeHolds === 0) return stopRelay();
+  if (!pendingReset) {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => (resolve = r));
+    pendingReset = { promise, resolve };
+  }
+  return pendingReset.promise;
+};
+
+/** Runs `f` with the relay kept up; a reset asked for meanwhile happens after `f` settles. */
+export const holdRoute = async <T>(f: () => Promise<T>): Promise<T> => {
+  routeHolds++;
+  try {
+    return await f();
+  } finally {
+    routeHolds--;
+    if (routeHolds === 0 && pendingReset) {
+      const { resolve } = pendingReset;
+      pendingReset = null;
+      // Awaited: the relay is gone before the caller (onPaired) opens a new route.
+      await stopRelay();
+      resolve();
+    }
+  }
+};
 
 export const signOutOfTailnet = () => (tailnetAvailable ? Native.tailnetLogout() : Promise.resolve());
 

@@ -10,7 +10,7 @@ import { RpcClient, RpcSerialization } from "effect/rpc";
 import * as Socket from "effect/socket/Socket";
 import * as SecureStore from "expo-secure-store";
 import { Platform } from "react-native";
-import { devicePublicKey, makeProofPool, proofFor, routeTo, type ServerPin } from "./tailnet.ts";
+import { devicePublicKey, holdRoute, makeProofPool, proofFor, routeTo, type ServerPin } from "./tailnet.ts";
 
 /**
  * Where this phone is paired: the Apollo server's tailnet URL, its session token, and the
@@ -65,7 +65,12 @@ export const parsePairingCode = (text: string): PairingCode | null => {
  * The request registers this phone's device key, signed with it, and waits until someone
  * allows the phone on the computer.
  */
-export const pair = async (code: PairingCode): Promise<Pairing> => {
+export const pair = (code: PairingCode): Promise<Pairing> =>
+  // Backgrounding the app must not drop the relay mid-request: the server spends the
+  // one-time token on arrival, so a cut request could not be retried with the same code.
+  holdRoute(() => pairOnce(code));
+
+const pairOnce = async (code: PairingCode): Promise<Pairing> => {
   const { server, pin } = code;
   const base = await routeTo(server, pin);
   const deviceKey = await devicePublicKey();
