@@ -8,17 +8,23 @@ import type {
   InputAction,
   InputField,
   MessageAuthor,
+  RepoChanges,
   SessionEvent,
   SessionId,
 } from "@apollo/contracts";
 
-export type TranscriptItem =
+/** Every item carries when it happened (its event's time), for times and day groups. */
+export type TranscriptItem = TranscriptItemKind & { readonly at?: number };
+
+type TranscriptItemKind =
   | {
       readonly kind: "user";
       readonly key: string;
       readonly text: string;
       readonly author: MessageAuthor;
       readonly attachments?: ReadonlyArray<AttachmentRef>;
+      /** For `peer` messages: the bot that wrote it. */
+      readonly fromBotId?: string;
       /** Position in the session log; `excluded` when kept out of the bot's memory. */
       readonly seq: number;
       readonly excluded?: boolean;
@@ -83,7 +89,11 @@ export type TranscriptItem =
       readonly outcome: "provided" | "declined" | "expired" | null;
       readonly source: "typed" | "1password" | null;
     }
-  | { readonly kind: "turn-end"; readonly key: string; readonly outcome: string; readonly error: string | null };
+  | { readonly kind: "turn-end"; readonly key: string; readonly outcome: string; readonly error: string | null }
+  /** Files a turn changed in git repositories (detected by Apollo). */
+  | { readonly kind: "changes"; readonly key: string; readonly repos: ReadonlyArray<RepoChanges> }
+  /** Live only, while the agent compacts its context; clients show it instead of "Working…". */
+  | { readonly kind: "compacting"; readonly key: string };
 
 export interface TranscriptState {
   readonly sessionId: SessionId;
@@ -112,7 +122,7 @@ export const reduceTranscript = (state: TranscriptState, e: SessionEvent): Trans
   const lastSeq = e.seq === 0 ? state.lastSeq : e.seq;
   const event = e.event;
   const items = state.items;
-  const push = (item: TranscriptItem) => ({ ...state, lastSeq, items: [...items, item] });
+  const push = (item: TranscriptItem) => ({ ...state, lastSeq, items: [...items, { ...item, at: e.at }] });
 
   switch (event._tag) {
     // `/clear`: the chat starts over (the log keeps everything for search and memory).
@@ -126,6 +136,7 @@ export const reduceTranscript = (state: TranscriptState, e: SessionEvent): Trans
         author: event.author,
         seq: e.seq,
         ...(event.attachments ? { attachments: event.attachments } : {}),
+        ...(event.fromBotId ? { fromBotId: event.fromBotId } : {}),
       });
     case "MemoryExclusion": {
       const updated = updateWhere(
@@ -274,10 +285,19 @@ export const reduceTranscript = (state: TranscriptState, e: SessionEvent): Trans
     }
     case "Notice":
       return push({ kind: "notice", key: `n${e.seq}`, level: event.level, message: event.message });
-    case "TurnCompleted":
+    case "FilesChanged":
+      return push({ kind: "changes", key: `c${e.seq}`, repos: event.repos });
+    case "Compacting": {
+      const rest = items.filter((i) => i.kind !== "compacting");
+      return { ...state, items: event.active ? [...rest, { kind: "compacting", key: "compacting" }] : rest };
+    }
+    case "TurnCompleted": {
+      // A turn that ends also ends any compaction it was doing.
+      const ended = { ...state, items: items.filter((i) => i.kind !== "compacting") };
       return event.outcome === "completed"
-        ? { ...state, lastSeq }
-        : push({ kind: "turn-end", key: `t${e.seq}`, outcome: event.outcome, error: event.error });
+        ? { ...ended, lastSeq }
+        : { ...ended, lastSeq, items: [...ended.items, { kind: "turn-end", key: `t${e.seq}`, outcome: event.outcome, error: event.error }] };
+    }
     case "TurnStarted":
       return { ...state, lastSeq };
   }

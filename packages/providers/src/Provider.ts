@@ -42,6 +42,11 @@ export interface ProviderSessionOptions {
    * plus `<dir>/skills/<name>/SKILL.md`. Codex loads `<dir>/skills` as an extra skill root.
    */
   readonly skillsPluginDir: string | null;
+  /**
+   * A session that only reads and saves memories (a reflection): it may not ask the user
+   * anything, edit files or run commands.
+   */
+  readonly readOnly?: boolean;
 }
 
 /** What an adapter reports back to the session manager. */

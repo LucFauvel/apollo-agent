@@ -252,6 +252,30 @@ const MIGRATIONS: ReadonlyArray<string> = [
   alter table client_sessions add column node_name text;
   alter table client_sessions add column device_key text;  -- base64url uncompressed P-256 point
   `,
+  // 16: what each turn changed in git repositories, and workers' explanations of it.
+  `
+  create table turn_changes (
+    session_id text not null references sessions(id) on delete cascade,
+    turn_seq integer not null,          -- seq of the turn's TurnStarted event
+    repo text not null,                 -- the repository (or worktree) folder
+    git_dir text not null,              -- its common git dir, where the snapshot trees live
+    before_tree text not null,
+    after_tree text not null,
+    files text not null,                -- JSON ChangedFile[]
+    created_at integer not null,
+    primary key (session_id, turn_seq, repo)
+  );
+  create table change_notes (
+    session_id text not null references sessions(id) on delete cascade,
+    turn_seq integer not null,
+    repo text not null,                 -- '' for a summary of the turn
+    path text not null,                 -- '' for a summary of the turn
+    symbol text not null,               -- '' for the whole file
+    text text not null,
+    created_at integer not null,
+    primary key (session_id, turn_seq, repo, path, symbol)
+  );
+  `,
 ];
 
 export class Database extends Context.Service<Database, DatabaseSync>()("apollo/Database") {}

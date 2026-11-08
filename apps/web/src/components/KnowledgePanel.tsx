@@ -199,6 +199,7 @@ export function KnowledgePanel({ bot, onClose }: { bot: Bot; onClose: () => void
 
   return (
     <Panel
+      name="knowledge"
       onClose={onClose}
       title={
         <div className="-ml-2 flex rounded-lg bg-zinc-900 p-0.5">

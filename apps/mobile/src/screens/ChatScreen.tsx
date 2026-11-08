@@ -1,5 +1,6 @@
 import {
   reduceTranscript,
+  isCompacting,
   showWorking,
   systemMessageParts,
   toBlocks,
@@ -7,7 +8,7 @@ import {
   type TranscriptItem,
   type TranscriptState,
 } from "@apollo/client";
-import type { InputField, InputValue, SessionId } from "@apollo/contracts";
+import type { Bot, InputField, InputValue, RepoChanges, SessionId } from "@apollo/contracts";
 import {
   type ReactNode,
   useEffect,
@@ -32,13 +33,15 @@ import { useApollo } from "../AppState.tsx";
 import { BlobAvatar } from "../BlobAvatar.tsx";
 import { Markdown } from "../Markdown.tsx";
 import { ActivityGroup } from "../Activity.tsx";
-import { animateLayout, FadeIn, Pulse, ScrollHold, Spin, Turn, useKeyboardInset, useToggle } from "../motion.tsx";
+import { ChangesScreen } from "./ChangesScreen.tsx";
+import { animateLayout, FadeIn, Pulse, ScrollHold, Spin, SwipeBack, Turn, useKeyboardInset, useToggle } from "../motion.tsx";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { errorMessage } from "../connection.ts";
 import { colors } from "../theme.ts";
 import { ConversationBar, ConversationToggle, MicButton, useVoiceConversation, useVoiceStatus } from "../VoiceChat.tsx";
 import {
   ArrowUpIcon,
+  GitCompareArrowsIcon,
   BanIcon,
   CheckIcon,
   ChevronDownIcon,
@@ -69,9 +72,12 @@ const reducer = (state: TranscriptState, action: Action): TranscriptState =>
 export function ChatScreen({
   sessionId,
   onBack,
+  onOpenSession,
 }: {
   sessionId: SessionId;
   onBack: () => void;
+  /** Opens another session (a worker, from the Changes screen). */
+  onOpenSession: (id: SessionId) => void;
 }) {
   const { state, connection } = useApollo();
   const session = state.sessions.get(sessionId);
@@ -149,6 +155,8 @@ export function ChatScreen({
 
   const items = transcript.items;
   const blocks = useMemo(() => toBlocks(items), [items]);
+  // Compaction can take minutes on a local model: say so instead of "Working…".
+  const compacting = useMemo(() => isCompacting(items), [items]);
   // Hands-free voice conversation with this session.
   const [talking, setTalking] = useState(false);
   useVoiceConversation({
@@ -186,7 +194,25 @@ export function ChatScreen({
     if (count && Date.now() - openedAt.current > 1000) animateLayout(180);
   }, [count]);
 
+  // `@Name` asks another bot: suggest bots while a tag is being typed at the end.
+  const mentionQuery = /(?:^|\s)@([^\s@]*)$/.exec(text)?.[1];
+  const mentionMatches =
+    mentionQuery === undefined || !session
+      ? []
+      : [...state.bots.values()].filter((b) => b.id !== session.botId && b.name.toLowerCase().startsWith(mentionQuery.toLowerCase())).slice(0, 6);
+  // The Changes screen, over the conversation (swipe from the edge to come back).
+  const [changesOpen, setChangesOpen] = useState(false);
+  const openPullRequests = useMemo(() => {
+    if (!session) return 0;
+    const ids = new Set(session.role === "main" ? [...state.sessions.values()].filter((s) => s.botId === session.botId).map((s) => s.id) : [session.id]);
+    const urls = new Set<string>();
+    for (const pr of state.pullRequests.values()) if (ids.has(pr.sessionId) && (pr.state === "open" || pr.state === "draft")) urls.add(pr.url);
+    return urls.size;
+  }, [state.pullRequests, state.sessions, session]);
+  const hasChanges = useMemo(() => items.some((item) => item.kind === "changes"), [items]);
+
   return (
+    <View style={{ flex: 1 }}>
     <Animated.View style={[styles.screen, { paddingBottom: keyboard }]}>
       <View style={styles.header}>
         <Pressable onPress={onBack} hitSlop={12}>
@@ -203,10 +229,27 @@ export function ChatScreen({
             {session?.status === "waiting-approval"
               ? "Needs you"
               : working
-                ? "Working…"
+                ? compacting
+                  ? "Compacting…"
+                  : "Working…"
                 : (session?.provider ?? "")}
           </Text>
         </View>
+        <Pressable
+          onPress={() => setChangesOpen(true)}
+          hitSlop={8}
+          accessibilityLabel={openPullRequests > 0 ? `Changes and pull requests, ${openPullRequests} open` : "Changes and pull requests"}
+          style={({ pressed }) => [styles.headerButton, pressed && { opacity: 0.6 }]}
+        >
+          <GitCompareArrowsIcon size={19} color={colors.muted} />
+          {openPullRequests > 0 ? (
+            <View style={styles.prBadge}>
+              <Text style={styles.badgeCount}>{openPullRequests}</Text>
+            </View>
+          ) : hasChanges ? (
+            <View style={styles.changesDot} />
+          ) : null}
+        </Pressable>
         <ConversationToggle active={talking} onToggle={() => setTalking((t) => !t)} />
       </View>
 
@@ -236,6 +279,7 @@ export function ChatScreen({
               <Item
                 item={item}
                 live={busy && i === blocks.length - 1}
+                onOpenChanges={() => setChangesOpen(true)}
                 onApprove={(requestId, decision) =>
                   act((c) =>
                     c["sessions.respondApproval"]({
@@ -277,13 +321,13 @@ export function ChatScreen({
             </View>
           </FadeIn>
         ))}
-        {outbox.length > 0 || showWorking(busy, session?.status === "waiting-approval", blocks.at(-1)) ? (
+        {compacting || outbox.length > 0 || showWorking(busy, session?.status === "waiting-approval", blocks.at(-1)) ? (
           <View style={styles.working}>
             <Spin>
               <LoaderIcon size={14} color={colors.faint} />
             </Spin>
             <Pulse>
-              <Text style={styles.workingText}>Working…</Text>
+              <Text style={styles.workingText}>{compacting ? "Compacting the conversation…" : "Working…"}</Text>
             </Pulse>
           </View>
         ) : null}
@@ -291,6 +335,20 @@ export function ChatScreen({
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {talking ? <ConversationBar session={session} onEnd={() => setTalking(false)} /> : null}
+      {mentionMatches.length > 0 ? (
+        <ScrollView horizontal keyboardShouldPersistTaps="always" showsHorizontalScrollIndicator={false} contentContainerStyle={styles.mentions}>
+          {mentionMatches.map((b) => (
+            <Pressable
+              key={b.id}
+              onPress={() => setText((t) => t.replace(/@([^\s@]*)$/, `@${b.name} `))}
+              style={({ pressed }) => [styles.mentionChip, pressed && { opacity: 0.6 }]}
+            >
+              <BlobAvatar avatar={b.avatar} size={18} />
+              <Text style={styles.mentionName}>{b.name}</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+      ) : null}
       <View style={styles.composer}>
         <MicButton
           disabled={talking}
@@ -322,6 +380,21 @@ export function ChatScreen({
         </Pressable>
       </View>
     </Animated.View>
+      {changesOpen && session ? (
+        <View style={StyleSheet.absoluteFill}>
+          <SwipeBack onBack={() => setChangesOpen(false)}>
+            <ChangesScreen
+              session={session}
+              onBack={() => setChangesOpen(false)}
+              onOpenSession={(id) => {
+                setChangesOpen(false);
+                if (id !== sessionId) onOpenSession(id);
+              }}
+            />
+          </SwipeBack>
+        </View>
+      ) : null}
+    </View>
   );
 }
 
@@ -332,8 +405,17 @@ type Respond = {
 };
 
 /** One block of the conversation, drawn as the desktop app draws it (apps/web SessionView.tsx). */
-function Item({ item, live, onApprove, onInput, onSecret }: { item: TranscriptBlock; live: boolean } & Respond) {
+function Item({
+  item,
+  live,
+  onApprove,
+  onInput,
+  onSecret,
+  onOpenChanges,
+}: { item: TranscriptBlock; live: boolean; onOpenChanges: () => void } & Respond) {
   switch (item.kind) {
+    case "changes":
+      return <TurnChanges repos={item.repos} onOpen={onOpenChanges} />;
     case "activity":
       return <ActivityGroup block={item} live={live} />;
     case "user":
@@ -341,6 +423,8 @@ function Item({ item, live, onApprove, onInput, onSecret }: { item: TranscriptBl
         <View style={styles.userBubble}>
           <Text style={styles.userText}>{item.text}</Text>
         </View>
+      ) : item.author === "peer" ? (
+        <PeerMessage botId={item.fromBotId} text={item.text} />
       ) : (
         <SystemMessage author={item.author} text={item.text} />
       );
@@ -388,6 +472,64 @@ function Item({ item, live, onApprove, onInput, onSecret }: { item: TranscriptBl
     default:
       return null;
   }
+}
+
+/** A message from another of the user's bots: collapsed to its first line, opened on tap. */
+function PeerMessage({ botId, text }: { botId: string | undefined; text: string }) {
+  const { state } = useApollo();
+  const bot = botId ? state.bots.get(botId as Bot["id"]) : undefined;
+  const [open, toggle] = useToggle();
+  const first = text.trim().split("\n").find((l) => l.trim())?.replace(/^[#*>\-\s]+/, "") ?? "";
+  return (
+    <View style={styles.peerCard}>
+      <Pressable onPress={toggle} style={styles.peerHeader}>
+        {bot ? <BlobAvatar avatar={bot.avatar} size={20} /> : null}
+        <Text style={styles.peerName}>{bot?.name ?? "Another bot"}</Text>
+        <Text style={styles.peerFirst} numberOfLines={1}>
+          {open ? "" : first}
+        </Text>
+        <Turn open={open} degrees={180}>
+          <ChevronDownIcon size={14} color={colors.faint} />
+        </Turn>
+      </Pressable>
+      {/* Outside the tap target, so code inside can scroll sideways. */}
+      {open ? (
+        <View style={styles.peerBody}>
+          <Markdown text={text} size={14.5} />
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+/** What a turn changed in git repositories (detected by Apollo); opens the Changes screen. */
+function TurnChanges({ repos, onOpen }: { repos: ReadonlyArray<RepoChanges>; onOpen: () => void }) {
+  const files = repos.flatMap((r) => r.files);
+  const additions = files.reduce((n, f) => n + (f.additions ?? 0), 0);
+  const deletions = files.reduce((n, f) => n + (f.deletions ?? 0), 0);
+  const dot = { added: "#34d399", modified: "#fbbf24", deleted: "#f87171", renamed: "#38bdf8" } as const;
+  return (
+    <Pressable onPress={onOpen} style={({ pressed }) => [styles.turnChanges, pressed && { opacity: 0.6 }]}>
+      <GitCompareArrowsIcon size={15} color={colors.faint} />
+      <View style={{ flex: 1, minWidth: 0 }}>
+        <Text style={styles.turnChangesTitle} numberOfLines={1}>
+          Changed {files.length} {files.length === 1 ? "file" : "files"}
+          <Text style={{ color: colors.faint }}> in {repos.map((r) => r.name).join(", ")}</Text>
+        </Text>
+        <View style={styles.turnChangesMeta}>
+          <View style={{ flexDirection: "row", gap: 3 }}>
+            {files.slice(0, 14).map((f) => (
+              <View key={f.path} style={[styles.fileDot, { backgroundColor: dot[f.status] }]} />
+            ))}
+          </View>
+          <Text style={styles.turnChangesCounts}>
+            <Text style={{ color: "#34d399" }}>+{additions}</Text> <Text style={{ color: "#f87171" }}>−{deletions}</Text>
+          </Text>
+        </View>
+      </View>
+      <Text style={styles.turnChangesReview}>Review ›</Text>
+    </Pressable>
+  );
 }
 
 /** A small colored label (the desktop's Badge). */
@@ -701,6 +843,58 @@ const styles = StyleSheet.create({
     borderBottomColor: colors.border,
   },
   back: { color: colors.accent, fontSize: 16 },
+  headerButton: { width: 34, height: 34, borderRadius: 17, alignItems: "center", justifyContent: "center" },
+  prBadge: {
+    position: "absolute",
+    top: 1,
+    right: 0,
+    minWidth: 16,
+    height: 16,
+    borderRadius: 8,
+    paddingHorizontal: 4,
+    backgroundColor: "#10b981",
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 2,
+    borderColor: colors.bg,
+  },
+  badgeCount: { color: "#fff", fontSize: 9, fontWeight: "700" },
+  changesDot: { position: "absolute", top: 6, right: 6, width: 7, height: 7, borderRadius: 4, backgroundColor: "#fbbf24", borderWidth: 1.5, borderColor: colors.bg },
+  peerCard: { borderRadius: 12, borderWidth: 1, borderColor: "rgba(39,39,42,0.8)", backgroundColor: "rgba(24,24,27,0.4)" },
+  peerHeader: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 12, paddingVertical: 9 },
+  peerName: { color: colors.textSoft, fontSize: 12.5, fontWeight: "600" },
+  peerFirst: { flex: 1, color: colors.faint, fontSize: 12.5 },
+  peerBody: { borderTopWidth: 1, borderTopColor: "rgba(39,39,42,0.8)", paddingHorizontal: 12, paddingVertical: 8 },
+  mentions: { gap: 8, paddingHorizontal: 10, paddingTop: 8 },
+  mentionChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "rgba(139,92,246,0.35)",
+    backgroundColor: "rgba(139,92,246,0.12)",
+    paddingLeft: 5,
+    paddingRight: 11,
+    paddingVertical: 4,
+  },
+  mentionName: { color: "#ddd6fe", fontSize: 13, fontWeight: "600" },
+  turnChanges: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "rgba(39,39,42,0.9)",
+    backgroundColor: "rgba(24,24,27,0.35)",
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+  },
+  turnChangesTitle: { color: colors.textSoft, fontSize: 13 },
+  turnChangesMeta: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 4 },
+  fileDot: { width: 6, height: 6, borderRadius: 3 },
+  turnChangesCounts: { fontFamily: MONO, fontSize: 11 },
+  turnChangesReview: { color: colors.faint, fontSize: 12 },
   headerTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
   headerMeta: { color: colors.faint, fontSize: 12 },
   transcript: { padding: 16, gap: 12 },

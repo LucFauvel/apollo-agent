@@ -1,4 +1,7 @@
 import { mkdirSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
+import { type ExplainItem, makeChangeTracker } from "./changes/Tracker.ts";
+import { Database } from "./Database.ts";
 import { isAbsolute, join, relative } from "node:path";
 import { randomUUID } from "node:crypto";
 import {
@@ -152,6 +155,8 @@ const isBusy = (status: SessionStatus) =>
 
 const make = Effect.gen(function* () {
   const store = yield* Store;
+  /** What each turn changes in git repositories (see changes/Tracker.ts). */
+  const changeTracker = makeChangeTracker(yield* Database, homedir());
   const config = yield* ServerConfig;
   const providers = yield* Providers;
   const appSettings = yield* AppSettings;
@@ -260,20 +265,43 @@ const make = Effect.gen(function* () {
           }
           case "Event": {
             const event = emission.event;
-            if (event._tag === "AssistantDelta" || event._tag === "ReasoningDelta" || event._tag === "ToolPending") {
+            if (event._tag === "AssistantDelta" || event._tag === "ReasoningDelta" || event._tag === "ToolPending" || event._tag === "Compacting") {
               // Live-only (seq 0); the final AssistantMessage / Reasoning / ToolStarted is persisted.
               yield* PubSub.publish(events, { sessionId: id, seq: 0, at: Date.now(), event });
               return;
             }
-            yield* appendEvent(id, event);
+            const stored = yield* appendEvent(id, event);
             switch (event._tag) {
-              case "TurnStarted":
+              case "TurnStarted": {
                 yield* updateSession(id, { status: "running" });
+                // Snapshot the session's repositories, to see what this turn changes.
+                const session = yield* store.getSession(id);
+                if (session.role !== "reflection") {
+                  yield* background(Effect.promise(() => changeTracker.turnStarted(id, stored.seq, session.cwd)));
+                }
+                return;
+              }
+              case "ToolStarted":
+                yield* background(Effect.promise(() => changeTracker.toolStarted(id, event.summary)));
                 return;
               case "ApprovalRequested":
-              case "InputRequested":
+              case "InputRequested": {
+                // A reflection works alone: whatever it asks is declined, and never reaches the user.
+                if ((yield* store.getSession(id)).role === "reflection") {
+                  const entry = live.get(id);
+                  if (entry) {
+                    yield* (
+                      event._tag === "ApprovalRequested"
+                        ? entry.provider.respondApproval(event.requestId, "decline")
+                        : entry.provider.respondInput(event.requestId, { action: "decline", values: {} })
+                    ).pipe(Effect.ignore);
+                  }
+                  yield* Effect.logWarning(`reflection ${id} asked for ${event._tag === "ApprovalRequested" ? "approval" : "input"}; declined`);
+                  return;
+                }
                 yield* updateSession(id, { status: "waiting-approval" });
                 return;
+              }
               case "ApprovalResolved":
               case "InputResolved":
                 yield* updateSession(id, { status: "running" });
@@ -366,6 +394,7 @@ const make = Effect.gen(function* () {
               }),
               extraDirectories: projectFolders,
               runtimeMode: session.runtimeMode ?? bot.runtimeMode,
+              readOnly: session.role === "reflection",
               mcp: { name: MCP_SERVER_NAME, url: `${config.baseUrl}/mcp`, bearerToken: token },
               skillsPluginDir,
             },
@@ -480,9 +509,47 @@ const make = Effect.gen(function* () {
 
   // --- turn lifecycle -----------------------------------------------------
 
+  /**
+   * The changes part of a worker's report: the files (detected by Apollo) and the worker's
+   * explanations of them (from apollo_explain_changes), if it gave any.
+   */
+  const changesReport = (
+    repos: ReadonlyArray<{ name: string; files: ReadonlyArray<{ path: string; status: string; additions: number | null; deletions: number | null }> }>,
+    notes: ReadonlyArray<{ repo: string; path: string; symbol: string; text: string }>,
+  ) => {
+    if (repos.length === 0 && notes.length === 0) return null;
+    const lines: Array<string> = [];
+    for (const repo of repos) {
+      const shown = repo.files.slice(0, 25);
+      lines.push(`Files it changed in ${repo.name}:`);
+      for (const f of shown) {
+        const counts = f.additions === null ? "binary" : `+${f.additions} -${f.deletions ?? 0}`;
+        lines.push(`- ${f.path} (${f.status}, ${counts})`);
+      }
+      if (repo.files.length > shown.length) lines.push(`- and ${repo.files.length - shown.length} more`);
+    }
+    const summary = notes.find((n) => n.path === "");
+    const fileNotes = notes.filter((n) => n.path !== "");
+    if (summary || fileNotes.length > 0) {
+      lines.push("Its explanation of the changes:");
+      if (summary) lines.push(summary.text);
+      for (const n of fileNotes) lines.push(`- ${n.path}${n.symbol ? ` › ${n.symbol}` : ""}: ${n.text}`);
+    }
+    return lines.join("\n");
+  };
+
   const onTurnCompleted = (id: SessionId, event: Extract<AgentEvent, { _tag: "TurnCompleted" }>) =>
     Effect.gen(function* () {
       const { session, turnsSinceReflection } = yield* store.recordTurn(id);
+      yield* background(deliverMentionReplies(session, event));
+      // What the turn changed in git repositories, shown in the conversation (deterministic).
+      const turnChanges = yield* Effect.promise(() => changeTracker.turnCompleted(id).catch(() => null)).pipe(
+        Effect.timeoutOrElse({ duration: "90 seconds", orElse: () => Effect.succeed(null) }),
+      );
+      if (turnChanges && turnChanges.repos.length > 0) {
+        yield* appendEvent(id, { _tag: "FilesChanged", repos: turnChanges.repos });
+        yield* publish({ _tag: "ChangesUpdated", sessionId: id, botId: session.botId });
+      }
       yield* updateSession(id, { status: "idle" });
       if (pendingReopen.delete(id)) yield* reopenWithNewSettings(id);
 
@@ -501,6 +568,7 @@ const make = Effect.gen(function* () {
           `[Apollo] Worker session "${session.title}" (${session.id}, ${session.provider}) finished a turn: ${event.outcome}.`,
           event.error ? `Error: ${event.error}` : null,
           session.lastMessage ? `Its last message:\n${session.lastMessage}` : "It produced no final message.",
+          turnChanges ? changesReport(turnChanges.repos, changeTracker.turnNotes(id, turnChanges.seq)) : null,
         ]
           .filter((line) => line !== null)
           .join("\n");
@@ -537,6 +605,8 @@ const make = Effect.gen(function* () {
     text: string,
     author: MessageAuthor = "user",
     attachments: ReadonlyArray<AttachmentRef> = [],
+    /** A `peer` message's bot, and what the agent reads when it differs from what the chat shows. */
+    extra: { readonly fromBotId?: BotId; readonly agentText?: string } = {},
   ) =>
     Effect.gen(function* () {
       if (text.trim().length === 0 && attachments.length === 0) return yield* invalid("message is empty");
@@ -552,6 +622,7 @@ const make = Effect.gen(function* () {
       if (author === "user") {
         // The user is back in the loop.
         if (target.role === "main") autonomousTurns.delete(target.botId);
+        botTalk.delete(id);
       } else {
         yield* guardAutomated(target);
       }
@@ -562,18 +633,154 @@ const make = Effect.gen(function* () {
         text,
         author,
         ...(attachments.length > 0 ? { attachments: files.map((f) => ({ id: f!.id, name: f!.name, mime: f!.mime, size: f!.size })) } : {}),
+        ...(extra.fromBotId ? { fromBotId: extra.fromBotId } : {}),
       });
       // Mark busy before the provider acknowledges the turn, so a caller that
       // immediately waits on this session (e.g. apollo_wait_session) cannot see
       // a stale "idle". TurnCompleted flips it back.
       const before = yield* store.getSession(id);
       if (!isBusy(before.status)) yield* updateSession(id, { status: "running" });
+      // `@OtherBot` in the user's message points the agent at that bot: it reads who that is.
+      const agentText = extra.agentText ?? (author === "user" ? yield* withMentionNote(target, text) : text);
       // A failure to open posts its own notice and marks the session as errored.
       const entry = yield* ensureOpen(id, true);
-      yield* entry.provider.send(text, files.map((f) => ({ path: f!.path, name: f!.name, mime: f!.mime, size: f!.size }))).pipe(
+      yield* entry.provider.send(agentText, files.map((f) => ({ path: f!.path, name: f!.name, mime: f!.mime, size: f!.size }))).pipe(
         Effect.mapError((error) => providerFailure(error.message)),
         Effect.tapError(() => updateSession(id, { status: "idle" }).pipe(Effect.ignore)),
       );
+    });
+
+  // --- other bots ------------------------------------------------------------
+  // The user can tag another of their bots with `@Name`: the agent is told who that is.
+  // Bots write to each other with apollo_ask_bot; answers come back as `peer` messages.
+
+  /** Conversations waiting for another bot's answer (apollo_ask_bot), by that bot's main session. */
+  const mentionReplies = new Map<SessionId, Array<{ fromSessionId: SessionId; kind: "ask" }>>();
+  /** Messages a conversation sent to other bots since the user last wrote in it. */
+  const botTalk = new Map<SessionId, number>();
+  /** How many messages bots may exchange before the user takes part again. */
+  const MAX_BOT_TALK = 6;
+
+  const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  /** The bots a message tags (`@Name`, any case), other than the conversation's own. */
+  const mentionedBots = (text: string, ownBotId: BotId) =>
+    Effect.map(store.listBots, (bots) =>
+      bots.filter(
+        (bot) =>
+          bot.id !== ownBotId && new RegExp(`(^|[^\\w@])@${escapeRegExp(bot.name)}(?![\\w-])`, "i").test(text),
+      ),
+    );
+
+  /**
+   * The user's message as the agent reads it: with a note on the bots it tags. A tag is a
+   * reference ("talk to @Vega about this"), not a message to that bot: the agent decides
+   * whether to write to it with apollo_ask_bot.
+   */
+  const withMentionNote = (session: Session, text: string) =>
+    Effect.gen(function* () {
+      const bots = yield* mentionedBots(text, session.botId);
+      if (bots.length === 0) return text;
+      const lines = bots.map((bot) => {
+        const about = bot.instructions.trim().split("\n")[0]?.slice(0, 160);
+        return `- @${bot.name}: another of the user's bots${about ? ` (${about})` : ""}`;
+      });
+      const canAsk = session.role === "main";
+      return [
+        text,
+        "",
+        `[Apollo] The user tagged ${bots.length === 1 ? "another bot" : "other bots"}:`,
+        ...lines,
+        canAsk
+          ? "Tags say who the user means; nothing was sent to them. Write to one with `apollo_ask_bot` if the task needs it."
+          : "Tags say who the user means; nothing was sent to them. Your orchestrator can write to them with `apollo_ask_bot`.",
+      ].join("\n");
+    });
+
+  /**
+   * Where `from` talks to `bot`: a side conversation of `bot` (not its main thread), one per
+   * pair of bots, reused for later messages. It runs on the bot's orchestrator model.
+   */
+  const botChannel = (bot: Bot, from: Bot) =>
+    Effect.gen(function* () {
+      const title = `Conversation with ${from.name}`;
+      const existing = (yield* store.listSessions(bot.id)).find(
+        (s) => s.role === "worker" && s.parentSessionId === null && s.title === title && s.status !== "closed",
+      );
+      if (existing) return existing;
+      return yield* createSession({ botId: bot.id, title, provider: bot.main, role: "worker", parentSessionId: null });
+    });
+
+  /**
+   * A bot's orchestrator writes to another of the user's bots (`apollo_ask_bot`). The message
+   * goes to a side conversation of that bot (from the asking bot); its answer is sent back.
+   * Bots can exchange a few messages before the user has to take part again.
+   */
+  const askBot = (fromId: SessionId, target: string, message: string): Effect.Effect<{ bot: string }, ApolloError> =>
+    Effect.gen(function* () {
+      const from = yield* store.getSession(fromId);
+      if (from.role !== "main") return yield* invalid("only a bot's orchestrator can write to other bots");
+      const fromBot = yield* store.getBot(from.botId);
+      const wanted = target.replace(/^@/, "").trim().toLowerCase();
+      const bot = (yield* store.listBots).find((b) => b.id === target || b.name.toLowerCase() === wanted);
+      if (!bot) return yield* invalid(`no bot named "${target}"; apollo_list_bots lists them`);
+      if (bot.id === fromBot.id) return yield* invalid("that is you");
+      if (!message.trim()) return yield* invalid("the message is empty");
+      const sent = (botTalk.get(fromId) ?? 0) + 1;
+      if (sent > MAX_BOT_TALK) {
+        return yield* invalid(`you already sent ${MAX_BOT_TALK} messages to other bots since the user last wrote; check with the user first`);
+      }
+      botTalk.set(fromId, sent);
+      // Not in the other bot's main conversation: in a side conversation for this pair of bots.
+      const channel = yield* botChannel(bot, fromBot);
+      mentionReplies.set(channel.id, [...(mentionReplies.get(channel.id) ?? []), { fromSessionId: fromId, kind: "ask" }]);
+      yield* send(channel.id, message.trim(), "peer", [], {
+        fromBotId: fromBot.id,
+        agentText: [
+          `[Apollo] ${fromBot.name}, another of the user's bots, writes to you:`,
+          message.trim(),
+          "",
+          `Your final message this turn is sent back to ${fromBot.name}. Answer directly; ask the user only if you must.`,
+        ].join("\n"),
+      }).pipe(
+        Effect.tapError(() =>
+          Effect.sync(() =>
+            mentionReplies.set(
+              channel.id,
+              (mentionReplies.get(channel.id) ?? []).filter((w) => !(w.fromSessionId === fromId && w.kind === "ask")),
+            ),
+          ),
+        ),
+      );
+      return { bot: bot.name };
+    });
+
+  /** A bot that was written to finished its turn: send its answer back. */
+  const deliverMentionReplies = (session: Session, event: Extract<AgentEvent, { _tag: "TurnCompleted" }>): Effect.Effect<void, ApolloError> =>
+    Effect.gen(function* () {
+      const waiting = mentionReplies.get(session.id);
+      if (!waiting?.length) return;
+      mentionReplies.delete(session.id);
+      const bot = yield* store.getBot(session.botId);
+      const answer = session.lastMessage?.trim();
+      for (const { fromSessionId } of waiting) {
+        if (event.outcome !== "completed" || !answer || answer === "[SILENT]") {
+          yield* appendEvent(fromSessionId, {
+            _tag: "Notice",
+            level: "warning",
+            message: `${bot.name} did not answer${event.outcome !== "completed" ? ` (its turn ${event.outcome})` : ""}.`,
+          });
+          continue;
+        }
+        yield* send(fromSessionId, answer, "peer", [], {
+          fromBotId: bot.id,
+          agentText: `[Apollo] ${bot.name}, another of the user's bots, answered your message:\n${answer}`,
+        }).pipe(
+          Effect.catchTag("ApolloError", (error) =>
+            appendEvent(fromSessionId, { _tag: "Notice", level: "warning", message: `${bot.name} answered, but it could not be posted: ${error.message}` }),
+          ),
+        );
+      }
     });
 
   const createSession = (input: {
@@ -811,6 +1018,8 @@ const make = Effect.gen(function* () {
       return yield* startReflection(id);
     });
 
+  // Without skill review, proposals left from before (or from review being on) are active.
+  if (!(yield* appSettings.read).reviewSkills) yield* store.activateProposedSkills;
   yield* store.resetLiveStatuses;
   // Reflections remove themselves when done; clear any left from before (or cut short by a restart).
   for (const session of yield* store.listSessions()) {
@@ -981,6 +1190,43 @@ const make = Effect.gen(function* () {
       }),
 
     /** A worker's worktree: its commits, uncommitted changes and diff summary. */
+    // --- other bots ------------------------------------------------------------
+    askBot,
+
+    // --- changes -----------------------------------------------------------
+
+    /** What a session changed (an orchestrator: with its workers'), per repository. */
+    changesList: (id: SessionId) =>
+      Effect.gen(function* () {
+        const session = yield* store.getSession(id);
+        const sessions =
+          session.role === "main"
+            ? [session, ...(yield* store.listSessions(session.botId)).filter((s) => s.id !== session.id && s.role !== "reflection")]
+            : [session];
+        const all = yield* Effect.promise(() =>
+          Promise.all(sessions.map((s) => changeTracker.sessionChanges(s.id, s.role === "main" ? "Orchestrator" : s.title))),
+        );
+        return { sessions: all.filter((c) => c !== null) };
+      }),
+
+    /** One changed file of a session as a semantic diff. */
+    changesFile: (id: SessionId, repo: string, path: string) =>
+      Effect.gen(function* () {
+        yield* store.getSession(id);
+        const diff = yield* Effect.promise(() => changeTracker.file(id, repo, path));
+        if (!diff) return yield* invalid(`${path} is not among this session's changes`);
+        return diff;
+      }),
+
+    /** A worker's explanation of the changes in its running turn. */
+    explainChanges: (id: SessionId, summary: string, items: ReadonlyArray<ExplainItem>) =>
+      Effect.gen(function* () {
+        const session = yield* store.getSession(id);
+        const result = yield* Effect.promise(() => changeTracker.explain(id, summary, items));
+        yield* publish({ _tag: "ChangesUpdated", sessionId: id, botId: session.botId });
+        return result;
+      }),
+
     worktreeStatus: (id: SessionId) =>
       Effect.gen(function* () {
         const session = yield* store.getSession(id);

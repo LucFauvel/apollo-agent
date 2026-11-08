@@ -31,6 +31,8 @@ export interface AppState {
   readonly browserTabs: ReadonlyMap<string, BrowserTab>;
   /** Pull requests linked to sessions, keyed `${sessionId} ${url}`. */
   readonly pullRequests: ReadonlyMap<string, PullRequest>;
+  /** Bumped when a bot's sessions changed files or explained changes: the Changes panel refetches. */
+  readonly changesVersion: ReadonlyMap<BotId, number>;
 }
 
 export type Notice = Extract<AppChange, { _tag: "Notify" }>;
@@ -52,6 +54,7 @@ let state: AppState = {
   schedules: new Map(),
   browserTabs: new Map(),
   pullRequests: new Map(),
+  changesVersion: new Map(),
 };
 const listeners = new Set<() => void>();
 
@@ -120,6 +123,8 @@ const apply = (change: AppChange) => {
       const pr = change.pullRequest;
       return setState({ ...state, pullRequests: new Map(state.pullRequests).set(`${pr.sessionId} ${pr.url}`, pr) });
     }
+    case "ChangesUpdated":
+      return setState({ ...state, changesVersion: new Map(state.changesVersion).set(change.botId, (state.changesVersion.get(change.botId) ?? 0) + 1) });
     case "PullRequestRemoved": {
       const pullRequests = new Map(state.pullRequests);
       pullRequests.delete(`${change.sessionId} ${change.url}`);

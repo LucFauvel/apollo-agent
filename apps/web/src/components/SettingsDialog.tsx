@@ -3,7 +3,7 @@ import { Folder, FolderGit2, FolderPlus, Loader2, Settings, X } from "lucide-rea
 import { useEffect, useState } from "react";
 import { tildify } from "../appSettings.ts";
 import { errorMessage, rpc } from "../rpc.ts";
-import { Button, cx, ErrorText, Field, FormSection, IconButton, inputClass, Modal } from "./ui.tsx";
+import { Button, cx, ErrorText, Field, FormSection, IconButton, inputClass, Modal, Toggle } from "./ui.tsx";
 import { NotificationSettings, VoiceSettings } from "./Voice.tsx";
 
 const count = (n: number) => (n === 1 ? "1 project" : `${n} projects`);
@@ -151,6 +151,18 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
             ) : null}
           </form>
         </Field>
+      </FormSection>
+      <FormSection title="Skills">
+        <Toggle
+          checked={settings?.reviewSkills ?? false}
+          onChange={(reviewSkills) => save({ reviewSkills })}
+          label="Review skills before bots use them"
+          description={
+            settings?.reviewSkills
+              ? "Skills bots save wait in Memory and skills until you approve them."
+              : "Skills bots save are active right away; reflections keep them tidy (merging duplicates, archiving stale ones). Turning review off activates any skills still waiting."
+          }
+        />
       </FormSection>
       <NotificationSettings />
       <VoiceSettings />

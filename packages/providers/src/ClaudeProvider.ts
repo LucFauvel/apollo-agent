@@ -32,6 +32,21 @@ import type { ConnectorInfo, InputField } from "@apollo/contracts";
 
 const errorMessage = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
 
+/** What a read-only session (a reflection) may not use: questions to the user, edits, commands. */
+const READ_ONLY_DISALLOWED = [
+  "AskUserQuestion",
+  "Bash",
+  "PowerShell",
+  "Edit",
+  "MultiEdit",
+  "Write",
+  "NotebookEdit",
+  "Agent",
+  "Task",
+  "EnterPlanMode",
+  "ExitPlanMode",
+];
+
 /** Claude Code's tools that start a subagent. */
 const SUBAGENT_TOOLS = new Set(["Agent", "Task"]);
 
@@ -400,6 +415,8 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
       });
     let inputCounter = 0;
     const onElicitation: OnElicitation = (request, { signal }) => {
+      // A read-only session never asks the user anything.
+      if (options.readOnly) return Promise.resolve({ action: "decline" as const });
       const requestId = `claude-input-${++inputCounter}`;
       signal.addEventListener("abort", () => run(inputs.cancel(requestId)));
       return Effect.runPromiseWith(context)(
@@ -436,7 +453,9 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
         append: backend.instructions ? `${backend.instructions}\n\n${options.instructions}` : options.instructions,
       },
       ...(backend.model ? { model: backend.model } : {}),
-      ...(backend.disallowedTools?.length ? { disallowedTools: [...backend.disallowedTools] } : {}),
+      ...(backend.disallowedTools?.length || options.readOnly
+        ? { disallowedTools: [...(backend.disallowedTools ?? []), ...(options.readOnly ? READ_ONLY_DISALLOWED : [])] }
+        : {}),
       ...withEnvironment(backend.env),
       ...(options.effort ? { effort: options.effort as EffortLevel } : {}),
       ...(options.resumeId ? { resume: options.resumeId } : {}),
@@ -482,6 +501,8 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
       inTurn = true;
       return agent({ _tag: "TurnStarted" });
     });
+    /** Whether Claude Code said it is compacting the conversation. */
+    let compactingNow = false;
     /** Subagents Claude Code started, by task id, to report the ones that ran in the background. */
     const subagents = new Map<string, { description: string; background: boolean }>();
 
@@ -509,9 +530,20 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
                   message: `Background subagent “${task.description}” ${verb}${message.summary ? `: ${truncate(message.summary, 300)}` : "."}`,
                 });
               }
+            } else if (message.subtype === "status") {
+              // Compaction can take minutes on a local model: say so instead of "working".
+              const compacting = message.status === "compacting";
+              if (compacting !== compactingNow) {
+                compactingNow = compacting;
+                yield* agent({ _tag: "Compacting", active: compacting });
+              }
             } else if (message.subtype === "init") {
               yield* emit({ _tag: "ResumeId", resumeId: message.session_id });
             } else if (message.subtype === "compact_boundary") {
+              if (compactingNow) {
+                compactingNow = false;
+                yield* agent({ _tag: "Compacting", active: false });
+              }
               const meta = (message as { compact_metadata?: { trigger?: string; pre_tokens?: number } }).compact_metadata;
               yield* agent({
                 _tag: "Notice",

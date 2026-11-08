@@ -3,6 +3,7 @@ import type { Bot, SessionId } from "@apollo/contracts";
 import { useEffect, useRef, useState } from "react";
 import { BotSettingsDialog, NewBotDialog, NewSessionDialog } from "./components/Dialogs.tsx";
 import { BrowserPanel } from "./components/BrowserPanel.tsx";
+import { ChangesPanel } from "./components/ChangesPanel.tsx";
 import { DevicesDialog } from "./components/DevicesDialog.tsx";
 import { LocalModelsDialog } from "./components/LocalModelsDialog.tsx";
 import { ProvidersDialog } from "./components/ProvidersDialog.tsx";
@@ -100,6 +101,9 @@ export function App() {
           </Button>
         </main>
       )}
+      {panel === "changes" && bot && session ? (
+        <ChangesPanel session={session} bot={bot} onClose={() => setPanel(null)} onOpenSession={setSelectedId} />
+      ) : null}
       {panel === "browser" && bot ? <BrowserPanel bot={bot} onClose={() => setPanel(null)} /> : null}
       {panel === "knowledge" && bot ? <KnowledgePanel bot={bot} onClose={() => setPanel(null)} /> : null}
       {panel === "schedules" && bot ? (

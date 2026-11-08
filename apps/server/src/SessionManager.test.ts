@@ -33,6 +33,8 @@ const sentFiles: Array<ReadonlyArray<{ path: string; name: string }>> = [];
 let skillReloads = 0;
 let modelListings = 0;
 let interrupts = 0;
+/** Answers given to the fake agent's questions. */
+const inputAnswers: Array<{ requestId: string; action: string }> = [];
 
 /** Each turn of the fake provider uses this much (as a running total per conversation). */
 const TURN_USAGE = { inputTokens: 1000, cachedInputTokens: 0, outputTokens: 100, costUsd: 0.01 };
@@ -73,6 +75,23 @@ const echoProvider = (kind: ProviderKind): Provider => ({
             sentFiles.push(attachments);
             interrupted = false;
             yield* agent({ _tag: "TurnStarted" });
+            // "write <file>" edits a file in the session's folder, like an agent would.
+            const write = /^write (\S+)$/.exec(text);
+            if (write) {
+              yield* Effect.sleep("300 millis"); // the turn's snapshot is taken first
+              writeFileSync(join(options.cwd, write[1]!), "export const answer = 42;\n");
+            }
+            // "please ask" makes the agent ask the user a question.
+            if (text.includes("please ask")) {
+              yield* agent({
+                _tag: "InputRequested",
+                requestId: `q-${n}`,
+                source: "Claude Code",
+                message: "Which scope?",
+                url: null,
+                fields: [],
+              });
+            }
             yield* agent({ _tag: "AssistantDelta", itemId, text: "echo: " });
             if (text.includes("slow")) {
               for (let i = 0; i < 40 && !interrupted; i++) yield* Effect.sleep("25 millis");
@@ -99,7 +118,8 @@ const echoProvider = (kind: ProviderKind): Provider => ({
           interrupted = true;
         }),
         respondApproval: () => Effect.void,
-        respondInput: () => Effect.void,
+        respondInput: (requestId: string, response: { action: string }) =>
+          Effect.sync(() => void inputAnswers.push({ requestId, action: response.action })),
         compact: (instructions: string) => Effect.sync(() => void compactions.push(instructions)),
         commands: Effect.succeed([{ name: "review", description: "Review the diff", argumentHint: "[focus]" }]),
         reloadSkills: Effect.sync(() => void skillReloads++),
@@ -406,6 +426,115 @@ describe("SessionManager", () => {
     }).pipe(Effect.provide(layer)),
   );
 
+  it.live("tells the bot who an @tag means, without messaging the tagged bot", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const atlas = yield* createBot(manager);
+      const vega = yield* manager.createBot({
+        name: "Vega",
+        instructions: "Owns the billing service.\nMore details.",
+        cwd: "/tmp",
+        main: { provider: "claude" },
+        defaultWorker: { provider: "codex" },
+        runtimeMode: "full-access",
+        autoLearn: false,
+      });
+
+      yield* manager.send(atlas.mainSessionId, "check with @vega about invoices", "user");
+      yield* waitIdle(manager, atlas.mainSessionId);
+      // The chat shows the message as typed; the agent reads who Vega is.
+      const shown = (yield* store.listEvents(atlas.mainSessionId, 0)).map((e) => e.event).find((e) => e._tag === "UserMessage");
+      expect(shown).toMatchObject({ text: "check with @vega about invoices", author: "user" });
+      const read = sent.findLast((t) => t.startsWith("check with @vega about invoices"));
+      expect(read).toContain("- @Vega: another of the user's bots (Owns the billing service.)");
+      expect(read).toContain("nothing was sent to them");
+      // Nothing reached Vega.
+      expect((yield* store.listEvents(vega.mainSessionId, 0)).length).toBe(0);
+
+      // Its own name and email addresses are not tags.
+      yield* manager.send(atlas.mainSessionId, "@Atlas, mail ops@vega.dev", "user");
+      yield* waitIdle(manager, atlas.mainSessionId);
+      expect(sent.findLast((t) => t.startsWith("@Atlas, mail"))).toBe("@Atlas, mail ops@vega.dev");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("lets bots write to each other, with answers sent back and a limit without the user", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const atlas = yield* createBot(manager);
+      const vega = yield* manager.createBot({
+        name: "Vega",
+        instructions: "Owns the billing service.",
+        cwd: "/tmp",
+        main: { provider: "claude" },
+        defaultWorker: { provider: "codex" },
+        runtimeMode: "full-access",
+        autoLearn: false,
+      });
+
+      expect(yield* manager.askBot(atlas.mainSessionId, "vega", "Is the invoice job still on cron?")).toEqual({ bot: "Vega" });
+      // Vega gets it in a side conversation with Atlas, not in its main thread.
+      const channel = (yield* store.listSessions(vega.id)).find((s) => s.title === "Conversation with Atlas");
+      expect(channel).toMatchObject({ role: "worker", parentSessionId: null, provider: "claude" });
+      expect((yield* store.listEvents(vega.mainSessionId, 0)).length).toBe(0);
+      const incoming = (yield* store.listEvents(channel!.id, 0)).map((e) => e.event).find((e) => e._tag === "UserMessage");
+      expect(incoming).toMatchObject({ author: "peer", fromBotId: atlas.id, text: "Is the invoice job still on cron?" });
+      for (let i = 0; i < 40 && !sent.some((t) => t.startsWith("[Apollo] Atlas, another of the user's bots, writes to you:")); i++) {
+        yield* Effect.sleep("25 millis");
+      }
+      expect(sent.some((t) => t.startsWith("[Apollo] Atlas, another of the user's bots, writes to you:"))).toBe(true);
+      // Vega's answer comes back to Atlas.
+      let answer: unknown;
+      for (let i = 0; i < 80 && !answer; i++) {
+        yield* Effect.sleep("25 millis");
+        answer = (yield* store.listEvents(atlas.mainSessionId, 0)).map((e) => e.event).find((e) => e._tag === "UserMessage" && e.author === "peer");
+      }
+      expect(answer).toMatchObject({ fromBotId: vega.id });
+      for (let i = 0; i < 40 && !sent.some((t) => t.startsWith("[Apollo] Vega, another of the user's bots, answered your message:")); i++) {
+        yield* Effect.sleep("25 millis");
+      }
+      expect(sent.some((t) => t.startsWith("[Apollo] Vega, another of the user's bots, answered your message:"))).toBe(true);
+
+      // Unknown bots and itself are refused.
+      expect((yield* Effect.flip(manager.askBot(atlas.mainSessionId, "Nobody", "hi"))).message).toContain("no bot named");
+      expect((yield* Effect.flip(manager.askBot(atlas.mainSessionId, "Atlas", "hi"))).message).toContain("that is you");
+
+      // A few messages, then the user has to take part again.
+      for (let i = 0; i < 5; i++) yield* manager.askBot(atlas.mainSessionId, "Vega", `ping ${i}`);
+      // Later messages reuse the same side conversation.
+      expect((yield* store.listSessions(vega.id)).filter((s) => s.title === "Conversation with Atlas").length).toBe(1);
+      expect((yield* Effect.flip(manager.askBot(atlas.mainSessionId, "Vega", "one more"))).message).toContain("check with the user");
+      yield* waitIdle(manager, atlas.mainSessionId);
+      yield* manager.send(atlas.mainSessionId, "carry on", "user");
+      expect(yield* manager.askBot(atlas.mainSessionId, "Vega", "again")).toEqual({ bot: "Vega" });
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("never lets a reflection ask the user anything", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      yield* manager.send(bot.mainSessionId, "notes for later", "user");
+      yield* waitIdle(manager, bot.mainSessionId);
+      // A transcript with a question in it: the reflection's prompt contains "please ask".
+      yield* manager.send(bot.mainSessionId, "please ask me which scope", "user");
+      yield* Effect.sleep("50 millis");
+      const before = inputAnswers.length;
+
+      const reflection = yield* manager.reflect(bot.mainSessionId).pipe(Effect.orElseSucceed(() => null));
+      expect(reflection).not.toBeNull();
+      expect(opened.at(-1)?.readOnly).toBe(true);
+      for (let i = 0; i < 80 && !inputAnswers.slice(before).some((a) => a.requestId.startsWith("q-")); i++) yield* Effect.sleep("25 millis");
+      expect(inputAnswers.slice(before)).toContainEqual(expect.objectContaining({ action: "decline" }));
+      // It was never shown as waiting for the user.
+      const sessions = yield* store.listSessions();
+      expect(sessions.some((s) => s.role === "reflection" && s.status === "waiting-approval")).toBe(false);
+    }).pipe(Effect.provide(layer)),
+  );
+
   it.live("keeps excluded messages out of memory search and reflection", () =>
     Effect.gen(function* () {
       const manager = yield* SessionManager.SessionManager;
@@ -580,6 +709,45 @@ describe("SessionManager", () => {
       const report = parentEvents.find((e) => e.event._tag === "UserMessage");
       expect(report?.event).toMatchObject({ _tag: "UserMessage", author: "system" });
       expect(report?.event._tag === "UserMessage" && report.event.text).toContain("echo: do the thing");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("shows what a worker's turn changed in git and reports it to the orchestrator", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      const repo = realpathSync(mkdtempSync(join(tmpdir(), "apollo-changes-")));
+      execSync("git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", { cwd: repo });
+
+      const worker = yield* manager.createSession({
+        botId: bot.id,
+        title: "feature",
+        provider: bot.defaultWorker,
+        cwd: repo,
+        prompt: "write answer.ts",
+        parentSessionId: bot.mainSessionId,
+        notifyParent: true,
+        author: "bot",
+      });
+      yield* waitIdle(manager, worker.id);
+
+      // Apollo detected the change and put it in the worker's conversation.
+      const events = yield* store.listEvents(worker.id, 0);
+      expect(events.find((e) => e.event._tag === "FilesChanged")?.event).toMatchObject({
+        repos: [{ repo, files: [{ path: "answer.ts", status: "added", additions: 1, deletions: 0 }] }],
+      });
+      // The orchestrator's view includes its worker's changes.
+      const overview = yield* manager.changesList(bot.mainSessionId);
+      expect(overview.sessions).toMatchObject([{ sessionId: worker.id, title: "feature", repos: [{ files: [{ path: "answer.ts" }] }] }]);
+      const diff = yield* manager.changesFile(worker.id, repo, "answer.ts");
+      expect(diff.symbols.map((s) => [s.name, s.change])).toEqual([["answer", "added"]]);
+
+      // And the report to the orchestrator lists the file.
+      yield* Effect.sleep(Duration.millis(50));
+      yield* waitIdle(manager, bot.mainSessionId);
+      const report = (yield* store.listEvents(bot.mainSessionId, 0)).find((e) => e.event._tag === "UserMessage");
+      expect(report?.event._tag === "UserMessage" && report.event.text).toContain("- answer.ts (added, +1 -0)");
     }).pipe(Effect.provide(layer)),
   );
 

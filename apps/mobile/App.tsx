@@ -120,7 +120,7 @@ export default function App() {
             <AvatarSync pairing={pairing} />
             {open ? (
               <SwipeBack key={open} onBack={() => setOpen(null)}>
-                <ChatScreen sessionId={open} onBack={() => setOpen(null)} />
+                <ChatScreen sessionId={open} onBack={() => setOpen(null)} onOpenSession={setOpen} />
               </SwipeBack>
             ) : settings ? (
               <SwipeBack key="settings" onBack={() => setSettings(false)}>

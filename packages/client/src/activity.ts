@@ -242,6 +242,13 @@ export const systemMessageParts = (text: string) => {
   return { first, body: rest.join("\n").trim() };
 };
 
+/** When a block happened: its own time, or its first step's. */
+export const blockTime = (block: TranscriptBlock): number | undefined =>
+  block.kind === "activity" ? block.steps[0]?.at : block.at;
+
+/** Whether the agent is compacting its context right now (shown instead of "Working…"). */
+export const isCompacting = (items: ReadonlyArray<TranscriptItem>) => items.some((i) => i.kind === "compacting");
+
 /**
  * Whether the "Working…" row shows: the agent is busy, but nothing it is doing is on
  * screen yet (between the user's message and the first output, or between steps).

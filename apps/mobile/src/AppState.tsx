@@ -1,4 +1,4 @@
-import type { AppChange, AppSnapshot, Bot, BotId, Session, SessionId } from "@apollo/contracts";
+import type { AppChange, AppSnapshot, Bot, BotId, PullRequest, Session, SessionId } from "@apollo/contracts";
 import * as Stream from "effect/Stream";
 import { createContext, type ReactNode, useContext, useEffect, useState } from "react";
 import type { Connection } from "./connection.ts";
@@ -7,9 +7,13 @@ export interface AppState {
   readonly connected: boolean;
   readonly bots: ReadonlyMap<BotId, Bot>;
   readonly sessions: ReadonlyMap<SessionId, Session>;
+  /** By `<sessionId> <url>`: a PR can be linked from several sessions. */
+  readonly pullRequests: ReadonlyMap<string, PullRequest>;
+  /** Bumped when a bot's sessions changed files or explained changes: the Changes screen refetches. */
+  readonly changesVersion: ReadonlyMap<BotId, number>;
 }
 
-const empty: AppState = { connected: false, bots: new Map(), sessions: new Map() };
+const empty: AppState = { connected: false, bots: new Map(), sessions: new Map(), pullRequests: new Map(), changesVersion: new Map() };
 
 type Incoming = ({ readonly _tag: "Snapshot" } & AppSnapshot) | AppChange;
 
@@ -20,7 +24,21 @@ const apply = (state: AppState, item: Incoming): AppState => {
         connected: true,
         bots: new Map(item.bots.map((b) => [b.id, b])),
         sessions: new Map(item.sessions.map((s) => [s.id, s])),
+        pullRequests: new Map(item.pullRequests.map((pr) => [`${pr.sessionId} ${pr.url}`, pr])),
+        // A reconnect may have missed updates: count it as one.
+        changesVersion: new Map([...state.changesVersion].map(([botId, v]) => [botId, v + 1])),
       };
+    case "PullRequestUpserted": {
+      const pr = item.pullRequest;
+      return { ...state, pullRequests: new Map(state.pullRequests).set(`${pr.sessionId} ${pr.url}`, pr) };
+    }
+    case "PullRequestRemoved": {
+      const pullRequests = new Map(state.pullRequests);
+      pullRequests.delete(`${item.sessionId} ${item.url}`);
+      return { ...state, pullRequests };
+    }
+    case "ChangesUpdated":
+      return { ...state, changesVersion: new Map(state.changesVersion).set(item.botId, (state.changesVersion.get(item.botId) ?? 0) + 1) };
     case "BotUpserted":
       return { ...state, bots: new Map(state.bots).set(item.bot.id, item.bot) };
     case "BotDeleted": {

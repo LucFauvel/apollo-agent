@@ -203,6 +203,23 @@ export interface SessionPatch {
   readonly context?: Session["context"];
 }
 
+/**
+ * Core memory entries, tidied: whitespace collapsed, blanks dropped, and each entry kept
+ * once (two copies of one line waste the budget and cannot be told apart to remove one).
+ */
+export const uniqueEntries = (entries: ReadonlyArray<string>): Array<string> => {
+  const seen = new Set<string>();
+  const out: Array<string> = [];
+  for (const entry of entries) {
+    const clean = entry.replace(/\s+/g, " ").trim();
+    const key = clean.toLowerCase();
+    if (!clean || seen.has(key)) continue;
+    seen.add(key);
+    out.push(clean);
+  }
+  return out;
+};
+
 const makeStore = (db: DatabaseSync) => {
   const all = (sql: string, ...params: Array<SQLInputValue>) =>
     db.prepare(sql).all(...params) as Array<Row>;
@@ -564,16 +581,17 @@ const makeStore = (db: DatabaseSync) => {
     /** The user profile (shared by every bot) and this bot's notes. */
     getCoreMemory: (botId: BotId) =>
       Effect.sync((): CoreMemory => {
+        // Copies saved before entries were deduplicated read as one.
         const read = (scope: string, target: CoreMemoryTarget) => {
           const row = get("select entries from core_memory where scope = ? and target = ?", scope, target);
-          return row ? (JSON.parse(row.entries as string) as Array<string>) : [];
+          return row ? uniqueEntries(JSON.parse(row.entries as string) as Array<string>) : [];
         };
         return { user: read("global", "user"), notes: read(botId, "notes") };
       }),
     /** Replaces one core memory list. Fails when it does not fit the budget. */
     setCoreMemory: (botId: BotId, target: CoreMemoryTarget, entries: ReadonlyArray<string>) =>
       Effect.suspend(() => {
-        const clean = entries.map((e) => e.replace(/\s+/g, " ").trim()).filter((e) => e.length > 0);
+        const clean = uniqueEntries(entries);
         const used = coreMemoryUsage(clean);
         const limit = CORE_MEMORY_LIMITS[target];
         if (used > limit) {
@@ -731,6 +749,43 @@ const makeStore = (db: DatabaseSync) => {
         );
         return skill;
       }),
+    /**
+     * Activates the skills waiting for review: the newest proposal of each, when it is newer
+     * than the active version (older proposals are archived). Returns the bots whose skills changed.
+     */
+    activateProposedSkills: Effect.sync((): Array<BotId | null> => {
+      const proposed = all("select * from skills where status = 'proposed' order by version desc").map(toSkill);
+      const seen = new Set<string>();
+      const changed = new Set<BotId | null>();
+      const now = Date.now();
+      for (const skill of proposed) {
+        const key = `${skill.botId ?? ""}\0${skill.name}`;
+        changed.add(skill.botId);
+        if (seen.has(key)) {
+          run("update skills set status = 'archived', updated_at = ? where id = ?", now, skill.id);
+          continue;
+        }
+        seen.add(key);
+        const active = get(
+          "select version from skills where name = ? and coalesce(bot_id, '') = ? and status = 'active'",
+          skill.name,
+          skill.botId ?? "",
+        );
+        if (active && Number(active.version) > skill.version) {
+          run("update skills set status = 'archived', updated_at = ? where id = ?", now, skill.id);
+          continue;
+        }
+        run(
+          `update skills set status = 'archived', updated_at = ?
+           where name = ? and coalesce(bot_id, '') = ? and status = 'active'`,
+          now,
+          skill.name,
+          skill.botId ?? "",
+        );
+        run("update skills set status = 'active', updated_at = ? where id = ?", now, skill.id);
+      }
+      return [...changed];
+    }),
     /** Sets a skill's status; activating archives the previously active version. */
     setSkillStatus: (id: SkillId, status: SkillStatus) =>
       Effect.sync(() => {

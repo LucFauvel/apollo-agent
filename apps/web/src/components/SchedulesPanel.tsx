@@ -410,6 +410,7 @@ export function SchedulesPanel({
 
   return (
     <Panel
+      name="schedules"
       title={<span className="text-[13px] font-semibold text-zinc-100">Schedules</span>}
       actions={
         <Button size="sm" onClick={() => setEditing("new")}>

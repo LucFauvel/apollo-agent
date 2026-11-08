@@ -1,4 +1,5 @@
 import * as Schema from "effect/Schema";
+import { RepoChanges } from "./changes.ts";
 
 // ---------------------------------------------------------------------------
 // Identifiers
@@ -231,7 +232,8 @@ export type Session = typeof Session.Type;
 // Normalized agent events (provider-agnostic)
 // ---------------------------------------------------------------------------
 
-export const MessageAuthor = Schema.Literals(["user", "bot", "system"]);
+/** `peer`: another of the user's bots, answering a mention (`fromBotId`). */
+export const MessageAuthor = Schema.Literals(["user", "bot", "system", "peer"]);
 export type MessageAuthor = typeof MessageAuthor.Type;
 
 export const ApprovalDecision = Schema.Literals(["accept", "accept-for-session", "decline"]);
@@ -289,8 +291,12 @@ export const AgentEvent = Schema.Union([
     /** Who sent it: the human, the orchestrating bot, or Apollo itself. */
     author: MessageAuthor,
     attachments: Schema.optional(Schema.Array(AttachmentRef)),
+    /** For `peer` messages: the bot that wrote it. */
+    fromBotId: Schema.optional(BotId),
   }),
   Schema.TaggedStruct("TurnStarted", {}),
+  /** Files the turn changed in git repositories (Apollo detects these, not the agent). */
+  Schema.TaggedStruct("FilesChanged", { repos: Schema.Array(RepoChanges) }),
   /** A browser recording an agent made; its frames are served at /api/recordings/<id>/<frame>.jpg. */
   Schema.TaggedStruct("Recording", {
     recordingId: Schema.String,
@@ -308,6 +314,8 @@ export const AgentEvent = Schema.Union([
   Schema.TaggedStruct("AssistantDelta", { itemId: Schema.String, text: Schema.String }),
   /** Live only: streamed thinking, then the final Reasoning with the same itemId. */
   Schema.TaggedStruct("ReasoningDelta", { itemId: Schema.String, text: Schema.String }),
+  /** Live only: the agent is compacting its context (true), or done (false). */
+  Schema.TaggedStruct("Compacting", { active: Schema.Boolean }),
   /** Live only: the model started writing a tool call; ToolStarted follows with its input. */
   Schema.TaggedStruct("ToolPending", { itemId: Schema.String, name: Schema.String }),
   Schema.TaggedStruct("AssistantMessage", { itemId: Schema.String, text: Schema.String }),

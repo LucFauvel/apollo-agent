@@ -35,3 +35,21 @@ describe("activity", () => {
     expect(toolSummary("mcp__apollo__apollo_browser_open", '{"url":"https://example.com"}')).toBe("https://example.com");
   });
 });
+
+describe("compacting", () => {
+  const at = (seq: number, event: unknown) => ({ sessionId: "s", seq, at: 0, event }) as never;
+  it("shows while the agent compacts, until it is done or the turn ends", async () => {
+    const { reduceTranscript, isCompacting } = await import("../src/index.ts");
+    let state = { sessionId: "s" as never, lastSeq: 0, items: [] as ReadonlyArray<TranscriptItem> };
+    state = reduceTranscript(state, at(1, { _tag: "TurnStarted" }));
+    state = reduceTranscript(state, at(0, { _tag: "Compacting", active: true }));
+    expect(isCompacting(state.items)).toBe(true);
+    state = reduceTranscript(state, at(0, { _tag: "Compacting", active: false }));
+    expect(isCompacting(state.items)).toBe(false);
+    state = reduceTranscript(state, at(0, { _tag: "Compacting", active: true }));
+    state = reduceTranscript(state, at(2, { _tag: "TurnCompleted", outcome: "interrupted", error: null }));
+    expect(isCompacting(state.items)).toBe(false);
+    expect(state.items.map((i) => i.kind)).toEqual(["turn-end"]);
+  });
+});
+

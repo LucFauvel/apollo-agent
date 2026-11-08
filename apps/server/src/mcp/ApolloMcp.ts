@@ -24,11 +24,14 @@ import { McpProtocol, McpServer, Tool, Toolkit } from "effect/ai";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { transcriptForReflection, withoutExcluded } from "../Instructions.ts";
 import * as BrowserTools from "./BrowserTools.ts";
+import * as BotTools from "./BotTools.ts";
+import * as ChangeTools from "./ChangeTools.ts";
 import * as JobTools from "./JobTools.ts";
 import * as PullRequestTools from "./PullRequestTools.ts";
 import * as UserTools from "./UserTools.ts";
 import * as WorktreeTools from "./WorktreeTools.ts";
 import { McpCaller } from "./Caller.ts";
+import { AppSettings } from "../AppSettings.ts";
 import { Scheduler } from "../schedule/Scheduler.ts";
 import { SessionManager } from "../SessionManager.ts";
 import { Store } from "../Store.ts";
@@ -180,7 +183,7 @@ const SessionRead = Tool.make("apollo_session_read", {
 
 const SkillList = Tool.make("apollo_skill_list", {
   ...shared,
-  description: "List the bot's skills (reusable procedures), including pending proposals.",
+  description: "List the bot's skills (reusable procedures): active ones, and any waiting for the user's review.",
   success: Schema.Struct({
     skills: Schema.Array(
       Schema.Struct({ name: Schema.String, description: Schema.String, status: Schema.String }),
@@ -195,10 +198,13 @@ const SkillRead = Tool.make("apollo_skill_read", {
   success: Skill,
 }).annotate(Tool.Readonly, true);
 
-const SkillPropose = Tool.make("apollo_skill_propose", {
+const SkillSave = Tool.make("apollo_skill_save", {
   ...shared,
-  description:
-    "Propose a new skill, or an improved version of an existing one (same name). The user reviews proposals before they become active. `body` is markdown instructions written for a future agent.",
+  description: [
+    "Save a new skill, or a better version of an existing one (same name replaces it). It is active right away",
+    "(unless the user turned on skill review). `body` is markdown instructions written for a future agent: when to",
+    "use it, the steps, and the pitfalls. Prefer improving an existing skill over adding a near-duplicate.",
+  ].join(" "),
   parameters: Schema.Struct({
     name: Schema.String,
     description: Schema.String,
@@ -207,6 +213,14 @@ const SkillPropose = Tool.make("apollo_skill_propose", {
   }),
   success: Skill,
 }).annotate(Tool.Destructive, false);
+
+const SkillArchive = Tool.make("apollo_skill_archive", {
+  ...shared,
+  description:
+    "Archive a skill that is stale, wrong, or replaced by another (merged into it): it stops being offered. Archived skills are kept and the user can restore them.",
+  parameters: Schema.Struct({ name: Schema.String, reason: Schema.String }),
+  success: Schema.Struct({ archived: Schema.String }),
+});
 
 const ListSessions = Tool.make("apollo_list_sessions", {
   ...shared,
@@ -362,7 +376,8 @@ export const ApolloToolkit = Toolkit.make(
   SessionRead,
   SkillList,
   SkillRead,
-  SkillPropose,
+  SkillSave,
+  SkillArchive,
   ListSessions,
   SpawnSession,
   SendToSession,
@@ -378,6 +393,7 @@ const invalid = (message: string) => new ApolloError({ code: "invalid", message 
 
 const handlers = ApolloToolkit.toLayer(
   Effect.gen(function* () {
+    const appSettings = yield* AppSettings;
     const store = yield* Store;
     const manager = yield* SessionManager;
     const scheduler = yield* Scheduler;
@@ -481,7 +497,9 @@ const handlers = ApolloToolkit.toLayer(
             if (!needle) return Effect.fail(invalid("`match` is required: a distinctive part of the entry"));
             const hits = current.flatMap((entry, index) => (entry.toLowerCase().includes(needle) ? [index] : []));
             if (hits.length === 0) return Effect.fail(invalid(`no ${target} entry contains "${match}"`));
-            if (hits.length > 1) return Effect.fail(invalid(`"${match}" matches ${hits.length} entries; be more specific`));
+            // Identical entries are one entry: any of them will do.
+            const distinct = new Set(hits.map((i) => current[i]!.toLowerCase()));
+            if (distinct.size > 1) return Effect.fail(invalid(`"${match}" matches ${hits.length} entries; be more specific`));
             return Effect.succeed(hits[0]!);
           };
           const needText = () =>
@@ -491,9 +509,12 @@ const handlers = ApolloToolkit.toLayer(
           switch (action) {
             case "view":
               break;
-            case "add":
-              next = [...current, yield* needText()];
+            case "add": {
+              const value = yield* needText();
+              // Already there: nothing to add (a second copy would only use up the budget).
+              next = current.some((entry) => entry.toLowerCase() === value.toLowerCase()) ? current : [...current, value];
               break;
+            }
             case "replace": {
               const index = yield* find();
               const value = yield* needText();
@@ -555,7 +576,7 @@ const handlers = ApolloToolkit.toLayer(
           return skill ?? (yield* new ApolloError({ code: "not_found", message: `no active skill "${name}"` }));
         }),
 
-      apollo_skill_propose: ({ name, description, body, scope }) =>
+      apollo_skill_save: ({ name, description, body, scope }) =>
         Effect.gen(function* () {
           const caller = yield* McpCaller;
           const slug = name
@@ -567,7 +588,9 @@ const handlers = ApolloToolkit.toLayer(
             return yield* invalid("name and body are required");
           }
           const botId = scope === "global" ? null : caller.botId;
-          const skill = yield* store.insertSkill({
+          // Active right away, replacing the previous version, unless the user reviews skills.
+          const review = (yield* appSettings.read).reviewSkills;
+          const saved = yield* store.insertSkill({
             botId,
             name: slug,
             description: description.trim(),
@@ -575,8 +598,20 @@ const handlers = ApolloToolkit.toLayer(
             status: "proposed",
             sourceSessionId: caller.sessionId,
           });
+          if (!review) yield* store.setSkillStatus(saved.id, "active");
           yield* manager.publishSkillChanged(botId);
-          return skill;
+          return review ? saved : { ...saved, status: "active" as const };
+        }),
+
+      apollo_skill_archive: ({ name, reason }) =>
+        Effect.gen(function* () {
+          const caller = yield* McpCaller;
+          const skill = yield* store.findActiveSkill(caller.botId, name.trim().toLowerCase());
+          if (!skill) return yield* invalid(`no active skill "${name}"`);
+          yield* store.setSkillStatus(skill.id, "archived");
+          yield* manager.publishSkillChanged(skill.botId);
+          yield* Effect.logInfo(`skill ${skill.name} archived: ${reason}`);
+          return { archived: skill.name };
         }),
 
       apollo_list_sessions: () =>
@@ -696,6 +731,8 @@ export const layer = McpServer.layerHttp({
     McpServer.toolkit(UserTools.UserToolkit).pipe(Layer.provide(UserTools.handlers)),
     McpServer.toolkit(JobTools.JobToolkit).pipe(Layer.provide(JobTools.handlers)),
     McpServer.toolkit(WorktreeTools.WorktreeToolkit).pipe(Layer.provide(WorktreeTools.handlers)),
+    McpServer.toolkit(ChangeTools.ChangeToolkit).pipe(Layer.provide(ChangeTools.handlers)),
+    McpServer.toolkit(BotTools.BotToolkit).pipe(Layer.provide(BotTools.handlers)),
     McpServer.toolkit(PullRequestTools.PullRequestToolkit).pipe(Layer.provide(PullRequestTools.handlers)),
   ),
 }).pipe(Layer.provide(authMiddleware));

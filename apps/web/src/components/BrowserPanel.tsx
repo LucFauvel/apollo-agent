@@ -238,6 +238,7 @@ export function BrowserPanel({ bot, onClose }: { bot: Bot; onClose: () => void }
 
   return (
     <Panel
+      name="browser"
       width="wide"
       onClose={onClose}
       title={

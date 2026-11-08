@@ -96,7 +96,15 @@ export const layer = ApolloRpcs.toLayer(
 
       "providers.models": ({ provider }) => manager.listModels(provider),
       "app.settings": () => appSettings.read,
-      "app.updateSettings": (input) => appSettings.update(input),
+      "app.updateSettings": (input) =>
+        Effect.gen(function* () {
+          const settings = yield* appSettings.update(input);
+          // Review turned off: what was waiting becomes active.
+          if (input.reviewSkills === false) {
+            for (const botId of yield* store.activateProposedSkills) yield* manager.publishSkillChanged(botId);
+          }
+          return settings;
+        }),
       "app.projects": () => appSettings.projects,
       "providers.settings": () => providerSettings.view,
       "providers.updateSettings": (input) =>
@@ -161,6 +169,8 @@ export const layer = ApolloRpcs.toLayer(
         }),
 
       "auth.listClients": () => Effect.sync(() => auth.listClients()),
+      "changes.list": ({ sessionId }) => manager.changesList(sessionId),
+      "changes.file": ({ sessionId, repo, path }) => manager.changesFile(sessionId, repo, path),
       "remote.status": () => tailscale.read,
       "remote.setTailscale": ({ enabled }) => tailscale.setEnabled(enabled),
       "remote.signOutTailscale": () => tailscale.signOut,

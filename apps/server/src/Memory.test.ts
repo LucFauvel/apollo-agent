@@ -76,12 +76,55 @@ describe("core memory", () => {
     }).pipe(Effect.provide(layer)),
   );
 
+  it.effect("keeps each entry once, including copies saved before that rule", () =>
+    Effect.gen(function* () {
+      const store = yield* Store.Store;
+      const db = yield* Database.Database;
+      const profile = "Luc — Head of Product, writes in franglais.";
+      // Saving a duplicate (any spacing or case) keeps one copy.
+      expect(yield* store.setCoreMemory("a" as BotId, "user", [profile, `  ${profile.toUpperCase()} `, "Reply in English."])).toEqual([
+        profile,
+        "Reply in English.",
+      ]);
+      // A row written by an older version with two copies reads as one, so it can be edited.
+      db.prepare("update core_memory set entries = ? where scope = 'global' and target = 'user'").run(JSON.stringify([profile, profile, "Reply in English."]));
+      expect((yield* store.getCoreMemory("a" as BotId)).user).toEqual([profile, "Reply in English."]);
+    }).pipe(Effect.provide(layer)),
+  );
+
   it.effect("refuses edits over the character budget", () =>
     Effect.gen(function* () {
       const store = yield* seed;
       const error = yield* Effect.flip(store.setCoreMemory("a" as BotId, "user", ["x".repeat(1400)]));
       expect(error.message).toContain("1400/1375");
       expect((yield* store.getCoreMemory("a" as BotId)).user).toEqual([]);
+    }).pipe(Effect.provide(layer)),
+  );
+});
+
+describe("skills", () => {
+  it.effect("activates waiting proposals: the newest of each, never over a newer active version", () =>
+    Effect.gen(function* () {
+      const store = yield* Store.Store;
+      // Global skills: no bot row needed.
+      const bot = "a" as BotId;
+      const save = (name: string, body: string, status: "proposed" | "active") =>
+        store.insertSkill({ botId: null, name, description: name, body, status, sourceSessionId: null });
+      const v1 = yield* save("deploy", "v1", "active");
+      yield* save("deploy", "v2", "proposed");
+      const v3 = yield* save("deploy", "v3", "proposed");
+      yield* save("triage", "only", "proposed");
+      const old = yield* save("release", "r1", "proposed");
+      const current = yield* save("release", "r2", "active");
+
+      yield* store.activateProposedSkills;
+      const byId = new Map((yield* store.listSkills(bot)).map((s) => [s.id, s.status]));
+      expect(byId.get(v3.id)).toBe("active");
+      expect(byId.get(v1.id)).toBe("archived");
+      expect([...byId.values()].filter((s) => s === "proposed")).toEqual([]);
+      expect((yield* store.findActiveSkill(bot, "triage"))?.body).toBe("only");
+      expect(byId.get(current.id)).toBe("active");
+      expect(byId.get(old.id)).toBe("archived");
     }).pipe(Effect.provide(layer)),
   );
 });

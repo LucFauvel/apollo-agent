@@ -1,6 +1,6 @@
 import type { ProviderKind, SessionStatus } from "@apollo/contracts";
 import { type LucideIcon, X } from "lucide-react";
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import type { ButtonHTMLAttributes, CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ProviderLogo } from "./icons.tsx";
@@ -234,27 +234,114 @@ export function Modal({
 }
 
 /** A side panel next to the conversation. */
+const PANEL_MIN = 300;
+/** The conversation keeps at least this much room beside a panel. */
+const PANEL_ROOM = 420;
+
+const panelWidthKey = (name: string) => `apollo.panelWidth.${name}`;
+const savedPanelWidth = (name: string): number | null => {
+  try {
+    const value = Number(localStorage.getItem(panelWidthKey(name)));
+    return Number.isFinite(value) && value >= PANEL_MIN ? value : null;
+  } catch {
+    return null;
+  }
+};
+const defaultPanelWidth = (width: "normal" | "wide") =>
+  width === "wide" ? Math.min(640, Math.round(window.innerWidth * 0.45)) : 380;
+const clampPanelWidth = (value: number) => Math.max(PANEL_MIN, Math.min(value, window.innerWidth - PANEL_ROOM));
+
+/**
+ * A panel on the right. Drag its left edge to resize it (double-click to reset); each
+ * panel remembers its width.
+ */
 export function Panel({
   title,
   actions,
   onClose,
   children,
   width = "normal",
+  name,
 }: {
   title: ReactNode;
   actions?: ReactNode;
   onClose: () => void;
   children: ReactNode;
   width?: "normal" | "wide";
+  /** Which panel this is, for remembering its width. */
+  name?: string;
 }) {
+  const key = name ?? width;
+  const [size, setSize] = useState(() => clampPanelWidth(savedPanelWidth(key) ?? defaultPanelWidth(width)));
+  const [dragging, setDragging] = useState(false);
+  // Keep the conversation usable when the window gets smaller.
+  useEffect(() => {
+    const onResize = () => setSize((current) => clampPanelWidth(current));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  const save = (value: number) => {
+    try {
+      localStorage.setItem(panelWidthKey(key), String(Math.round(value)));
+    } catch {
+      // Storage off: the width lasts until the panel closes.
+    }
+  };
+  const startDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const handle = event.currentTarget;
+    handle.setPointerCapture(event.pointerId);
+    const startX = event.clientX;
+    const startSize = size;
+    let latest = startSize;
+    setDragging(true);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    const move = (e: PointerEvent) => {
+      latest = clampPanelWidth(startSize + (startX - e.clientX));
+      setSize(latest);
+    };
+    const end = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", end);
+      handle.removeEventListener("pointercancel", end);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      setDragging(false);
+      save(latest);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+  };
+  const reset = () => {
+    const value = clampPanelWidth(defaultPanelWidth(width));
+    setSize(value);
+    try {
+      localStorage.removeItem(panelWidthKey(key));
+    } catch {}
+  };
   return (
-    <aside
-      className={cx(
-        "animate-slide-in flex shrink-0 flex-col border-l border-zinc-800/80 bg-zinc-950",
-        width === "wide" ? "w-[min(640px,45vw)]" : "w-[380px]",
-      )}
-    >
-      <div className="app-drag flex h-12 shrink-0 items-center gap-2 border-b border-zinc-800/80 pr-2 pl-4">
+    <aside className="animate-slide-in relative flex shrink-0 flex-col border-l border-zinc-800/80 bg-zinc-950" style={{ width: size }}>
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize panel"
+        title="Drag to resize · double-click to reset"
+        onPointerDown={startDrag}
+        onDoubleClick={reset}
+        style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
+        className="group/resize absolute inset-y-0 -left-1.5 z-20 w-3 cursor-col-resize"
+      >
+        <span
+          className={cx(
+            "absolute inset-y-0 left-1/2 w-px -translate-x-1/2 transition-all duration-150",
+            dragging ? "w-0.5 bg-sky-400" : "bg-transparent group-hover/resize:w-0.5 group-hover/resize:bg-sky-500/60",
+          )}
+        />
+      </div>
+      {/* Same height as the session header beside it, so their borders line up. */}
+      <div className="app-drag flex h-14 shrink-0 items-center gap-2 border-b border-zinc-800/80 pr-2 pl-4">
         <div className="flex min-w-0 flex-1 items-center gap-1">{title}</div>
         {actions}
         <IconButton icon={X} label="Close panel" size="sm" onClick={onClose} />

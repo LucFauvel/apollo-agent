@@ -1,4 +1,4 @@
-import type { ApprovalDecision, AttachmentRef, Bot, InputResponse, LocalModel, PullRequest, Session } from "@apollo/contracts";
+import type { ApprovalDecision, AttachmentRef, Bot, InputResponse, LocalModel, RepoChanges, Session } from "@apollo/contracts";
 import {
   ArrowUp,
   Ban,
@@ -13,8 +13,7 @@ import {
   ChevronDown,
   CircleAlert,
   GitBranch,
-  GitMerge,
-  GitPullRequest,
+  GitCompareArrows,
   Info,
   Library,
   Loader2,
@@ -27,7 +26,7 @@ import {
   Square,
   Trash2,
 } from "lucide-react";
-import { showWorking, systemMessageParts } from "@apollo/client";
+import { isCompacting, showWorking, systemMessageParts } from "@apollo/client";
 import { MarkdownText } from "./Code.tsx";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { formatUsage, usageTitle } from "../format.ts";
@@ -55,9 +54,12 @@ import { ContextMeter, parseCommand, SlashMenu, useSlashCommands } from "./Slash
 import { VisualItem } from "./VisualItem.tsx";
 import { ConversationBar, ConversationButton, DictateButton, ReadAloudButton, useConversation } from "./Voice.tsx";
 import { BotAvatar } from "./Sidebar.tsx";
+import { MentionMenu, PeerMessage, useMentions, WithMentions } from "./Mentions.tsx";
+import { DayDivider, groupByDay, MessageTime } from "./DayGroups.tsx";
+import { MessageRail, type RailTurn } from "./MessageRail.tsx";
 import { Badge, Button, Collapse, cx, IconButton, Menu, ModelChip, providerName, StatusDot, statusLabel, Tooltip } from "./ui.tsx";
 
-export type PanelKind = "knowledge" | "schedules" | "browser";
+export type PanelKind = "knowledge" | "schedules" | "browser" | "changes";
 
 function ApprovalItem({
   item,
@@ -209,8 +211,24 @@ function SystemMessage({ author, text }: { author: string; text: string }) {
   );
 }
 
-function Item({ item, respond, live, sessionId }: { item: Block; respond: Responders; live: boolean; sessionId: Session["id"] }) {
+function Item({
+  item,
+  respond,
+  live,
+  sessionId,
+  onOpenChanges,
+}: {
+  item: Block;
+  respond: Responders;
+  live: boolean;
+  sessionId: Session["id"];
+  onOpenChanges: () => void;
+}) {
   switch (item.kind) {
+    case "changes":
+      return <TurnChanges repos={item.repos} onOpen={onOpenChanges} />;
+    case "compacting":
+      return null; // shown as the working row at the end
     case "visual":
       return <VisualItem item={item} />;
     case "recording":
@@ -220,12 +238,14 @@ function Item({ item, respond, live, sessionId }: { item: Block; respond: Respon
     case "activity":
       return <ActivityGroup block={item} live={live} />;
     case "user":
+      if (item.author === "peer") return <PeerMessage botId={item.fromBotId} text={item.text} />;
       if (item.author !== "user") return <SystemMessage author={item.author} text={item.text} />;
       return (
-        <div className="group animate-fade-up space-y-1.5 pt-2">
+        <div className="group animate-fade-up scroll-mt-12 space-y-1.5 pt-2" data-turn={item.key}>
           {item.attachments?.length ? <MessageAttachments sessionId={sessionId} attachments={item.attachments} /> : null}
           {item.text ? (
             <div className="flex items-center justify-end gap-1.5">
+              <MessageTime at={item.at} />
               <MemoryToggle sessionId={sessionId} seq={item.seq} excluded={item.excluded ?? false} align="end" />
               <div
                 className={cx(
@@ -233,7 +253,7 @@ function Item({ item, respond, live, sessionId }: { item: Block; respond: Respon
                   item.excluded && "opacity-45",
                 )}
               >
-                {item.text}
+                <WithMentions text={item.text} />
               </div>
             </div>
           ) : null}
@@ -254,6 +274,7 @@ function Item({ item, respond, live, sessionId }: { item: Block; respond: Respon
             <div className="-mt-0.5 flex h-6 items-center gap-0.5">
               <MemoryToggle sessionId={sessionId} seq={item.seq} excluded={item.excluded ?? false} align="start" />
               <ReadAloudButton text={item.text} />
+              <MessageTime at={item.at} className="ml-1" />
             </div>
           ) : null}
         </div>
@@ -366,6 +387,18 @@ function Composer({
   const picker = useRef<HTMLInputElement>(null);
   const files = useAttachments(session.id);
   const slash = useSlashCommands(session, text);
+  // `@Name` asks another bot; the picker follows the caret.
+  const [caret, setCaret] = useState(0);
+  const mention = useMentions(session.botId, text, caret);
+  const pickMention = (bot: Bot) => {
+    const next = mention.complete(bot);
+    setText(next.text);
+    setCaret(next.caret);
+    requestAnimationFrame(() => {
+      ref.current?.focus();
+      ref.current?.setSelectionRange(next.caret, next.caret);
+    });
+  };
 
   // Focus the box when switching sessions.
   useEffect(() => ref.current?.focus(), [session.id]);
@@ -451,7 +484,9 @@ function Composer({
             files.add([...e.dataTransfer.files]);
           }}
         >
-          {slash.open ? (
+          {mention.open ? (
+            <MentionMenu matches={mention.matches} selected={mention.selected} onPick={pickMention} />
+          ) : slash.open ? (
             <SlashMenu
               matches={slash.matches}
               selected={slash.selected}
@@ -489,8 +524,29 @@ function Composer({
             }}
             ref={ref}
             value={text}
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => {
+              setText(e.target.value);
+              setCaret(e.target.selectionStart);
+            }}
+            onSelect={(e) => setCaret(e.currentTarget.selectionStart)}
             onKeyDown={(e) => {
+              if (mention.open) {
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  mention.move(e.key === "ArrowDown" ? 1 : -1);
+                  return;
+                }
+                if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+                  e.preventDefault();
+                  pickMention(mention.matches[mention.selected]!);
+                  return;
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  mention.dismiss();
+                  return;
+                }
+              }
               if (slash.open && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
                 e.preventDefault();
                 slash.move(e.key === "ArrowDown" ? 1 : -1);
@@ -516,7 +572,7 @@ function Composer({
                 : busy
                   ? "Queue a message for when this turn ends…"
                   : session.role === "main"
-                    ? `Message ${botName}… (/ for commands)`
+                    ? `Message ${botName}… (/ for commands, @ to tag a bot)`
                     : "Message this session…"
             }
             className="block max-h-72 w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm leading-relaxed text-zinc-100 placeholder:text-zinc-600 focus:outline-none disabled:cursor-not-allowed"
@@ -572,54 +628,46 @@ function Composer({
   );
 }
 
-const PR_CHECKS: Record<PullRequest["checks"], { label: string; className: string }> = {
-  none: { label: "No checks", className: "text-zinc-400" },
-  pending: { label: "Checks running", className: "text-amber-300" },
-  passing: { label: "Checks passed", className: "text-emerald-300" },
-  failing: { label: "Checks failed", className: "text-red-300" },
-};
-
-/** A pull request linked to the session: number, CI status and review state; opens it on GitHub. */
-function PullRequestChip({ pr }: { pr: PullRequest }) {
-  const checks = PR_CHECKS[pr.checks];
-  const done = pr.state === "merged" || pr.state === "closed";
-  const Icon = pr.state === "merged" ? GitMerge : GitPullRequest;
+/**
+ * What a turn changed in git repositories (detected by Apollo, not the agent): a compact
+ * line per repository; opens the Changes panel.
+ */
+function TurnChanges({ repos, onOpen }: { repos: ReadonlyArray<RepoChanges>; onOpen: () => void }) {
+  const files = repos.flatMap((r) => r.files);
+  const additions = files.reduce((n, f) => n + (f.additions ?? 0), 0);
+  const deletions = files.reduce((n, f) => n + (f.deletions ?? 0), 0);
+  const dot = { added: "bg-emerald-400", modified: "bg-amber-400", deleted: "bg-red-400", renamed: "bg-sky-400" } as const;
   return (
-    <Tooltip
-      align="start"
-      content={
-        <>
-          <span className="block font-medium text-zinc-100">
-            {pr.repo}#{pr.number}: {pr.title}
-          </span>
-          {pr.state === "merged" ? "Merged" : pr.state === "closed" ? "Closed" : pr.state === "draft" ? "Draft" : "Open"} · {checks.label}
-          {pr.review ? ` · ${pr.review.replace("_", " ")}` : ""}
-          {pr.watched ? <span className="mt-1 block text-zinc-400">Watched: the bot hears about CI results, reviews and comments.</span> : null}
-        </>
-      }
+    <button
+      type="button"
+      onClick={onOpen}
+      className="animate-fade-up group flex w-full min-w-0 items-center gap-2.5 rounded-xl border border-zinc-800/80 bg-zinc-900/30 px-3 py-2 text-left text-xs transition-all hover:border-zinc-700 hover:bg-zinc-900/60"
     >
-      <a
-        href={pr.url}
-        target="_blank"
-        rel="noreferrer"
-        className={cx(
-          "flex shrink-0 items-center gap-1 rounded-md bg-zinc-800/80 px-1.5 py-px transition-colors hover:bg-zinc-700/80",
-          done ? (pr.state === "merged" ? "text-violet-300" : "text-zinc-400") : checks.className,
-        )}
-      >
-        <Icon className="size-3" />#{pr.number}
-        {!done && pr.checks === "pending" ? <Loader2 className="size-2.5 animate-spin" /> : null}
-      </a>
-    </Tooltip>
+      <GitCompareArrows className="size-3.5 shrink-0 text-zinc-500 transition-colors group-hover:text-zinc-300" />
+      <span className="shrink-0 text-zinc-300">
+        Changed {files.length} {files.length === 1 ? "file" : "files"}
+      </span>
+      <span className="min-w-0 truncate text-zinc-500">in {repos.map((r) => r.name).join(", ")}</span>
+      <span className="flex shrink-0 -space-x-0.5">
+        {files.slice(0, 12).map((f) => (
+          <span key={`${f.path}`} title={`${f.path} (${f.status})`} className={cx("size-1.5 rounded-full ring-2 ring-zinc-950", dot[f.status])} />
+        ))}
+      </span>
+      <span className="flex-1" />
+      <span className="shrink-0 font-mono text-[10.5px] tabular-nums">
+        <span className="text-emerald-400">+{additions}</span> <span className="text-red-400">−{deletions}</span>
+      </span>
+      <span className="shrink-0 text-[11px] text-zinc-500 transition-colors group-hover:text-zinc-200">Review →</span>
+    </button>
   );
 }
 
-/** Shown while the agent works but nothing has streamed yet. */
-function WorkingRow() {
+/** Shown while the agent works but nothing has streamed yet (or while it compacts its context). */
+function WorkingRow({ label = "Working…" }: { label?: string }) {
   return (
-    <div className="animate-fade-up flex items-center gap-2.5 px-2.5 py-1.5 text-xs">
+    <div key={label} className="animate-fade-up flex items-center gap-2.5 px-2.5 py-1.5 text-xs">
       <Loader2 className="size-3.5 shrink-0 animate-spin text-zinc-500" />
-      <span className="shimmer-text">Working…</span>
+      <span className="shimmer-text">{label}</span>
     </div>
   );
 }
@@ -637,6 +685,59 @@ export function SessionView({
 }) {
   const items = useTranscript(session.id);
   const blocks = useMemo(() => toBlocks(items), [items]);
+  // Long chats fold by day: the latest day open, earlier ones folded (each can be toggled).
+  const days = useMemo(() => groupByDay(blocks), [blocks]);
+  const foldOlderDays = blocks.length > 30;
+  const [toggledDays, setToggledDays] = useState<ReadonlySet<string>>(new Set());
+  useEffect(() => setToggledDays(new Set()), [session.id]);
+  const isDayOpen = (key: string, index: number) => {
+    const byDefault = !foldOlderDays || index === days.length - 1;
+    return toggledDays.has(key) ? !byDefault : byDefault;
+  };
+  // The rail beside the conversation: one tick per message the user sent, with its answer.
+  const railTurns = useMemo(() => {
+    const turns: Array<RailTurn> = [];
+    for (const block of blocks) {
+      if (block.kind === "user" && block.author === "user" && block.text.trim()) {
+        turns.push({ key: block.key, text: block.text.replace(/\s+/g, " ").trim(), reply: null, at: block.at });
+      } else if (block.kind === "assistant" && turns.length > 0 && turns.at(-1)!.reply === null && block.text.trim() !== "[SILENT]") {
+        const last = turns.at(-1)!;
+        turns[turns.length - 1] = { ...last, reply: block.text.replace(/[#*`>_]+/g, "").replace(/\s+/g, " ").trim().slice(0, 300) };
+      }
+    }
+    return turns;
+  }, [blocks]);
+  /** Scrolls to a message, opening its day first if it is folded. */
+  const jumpToTurn = (key: string) => {
+    const dayIndex = days.findIndex((day) => day.blocks.some(({ block }) => block.key === key));
+    stick.current = false;
+    const scroll = (behavior: ScrollBehavior) => {
+      const el = scrollRef.current?.querySelector<HTMLElement>(`[data-turn="${CSS.escape(key)}"]`);
+      if (!el) return false;
+      stick.current = false;
+      el.scrollIntoView({ block: "start", behavior });
+      return true;
+    };
+    if (dayIndex >= 0 && days.length > 1 && !isDayOpen(days[dayIndex]!.key, dayIndex)) {
+      toggleDay(days[dayIndex]!.key, dayIndex);
+      // The day opens with an animation: jump once it is laid out, then settle when it has finished.
+      let tries = 0;
+      const retry = () => !scroll("auto") && tries++ < 20 && requestAnimationFrame(retry);
+      requestAnimationFrame(retry);
+      setTimeout(() => scroll("smooth"), 320);
+    } else scroll("smooth");
+  };
+  const toggleDay = (key: string, _index: number) =>
+    setToggledDays((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  // A dot on the Changes button once this conversation changed files.
+  const hasChanges = useMemo(() => items.some((item) => item.kind === "changes"), [items]);
+  // Compaction can take minutes on a local model: say so instead of "Working…".
+  const compacting = useMemo(() => isCompacting(items), [items]);
   // Between the user's message and the first streamed output (or a finished step and the
   // next) nothing else shows that the agent is at work: say so.
   const lastBlock = blocks.at(-1);
@@ -650,10 +751,14 @@ export function SessionView({
   const [settingsOpen, setSettingsOpen] = useState(false);
   // The map itself is stable between changes; a filtered array from the selector would not be.
   const allPullRequests = useApp((s) => s.pullRequests);
-  const pullRequests = useMemo(
-    () => [...allPullRequests.values()].filter((p) => p.sessionId === session.id),
-    [allPullRequests, session.id],
-  );
+  // Open pull requests, counted on the Changes button (an orchestrator's include its workers', as in the panel).
+  const allSessions = useApp((s) => s.sessions);
+  const openPullRequests = useMemo(() => {
+    const ids = new Set(session.role === "main" ? [...allSessions.values()].filter((s) => s.botId === session.botId).map((s) => s.id) : [session.id]);
+    const urls = new Set<string>();
+    for (const pr of allPullRequests.values()) if (ids.has(pr.sessionId) && (pr.state === "open" || pr.state === "draft")) urls.add(pr.url);
+    return urls.size;
+  }, [allPullRequests, allSessions, session.id, session.botId, session.role]);
   const modelLabel = useModelLabel(session.provider, session.model);
   const localModels = useLocalModels(session.provider === "llamacpp");
   const waitingFor = session.provider === "llamacpp" ? blockingDownload(localModels, session.model) : null;
@@ -713,14 +818,15 @@ export function SessionView({
             <ProviderLogo provider={session.provider} size={18} />
           </span>
         )}
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <span className="truncate text-sm font-semibold text-zinc-100">{main ? bot.name : session.title}</span>
+        {/* Keeps room for the name when a side panel narrows the header; the model chip gives way first. */}
+        <div className="min-w-28 flex-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="min-w-8 truncate text-sm font-semibold text-zinc-100">{main ? bot.name : session.title}</span>
             {main ? <Badge>Orchestrator</Badge> : session.role === "reflection" ? <Badge tone="violet"><Sparkles className="size-2.5" />Reflection</Badge> : null}
             {session.status !== "idle" ? (
               <span className="flex shrink-0 items-center gap-1.5 text-[11px] text-zinc-400">
                 <StatusDot status={session.status} />
-                {statusLabel[session.status]}
+                {compacting ? "Compacting" : statusLabel[session.status]}
               </span>
             ) : null}
           </div>
@@ -750,9 +856,6 @@ export function SessionView({
                 {session.cwd}
               </span>
             )}
-            {pullRequests.map((pr) => (
-              <PullRequestChip key={pr.url} pr={pr} />
-            ))}
             {tokens > 0 ? (
               <>
                 <span className="text-zinc-700">·</span>
@@ -791,6 +894,23 @@ export function SessionView({
         ) : null}
 
         <div className="flex items-center gap-0.5 border-l border-zinc-800/80 pl-2">
+          <IconButton
+            icon={GitCompareArrows}
+            label={openPullRequests > 0 ? `Changes and pull requests (${openPullRequests} open)` : "Changes and pull requests"}
+            active={panel === "changes"}
+            onClick={() => onTogglePanel("changes")}
+          >
+            {openPullRequests > 0 ? (
+              <span
+                key={openPullRequests}
+                className="animate-pop-in absolute -top-0.5 -right-0.5 flex size-3.5 items-center justify-center rounded-full bg-emerald-500 text-[9px] font-semibold text-white tabular-nums"
+              >
+                {openPullRequests}
+              </span>
+            ) : hasChanges ? (
+              <span className="absolute top-1 right-1 size-1.5 rounded-full bg-amber-400 ring-2 ring-zinc-950" />
+            ) : null}
+          </IconButton>
           <IconButton icon={CalendarClock} label="Schedules" active={panel === "schedules"} onClick={() => onTogglePanel("schedules")}>
             {scheduleCount > 0 ? (
               <span className="absolute -top-0.5 -right-0.5 flex size-3.5 items-center justify-center rounded-full bg-sky-500 text-[9px] font-semibold text-white tabular-nums">
@@ -851,9 +971,12 @@ export function SessionView({
         </div>
       ) : null}
 
+      <div className="relative flex min-h-0 flex-1 flex-col">
+      {railTurns.length >= 3 ? <MessageRail turns={railTurns} scrollRef={scrollRef} onJump={jumpToTurn} /> : null}
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto"
+        // Room for the rail, so the conversation never runs under it when the column is narrow.
+        className={cx("flex-1 overflow-y-auto", railTurns.length >= 3 && "pl-10")}
         onScroll={(e) => {
           const el = e.currentTarget;
           stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
@@ -876,13 +999,40 @@ export function SessionView({
               </p>
             </div>
           ) : (
-            blocks.map((block, i) => (
-              <Item key={block.key} item={block} respond={respond} live={busy && i === blocks.length - 1} sessionId={session.id} />
-            ))
+            (() => {
+              const render = (block: Block, i: number) => (
+                <Item
+                  key={block.key}
+                  item={block}
+                  respond={respond}
+                  live={busy && i === blocks.length - 1}
+                  sessionId={session.id}
+                  onOpenChanges={() => panel !== "changes" && onTogglePanel("changes")}
+                />
+              );
+              // One day: no dividers. Several: a divider per day, earlier days folded when the chat is long.
+              if (days.length <= 1) return blocks.map(render);
+              return days.map((day, d) => {
+                const open = isDayOpen(day.key, d);
+                return (
+                  <div key={day.key} className="space-y-2">
+                    <DayDivider group={day} open={open} onToggle={() => toggleDay(day.key, d)} />
+                    <Collapse open={open} className="space-y-2">
+                      {day.blocks.map(({ block, index }) => render(block, index))}
+                    </Collapse>
+                  </div>
+                );
+              });
+            })()
           )}
           {waitingFor ? <DownloadProgress model={waitingFor} /> : null}
-          {pending ? loadingModel ? <LoadProgress model={loadingModel} /> : <WorkingRow /> : null}
+          {compacting ? (
+            <WorkingRow label="Compacting the conversation…" />
+          ) : pending ? (
+            loadingModel ? <LoadProgress model={loadingModel} /> : <WorkingRow />
+          ) : null}
         </div>
+      </div>
       </div>
 
       {session.role === "reflection" ? null : (

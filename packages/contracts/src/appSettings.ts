@@ -8,12 +8,15 @@ export const AppSettings = Schema.Struct({
   workspaceRoot: Schema.String,
   /** The user's home directory, for display. */
   homeDir: Schema.String,
+  /** Skills bots save wait for the user's approval (off: they are active right away, as in Hermes). */
+  reviewSkills: Schema.Boolean,
 });
 export type AppSettings = typeof AppSettings.Type;
 
 export const UpdateAppSettingsInput = Schema.Struct({
   projectFolders: Schema.optional(Schema.Array(Schema.String)),
   workspaceRoot: Schema.optional(Schema.String),
+  reviewSkills: Schema.optional(Schema.Boolean),
 });
 export type UpdateAppSettingsInput = typeof UpdateAppSettingsInput.Type;
 

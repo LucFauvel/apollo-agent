@@ -1,5 +1,6 @@
 import { AppSettings, ProjectInfo, UpdateAppSettingsInput } from "./appSettings.ts";
 import { PullRequest } from "./pullRequests.ts";
+import { ChangesOverview, SemanticFileDiff } from "./changes.ts";
 import { RemoteAccess } from "./remote.ts";
 import { ProviderVersion } from "./connectors.ts";
 import * as Schema from "effect/Schema";
@@ -68,6 +69,8 @@ export const AppChange = Schema.Union([
   Schema.TaggedStruct("BrowserTabClosed", { tabId: Schema.String, botId: BotId }),
   Schema.TaggedStruct("PullRequestUpserted", { pullRequest: PullRequest }),
   Schema.TaggedStruct("PullRequestRemoved", { url: Schema.String, sessionId: SessionId }),
+  /** A session's changes or their explanations changed: refetch `changes.list`. */
+  Schema.TaggedStruct("ChangesUpdated", { sessionId: SessionId, botId: BotId }),
   /** Something the user should see now: clients show it as a desktop notification. */
   Schema.TaggedStruct("Notify", {
     botId: BotId,
@@ -334,6 +337,15 @@ export class ApolloRpcs extends RpcGroup.make(
 
   Rpc.make("auth.listClients", { success: Schema.Array(PairedClient), error }),
   /** Reaching Apollo from phones over Tailscale. */
+  // --- changes -------------------------------------------------------------
+  /** What a session changed in git repositories (an orchestrator: with its workers'). */
+  Rpc.make("changes.list", { payload: { sessionId: SessionId }, success: ChangesOverview, error }),
+  /** One changed file as a semantic diff, grouped by the declarations it touches. */
+  Rpc.make("changes.file", {
+    payload: { sessionId: SessionId, repo: Schema.String, path: Schema.String },
+    success: SemanticFileDiff,
+    error,
+  }),
   Rpc.make("remote.status", { success: RemoteAccess, error }),
   Rpc.make("remote.setTailscale", { payload: { enabled: Schema.Boolean }, success: RemoteAccess, error }),
   /** Signs Apollo's Tailscale node out of the tailnet (publishing turns off). */

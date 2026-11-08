@@ -467,12 +467,14 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
           });
         case "item/started": {
           const item = p.item as CodexItem;
+          if (item.type === "contextCompaction") return agent({ _tag: "Compacting", active: true });
           if (item.type === "subAgentActivity" || item.type === "collabAgentToolCall") return subagentItem(threadId ?? "", item);
           const event = toolStart(item);
           return event ? agent(event) : Effect.void;
         }
         case "item/completed": {
           const item = p.item as CodexItem;
+          if (item.type === "contextCompaction") return agent({ _tag: "Compacting", active: false });
           if (item.type === "subAgentActivity" || item.type === "collabAgentToolCall") return subagentItem(threadId ?? "", item);
           const event = itemCompleted(item);
           return event ? agent(event) : Effect.void;
@@ -522,6 +524,7 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
           );
         }
         case "mcpServer/elicitation/request": {
+          if (options.readOnly) return Effect.succeed({ action: "decline", content: null, _meta: null });
           // An MCP server wants a form filled in, or a URL visited (e.g. OAuth).
           const isUrl = p.mode === "url";
           return inputs
@@ -540,6 +543,7 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
             );
         }
         case "item/tool/requestUserInput": {
+          if (options.readOnly) return Effect.succeed({ answers: {} });
           // Codex's own request_user_input tool: a few questions, optionally multiple choice.
           const questions = (p.questions ?? []) as ReadonlyArray<CodexQuestion>;
           return inputs
@@ -613,8 +617,9 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
     const threadParams = {
       cwd: options.cwd,
       ...(options.model ? { model: options.model } : {}),
-      approvalPolicy: options.runtimeMode === "full-access" ? "never" : "on-request",
-      sandbox: options.runtimeMode === "full-access" ? "danger-full-access" : "workspace-write",
+      // A read-only session (a reflection) never asks anything and cannot write.
+      approvalPolicy: options.readOnly || options.runtimeMode === "full-access" ? "never" : "on-request",
+      sandbox: options.readOnly ? "read-only" : options.runtimeMode === "full-access" ? "danger-full-access" : "workspace-write",
       // Auto: Codex's reviewer agent decides approval requests instead of the user.
       ...(options.runtimeMode === "auto" ? { approvalsReviewer: "auto_review" } : {}),
       developerInstructions: options.instructions,

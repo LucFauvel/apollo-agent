@@ -195,6 +195,8 @@ export const layerWatcher = Layer.effectDiscard(
           // (Secret requests arrive as a Notify from the secrets service, handled below.)
           if (!["ApprovalRequested", "InputRequested", "TurnCompleted"].includes(event._tag)) return;
           const session = yield* store.getSession(sessionId);
+          // Reflections work in the background and never need the user.
+          if (session.role === "reflection") return;
           const bot = yield* store.getBot(session.botId).pipe(Effect.option);
           const note = notificationFor(session, bot._tag === "Some" ? bot.value : undefined, event, lastReply.get(sessionId) ?? null);
           if (event._tag === "TurnCompleted") lastReply.delete(sessionId);

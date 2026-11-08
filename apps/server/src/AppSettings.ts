@@ -10,6 +10,7 @@ import { Store } from "./Store.ts";
 const KEYS = {
   projectFolders: "app.projectFolders",
   workspaceRoot: "app.workspaceRoot",
+  reviewSkills: "skills.review",
 } as const;
 
 /** Files that mark a folder as a project, besides `.git`. */
@@ -95,6 +96,7 @@ const make = Effect.gen(function* () {
       projectFolders,
       workspaceRoot: root ?? join(home, "Apollo"),
       homeDir: home,
+      reviewSkills: (yield* store.getSetting(KEYS.reviewSkills)) === "on",
     } satisfies AppSettingsView;
   });
 
@@ -116,6 +118,9 @@ const make = Effect.gen(function* () {
         if (!root) yield* store.setSetting(KEYS.workspaceRoot, null);
         else if (!isAbsolute(root)) return yield* Effect.fail(invalid(`use a full path: ${root}`));
         else yield* store.setSetting(KEYS.workspaceRoot, root);
+      }
+      if (input.reviewSkills !== undefined) {
+        yield* store.setSetting(KEYS.reviewSkills, input.reviewSkills ? "on" : null);
       }
       return yield* read;
     });
