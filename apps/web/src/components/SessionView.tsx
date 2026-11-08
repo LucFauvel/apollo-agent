@@ -62,6 +62,7 @@ import { SecretItem } from "./SecretItem.tsx";
 import { HandoffItem } from "./HandoffItem.tsx";
 import { MessageAttachments, PendingAttachments, useAttachments } from "./Attachments.tsx";
 import { RecordingItem } from "./RecordingItem.tsx";
+import { FullDiff } from "./FullDiff.tsx";
 import { ContextMeter, parseCommand, SlashMenu, useSlashCommands } from "./SlashCommands.tsx";
 import { VisualItem } from "./VisualItem.tsx";
 import { ConversationBar, ConversationButton, DictateButton, ReadAloudButton, useConversation } from "./Voice.tsx";
@@ -240,6 +241,9 @@ function Item({
 }) {
   switch (item.kind) {
     case "changes":
+      if (item.report && item.repos[0]) {
+        return <FullDiff sessionId={sessionId} seq={item.seq} repo={item.repos[0]} report={item.report} at={item.at} />;
+      }
       if (cards.dismissed.has(item.seq)) {
         return cards.justCleared.has(item.seq) ? <ClearedChanges onUndo={() => cards.setDismissed(item.seq, false)} /> : null;
       }
@@ -912,8 +916,10 @@ export function SessionView({
       return next;
     });
   // A dot on the Changes button once this conversation changed files.
-  const hasChanges = useMemo(() => items.some((item) => item.kind === "changes"), [items]);
-  const cards = useChangesCards(session, blocks, hasChanges);
+  const hasChanges = useMemo(() => items.some((item) => item.kind === "changes" && !item.report), [items]);
+  // Full-diff reports are not a turn's changes card: they neither fold history nor take its place.
+  const turnBlocks = useMemo(() => blocks.filter((b) => !(b.kind === "changes" && b.report)), [blocks]);
+  const cards = useChangesCards(session, turnBlocks, hasChanges);
   // Compaction can take minutes on a local model: say so instead of "Working…".
   const compacting = useMemo(() => isCompacting(items), [items]);
   // Between the user's message and the first streamed output (or a finished step and the

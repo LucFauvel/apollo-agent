@@ -660,6 +660,34 @@ const makeStore = (db: DatabaseSync) => {
         if (excluded) run("insert or ignore into memory_exclusions (session_id, seq) values (?, ?)", sessionId, seq);
         else run("delete from memory_exclusions where session_id = ? and seq = ?", sessionId, seq);
       }),
+    /**
+     * The turn running in a session, as the full diff's request check sees it: the messages
+     * posted since the previous turn ended (the one that started this turn, and any sent
+     * while it runs). `running` is false when no turn has started since the last one ended.
+     */
+    currentTurn: (sessionId: SessionId) =>
+      Effect.sync(() => {
+        const last = (tag: string, below?: number) =>
+          Number(
+            get(
+              `select max(seq) as seq from session_events
+               where session_id = ? and json_extract(event, '$._tag') = ? and seq < ?`,
+              sessionId,
+              tag,
+              below ?? Number.MAX_SAFE_INTEGER,
+            )?.seq ?? 0,
+          );
+        const started = last("TurnStarted");
+        if (started === 0 || last("TurnCompleted") > started) return { running: false, messages: [] };
+        const since = Math.max(last("TurnCompleted", started), last("ConversationCleared"));
+        const messages = all(
+          `select json_extract(event, '$.author') as author, json_extract(event, '$.text') as text from session_events
+           where session_id = ? and seq > ? and json_extract(event, '$._tag') = 'UserMessage' order by seq`,
+          sessionId,
+          since,
+        ).map((r) => ({ author: String(r.author), text: String(r.text ?? "") }));
+        return { running: true, messages };
+      }),
     /** The event at `seq`, if any. */
     eventAt: (sessionId: SessionId, seq: number) =>
       Effect.sync(() => {

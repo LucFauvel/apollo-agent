@@ -1,6 +1,7 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { type ExplainItem, makeChangeTracker } from "./changes/Tracker.ts";
+import { unrequested } from "./changes/requested.ts";
 import { Database } from "./Database.ts";
 import { isAbsolute, join, relative } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -153,6 +154,9 @@ interface LiveSession {
 }
 
 const invalid = (message: string) => new ApolloError({ code: "invalid", message });
+
+/** How long a full semantic diff may take before it is stopped. */
+const SEMANTIC_DIFF_TIMEOUT = Duration.seconds(120);
 const providerFailure = (message: string) => new ApolloError({ code: "provider", message });
 
 /** A turn is under way (not just the process starting). */
@@ -1242,10 +1246,18 @@ const make = Effect.gen(function* () {
         return { sessions: all.filter((c) => c !== null) };
       }),
 
-    /** One changed file of a session as a semantic diff. */
-    changesFile: (id: SessionId, repo: string, path: string) =>
+    /** One changed file of a session as a semantic diff (with `reportSeq`: of the full diff in that event). */
+    changesFile: (id: SessionId, repo: string, path: string, reportSeq?: number) =>
       Effect.gen(function* () {
         yield* store.getSession(id);
+        if (reportSeq !== undefined) {
+          const event = yield* store.eventAt(id, reportSeq);
+          const report = event?._tag === "FilesChanged" && event.repos[0]?.repo === repo ? event.report : undefined;
+          if (!report) return yield* invalid(`There is no full diff of ${repo} at ${reportSeq} in this session`);
+          const diff = yield* Effect.promise(() => changeTracker.reportFile(repo, report, path).catch(() => null));
+          if (!diff) return yield* invalid(`${path} is not in this diff (or its snapshot is no longer in the repository)`);
+          return diff;
+        }
         const diff = yield* Effect.promise(() => changeTracker.file(id, repo, path));
         if (!diff) return yield* invalid(`${path} is not among this session's changes`);
         return diff;
@@ -1266,6 +1278,32 @@ const make = Effect.gen(function* () {
         if (event?._tag !== "FilesChanged") return yield* invalid("only a turn's changes can be cleared");
         changeTracker.setDismissed(id, seq, dismissed);
         yield* publish({ _tag: "ChangesUpdated", sessionId: id, botId: session.botId });
+      }),
+
+    /**
+     * The full semantic diff of a repository against its baseline, which the user asked for:
+     * shown in the conversation as a card (a FilesChanged event with `report`), never sent to
+     * the model. `request` quotes the user's message that started the running turn (see changes/requested.ts).
+     */
+    semanticDiff: (id: SessionId, input: { readonly repo?: string | undefined; readonly base?: string | undefined; readonly request: string }) =>
+      Effect.gen(function* () {
+        const session = yield* store.getSession(id);
+        const refused = unrequested(yield* store.currentTurn(id), input.request);
+        if (refused) return yield* invalid(`Not shown: ${refused}.`);
+        const path = input.repo ? (isAbsolute(input.repo) ? input.repo : join(session.cwd, input.repo)) : session.cwd;
+        // Hitting the bound interrupts this, which aborts the signal: the git processes are
+        // killed and no further step starts.
+        const result = yield* Effect.tryPromise({
+          try: (signal) => changeTracker.report(path, input.base, signal),
+          catch: (error) => invalid((error as Error).message),
+        }).pipe(
+          Effect.timeoutOrElse({
+            duration: SEMANTIC_DIFF_TIMEOUT,
+            orElse: () => Effect.fail(invalid("The diff took over two minutes and was stopped; try a closer base ref")),
+          }),
+        );
+        const stored = yield* appendEvent(id, { _tag: "FilesChanged", repos: [result.repo], report: result.report });
+        return { seq: stored.seq, ...result };
       }),
 
     /** A worker's explanation of the changes in its running turn. */

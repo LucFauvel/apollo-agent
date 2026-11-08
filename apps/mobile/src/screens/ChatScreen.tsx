@@ -42,7 +42,7 @@ import { BlobAvatar } from "../BlobAvatar.tsx";
 import { Markdown } from "../Markdown.tsx";
 import { ActivityGroup } from "../Activity.tsx";
 import { BrowserScreen, type Handoff } from "./BrowserScreen.tsx";
-import { ChangesScreen } from "./ChangesScreen.tsx";
+import { ChangesScreen, FullDiff } from "./ChangesScreen.tsx";
 import { animateLayout, FadeIn, Pulse, ScrollHold, Spin, SwipeBack, Turn, useKeyboardInset, useToggle } from "../motion.tsx";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { errorMessage } from "../connection.ts";
@@ -222,7 +222,9 @@ export function ChatScreen({
     for (const pr of state.pullRequests.values()) if (ids.has(pr.sessionId) && (pr.state === "open" || pr.state === "draft")) urls.add(pr.url);
     return urls.size;
   }, [state.pullRequests, state.sessions, session]);
-  const hasChanges = useMemo(() => items.some((item) => item.kind === "changes"), [items]);
+  const hasChanges = useMemo(() => items.some((item) => item.kind === "changes" && !item.report), [items]);
+  // Full-diff reports are not a turn's changes card: they neither fold history nor take its place.
+  const turnItems = useMemo(() => items.filter((item) => !(item.kind === "changes" && item.report)), [items]);
   // Each turn's changes card: its worker's summary, and whether the user cleared it. Kept by
   // the server, so a card cleared on the desktop is gone here too, and after restarts.
   // Bumped by the server's ChangesUpdated, and by every reconnect (AppState.tsx).
@@ -247,8 +249,8 @@ export function ChatScreen({
   const cards = useMemo<ChangesCards>(() => {
     const own = cardsState.sessionId === sessionId ? cardsState : initialCards(sessionId);
     return {
-      current: currentChangesKey(items),
-      generation: latestChangesKey(items),
+      current: currentChangesKey(turnItems),
+      generation: latestChangesKey(turnItems),
       summaries: summariesByTurn(own.server),
       dismissed: dismissedCards(own),
       justCleared: own.justCleared,
@@ -266,7 +268,7 @@ export function ChatScreen({
         );
       },
     };
-  }, [items, cardsState, connection, sessionId]);
+  }, [turnItems, cardsState, connection, sessionId]);
   // Apollo's browser, live: opened from the header, or from a tab an agent handed over.
   const [browser, setBrowser] = useState<{ tabId?: string; handoff?: Handoff } | null>(null);
   const browserTabs = useMemo(() => {
@@ -352,6 +354,7 @@ export function ChatScreen({
             >
               <Item
                 item={item}
+                sessionId={sessionId}
                 live={busy && i === blocks.length - 1}
                 onOpenChanges={() => setChangesOpen(true)}
                 cards={cards}
@@ -505,6 +508,7 @@ type Respond = {
 /** One block of the conversation, drawn as the desktop app draws it (apps/web SessionView.tsx). */
 function Item({
   item,
+  sessionId,
   live,
   onApprove,
   onInput,
@@ -514,6 +518,7 @@ function Item({
   onOpenBrowser,
 }: {
   item: TranscriptBlock;
+  sessionId: SessionId;
   live: boolean;
   onOpenChanges: () => void;
   cards: ChangesCards;
@@ -521,6 +526,9 @@ function Item({
 } & Respond) {
   switch (item.kind) {
     case "changes":
+      if (item.report && item.repos[0]) {
+        return <FullDiff sessionId={sessionId} seq={item.seq} repo={item.repos[0]} report={item.report} />;
+      }
       if (cards.dismissed.has(item.seq)) {
         return cards.justCleared.has(item.seq) ? (
           <View style={styles.cleared}>

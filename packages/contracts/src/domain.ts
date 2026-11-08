@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { RepoChanges } from "./changes.ts";
+import { ChangeReport, RepoChanges } from "./changes.ts";
 
 // ---------------------------------------------------------------------------
 // Identifiers
@@ -306,8 +306,12 @@ export const AgentEvent = Schema.Union([
     fromBotId: Schema.optional(BotId),
   }),
   Schema.TaggedStruct("TurnStarted", {}),
-  /** Files the turn changed in git repositories (Apollo detects these, not the agent). */
-  Schema.TaggedStruct("FilesChanged", { repos: Schema.Array(RepoChanges) }),
+  /**
+   * Files the turn changed in git repositories (Apollo detects these, not the agent). With
+   * `report`: the full semantic diff of one repository against its baseline, which the user
+   * asked for (`repos` then holds that repository only).
+   */
+  Schema.TaggedStruct("FilesChanged", { repos: Schema.Array(RepoChanges), report: Schema.optional(ChangeReport) }),
   /** A browser recording an agent made; its frames are served at /api/recordings/<id>/<frame>.jpg. */
   Schema.TaggedStruct("Recording", {
     recordingId: Schema.String,

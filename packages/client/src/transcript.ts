@@ -5,6 +5,7 @@
 import type {
   AttachmentRef,
   ApprovalDecision,
+  ChangeReport,
   InputAction,
   InputField,
   MessageAuthor,
@@ -100,7 +101,10 @@ type TranscriptItemKind =
       readonly outcome: "done" | "cancelled" | "expired" | null;
     }
   | { readonly kind: "turn-end"; readonly key: string; readonly outcome: string; readonly error: string | null }
-  /** Files a turn changed in git repositories (detected by Apollo). */
+  /**
+   * Files a turn changed in git repositories (detected by Apollo). With `report`: the full
+   * diff of one repository the user asked for; its files open with `changes.file` and `reportSeq: seq`.
+   */
   | {
       readonly kind: "changes";
       readonly key: string;
@@ -109,6 +113,7 @@ type TranscriptItemKind =
       readonly seq: number;
       /** The turn it ended (its TurnStarted seq), to find the worker's summary; null if not seen. */
       readonly turnSeq: number | null;
+      readonly report?: ChangeReport;
     }
   /** Live only, while the agent compacts its context; clients show it instead of "Working…". */
   | { readonly kind: "compacting"; readonly key: string };
@@ -316,7 +321,14 @@ export const reduceTranscript = (state: TranscriptState, e: SessionEvent): Trans
     case "Notice":
       return push({ kind: "notice", key: `n${e.seq}`, level: event.level, message: event.message });
     case "FilesChanged":
-      return push({ kind: "changes", key: `c${e.seq}`, repos: event.repos, seq: e.seq, turnSeq: state.turnSeq ?? null });
+      return push({
+        kind: "changes",
+        key: `c${e.seq}`,
+        repos: event.repos,
+        seq: e.seq,
+        turnSeq: state.turnSeq ?? null,
+        ...(event.report ? { report: event.report } : {}),
+      });
     case "Compacting": {
       const rest = items.filter((i) => i.kind !== "compacting");
       return { ...state, items: event.active ? [...rest, { kind: "compacting", key: "compacting" }] : rest };

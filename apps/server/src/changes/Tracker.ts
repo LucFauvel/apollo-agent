@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { basename, isAbsolute, relative, resolve } from "node:path";
-import type { ChangedFile, ConversationChanges, OverviewFile, RepoChanges, SemanticFileDiff, SessionChanges } from "@apollo/contracts";
-import { commonGitDir, diffFile, diffFiles, fileAt, pathsIn, repoRoot, snapshot } from "./git.ts";
+import type { ChangedFile, ChangeReport, ConversationChanges, OverviewFile, RepoChanges, SemanticFileDiff, SessionChanges } from "@apollo/contracts";
+import { commitsBetween, commonGitDir, diffFile, diffFiles, fileAt, headCommit, headOf, pathsIn, repoRoot, resolveBaseline, snapshot } from "./git.ts";
 import { semanticDiff } from "./semantic.ts";
 
 /**
@@ -19,6 +19,13 @@ import { semanticDiff } from "./semantic.ts";
 
 /** Diffs larger than this are listed, not shown. */
 const MAX_DIFF_BYTES = 600_000;
+/** A full diff lists at most this many files (the rest are counted) and commits. */
+export const MAX_REPORT_FILES = 500;
+const MAX_REPORT_COMMITS = 50;
+/** File notes stored with a report are cut to this (the file's diff shows them whole). */
+const MAX_REPORT_NOTE = 300;
+/** Snapshots taken before giving up on a repository whose HEAD keeps moving. */
+const MAX_REPORT_ATTEMPTS = 3;
 
 interface Turn {
   readonly seq: number;
@@ -241,6 +248,50 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
     return { sessionId, title, repos: repos.sort((a, b) => a.name.localeCompare(b.name)), summaries, updatedAt };
   };
 
+  /**
+   * One changed file between two trees as a semantic diff. `notes` are the explanations of
+   * this file, by symbol ("" for the file itself).
+   */
+  const semanticFile = async (
+    gitDir: string,
+    before: string,
+    after: string,
+    changed: ChangedFile,
+    notes: ReadonlyMap<string, string>,
+  ): Promise<SemanticFileDiff> => {
+    const path = changed.path;
+    const base = { ...changed, note: notes.get("") ?? null, symbols: [] };
+    if (changed.additions === null) return { ...base, omitted: "Binary file" };
+    const diff = await diffFile(gitDir, before, after, path, changed.oldPath).catch(() => null);
+    if (diff === null) return { ...base, omitted: "This version is no longer in the repository." };
+    if (diff.length > MAX_DIFF_BYTES) return { ...base, omitted: `Too large to show (${changed.additions + (changed.deletions ?? 0)} changed lines)` };
+    const [oldContent, newContent] = await Promise.all([
+      changed.status === "added" ? null : fileAt(gitDir, before, changed.oldPath ?? path),
+      changed.status === "deleted" ? null : fileAt(gitDir, after, path),
+    ]);
+    const symbolNote = (name: string) => {
+      const exact = notes.get(name);
+      if (exact) return exact;
+      // A worker may name `listBots` for `Store.listBots`.
+      for (const [symbol, text] of notes) {
+        if (symbol && (name.endsWith(`.${symbol}`) || symbol.endsWith(`.${name}`))) return text;
+      }
+      return null;
+    };
+    const symbols = semanticDiff(path, oldContent, newContent, diff).map((s) => ({ ...s, note: symbolNote(s.name) }));
+    return { ...base, symbols, omitted: null };
+  };
+
+  /** The notes of one file out of `repo\0path\0symbol`-keyed notes, by symbol. */
+  const notesOfFile = (notes: ReadonlyMap<string, string>, repo: string, path: string) => {
+    const result = new Map<string, string>();
+    for (const [key, text] of notes) {
+      const [r, p, symbol] = key.split("\0");
+      if (r === repo && p === path) result.set(symbol ?? "", text);
+    }
+    return result;
+  };
+
   /** One file of a session's overall changes, as a semantic diff with the worker's notes. */
   const file = async (sessionId: string, repo: string, path: string): Promise<SemanticFileDiff | null> => {
     const span = spans(sessionId).get(repo);
@@ -248,29 +299,87 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
     const files = await diffFiles(span.gitDir, span.before, span.after).catch(() => mergedFiles(span.rows));
     const changed = files.find((f) => f.path === path);
     if (!changed) return null;
-    const notes = latestNotes(sessionId);
-    const note = notes.get(`${repo}\0${path}\0`) ?? null;
-    const base = { ...changed, note, symbols: [] };
-    if (changed.additions === null) return { ...base, omitted: "Binary file" };
-    const diff = await diffFile(span.gitDir, span.before, span.after, path, changed.oldPath).catch(() => null);
-    if (diff === null) return { ...base, omitted: "This version is no longer in the repository." };
-    if (diff.length > MAX_DIFF_BYTES) return { ...base, omitted: `Too large to show (${changed.additions + (changed.deletions ?? 0)} changed lines)` };
-    const [oldContent, newContent] = await Promise.all([
-      changed.status === "added" ? null : fileAt(span.gitDir, span.before, changed.oldPath ?? path),
-      changed.status === "deleted" ? null : fileAt(span.gitDir, span.after, path),
-    ]);
-    const symbolNote = (name: string) => {
-      const exact = notes.get(`${repo}\0${path}\0${name}`);
-      if (exact) return exact;
-      // A worker may name `listBots` for `Store.listBots`.
-      for (const [key, text] of notes) {
-        const [r, p, symbol] = key.split("\0");
-        if (r === repo && p === path && symbol && (name.endsWith(`.${symbol}`) || symbol.endsWith(`.${name}`))) return text;
+    return semanticFile(span.gitDir, span.before, span.after, changed, notesOfFile(latestNotes(sessionId), repo, path));
+  };
+
+  // --- the full diff of a repository against its baseline (asked for by the user) --------
+
+  /**
+   * The latest explanation per file and symbol of a repository, from any session and turn:
+   * notes are kept by worktree folder, so every worktree of the same git dir counts (paths
+   * are relative to the repository, so they line up).
+   */
+  const repoNotes = (repo: string, gitDir: string) => {
+    const rows = db
+      .prepare(
+        `select path, symbol, text from change_notes
+         where path != '' and (repo = ? or repo in (select distinct repo from turn_changes where git_dir = ?))
+         order by created_at`,
+      )
+      .all(repo, gitDir) as Array<{ path: string; symbol: string; text: string }>;
+    const notes = new Map<string, string>();
+    for (const row of rows) notes.set(`${row.path}\0${row.symbol}`, row.text);
+    return notes;
+  };
+
+  /**
+   * Everything that differs in the repository around `path` from its baseline (see
+   * `resolveBaseline`): commits since the merge base and the working tree as it is now.
+   * HEAD is read before and after the snapshot; when it moved (a commit or checkout in the
+   * meantime), it starts over, so the history and the files describe one state of the
+   * repository. `signal` stops it, and the git processes it runs.
+   */
+  const report = async (path: string, ref?: string, signal?: AbortSignal): Promise<{ repo: RepoChanges; report: ChangeReport }> => {
+    const repo = await repoRoot(path, signal);
+    if (!repo) throw new Error(`${path} is not in a git repository`);
+    const gitDir = await commonGitDir(repo, signal);
+    for (let attempt = 1; ; attempt++) {
+      const head = await headOf(repo, signal);
+      const baseline = await resolveBaseline(repo, head.commit, ref, signal);
+      const tree = await snapshot(repo, signal);
+      if ((await headCommit(repo, signal)) !== head.commit) {
+        if (attempt < MAX_REPORT_ATTEMPTS) continue;
+        throw new Error(`HEAD kept moving in ${repo} while reading it; ask again once it settles`);
       }
-      return null;
-    };
-    const symbols = semanticDiff(path, oldContent, newContent, diff).map((s) => ({ ...s, note: symbolNote(s.name) }));
-    return { ...base, symbols, omitted: null };
+      const [history, files] = await Promise.all([
+        commitsBetween(repo, baseline.commit, head.commit, MAX_REPORT_COMMITS, signal),
+        diffFiles(gitDir, baseline.tree, tree, signal),
+      ]);
+      const shown = files.slice(0, MAX_REPORT_FILES);
+      const listed = new Set(shown.map((f) => f.path));
+      const notes = [...repoNotes(repo, gitDir)]
+        .filter(([key]) => key.endsWith("\0") && listed.has(key.slice(0, -1)))
+        .map(([key, text]) => ({ path: key.slice(0, -1), text: text.length > MAX_REPORT_NOTE ? `${text.slice(0, MAX_REPORT_NOTE - 1)}…` : text }));
+      return {
+        repo: { repo, name: basename(repo), files: shown },
+        report: {
+          gitDir,
+          base: { ref: baseline.ref, commit: baseline.commit, tree: baseline.tree },
+          head: { branch: head.branch, commit: head.commit, tree },
+          commitCount: history.count,
+          commits: history.commits,
+          uncommitted: tree !== head.tree,
+          moreFiles: files.length - shown.length,
+          additions: files.reduce((n, f) => n + (f.additions ?? 0), 0),
+          deletions: files.reduce((n, f) => n + (f.deletions ?? 0), 0),
+          notes,
+        },
+      };
+    }
+  };
+
+  /** One file of a full diff, as a semantic diff with the latest explanations of it. */
+  const reportFile = async (repo: string, report: ChangeReport, path: string): Promise<SemanticFileDiff | null> => {
+    const files = await diffFiles(report.gitDir, report.base.tree, report.head.tree).catch(() => null);
+    if (files === null) return null;
+    const changed = files.find((f) => f.path === path);
+    if (!changed) return null;
+    const notes = new Map<string, string>();
+    for (const [key, text] of repoNotes(repo, report.gitDir)) {
+      const at = key.indexOf("\0");
+      if (key.slice(0, at) === path) notes.set(key.slice(at + 1), text);
+    }
+    return semanticFile(report.gitDir, report.base.tree, report.head.tree, changed, notes);
   };
 
   // --- the conversation's changes cards ------------------------------------------
@@ -293,7 +402,7 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
     else db.prepare("delete from dismissed_changes where session_id = ? and seq = ?").run(sessionId, seq);
   };
 
-  return { turnStarted, toolStarted, turnCompleted, currentTurn, explain, turnNotes, sessionChanges, file, conversation, setDismissed };
+  return { turnStarted, toolStarted, turnCompleted, currentTurn, explain, turnNotes, sessionChanges, file, report, reportFile, conversation, setDismissed };
 };
 
 export type ChangeTracker = ReturnType<typeof makeChangeTracker>;
