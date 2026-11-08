@@ -906,6 +906,13 @@ function SecretCard({ item, onSecret }: { item: Extract<TranscriptItem, { kind: 
         <TextInput
           style={[styles.fieldInput, { flex: 1, fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace", fontSize: 13 }]}
           secureTextEntry
+          // A password field gets iOS AutoFill: the key icon above the keyboard (or
+          // AutoFill > Passwords in the edit menu, iOS 18+) opens the AutoFill
+          // provider (1Password, Keychain) to search and pick any item. The value
+          // arrives through onChangeText like typed text. The app has no associated
+          // domains, so iOS never offers to save what was entered.
+          textContentType="password"
+          autoComplete="current-password"
           value={value}
           onChangeText={setValue}
           placeholder={item.placeholder ?? "Paste or type the secret"}
