@@ -332,6 +332,106 @@ describe("change tracker", () => {
       GIT_HEAVY,
     );
 
+    it(
+      "keeps each file's history off a path another file took over (path reuse), with or without clears between",
+      async () => {
+        const REPLACEMENT = "export const replacement = 88;";
+        const renameAway = (d: string) => renameSync(join(d, "store.ts"), join(d, "z.ts"));
+        const recreate = (d: string) => writeFileSync(join(d, "store.ts"), `${REPLACEMENT}\n`);
+        const remove = (name: string) => (d: string) => rmSync(join(d, name));
+        const all =
+          (...steps: Array<(d: string) => void>) =>
+          (d: string) =>
+            steps.forEach((step) => step(d));
+        /** Turns in order; "gap" is a turn (changing another file) that the user cleared. */
+        const cases: Array<{
+          name: string;
+          turns: Array<((d: string) => void) | "gap">;
+          files: Array<[string, string, string | null]>;
+          gone: Array<string>;
+          /** The path whose diff must be the replacement's own (no deletion served in its place). */
+          replacement?: "only" | "within";
+        }> = [
+          {
+            name: "renamed away · gap · recreated · gap · renamed one deleted",
+            turns: [renameAway, "gap", recreate, "gap", remove("z.ts")],
+            files: [["store.ts", "modified", null]],
+            gone: ["z.ts"],
+            replacement: "only",
+          },
+          {
+            name: "renamed away · gap · recreated and renamed one deleted",
+            turns: [renameAway, "gap", all(recreate, remove("z.ts"))],
+            files: [["store.ts", "modified", null]],
+            gone: ["z.ts"],
+            replacement: "only",
+          },
+          {
+            name: "renamed away, recreated, renamed one deleted: no clear",
+            turns: [all(renameAway, recreate, remove("z.ts"))],
+            files: [["store.ts", "modified", null]],
+            gone: ["z.ts"],
+            replacement: "within",
+          },
+          {
+            name: "renamed away · gap · recreated",
+            turns: [renameAway, "gap", recreate],
+            files: [
+              ["store.ts", "added", null],
+              ["z.ts", "renamed", "store.ts"],
+            ],
+            gone: [],
+            replacement: "only",
+          },
+          {
+            name: "renamed away · gap · recreated · gap · the new one deleted",
+            turns: [renameAway, "gap", recreate, "gap", remove("store.ts")],
+            files: [["z.ts", "renamed", "store.ts"]],
+            gone: ["store.ts"],
+          },
+          {
+            name: "renamed away · gap · recreated · gap · both deleted",
+            turns: [renameAway, "gap", recreate, "gap", remove("store.ts"), "gap", remove("z.ts")],
+            files: [["store.ts", "deleted", null]],
+            gone: ["z.ts"],
+          },
+          {
+            name: "renamed away · gap · recreated · gap · the renamed one modified",
+            turns: [renameAway, "gap", recreate, "gap", (d) => writeFileSync(join(d, "z.ts"), "export class Store {\n  list() {\n    return [2];\n  }\n}\n")],
+            files: [
+              ["store.ts", "added", null],
+              ["z.ts", "renamed", "store.ts"],
+            ],
+            gone: [],
+            replacement: "only",
+          },
+        ];
+        for (const [i, c] of cases.entries()) {
+          const t = setup();
+          const app = repo("app");
+          const id = `u${i}`;
+          for (const [n, step] of c.turns.entries()) {
+            const seq = (n + 1) * 10;
+            if (step === "gap") {
+              await turn(t, id, seq, app.dir, write(app.dir, `gap${n}.ts`, `export const gap${n} = ${n};\n`));
+              t.tracker.setDismissed(id, seq, true);
+            } else await turn(t, id, seq, app.dir, () => step(app.dir));
+          }
+          const { section } = await t.tracker.sessionChanges(id, "Worker");
+          const files = section?.repos.flatMap((r) => r.files.map((f): [string, string, string | null] => [f.path, f.status, f.oldPath])) ?? [];
+          expect([c.name, files]).toEqual([c.name, c.files]);
+          for (const path of c.gone) expect([c.name, path, await t.tracker.file(id, app.dir, path)]).toEqual([c.name, path, null]);
+          for (const [path] of c.files) expect([c.name, path, (await t.tracker.file(id, app.dir, path)) !== null]).toEqual([c.name, path, true]);
+          if (c.replacement) {
+            const lines = (await t.tracker.file(id, app.dir, "store.ts"))?.symbols.flatMap((s) => s.hunks.flatMap((h) => h.lines)) ?? [];
+            expect([c.name, lines.some((l) => l.kind === "add" && l.text === REPLACEMENT)]).toEqual([c.name, true]);
+            if (c.replacement === "only") expect([c.name, lines.filter((l) => l.kind === "del")]).toEqual([c.name, []]);
+          }
+        }
+      },
+      GIT_HEAVY,
+    );
+
     // Pinned: clearing a turn removes its entries (file rows, summaries, notes), not every line
     // it wrote. A later shown turn's diff is the real before/after of that turn, so a line the
     // cleared turn wrote shows there as deleted or as context. Intended; do not "fix".

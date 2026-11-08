@@ -315,10 +315,23 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
 
   /**
    * A repository's changed files over its spans, by path. With several spans (a cleared turn
-   * in between), each file's entries are composed oldest first, following it by identity:
-   * a rename moves it (its old path is gone), added then deleted is nothing, added then
-   * renamed or modified stays added, deleted then added is modified, renamed then deleted is
-   * its original path deleted. Its counts and diff are of the latest span that touched it.
+   * in between), each file is followed by identity, oldest span first, so that one file's
+   * history never lands on a path another file holds:
+   *
+   * - A live file is known by its current path and its `origin`: the path it had before the
+   *   first span (null when a span created it). A rename moves it to its new path, keeping
+   *   its origin; a modification keeps it where it is.
+   * - A deleted file whose origin is a path leaves that path "vacated"; one a span created
+   *   just goes (added, then deleted, is nothing).
+   * - A span that adds a file (or renames one) onto a path a live file still holds tells
+   *   that the cleared turn in between removed that file: the cleared turn's doing, so it is
+   *   dropped, not shown (its entries never are).
+   *
+   * Each path then shows as: a live file at its origin, modified; one created, added (or
+   * modified, when that path was vacated: another file had it before); one moved, renamed
+   * from its origin (onto a vacated path too: an approximation); a vacated path nothing
+   * holds, deleted. Counts and the diff are of the latest span that touched that file (for
+   * a vacated path, the span that deleted the file that had it, under whatever path then).
    *
    * This keeps the cleared turn's entries out (rows, notes, summaries), not every line it
    * wrote: a diff over a later span shows what that span changed, so a line the cleared turn
@@ -326,29 +339,36 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
    * editing next to it). Hiding those would mean misstating what the shown turns did.
    */
   const composeFiles = async (list: ReadonlyArray<Span>): Promise<Map<string, Composed>> => {
-    const files = new Map<string, Composed>();
+    type Live = { origin: string | null; span: Span; changed: ChangedFile };
+    const live = new Map<string, Live>();
+    const vacated = new Map<string, { span: Span; changed: ChangedFile }>();
     for (const span of list) {
       for (const changed of await spanFiles(span)) {
-        const set = (file: ChangedFile) => files.set(file.path, { file, span, changed });
         if (changed.status === "renamed" && changed.oldPath !== null) {
-          const before = files.get(changed.oldPath)?.file;
-          files.delete(changed.oldPath);
-          if (before?.status === "added") set({ ...changed, status: "added", oldPath: null });
-          else if (before?.status === "renamed") set({ ...changed, oldPath: before.oldPath });
-          else set(changed);
+          const moved = live.get(changed.oldPath);
+          live.delete(changed.oldPath);
+          live.set(changed.path, { origin: moved ? moved.origin : changed.oldPath, span, changed });
         } else if (changed.status === "deleted") {
-          const before = files.get(changed.path)?.file;
-          files.delete(changed.path);
-          if (before?.status === "added") continue;
-          if (before?.status === "renamed" && before.oldPath !== null) set({ ...changed, path: before.oldPath, oldPath: null });
-          else set(changed);
+          const gone = live.get(changed.path);
+          live.delete(changed.path);
+          const origin = gone ? gone.origin : changed.path;
+          if (origin !== null) vacated.set(origin, { span, changed });
         } else if (changed.status === "added") {
-          set(files.get(changed.path)?.file.status === "deleted" ? { ...changed, status: "modified" } : changed);
+          live.set(changed.path, { origin: null, span, changed });
         } else {
-          const before = files.get(changed.path)?.file;
-          set(before?.status === "added" || before?.status === "renamed" ? { ...changed, status: before.status, oldPath: before.oldPath } : changed);
+          const kept = live.get(changed.path);
+          live.set(changed.path, { origin: kept ? kept.origin : changed.path, span, changed });
         }
       }
+    }
+    const files = new Map<string, Composed>();
+    for (const [path, file] of live) {
+      const status = file.origin === null ? (vacated.has(path) ? "modified" : "added") : file.origin === path ? "modified" : "renamed";
+      const oldPath = status === "renamed" ? file.origin : null;
+      files.set(path, { file: { ...file.changed, path, status, oldPath }, span: file.span, changed: file.changed });
+    }
+    for (const [path, gone] of vacated) {
+      if (!files.has(path)) files.set(path, { file: { ...gone.changed, path, status: "deleted", oldPath: null }, span: gone.span, changed: gone.changed });
     }
     return files;
   };
