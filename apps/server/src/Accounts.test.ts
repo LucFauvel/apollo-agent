@@ -58,7 +58,7 @@ if (cmd === "login" && sub === "status") {
 } else if (cmd === "login") {
   console.log("Starting local login server on http://localhost:1455.");
   console.log("If your browser did not open, navigate to this URL to authenticate:\\n\\nhttps://auth.openai.com/oauth/authorize?client_id=x");
-  setTimeout(() => { fs.writeFileSync(file, JSON.stringify({ tokens: { id_token: ${JSON.stringify(idToken)} } })); process.exit(0); }, 200);
+  setTimeout(() => { fs.writeFileSync(file, JSON.stringify({ tokens: { id_token: ${JSON.stringify(idToken)} } })); process.exit(0); }, 1500);
 }
 `,
 );
@@ -143,7 +143,7 @@ describe("Accounts", () => {
       const started = yield* accounts.signIn(home.id);
       expect(started.signIn?.url).toBe("https://auth.openai.com/oauth/authorize?client_id=x");
       let after = started;
-      for (let i = 0; i < 50 && !after.loggedIn; i++) {
+      for (let i = 0; i < 100 && !after.loggedIn; i++) {
         yield* Effect.sleep("50 millis");
         after = (yield* accounts.list).find((a) => a.id === home.id)!;
       }

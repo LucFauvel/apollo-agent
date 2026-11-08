@@ -75,7 +75,9 @@ const providerEnv = (): Record<string, string> => {
   if (!app.isPackaged) return {};
   const path = [loginShellPath(), process.env.PATH].filter(Boolean).join(delimiter);
   const claude = process.env.APOLLO_CLAUDE_BIN ?? findOnPath("claude", path);
-  return { PATH: path, ...(claude ? { APOLLO_CLAUDE_BIN: claude } : {}) };
+  // Windows: `codex` is npm's codex.cmd, which a plain spawn of "codex" does not find.
+  const codex = process.env.APOLLO_CODEX_BIN ?? (process.platform === "win32" ? findOnPath("codex", path) : null);
+  return { PATH: path, ...(claude ? { APOLLO_CLAUDE_BIN: claude } : {}), ...(codex ? { APOLLO_CODEX_BIN: codex } : {}) };
 };
 
 /** Dev: Vite serves the UI and proxies /rpc to this port. Otherwise the server serves the built UI. */

@@ -8,3 +8,4 @@ out/
 .DS_Store
 apps/desktop/build/
 apps/desktop/release/
+apps/desktop/release-win/

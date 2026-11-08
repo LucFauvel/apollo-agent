@@ -36,6 +36,9 @@ mac:
     NSMicrophoneUsageDescription: Apollo listens when you dictate or talk with a bot. Speech is transcribed on this Mac.
 win:
   target: [nsis]
+# Per-user, one click: installs to %LOCALAPPDATA%\Programs\Apollo without an admin prompt.
 nsis:
-  oneClick: false
-  allowToChangeInstallationDirectory: true
+  oneClick: true
+  perMachine: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true

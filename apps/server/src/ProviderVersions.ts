@@ -14,7 +14,8 @@ const CHECK_EVERY_MS = 6 * 60 * 60_000;
 
 const run = (command: string, args: ReadonlyArray<string>, timeoutMs: number) =>
   new Promise<string>((resolve, reject) => {
-    execFile(command, [...args], { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
+    // Windows: npm's `.cmd` launchers only run through the shell.
+    execFile(command, [...args], { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(command) }, (error, stdout, stderr) => {
       if (error) reject(new Error(((stderr || stdout || error.message) as string).trim()));
       else resolve(`${stdout}${stderr}`);
     });

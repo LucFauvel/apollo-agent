@@ -50,7 +50,7 @@ const str = (v: unknown) => (typeof v === "string" && v ? v : null);
 
 const run = (exe: string, args: ReadonlyArray<string>, env: NodeJS.ProcessEnv) =>
   new Promise<{ ok: boolean; stdout: string }>((resolve) =>
-    execFile(exe, [...args], { env, timeout: 20_000 }, (error, stdout) => resolve({ ok: !error, stdout: String(stdout) })),
+    execFile(exe, [...args], { env, timeout: 20_000, shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(exe) }, (error, stdout) => resolve({ ok: !error, stdout: String(stdout) })),
   );
 
 const DRIVERS: Record<AccountProvider, Driver> = {
@@ -254,7 +254,11 @@ const make = Effect.gen(function* () {
       if (!exe) return yield* invalid(`the ${account.provider} CLI was not found on this machine`);
       signIns.get(id)?.child.kill();
       prepare(account);
-      const child = spawn(exe, [...DRIVERS[account.provider].signInArgs], { env: envOf(account), stdio: ["pipe", "pipe", "pipe"] });
+      const child = spawn(exe, [...DRIVERS[account.provider].signInArgs], {
+        env: envOf(account),
+        stdio: ["pipe", "pipe", "pipe"],
+        shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(exe),
+      });
       const entry: SignIn = { child, url: null, error: null };
       signIns.set(id, entry);
       let output = "";

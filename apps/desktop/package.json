@@ -15,7 +15,8 @@
     "package:dir": "pnpm build:package && electron-builder --dir --publish never",
     "build:package": "pnpm --filter @apollo/web exec vite build --outDir ../desktop/build/web --emptyOutDir && tsc -p . && node scripts/bundle-server.ts && bash ../server/native/tailnet/build.sh",
     "icons": "pnpm ensure:electron && electron scripts/render-icons.mjs",
-    "install:app": "node scripts/install-app.ts"
+    "install:app": "node scripts/install-app.ts",
+    "package:win": "pnpm --filter @apollo/web exec vite build --outDir ../desktop/build/web --emptyOutDir && tsc -p . && node scripts/bundle-server.ts && electron-builder --win --x64 --publish never --config electron-builder.win.yml && electron-builder --win --arm64 --publish never --config electron-builder.win.yml"
   },
   "devDependencies": {
     "@types/node": "catalog:",

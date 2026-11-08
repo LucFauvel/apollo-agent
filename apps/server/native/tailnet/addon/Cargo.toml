@@ -1,0 +1,27 @@
+[package]
+name = "apollo_tailnet"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Node-API side of Apollo's desktop tailnet addon: exposes the Go tsnet node to JavaScript"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Node-API 8; on Windows napi-rs resolves Node's functions in the running app at load time,
+# so the same addon loads in node.exe and in Electron (apollo.exe).
+napi = { version = "3", default-features = false, features = ["napi8", "dyn-symbols"] }
+napi-derive = "3"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = "debuginfo"
+
+# Build-time macros must keep their symbols (stripping them breaks proc-macro loading).
+[profile.release.build-override]
+strip = false

@@ -1,4 +1,4 @@
-import { accessSync, constants, readdirSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readdirSync, readFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import type { RuntimeMode } from "@apollo/contracts";
 import type { McpEndpoint, ProviderSessionOptions } from "./Provider.ts";
@@ -11,7 +11,14 @@ import type { McpEndpoint, ProviderSessionOptions } from "./Provider.ts";
 
 /** The first of `names` found on PATH (or an absolute path that exists), else null. */
 export const findExecutable = (names: ReadonlyArray<string>, path = process.env.PATH ?? ""): string | null => {
-  for (const name of names) {
+  // Windows CLIs are `name.exe` or npm's `name.cmd`.
+  const windows = process.platform === "win32";
+  const candidates = windows ? names.flatMap((n) => (/\.(exe|cmd|bat)$/i.test(n) ? [n] : [`${n}.exe`, `${n}.cmd`, n])) : names;
+  for (const name of candidates) {
+    if (windows && /^[a-z]:[\\/]|^\\\\/i.test(name)) {
+      if (existsSync(name)) return name;
+      continue;
+    }
     if (name.includes("/")) {
       try {
         accessSync(name, constants.X_OK);

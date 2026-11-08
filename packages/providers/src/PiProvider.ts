@@ -67,7 +67,12 @@ const spawnPi = (
     if (!command) return yield* fail(`Pi (\`pi\`) was not found. ${HINT}`);
     const child = yield* Effect.acquireRelease(
       Effect.try({
-        try: () => spawn(command, ["--mode", "rpc", ...args], { cwd, env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] }),
+        try: () => spawn(command, ["--mode", "rpc", ...args], {
+            cwd,
+            env: { ...process.env, ...env },
+            stdio: ["pipe", "pipe", "pipe"],
+            shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(command),
+          }),
         catch: (cause) => fail(`failed to start pi: ${String(cause)}`),
       }),
       (child) => Effect.sync(() => void (child.exitCode === null && child.signalCode === null && child.kill("SIGTERM"))),

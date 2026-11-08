@@ -1,0 +1,33 @@
+# Windows installers, built from macOS or Linux: `pnpm package:win` (output in release-win/),
+# one per architecture. The tailnet addon is built on Windows first
+# (apps/server/native/tailnet/build.ps1, into build/win-x64 and build/win-arm64).
+appId: dev.apollo.desktop
+productName: Apollo
+executableName: apollo
+directories:
+  output: release-win
+  buildResources: resources
+files:
+  - dist-electron/**/*
+  - package.json
+extraResources:
+  - from: build/server
+    to: server
+  - from: build/web
+    to: web
+  - from: resources/tray
+    to: tray
+  # Apollo's own Tailscale node for this architecture (build.ps1).
+  - from: ../server/native/tailnet/build/win-${arch}
+    to: native
+    filter: ["apollo_tailnet.node"]
+npmRebuild: false
+win:
+  target: [nsis]
+# Per-user, one click: installs to %LOCALAPPDATA%\Programs\Apollo without an admin prompt.
+nsis:
+  artifactName: Apollo-Setup-${version}-${arch}.${ext}
+  oneClick: true
+  perMachine: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true

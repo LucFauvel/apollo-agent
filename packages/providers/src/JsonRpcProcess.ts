@@ -58,6 +58,8 @@ export const spawnJsonRpcProcess = (options: {
             cwd: options.cwd,
             env: options.env ?? process.env,
             stdio: ["pipe", "pipe", "pipe"],
+            // Windows: npm's `.cmd` launchers only start through the shell.
+            shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(options.command),
           }),
         catch: (cause) => new JsonRpcFailure({ message: `failed to spawn ${options.command}: ${String(cause)}` }),
       }),
