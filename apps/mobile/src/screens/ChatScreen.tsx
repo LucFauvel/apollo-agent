@@ -1,5 +1,5 @@
 import {
-  cardRequestId,
+  cardsTick,
   currentChangesKey,
   dismissedCards,
   initialCards,
@@ -236,9 +236,12 @@ export function ChatScreen({
   useEffect(() => {
     if (!hasChanges) return;
     const id = sessionId;
+    // Issuing it makes every earlier answer for this view stale, whatever started either.
+    const fetchId = cardsTick();
+    dispatchCards({ type: "fetching", sessionId: id, fetchId });
     connection
       .rpc((c) => c["changes.conversation"]({ sessionId: id }))
-      .then((changes) => dispatchCards({ type: "fetched", sessionId: id, epoch: cardsEpoch, changes }))
+      .then((changes) => dispatchCards({ type: "fetched", sessionId: id, fetchId, changes }))
       .catch(() => {}); // the cards still show, without summaries
   }, [connection, sessionId, changesVersion, hasChanges, cardsEpoch]);
   const cards = useMemo<ChangesCards>(() => {
@@ -250,14 +253,14 @@ export function ChatScreen({
       dismissed: dismissedCards(own),
       justCleared: own.justCleared,
       setDismissed: (seq, value) => {
-        const id = cardRequestId();
+        const id = cardsTick();
         const forSession = sessionId;
         animateLayout();
         dispatchCards({ type: "requested", sessionId: forSession, id, seq, dismissed: value });
         connection.rpc((c) => c["changes.dismiss"]({ sessionId: forSession, seq, dismissed: value })).then(
-          () => dispatchCards({ type: "settled", sessionId: forSession, id, seq, ok: true }),
+          () => dispatchCards({ type: "settled", sessionId: forSession, id, seq, ok: true, tick: cardsTick() }),
           (e) => {
-            dispatchCards({ type: "settled", sessionId: forSession, id, seq, ok: false });
+            dispatchCards({ type: "settled", sessionId: forSession, id, seq, ok: false, tick: cardsTick() });
             if (shownSession.current === forSession) setError(errorMessage(e));
           },
         );

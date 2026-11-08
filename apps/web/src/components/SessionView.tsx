@@ -27,7 +27,7 @@ import {
   Trash2,
 } from "lucide-react";
 import {
-  cardRequestId,
+  cardsTick,
   currentChangesKey,
   dismissedCards,
   initialCards,
@@ -685,8 +685,11 @@ function useChangesCards(session: Session, items: ReadonlyArray<{ kind: string; 
   useEffect(() => {
     if (!enabled) return;
     const sessionId = session.id;
+    // Issuing it makes every earlier answer for this view stale, whatever started either.
+    const fetchId = cardsTick();
+    dispatch({ type: "fetching", sessionId, fetchId });
     rpc((c) => c["changes.conversation"]({ sessionId }))
-      .then((changes) => dispatch({ type: "fetched", sessionId, epoch, changes }))
+      .then((changes) => dispatch({ type: "fetched", sessionId, fetchId, changes }))
       .catch(() => {}); // the cards still show, without summaries
   }, [session.id, version, enabled, epoch]);
   const current = useMemo(() => currentChangesKey(items), [items]);
@@ -696,12 +699,12 @@ function useChangesCards(session: Session, items: ReadonlyArray<{ kind: string; 
   const dismissed = useMemo(() => dismissedCards(own), [own]);
   const setDismissed = (seq: number, value: boolean) => {
     const sessionId = session.id;
-    const id = cardRequestId();
+    const id = cardsTick();
     dispatch({ type: "requested", sessionId, id, seq, dismissed: value });
     rpc((c) => c["changes.dismiss"]({ sessionId, seq, dismissed: value })).then(
-      () => dispatch({ type: "settled", sessionId, id, seq, ok: true }),
+      () => dispatch({ type: "settled", sessionId, id, seq, ok: true, tick: cardsTick() }),
       (e) => {
-        dispatch({ type: "settled", sessionId, id, seq, ok: false });
+        dispatch({ type: "settled", sessionId, id, seq, ok: false, tick: cardsTick() });
         if (shown.current === sessionId) alert(errorMessage(e));
       },
     );
