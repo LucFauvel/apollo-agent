@@ -195,7 +195,7 @@ export const layerWatcher = Layer.effectDiscard(
           if (event._tag === "TurnStarted") lastReply.delete(sessionId);
           if (event._tag === "AssistantMessage") lastReply.set(sessionId, event.text);
           // (Secret requests arrive as a Notify from the secrets service, handled below.)
-          if (!["ApprovalRequested", "InputRequested", "TurnCompleted"].includes(event._tag)) return;
+          if (!["ApprovalRequested", "InputRequested", "BrowserHandoff", "TurnCompleted"].includes(event._tag)) return;
           const session = yield* store.getSession(sessionId);
           // Reflections work in the background and never need the user.
           if (session.role === "reflection") return;
