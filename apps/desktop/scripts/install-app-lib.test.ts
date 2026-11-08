@@ -1,38 +1,44 @@
 /**
- * install:app's decisions, with fakes for the filesystem, the clock and the app. Nothing
- * here touches /Applications or the running Apollo: the only real runs of the script use
- * --dry-run against a temporary data directory.
+ * install:app's building blocks, with fakes for the clock and temporary directories for
+ * files and databases. Nothing here touches /Applications, ~/.apollo or the running Apollo:
+ * the only real runs of the script use --dry-run against a temporary data directory.
  */
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import {
+  acquireLock,
   backoff,
   checkSchema,
   childArgs,
+  healthUrls,
   isHealthyResponse,
+  listenersFromLsof,
   listSnapshots,
+  lockHolder,
   parseArgs,
   plan,
-  portFromPsEnv,
-  portsFromLsof,
+  portsFromPsEnv,
   pruneSnapshots,
-  readDbVersion,
-  recoverIfNeeded,
-  recoveryDbAction,
+  readMarker,
+  realFileOps,
+  realSqliteOps,
   relaunchUntilHealthy,
-  restoreDbSnapshot,
+  releaseLock,
   restorePrevious,
-  snapshotDb,
+  restoreSnapshot,
+  staysHealthy,
   swap,
-  swapAndVerify,
+  takeSnapshot,
+  validateSnapshot,
   waitForIdle,
   writeResult,
   type BundleFs,
   type Bundles,
+  type FileOps,
   type InstallResult,
 } from "./install-app-lib.ts";
 
@@ -71,6 +77,24 @@ const fakeClock = () => {
   };
 };
 
+const tmp = (name: string) => mkdtempSync(join(tmpdir(), `install-app-${name}-`));
+const makeDb = (path: string, version: number) => {
+  const db = new DatabaseSync(path);
+  db.exec(`create table if not exists t (v integer); insert into t values (${version}); pragma user_version = ${version}`);
+  db.close();
+};
+/** Real file operations, failing where `fail` says. */
+const failing = (fail: (op: keyof FileOps, args: ReadonlyArray<string>) => boolean): FileOps =>
+  Object.fromEntries(
+    Object.entries(realFileOps).map(([op, fn]) => [
+      op,
+      (...args: Array<string>) => {
+        if (fail(op as keyof FileOps, args)) throw new Error(`${op}: injected failure`);
+        return (fn as (...a: Array<string>) => unknown)(...args);
+      },
+    ]),
+  ) as unknown as FileOps;
+
 describe("parseArgs", () => {
   it("defaults", () => {
     expect(parseArgs([])).toEqual({ detach: false, now: false, waitTimeoutMs: 120 * 60_000, force: false, dryRun: false, noOpen: false, detachedChild: false });
@@ -104,14 +128,29 @@ describe("database guard", () => {
     const forced = checkSchema(20, 19, true);
     expect(forced.ok && forced.note).toMatch(/--force/);
   });
-  it("reads user_version from a database file", () => {
+  it("inspects a database file: version and soundness", () => {
     const dir = mkdtempSync(join(tmpdir(), "install-app-db-"));
     const path = join(dir, "apollo.db");
-    expect(readDbVersion(path)).toBeNull();
+    expect(realSqliteOps.inspect(path)).toBeNull();
     const db = new DatabaseSync(path);
     db.exec("pragma user_version = 7");
     db.close();
-    expect(readDbVersion(path)).toBe(7);
+    expect(realSqliteOps.inspect(path)).toEqual({ version: 7, ok: true });
+    writeFileSync(path, "not a database at all, padded ".repeat(200));
+    expect(realSqliteOps.inspect(path)?.ok).toBe(false);
+    // Opens, reads its version, but fails quick_check: two cell pointers to one cell.
+    const torn = join(mkdtempSync(join(tmpdir(), "install-app-db-")), "torn.db");
+    const db2 = new DatabaseSync(torn);
+    db2.exec("pragma page_size = 4096; create table t (v text); pragma user_version = 3;");
+    const insert = db2.prepare("insert into t values (?)");
+    for (let i = 0; i < 500; i++) insert.run(`${"x".repeat(100)}${i}`);
+    db2.close();
+    const fd = openSync(torn, "r+");
+    const header = Buffer.alloc(10);
+    readSync(fd, header, 0, 10, 2 * 4096);
+    writeSync(fd, header.subarray(8, 10), 0, 2, 2 * 4096 + 10);
+    closeSync(fd);
+    expect(realSqliteOps.inspect(torn)).toEqual({ version: 3, ok: false });
   });
 });
 
@@ -138,21 +177,31 @@ describe("waitForIdle", () => {
 });
 
 describe("health", () => {
-  it("finds APOLLO_PORT in the server's environment", () => {
-    const ps = "/Applications/Apollo.app/Contents/MacOS/apollo /Applications/Apollo.app/Contents/Resources/server/server.mjs USER=me APOLLO_PORT=57686 APOLLO_HOST=127.0.0.1";
-    expect(portFromPsEnv(ps)).toBe(57686);
-    expect(portFromPsEnv("x XAPOLLO_PORT=1 APOLLO_PORTS=2")).toBeNull();
-    expect(portFromPsEnv("x APOLLO_PORT=99999")).toBeNull();
-    expect(portFromPsEnv("")).toBeNull();
+  it("finds APOLLO_PORT tokens, exact name only", () => {
+    expect(portsFromPsEnv("/x/apollo /x/server.mjs USER=me APOLLO_PORT=57686 APOLLO_HOST=127.0.0.1")).toEqual([57686]);
+    expect(portsFromPsEnv("x XAPOLLO_PORT=1 APOLLO_PORTS=2 APOLLO_NODE_PORT=3 APOLLO_PORT=4x")).toEqual([]);
+    expect(portsFromPsEnv("x APOLLO_PORT=99999")).toEqual([]);
+    expect(portsFromPsEnv("x --note APOLLO_PORT=5733 USER=me APOLLO_PORT=64000")).toEqual([5733, 64000]);
   });
-  it("lists only loopback listening ports from lsof", () => {
+  it("lists loopback listeners from lsof, IPv6 included, wildcard excluded", () => {
     const lsof = [
       "COMMAND   PID    USER   FD   TYPE  DEVICE SIZE/OFF NODE NAME",
       "apollo  86317 me   19u  IPv4 0x1      0t0  TCP 127.0.0.1:57686 (LISTEN)",
-      "apollo  86317 me   23u  IPv4 0x2      0t0  TCP 127.0.0.1:57896 (LISTEN)",
+      "apollo  86317 me   23u  IPv6 0x2      0t0  TCP [::1]:57896 (LISTEN)",
       "apollo  86317 me   37u  IPv4 0x3      0t0  TCP *:47468 (LISTEN)",
     ].join("\n");
-    expect(portsFromLsof(lsof)).toEqual([57686, 57896]);
+    expect(listenersFromLsof(lsof)).toEqual([
+      { host: "127.0.0.1", port: 57686 },
+      { host: "[::1]", port: 57896 },
+    ]);
+  });
+  it("asks only ports the server really listens on: a forged APOLLO_PORT is ignored", () => {
+    const lsof = "apollo 1 me 19u IPv4 0x1 0t0 TCP 127.0.0.1:64000 (LISTEN)\napollo 1 me 20u IPv4 0x1 0t0 TCP 127.0.0.1:64001 (LISTEN)";
+    expect(healthUrls("x --note APOLLO_PORT=5733 USER=me APOLLO_PORT=64000", lsof)).toEqual(["http://127.0.0.1:64000/health"]);
+    // No APOLLO_PORT: every loopback port of that process.
+    expect(healthUrls("x", lsof)).toEqual(["http://127.0.0.1:64000/health", "http://127.0.0.1:64001/health"]);
+    expect(healthUrls("x APOLLO_PORT=5733", lsof)).toEqual([]);
+    expect(healthUrls("x APOLLO_PORT=1", "a 1 me 1u IPv6 0 0t0 TCP [::1]:1 (LISTEN)")).toEqual(["http://[::1]:1/health"]);
   });
   it("only a 200 {ok:true} is healthy", () => {
     expect(isHealthyResponse(200, '{"ok":true}')).toBe(true);
@@ -160,6 +209,13 @@ describe("health", () => {
     expect(isHealthyResponse(200, '{"ok":"true"}')).toBe(false);
     expect(isHealthyResponse(401, '{"ok":true}')).toBe(false);
     expect(isHealthyResponse(200, "<html>")).toBe(false);
+  });
+  it("staysHealthy needs every sample", async () => {
+    const clock = fakeClock();
+    let calls = 0;
+    expect(await staysHealthy({ healthy: async () => ++calls !== 3, sleep: clock.sleep, samples: 3, intervalMs: 5000 })).toBe(false);
+    expect(await staysHealthy({ healthy: async () => true, sleep: clock.sleep, samples: 3, intervalMs: 5000 })).toBe(true);
+    expect(clock.now()).toBe(30_000);
   });
 });
 
@@ -211,169 +267,186 @@ describe("bundles", () => {
     expect(Object.fromEntries(files)).toEqual({ [B.target]: "old", [B.failed]: "new" });
     expect(restorePrevious(fakeFs({ [B.target]: "new" }).fs, B)).toBe(false);
   });
-  it("recovery restores previous only when the app is missing", () => {
-    const missing = fakeFs({ [B.previous]: "old" });
-    expect(recoverIfNeeded(missing.fs, B)).toBe(true);
-    expect(Object.fromEntries(missing.files)).toEqual({ [B.target]: "old" });
-    const present = fakeFs({ [B.target]: "new", [B.previous]: "old" });
-    expect(recoverIfNeeded(present.fs, B)).toBe(false);
-    expect(present.ops).toEqual([]);
-    expect(recoverIfNeeded(fakeFs({}).fs, B)).toBe(false);
-  });
 });
-
-describe("swapAndVerify", () => {
-  const run = async (initial: Record<string, string>, health: Array<boolean>, open = true) => {
-    const { fs, files, ops } = fakeFs(initial);
-    const events: Array<string> = [];
-    const outcome = await swapAndVerify({
-      fs,
-      bundles: B,
-      relaunch: async () => {
-        events.push(`relaunch ${files.get(B.target)}`);
-        return health.shift() ?? false;
-      },
-      stopApp: async () => void events.push(`stop ${files.get(B.target)}`),
-      // Each records which app is in place when it runs.
-      snapshotData: () => void events.push(`snapshot ${files.get(B.target) ?? "none"} staged=${files.get(B.staged)}`),
-      restoreData: () => void events.push(`restore-db ${files.get(B.target)}`),
-      log: () => {},
-      open,
-    });
-    return { outcome, files: Object.fromEntries(files), ops, events };
-  };
-
-  it("healthy: the previous app is deleted only after /health passed", async () => {
-    const r = await run({ [B.target]: "old", [B.staged]: "new" }, [true]);
-    expect(r.outcome).toEqual({ status: "ok", stage: "healthy" });
-    expect(r.files).toEqual({ [B.target]: "new" });
-    expect(r.events).toEqual(["snapshot old staged=new", "relaunch new"]);
-    expect(r.ops.at(-1)).toBe(`rm ${B.previous}`);
-  });
-  it("unhealthy: stops the new app, restores the previous one and relaunches it", async () => {
-    const r = await run({ [B.target]: "old", [B.staged]: "new" }, [false, true]);
-    expect(r.outcome.status).toBe("rolled-back");
-    expect(r.files).toEqual({ [B.target]: "old", [B.failed]: "new" });
-    // The database goes back after the new app is stopped and the old one is in place, before it opens.
-    expect(r.events).toEqual(["snapshot old staged=new", "relaunch new", "stop new", "restore-db old", "relaunch old"]);
-  });
-  it("rollback that is not healthy either is a failure, with the old app still in place", async () => {
-    const r = await run({ [B.target]: "old", [B.staged]: "new" }, [false, false]);
-    expect(r.outcome).toMatchObject({ status: "failed", stage: "rollback-unhealthy" });
-    expect(r.files[B.target]).toBe("old");
-  });
-  it("first install (no previous app) that is unhealthy fails without removing it", async () => {
-    const r = await run({ [B.staged]: "new" }, [false]);
-    expect(r.outcome).toMatchObject({ status: "failed", stage: "no-previous" });
-    expect(r.files).toEqual({ [B.target]: "new" });
-    expect(r.events).not.toContain("restore-db new");
-  });
-  it("--no-open keeps the previous app (its health is unknown)", async () => {
-    const r = await run({ [B.target]: "old", [B.staged]: "new" }, [], false);
-    expect(r.outcome).toEqual({ status: "ok", stage: "installed-not-opened" });
-    expect(r.files).toEqual({ [B.target]: "new", [B.previous]: "old" });
-    expect(r.events).toEqual(["snapshot old staged=new"]);
-  });
-});
-
-const tmp = (name: string) => mkdtempSync(join(tmpdir(), `install-app-${name}-`));
-const makeDb = (path: string, version: number) => {
-  const db = new DatabaseSync(path);
-  db.exec(`create table if not exists t (v integer); insert into t values (${version}); pragma user_version = ${version}`);
-  db.close();
-};
 
 describe("database snapshots", () => {
-  it("copies the database with its -wal and records the schema", () => {
+  it("one self-contained file (the -wal folded in), with its version and SHA-256", () => {
     const data = tmp("snap");
     const dbPath = join(data, "apollo.db");
     makeDb(dbPath, 5);
-    writeFileSync(`${dbPath}-wal`, "");
-    const snap = snapshotDb({ dbPath, backupsDir: join(data, "backups"), label: "abc123/dirty", now: 1000 });
+    // A database left in WAL mode with committed data still in the -wal.
+    const live = new DatabaseSync(dbPath);
+    live.exec("pragma journal_mode = wal; pragma wal_autocheckpoint = 0; insert into t values (42)");
+    expect(existsSync(`${dbPath}-wal`)).toBe(true);
+    const snap = takeSnapshot({ dbPath, backupsDir: join(data, "backups"), label: "abc123/dirty", now: 1000 })!;
+    live.close();
     expect(snap).toEqual({ dir: join(data, "backups", "pre-update-1000-abc123_dirty"), createdAt: 1000, dbVersion: 5 });
-    expect(readdirSync(snap!.dir).sort()).toEqual(["apollo.db", "apollo.db-wal", "snapshot.json"]);
-    expect(listSnapshots(join(data, "backups"))).toEqual([snap]);
-    expect(snapshotDb({ dbPath: join(data, "none.db"), backupsDir: join(data, "backups"), label: "x", now: 2 })).toBeNull();
+    expect(readdirSync(snap.dir).sort()).toEqual(["apollo.db", "snapshot.json"]);
+    const copy = new DatabaseSync(join(snap.dir, "apollo.db"), { readOnly: true });
+    expect(copy.prepare("select count(*) as n from t where v = 42").get()).toEqual({ n: 1 });
+    copy.close();
+    expect(validateSnapshot(snap.dir)).toEqual({ ok: true, version: 5, file: join(snap.dir, "apollo.db") });
+    expect(takeSnapshot({ dbPath: join(data, "none.db"), backupsDir: join(data, "backups"), label: "x", now: 2 })).toBeNull();
   });
 
-  it("restore puts the snapshot back, moving the newer database and its stale -wal/-shm aside", () => {
+  it("validation refuses a changed file, a wrong recorded version, a missing manifest", () => {
+    const data = tmp("validate");
+    const dbPath = join(data, "apollo.db");
+    makeDb(dbPath, 5);
+    const a = takeSnapshot({ dbPath, backupsDir: join(data, "b"), label: "a", now: 1 })!;
+    writeFileSync(join(a.dir, "apollo.db"), "not a SQLite database");
+    expect(validateSnapshot(a.dir)).toMatchObject({ ok: false, reason: expect.stringMatching(/SHA-256/) });
+    const b = takeSnapshot({ dbPath, backupsDir: join(data, "b"), label: "b", now: 2 })!;
+    const manifest = JSON.parse(readFileSync(join(b.dir, "snapshot.json"), "utf8"));
+    writeFileSync(join(b.dir, "snapshot.json"), JSON.stringify({ ...manifest, dbVersion: 4 }));
+    expect(validateSnapshot(b.dir)).toMatchObject({ ok: false, reason: expect.stringMatching(/recorded as 4/) });
+    const c = join(data, "b", "pre-update-3-c");
+    mkdirSync(c);
+    expect(validateSnapshot(c)).toMatchObject({ ok: false });
+    // A file whose hash matches but SQLite cannot read (hash recorded over garbage).
+    const d = takeSnapshot({ dbPath, backupsDir: join(data, "b"), label: "d", now: 4 })!;
+    writeFileSync(join(d.dir, "apollo.db"), "garbage ".repeat(100));
+    const md = JSON.parse(readFileSync(join(d.dir, "snapshot.json"), "utf8"));
+    writeFileSync(join(d.dir, "snapshot.json"), JSON.stringify({ ...md, sha256: { "apollo.db": realFileOps.sha256(join(d.dir, "apollo.db")) } }));
+    expect(validateSnapshot(d.dir)).toMatchObject({ ok: false, reason: expect.stringMatching(/not a sound SQLite/) });
+  });
+
+  it("restore: the snapshot in place, the replaced database and its stale -wal/-shm kept aside", () => {
     const data = tmp("restore");
     const dbPath = join(data, "apollo.db");
     makeDb(dbPath, 5);
-    const snap = snapshotDb({ dbPath, backupsDir: join(data, "backups"), label: "c", now: 1 })!;
-    // The new build migrated, and was killed with a write-ahead log in place.
-    const db = new DatabaseSync(dbPath);
-    db.exec("pragma user_version = 7");
-    db.close();
+    const snap = takeSnapshot({ dbPath, backupsDir: join(data, "backups"), label: "c", now: 1 })!;
+    makeDb(dbPath, 7);
     writeFileSync(`${dbPath}-wal`, "new build's wal");
     writeFileSync(`${dbPath}-shm`, "new build's shm");
-    const aside = restoreDbSnapshot({ snapshotDir: snap.dir, dbPath, now: 2 });
-    expect(readDbVersion(dbPath)).toBe(5);
-    expect(existsSync(`${dbPath}-wal`)).toBe(false);
-    expect(existsSync(`${dbPath}-shm`)).toBe(false);
+    let committed = 0;
+    const { aside, version } = restoreSnapshot({ snapshotDir: snap.dir, dbPath, now: 2, beforeCommit: () => void committed++ });
+    expect(committed).toBe(1);
+    expect(version).toBe(5);
+    expect(realSqliteOps.inspect(dbPath)).toEqual({ version: 5, ok: true });
     expect(readdirSync(data).sort()).toEqual(["apollo.db", "backups"]);
     expect(readdirSync(aside).sort()).toEqual(["apollo.db", "apollo.db-shm", "apollo.db-wal"]);
-    expect(readDbVersion(join(aside, "apollo.db"))).toBe(7);
-    // The snapshot itself is still there, to restore again.
-    expect(readDbVersion(join(snap.dir, "apollo.db"))).toBe(5);
+    expect(realSqliteOps.inspect(join(aside, "apollo.db"))?.version).toBe(7);
+    expect(validateSnapshot(snap.dir).ok).toBe(true);
   });
 
-  it("a snapshot without a database leaves the current one alone", () => {
+  it("restore refuses an invalid snapshot and leaves the database alone", () => {
     const data = tmp("restore-bad");
     const dbPath = join(data, "apollo.db");
+    makeDb(dbPath, 5);
+    const snap = takeSnapshot({ dbPath, backupsDir: join(data, "backups"), label: "c", now: 1 })!;
+    writeFileSync(join(snap.dir, "apollo.db"), "not a SQLite database");
     makeDb(dbPath, 7);
-    const empty = join(data, "backups", "pre-update-1-x");
-    mkdirSync(empty, { recursive: true });
-    expect(() => restoreDbSnapshot({ snapshotDir: empty, dbPath, now: 2 })).toThrow(/No database/);
-    expect(readDbVersion(dbPath)).toBe(7);
+    expect(() => restoreSnapshot({ snapshotDir: snap.dir, dbPath, now: 2, beforeCommit: () => {} })).toThrow(/not usable/);
+    expect(realSqliteOps.inspect(dbPath)?.version).toBe(7);
   });
 
-  it("prune keeps the newest, and always the one just taken", () => {
+  it("a failure before the commit changes nothing; beforeCommit failing stops it too", () => {
+    const data = tmp("restore-early");
+    const dbPath = join(data, "apollo.db");
+    makeDb(dbPath, 5);
+    const snap = takeSnapshot({ dbPath, backupsDir: join(data, "backups"), label: "c", now: 1 })!;
+    makeDb(dbPath, 7);
+    writeFileSync(`${dbPath}-wal`, "");
+    let committed = 0;
+    const copyFails = failing((op, [, to]) => op === "copy" && to!.includes(".restore-"));
+    expect(() => restoreSnapshot({ snapshotDir: snap.dir, dbPath, now: 2, beforeCommit: () => void committed++ }, copyFails)).toThrow();
+    expect(committed).toBe(0);
+    expect(realSqliteOps.inspect(dbPath)?.version).toBe(7);
+    expect(existsSync(`${dbPath}-wal`)).toBe(true);
+    expect(() =>
+      restoreSnapshot({ snapshotDir: snap.dir, dbPath, now: 3, beforeCommit: () => { throw new Error("marker: ENOSPC"); } }),
+    ).toThrow(/ENOSPC/);
+    expect(realSqliteOps.inspect(dbPath)?.version).toBe(7);
+    expect(existsSync(`${dbPath}-wal`)).toBe(true);
+  });
+
+  it("a copy that does not match the snapshot is caught before anything changes", () => {
+    const data = tmp("restore-copy");
+    const dbPath = join(data, "apollo.db");
+    makeDb(dbPath, 5);
+    const snap = takeSnapshot({ dbPath, backupsDir: join(data, "backups"), label: "c", now: 1 })!;
+    makeDb(dbPath, 7);
+    let committed = 0;
+    const corrupting: FileOps = {
+      ...realFileOps,
+      copy: (from, to) => (to.includes(".restore-") ? writeFileSync(to, "torn copy") : realFileOps.copy(from, to)),
+    };
+    expect(() => restoreSnapshot({ snapshotDir: snap.dir, dbPath, now: 2, beforeCommit: () => void committed++ }, corrupting)).toThrow(/does not match/);
+    // Same hash, but not readable at the right version (a lying SQLite read of the copy).
+    const badCopy = { ...realSqliteOps, inspect: (p: string) => (p.includes(".restore-") ? { version: 5, ok: false } : realSqliteOps.inspect(p)) };
+    expect(() => restoreSnapshot({ snapshotDir: snap.dir, dbPath, now: 3, beforeCommit: () => void committed++ }, realFileOps, badCopy)).toThrow(/not readable/);
+    expect(committed).toBe(0);
+    expect(realSqliteOps.inspect(dbPath)?.version).toBe(7);
+  });
+
+  it("an interrupted commit never leaves no database: the replaced one stays until the copy is renamed in", () => {
+    const data = tmp("restore-commit");
+    const dbPath = join(data, "apollo.db");
+    makeDb(dbPath, 5);
+    const snap = takeSnapshot({ dbPath, backupsDir: join(data, "backups"), label: "c", now: 1 })!;
+    makeDb(dbPath, 7);
+    const renameFails = failing((op, [from]) => op === "rename" && from!.includes(".restore-"));
+    expect(() => restoreSnapshot({ snapshotDir: snap.dir, dbPath, now: 2, beforeCommit: () => {} }, renameFails)).toThrow();
+    expect(realSqliteOps.inspect(dbPath)?.version).toBe(7);
+    // And a copy that does not read back after the rename is reported.
+    const badRead = { ...realSqliteOps, inspect: (p: string) => (p === dbPath ? { version: 5, ok: false } : realSqliteOps.inspect(p)) };
+    expect(() => restoreSnapshot({ snapshotDir: snap.dir, dbPath, now: 3, beforeCommit: () => {} }, realFileOps, badRead)).toThrow(/does not read back/);
+  });
+
+  it("prune keeps the newest, and always the protected ones", () => {
     const data = tmp("prune");
     const dbPath = join(data, "apollo.db");
     makeDb(dbPath, 1);
     const backups = join(data, "backups");
-    const snaps = [10, 40, 20, 30].map((now) => snapshotDb({ dbPath, backupsDir: backups, label: "c", now })!);
+    const snaps = [10, 40, 20, 30].map((now) => takeSnapshot({ dbPath, backupsDir: backups, label: "c", now })!);
     mkdirSync(join(backups, "pre-update-5-incomplete"));
     mkdirSync(join(backups, "unrelated"));
     expect(listSnapshots(backups).map((s) => s.createdAt)).toEqual([40, 30, 20, 10, 5]);
-    const removed = pruneSnapshots(backups, 2, snaps[2]!.dir);
-    expect(removed.sort()).toEqual([snaps[0]!.dir, snaps[3]!.dir, join(backups, "pre-update-5-incomplete")].sort());
-    expect(listSnapshots(backups).map((s) => s.createdAt)).toEqual([40, 20]);
+    const removed = pruneSnapshots(backups, 2, [snaps[2]!.dir]);
+    expect(removed.sort()).toEqual([snaps[0]!.dir, join(backups, "pre-update-5-incomplete")].sort());
+    expect(listSnapshots(backups).map((s) => s.createdAt)).toEqual([40, 30, 20]);
     expect(existsSync(join(backups, "unrelated"))).toBe(true);
-    pruneSnapshots(backups, 2, null);
-    expect(listSnapshots(backups).map((s) => s.createdAt)).toEqual([40, 20]);
+    pruneSnapshots(backups, 2, []);
+    expect(listSnapshots(backups).map((s) => s.createdAt)).toEqual([40, 30]);
   });
+});
 
-  it("recovery restores the database only when it is newer than the restored app and a readable snapshot exists", () => {
-    const snap = (dbVersion: number | null) => ({ dir: "/b/pre-update-1-x", createdAt: 1, dbVersion });
-    expect(recoveryDbAction(19, 19, snap(19))).toEqual({ action: "none" });
-    expect(recoveryDbAction(null, 19, snap(19))).toEqual({ action: "none" });
-    expect(recoveryDbAction(20, 19, snap(19))).toEqual({ action: "restore", snapshot: snap(19) });
-    expect(recoveryDbAction(20, 19, snap(20)).action).toBe("stuck");
-    expect(recoveryDbAction(20, 19, snap(null)).action).toBe("stuck");
-    expect(recoveryDbAction(20, 19, null).action).toBe("stuck");
+describe("lock", () => {
+  it("one holder at a time; a dead or reused pid is stale", () => {
+    const dir = tmp("lock");
+    const path = join(dir, "install-app.lock");
+    const alive = new Set([1, 2]);
+    const isInstaller = (pid: number) => alive.has(pid);
+    expect(acquireLock(path, { pid: 1, startedAt: "a" }, isInstaller)).toEqual({ ok: true, tookOver: null });
+    expect(acquireLock(path, { pid: 2, startedAt: "b" }, isInstaller)).toEqual({ ok: false, holder: { pid: 1, startedAt: "a" } });
+    expect(lockHolder(path, isInstaller)).toEqual({ pid: 1, startedAt: "a" });
+    releaseLock(path, { pid: 2, startedAt: "b" });
+    expect(existsSync(path)).toBe(true);
+    alive.delete(1);
+    expect(lockHolder(path, isInstaller)).toBeNull();
+    expect(acquireLock(path, { pid: 2, startedAt: "b" }, isInstaller)).toEqual({ ok: true, tookOver: { pid: 1, startedAt: "a" } });
+    releaseLock(path, { pid: 2, startedAt: "b" });
+    expect(existsSync(path)).toBe(false);
+    writeFileSync(path, "garbage");
+    expect(acquireLock(path, { pid: 2, startedAt: "c" }, isInstaller).ok).toBe(true);
+  });
+  it("an unreadable marker still counts as an unfinished install", () => {
+    const dir = tmp("marker");
+    expect(readMarker(join(dir, "none.json"))).toBeNull();
+    writeFileSync(join(dir, "m.json"), "{");
+    expect(readMarker(join(dir, "m.json"))).toMatchObject({ phase: "rolling-back" });
   });
 });
 
 describe("writeResult", () => {
   it("writes the whole JSON file in place, replacing the last one", () => {
-    const dir = mkdtempSync(join(tmpdir(), "install-app-result-"));
+    const dir = tmp("result");
     const path = join(dir, "logs", "install-app-last.result");
-    const result: InstallResult = {
-      status: "running",
-      stage: "build",
-      build: null,
-      startedAt: "2026-11-08T00:00:00.000Z",
-      finishedAt: null,
-      error: null,
-      log: null,
-      pid: 1,
-      snapshot: null,
-    };
+    const result: InstallResult = { status: "running", stage: "build", build: null, startedAt: "s", finishedAt: null, error: null, manual: null, log: null, pid: 1, snapshot: null };
     writeResult(path, result);
-    writeResult(path, { ...result, status: "rolled-back", stage: "rollback-healthy", error: "boom", finishedAt: "2026-11-08T00:01:00.000Z" });
-    expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({ status: "rolled-back", stage: "rollback-healthy", error: "boom" });
+    writeResult(path, { ...result, status: "rolled-back", stage: "rollback", error: "boom", finishedAt: "f" });
+    expect(JSON.parse(readFileSync(path, "utf8"))).toMatchObject({ status: "rolled-back", stage: "rollback", error: "boom" });
     expect(readdirSync(join(dir, "logs"))).toEqual(["install-app-last.result"]);
   });
 });
@@ -383,24 +456,29 @@ describe("plan", () => {
     options: parseArgs([]),
     targetExists: true,
     previousExists: false,
-    running: ["installed pid 1"],
+    marker: null,
+    lock: null,
+    running: ["installed 1"],
     busy: [],
     schema: checkSchema(19, 19, false),
     bundles: B,
     hasDb: true,
     backupsDir: "/data/backups",
   };
-  it("recovery comes first, and is all that happens", () => {
+  it("a held lock, then recovery, come first", () => {
+    expect(plan({ ...base, lock: { pid: 9, startedAt: "x" } })).toEqual([expect.stringMatching(/^Refuse: another install:app \(pid 9/)]);
     expect(plan({ ...base, targetExists: false, previousExists: true })).toEqual([expect.stringMatching(/^Recovery/)]);
+    expect(plan({ ...base, marker: { phase: "restoring-db", startedAt: "x", pid: 1, snapshot: null, previousSchema: 18 } })).toEqual([expect.stringMatching(/^Recovery.*phase restoring-db/)]);
   });
   it("a newer database stops everything", () => {
     expect(plan({ ...base, schema: checkSchema(20, 19, false) })).toEqual([expect.stringMatching(/^Refuse/)]);
   });
-  it("waits for busy bots, with the timeout", () => {
+  it("waits, stops, snapshots, swaps, verifies, rolls back", () => {
     const steps = plan({ ...base, busy: ["Ceres / x (running)"], options: parseArgs(["--wait-timeout", "15"]) }).join("\n");
     expect(steps).toMatch(/Wait up to 15 min for: Ceres \/ x.*abort/);
-    expect(steps).toMatch(/Snapshot the database to \/data\/backups\/pre-update-…, keeping the last 2\nSwap:/);
-    expect(steps).toMatch(/Not healthy: stop it.*restore the database snapshot, open/);
+    expect(steps).toMatch(/Snapshot the database to \/data\/backups\/pre-update-….*keeping the last 2\nSwap:/);
+    expect(steps).toMatch(/stay healthy for 15 s/);
+    expect(steps).toMatch(/Not healthy .*restore the database snapshot .*nothing is opened/);
   });
   it("--now and --no-open", () => {
     const steps = plan({ ...base, busy: ["Ceres / x (running)"], options: parseArgs(["--now", "--no-open"]) }).join("\n");
@@ -414,34 +492,56 @@ describe("install-app.ts --dry-run (real script, temporary data directory)", () 
   const script = join(import.meta.dirname, "install-app.ts");
   const dryRun = (dataDir: string, ...args: Array<string>) =>
     spawnSync(process.execPath, [script, "--dry-run", ...args], { encoding: "utf8", env: { ...process.env, APOLLO_DATA_DIR: dataDir }, timeout: 30_000 });
+  /** Every file under a directory, with size and modification time. */
+  const snapshotTree = (dir: string): Record<string, string> => {
+    const out: Record<string, string> = {};
+    const walk = (d: string) => {
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        const p = join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else {
+          const s = statSync(p);
+          out[p] = `${s.size}:${s.mtimeMs}`;
+        }
+      }
+    };
+    walk(dir);
+    return out;
+  };
 
-  it("prints a plan, writes no result file", () => {
-    const dir = mkdtempSync(join(tmpdir(), "install-app-dry-"));
-    const r = dryRun(dir);
-    expect(r.status).toBe(0);
-    expect(r.stdout).toMatch(/Dry run: nothing is built, quit or moved/);
-    expect(r.stdout).toMatch(/Database: no database yet/);
-    expect(existsSync(join(dir, "logs", "install-app-last.result"))).toBe(false);
+  it("writes nothing at all, even with a WAL database without -shm and --detach", () => {
+    const dir = tmp("dry");
+    const dbPath = join(dir, "apollo.db");
+    makeDb(dbPath, 19);
+    const live = new DatabaseSync(dbPath);
+    live.exec("pragma journal_mode = wal; pragma wal_autocheckpoint = 0; insert into t values (1)");
+    // Keep the -wal, lose the -shm, as after a crash.
+    const wal = readFileSync(`${dbPath}-wal`);
+    live.close();
+    writeFileSync(`${dbPath}-wal`, wal);
+    realFileOps.remove(`${dbPath}-shm`);
+    const before = snapshotTree(dir);
+    for (const args of [[], ["--detach"]]) {
+      const r = dryRun(dir, ...args);
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toMatch(/Dry run: nothing is built, stopped, moved or written/);
+      expect(r.stdout).toMatch(/Database: schema 19/);
+    }
+    expect(snapshotTree(dir)).toEqual(before);
   });
   it("refuses a newer database, unless --force", () => {
-    const dir = mkdtempSync(join(tmpdir(), "install-app-dry-"));
-    const db = new DatabaseSync(join(dir, "apollo.db"));
-    db.exec("pragma user_version = 100000");
-    db.close();
+    const dir = tmp("dry");
+    makeDb(join(dir, "apollo.db"), 100000);
     expect(dryRun(dir).stdout).toMatch(/Refuse: The database is at schema version 100000/);
     expect(dryRun(dir, "--force").stdout).toMatch(/Installing anyway \(--force\)/);
   });
-  it("--detach returns at once and the child logs to a file", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "install-app-dry-"));
-    const r = dryRun(dir, "--detach");
-    expect(r.status).toBe(0);
-    const logPath = /log:\s+(\S+)/.exec(r.stdout)?.[1];
-    expect(logPath).toMatch(new RegExp(`^${dir}/logs/install-app-\\d+\\.log$`));
-    for (let i = 0; i < 100 && !readFileSync(logPath!, "utf8").includes("Dry run"); i++) await new Promise((res) => setTimeout(res, 100));
-    expect(readFileSync(logPath!, "utf8")).toMatch(/Dry run: nothing is built/);
+  it("shows a pending install as recovery", () => {
+    const dir = tmp("dry");
+    writeFileSync(join(dir, "install-app.pending.json"), JSON.stringify({ phase: "verifying", startedAt: "x", pid: 1, snapshot: null, previousSchema: 18 }));
+    expect(dryRun(dir).stdout).toMatch(/Recovery: an install did not finish \(phase verifying\)/);
   });
   it("rejects unknown options before doing anything", () => {
-    const r = dryRun(mkdtempSync(join(tmpdir(), "install-app-dry-")), "--bogus");
+    const r = dryRun(tmp("dry"), "--bogus");
     expect(r.status).toBe(2);
     expect(r.stderr).toMatch(/Unknown option --bogus/);
   });
