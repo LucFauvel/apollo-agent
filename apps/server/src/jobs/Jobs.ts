@@ -215,6 +215,7 @@ const make = Effect.gen(function* () {
       process.kill(-pid, 0);
       return true;
     } catch (error) {
+      // EPERM: still there, e.g. a killed member not yet reaped by launchd (macOS).
       return (error as NodeJS.ErrnoException).code === "EPERM";
     }
   };
@@ -236,19 +237,25 @@ const make = Effect.gen(function* () {
     });
 
   /**
-   * Stops every job of a deleted bot, with everything each one started: SIGTERM to the
-   * process group, then SIGKILL to whatever of it is left after a grace period (even when
-   * the leader itself exited). None reports back to its (deleted) session; all are forgotten.
+   * Stops every running job of a deleted bot, with everything each one started: SIGTERM to
+   * the process group, then SIGKILL to whatever of it is left after a grace period (even when
+   * the leader itself exited meanwhile). None reports back to its (deleted) session; all are
+   * forgotten.
+   *
+   * Only a job whose leader is still running is signalled: until node reaps the leader its
+   * pid, hence its group id, cannot be reused, and the group keeps its id while any member
+   * lives, which is watched without a break (every 25 ms) until it is gone. A job that
+   * already finished has no claim on that number any more: the OS may have given it to an
+   * unrelated group. (Left: the inherent gap between a check and the signal that follows.)
    */
   const stopForBot = (botId: BotId) =>
     Effect.gen(function* () {
       const owned = [...jobs.values()].filter((j) => j.botId === botId);
-      for (const job of owned) {
-        job.orphaned = true;
-        if (groupAlive(job)) signalGroup(job, "SIGTERM");
-      }
+      const running = owned.filter((j) => j.endedAt === null);
+      for (const job of owned) job.orphaned = true;
+      for (const job of running) signalGroup(job, "SIGTERM");
       yield* Effect.forEach(
-        owned,
+        running,
         (job) =>
           Effect.gen(function* () {
             if (yield* groupGone(job, 3000)) return;

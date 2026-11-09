@@ -19,18 +19,18 @@ import * as Jobs from "./jobs/Jobs.ts";
 import * as SessionManager from "./SessionManager.ts";
 import * as Store from "./Store.ts";
 
-// Acceptance tests pinned from the round-1 adversarial review of bot deletion: each one
-// reproduces a reviewer probe (probes/server.ts, race-real.ts, post-row-real.ts).
+// Acceptance tests pinned from the adversarial reviews of bot deletion: each one reproduces
+// a reviewer probe (round 1: server.ts, race-real.ts, post-row-real.ts; round 2: residuals.ts, preclose.ts).
 
 const idle = (kind: ProviderKind): Provider => ({ kind, listModels: Effect.succeed([]), open: () => Effect.die("not used") });
 
-const fixture = (name: string) => {
+const fixture = (name: string, open: Provider["open"] = () => Effect.die("not used")) => {
   const dir = mkdtempSync(join(tmpdir(), `apollo-delete-${name}-`));
   const cwd = join(dir, "workspace");
   mkdirSync(cwd);
   const layer = Jobs.layer.pipe(
     Layer.provideMerge(SessionManager.layer),
-    Layer.provideMerge(Layer.succeed(SessionManager.Providers, Object.fromEntries(Kinds.literals.map((k) => [k, idle(k)])) as Record<ProviderKind, Provider>)),
+    Layer.provideMerge(Layer.succeed(SessionManager.Providers, Object.fromEntries(Kinds.literals.map((k) => [k, { ...idle(k), open }])) as Record<ProviderKind, Provider>)),
     Layer.provideMerge(AppSettings.layer),
     Layer.provideMerge(Store.layer),
     Layer.provideMerge(Database.layerMemory),
@@ -302,6 +302,125 @@ describe("deleting a bot (reviewer round 1)", () => {
       }
       expect(seen.filter((c) => c._tag === "BotDeleted")).toEqual([{ _tag: "BotDeleted", botId: bot.id }]);
       expect((yield* store.getCoreMemory(bot.id)).notes).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(f.layer));
+  });
+
+  it.live.skipIf(process.platform === "win32")(
+    "reviewer round 2 repro: deleting a bot never signals the process group of a job that already finished",
+    () => {
+      const f = fixture("old-pgid");
+      const original = process.kill;
+      return Effect.gen(function* () {
+        const manager = yield* SessionManager.SessionManager;
+        const jobs = yield* Jobs.Jobs;
+        const bot = yield* createBot(manager, "History", f.cwd);
+        const caller = { botId: bot.id, sessionId: bot.mainSessionId };
+        const job = yield* jobs.start(caller, { command: `exec ${process.execPath} -e 'console.log(process.pid)'`, notify: false });
+        const done = yield* jobs.wait(caller, job.jobId, 5);
+        expect(done.running).toBe(false);
+        const oldPid = Number(done.output.trim());
+        expect(oldPid).toBeGreaterThan(0);
+        // The OS hands the finished job's group id to an unrelated process group.
+        const signals: Array<string | number | undefined> = [];
+        let present = true;
+        process.kill = ((pid: number, signal?: string | number) => {
+          if (pid === -oldPid) {
+            if (!present) throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+            if (signal !== 0) {
+              signals.push(signal);
+              present = false; // the stranger dies of it
+            }
+            return true;
+          }
+          return original(pid, signal);
+        }) as typeof process.kill;
+        yield* manager.deleteBot(bot.id);
+        expect(signals).toEqual([]);
+      }).pipe(
+        Effect.ensuring(Effect.sync(() => void (process.kill = original))),
+        Effect.scoped,
+        Effect.provide(f.layer),
+      );
+    },
+  );
+
+  it.live("reviewer round 2 repro: a worktree that cannot be retired keeps the bot, and a retry completes the deletion", () => {
+    const f = fixture("dirty-worktree");
+    gitRepo(f.cwd);
+    const git = (...args: Array<string>) => execFileSync("git", args, { cwd: f.cwd, encoding: "utf8" });
+    return Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager, "Dirty", f.cwd);
+      const worker = yield* manager.createSession({ botId: bot.id, title: "w", provider: { provider: "codex" }, isolation: "worktree" });
+      writeFileSync(join(worker.cwd, "unsaved"), "owned data");
+      // The uncommitted work cannot be committed: no usable git identity.
+      git("config", "user.name", "");
+      git("config", "user.email", "");
+      const seen = yield* collect(manager);
+
+      const failed = yield* Effect.flip(manager.deleteBot(bot.id));
+      expect(failed.code).toBe("internal");
+      expect((yield* store.getBot(bot.id)).id).toBe(bot.id);
+      expect((yield* store.getSession(worker.id)).id).toBe(worker.id);
+      expect(existsSync(join(worker.cwd, "unsaved"))).toBe(true);
+      expect(seen.some((c) => c._tag === "BotDeleted")).toBe(false);
+
+      git("config", "user.name", "Test");
+      git("config", "user.email", "t@example.com");
+      yield* manager.deleteBot(bot.id);
+      yield* Effect.yieldNow;
+      expect(existsSync(worker.cwd)).toBe(false);
+      expect(git("worktree", "list", "--porcelain")).not.toContain(worker.cwd);
+      // The work is kept on its branch.
+      expect(git("show", `${worker.worktree!.branch}:unsaved`)).toBe("owned data");
+      expect(seen.at(-1)).toEqual({ _tag: "BotDeleted", botId: bot.id });
+    }).pipe(Effect.scoped, Effect.provide(f.layer));
+  });
+
+  it.live("reviewer round 2 repro: a provider that fails to close surfaces as a typed, retryable error", () => {
+    const f = fixture("preclose", (_options, emit) =>
+      Effect.gen(function* () {
+        yield* Effect.addFinalizer(() => Effect.die(new Error("provider cleanup failed")));
+        return {
+          send: () => emit({ _tag: "Event", event: { _tag: "TurnStarted" } }),
+          interrupt: Effect.void,
+          respondApproval: () => Effect.void,
+          respondInput: () => Effect.void,
+          compact: () => Effect.void,
+          commands: Effect.succeed([]),
+          reloadSkills: Effect.void,
+        };
+      }),
+    );
+    return Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager, "CloseFailure", f.cwd);
+      yield* manager.send(bot.mainSessionId, "test", "user");
+      const failed = yield* Effect.exit(manager.deleteBot(bot.id));
+      expect(Exit.isFailure(failed)).toBe(true);
+      expect(Exit.findErrorOption(failed)).toMatchObject({ _tag: "Some", value: { _tag: "ApolloError", code: "internal" } });
+      expect((yield* store.getBot(bot.id)).id).toBe(bot.id);
+      yield* manager.deleteBot(bot.id);
+      expect((yield* Effect.flip(store.getBot(bot.id))).code).toBe("not_found");
+    }).pipe(Effect.scoped, Effect.provide(f.layer));
+  });
+
+  it.live("reviewer round 2 repro: any other defect on the deletion path (a store failure) is a typed, retryable error", () => {
+    const f = fixture("store-defect");
+    return Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager, "StoreFailure", f.cwd);
+      const original = store.listSessions;
+      const patched = store as { listSessions: typeof original };
+      patched.listSessions = () => Effect.die(new Error("injected SQL I/O failure"));
+      const failed = yield* Effect.exit(manager.deleteBot(bot.id)).pipe(Effect.ensuring(Effect.sync(() => (patched.listSessions = original))));
+      expect(Exit.findErrorOption(failed)).toMatchObject({ _tag: "Some", value: { _tag: "ApolloError", code: "internal" } });
+      expect((yield* store.getBot(bot.id)).id).toBe(bot.id);
+      yield* manager.deleteBot(bot.id);
+      expect((yield* Effect.flip(store.getBot(bot.id))).code).toBe("not_found");
     }).pipe(Effect.scoped, Effect.provide(f.layer));
   });
 
