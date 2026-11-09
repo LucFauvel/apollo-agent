@@ -4,7 +4,7 @@ import * as AppSettings from "./AppSettings.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AVATAR_SHAPES, type AgentEvent, type BotLimits, DEFAULT_BOT_LIMITS, type ProviderKind, type SessionId } from "@apollo/contracts";
-import type { Provider, ProviderSessionOptions } from "@apollo/providers";
+import { type Provider, ProviderError, type ProviderSessionOptions } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -53,6 +53,17 @@ const echoProvider = (kind: ProviderKind): Provider => ({
           { name: "Notion", kind: "connector" as const, status: "needs-auth" as const, tools: null },
           { name: "node_repl", kind: "mcp" as const, status: "connected" as const, tools: 4 },
         ]),
+      }
+    : {}),
+  // Claude names untitled sessions; "unnamed" makes it fail, "slow name" makes it take a while.
+  ...(kind === "claude"
+    ? {
+        generateTitle: (text: string) =>
+          text.includes("unnamed")
+            ? Effect.fail(new ProviderError({ provider: "claude", message: "no title" }))
+            : Effect.sleep(text.includes("slow name") ? "300 millis" : "10 millis").pipe(
+                Effect.as(`Named: ${text.split(/\s/)[0]}`),
+              ),
       }
     : {}),
   listModels: Effect.sync(() => {
@@ -302,6 +313,49 @@ describe("SessionManager", () => {
         .send(bot.mainSessionId, "again", "user", [{ ...ref, id: "att_000000000000" }])
         .pipe(Effect.flip);
       expect(missing.message).toContain("attachment is missing");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("names sessions started without a title from their first message", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      const title = (id: SessionId) => store.getSession(id).pipe(Effect.map((s) => s.title));
+
+      // With a first message: its opening words at once, then the model's title.
+      const prompted = yield* manager.createSession({
+        botId: bot.id,
+        title: "  ",
+        provider: { provider: "codex" },
+        prompt: "Refactor\nthe billing   service so invoices are retried when the payment provider times out",
+      });
+      expect(prompted.title).toBe("Refactor the billing service so invoices are…");
+      yield* Effect.sleep("100 millis");
+      expect(yield* title(prompted.id)).toBe("Named: Refactor");
+
+      // Without one: named from the first message the user sends, and only that one.
+      const empty = yield* manager.createSession({ botId: bot.id, title: "", provider: { provider: "codex" } });
+      expect(empty.title).toBe("New session");
+      yield* manager.send(empty.id, "Deploy the docs site", "user");
+      yield* Effect.sleep("100 millis");
+      expect(yield* title(empty.id)).toBe("Named: Deploy");
+      yield* manager.send(empty.id, "Something else entirely", "user");
+      yield* Effect.sleep("100 millis");
+      expect(yield* title(empty.id)).toBe("Named: Deploy");
+
+      // A title the user gave, or a rename while the model thinks, wins.
+      const given = yield* manager.createSession({ botId: bot.id, title: "Mine", provider: { provider: "codex" }, prompt: "Ship it" });
+      const renamed = yield* manager.createSession({ botId: bot.id, title: "", provider: { provider: "codex" }, prompt: "slow name please" });
+      yield* manager.updateSessionSettings({ sessionId: renamed.id, title: "Renamed" });
+      yield* Effect.sleep("500 millis");
+      expect(yield* title(given.id)).toBe("Mine");
+      expect(yield* title(renamed.id)).toBe("Renamed");
+
+      // When the model cannot answer, the opening words stay.
+      const failed = yield* manager.createSession({ botId: bot.id, title: "", provider: { provider: "codex" }, prompt: "unnamed task" });
+      yield* Effect.sleep("100 millis");
+      expect(yield* title(failed.id)).toBe("unnamed task");
     }).pipe(Effect.provide(layer)),
   );
 

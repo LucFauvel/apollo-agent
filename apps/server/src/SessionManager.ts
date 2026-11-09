@@ -36,6 +36,7 @@ import {
   type SlashCommand,
 } from "@apollo/contracts";
 import {
+  cleanTitle,
   makeClaudeProvider,
   makeAcpProviders,
   makeCodexProvider,
@@ -621,6 +622,32 @@ const make = Effect.gen(function* () {
       }
     });
 
+  // --- session titles --------------------------------------------------------
+  // A session the user starts without a title is named after its first message: at once
+  // from the message's opening words, then by a small model in the background.
+
+  /** Started without a title, still waiting for a first message to be named from. */
+  const untitled = new Set<SessionId>();
+
+  /** The message's opening words, until the model's title arrives (or when it cannot). */
+  const provisionalTitle = (text: string) => cleanTitle(text.replace(/\s+/g, " "), 48) || "New session";
+
+  /** Asks for a title in the background; it replaces `provisional` unless the user renamed the session meanwhile. */
+  const nameSession = (session: Session, text: string, provisional: string) =>
+    Effect.gen(function* () {
+      const generate = providers.claude.generateTitle;
+      if (!generate) return;
+      const bot = yield* store.getBot(session.botId);
+      const title = yield* generate(
+        text,
+        bot.claudeAccountId ? accountEnvironment(config.dataDir, "claude", bot.claudeAccountId) : undefined,
+      );
+      // The user renamed it meanwhile, or it is gone: leave it.
+      const current = yield* store.getSession(session.id).pipe(Effect.option);
+      if (Option.isNone(current) || current.value.title !== provisional) return;
+      yield* updateSession(session.id, { title });
+    }).pipe(Effect.catchCause((cause) => Effect.logInfo(`session ${session.id} keeps its provisional title`, cause)));
+
   // --- public API ---------------------------------------------------------
 
   const send = (
@@ -641,6 +668,12 @@ const make = Effect.gen(function* () {
         if (blocking) {
           return yield* invalid(`${blocking} is still downloading. Send the message once the download finishes.`);
         }
+      }
+      if (author === "user" && untitled.has(id) && text.trim()) {
+        untitled.delete(id);
+        const provisional = provisionalTitle(text);
+        const named = target.title === provisional ? target : yield* updateSession(id, { title: provisional });
+        yield* background(nameSession(named, text, provisional));
       }
       if (author === "user") {
         // The user is back in the loop.
@@ -930,6 +963,7 @@ const make = Effect.gen(function* () {
       yield* closeSession(id);
       const session = yield* store.getSession(id);
       removeAttachments(config.dataDir, id);
+      untitled.delete(id);
       if (session.worktree) {
         yield* Effect.tryPromise(() => retireWorktree(session.worktree!)).pipe(
           Effect.catch((error) => Effect.logWarning(`could not remove the worktree of ${id}`, error)),
@@ -1383,15 +1417,18 @@ const make = Effect.gen(function* () {
       readonly author?: MessageAuthor;
     }) =>
       Effect.gen(function* () {
+        // No title: named after the first message (see nameSession).
+        const named = input.title.trim().length > 0;
         const session = yield* createSession({
           botId: input.botId,
-          title: input.title,
+          title: named ? input.title : provisionalTitle(input.prompt ?? ""),
           provider: input.provider,
           cwd: input.cwd,
           isolation: input.isolation,
           role: "worker",
           parentSessionId: input.parentSessionId ?? null,
         });
+        if (!named) untitled.add(session.id);
         if (input.notifyParent && session.parentSessionId) yield* store.setNotifyParent(session.id, true);
         if (input.prompt && input.prompt.trim().length > 0) {
           yield* send(session.id, input.prompt, input.author ?? "user");

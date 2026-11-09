@@ -135,7 +135,30 @@ export interface Provider {
    * conversation, so it costs no tokens; takes a few seconds).
    */
   readonly listConnectors?: Effect.Effect<ReadonlyArray<ConnectorInfo>, ProviderError>;
+  /**
+   * A few words naming a conversation that opens with `text`, from a small fast model
+   * (one request, no tools, nothing saved). `environment` overrides the CLI's (an
+   * account's folder). Absent where that is not cheap.
+   */
+  readonly generateTitle?: (
+    text: string,
+    environment?: Record<string, string | undefined>,
+  ) => Effect.Effect<string, ProviderError>;
 }
+
+/** Cleans a model's answer into a session title: one line, no quotes or end punctuation. */
+export const cleanTitle = (raw: string, max = 60): string => {
+  const line = raw.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+  const text = line
+    .replace(/^(title|titre)\s*:\s*/i, "")
+    .replace(/^[#*\s"'`“”«»]+|["'`“”«».!?\s*]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > max / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
+};
 
 /** Compact one-line description of a tool input for transcript display. */
 export const summarizeToolInput = (input: unknown): string => {
