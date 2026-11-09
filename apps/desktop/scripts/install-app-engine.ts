@@ -25,6 +25,7 @@ import {
   listSnapshots,
   pruneSnapshots,
   readMarker,
+  describeAttempt,
   launchUntilHealthy,
   releaseLock,
   restorePrevious,
@@ -120,7 +121,7 @@ export interface Deps {
   /** Builds the app and stages it at `bundles.staged`. */
   readonly build: () => Promise<BuildInfo>;
   /** One attempt at launching the installed app with the given strategy, recorded. */
-  readonly launch: (strategy: LaunchStrategy) => LaunchAttempt;
+  readonly launch: (strategy: LaunchStrategy) => Promise<LaunchAttempt>;
   /** Whether a server of the installed app answers /health now. */
   readonly healthy: () => Promise<boolean>;
   /** From here on, SIGTERM/SIGHUP/SIGINT are ignored. */
@@ -349,7 +350,7 @@ const launchAndVerify = async (run: Run): Promise<Launched> => {
       ok: false,
       why:
         outcome.why === "never-launched"
-          ? `it never launched (${n} attempt(s): ${[...new Set(outcome.attempts.map((a) => a.strategy))].join(" → ")})`
+          ? `it never launched (${n} attempt(s): ${[...new Set(outcome.attempts.map((a) => a.strategy))].join(" → ")}; last: ${outcome.attempts.at(-1) ? describeAttempt(outcome.attempts.at(-1)!) : "none"})`
           : "it launched but did not answer /health",
     };
   }

@@ -89,6 +89,8 @@ const world = (o: {
     /** stderr `open` prints (even with exit 0). */
     openStderr: "",
     launches: [] as Array<LaunchStrategy>,
+    /** How the direct exec behaves: starts the app, creates a process that dies at once, or fails to spawn. */
+    exec: "launches" as "launches" | "dies" | "enoent",
     apolloCalls: 0,
     quitIgnored: false,
     respawnOnQuit: false,
@@ -170,15 +172,24 @@ const world = (o: {
       w.builds++;
       return makeBundle(bundles.staged, w.next);
     },
-    launch: (strategy): LaunchAttempt => {
+    launch: async (strategy): Promise<LaunchAttempt> => {
       w.opens++;
       w.launches.push(strategy);
+      const exe = join(bundles.target, "Contents", "MacOS", "apollo");
+      if (strategy === "exec" && w.exec === "enoent") {
+        return { strategy, command: exe, args: [], status: null, signal: null, stderr: "", error: `spawn ${exe} ENOENT`, pid: null, spawned: false };
+      }
+      if (strategy === "exec" && w.exec === "dies") {
+        // The process was created (it has a pid) and exited before anyone could look.
+        return { strategy, command: exe, args: [], status: 1, signal: null, stderr: "", error: null, pid: 4242, spawned: true };
+      }
       const attempt: LaunchAttempt =
         strategy === "exec"
-          ? { strategy, command: join(bundles.target, "Contents", "MacOS", "apollo"), args: [], status: null, signal: null, stderr: "", error: null, pid: 4242 }
-          : { strategy, command: "/usr/bin/open", args: strategy === "open-new" ? ["-n", "-a", bundles.target] : ["-a", bundles.target], status: 0, signal: null, stderr: w.openStderr, error: null, pid: null };
+          ? { strategy, command: exe, args: [], status: null, signal: null, stderr: "", error: null, pid: 4242, spawned: true }
+          : { strategy, command: "/usr/bin/open", args: strategy === "open-new" ? ["-n", "-a", bundles.target] : ["-a", bundles.target], status: 0, signal: null, stderr: w.openStderr, error: null, pid: null, spawned: false };
       if (w.dropped.has(strategy)) return attempt;
-      if (w.swallowOpens > 0) {
+      // LaunchServices dropping requests: only `open` goes through it.
+      if (w.swallowOpens > 0 && strategy !== "exec") {
         w.swallowOpens--;
         return attempt;
       }
@@ -235,7 +246,8 @@ describe("install: the normal path", () => {
     const { w, deps, state } = world({});
     w.swallowOpens = 4;
     expect((await runInstall(deps())).status).toBe("ok");
-    expect(w.opens).toBe(5);
+    // open and open -n are dropped; the direct exec (not LaunchServices) starts it.
+    expect(w.launches).toEqual(["open", "open-new", "exec"]);
     expect(state().running).toBe("new");
   });
 
@@ -394,8 +406,8 @@ describe("install: rollback (P1-1, P2a)", () => {
     const launch = d.launch;
     const r = await runInstall({
       ...d,
-      launch: (strategy) => {
-        const attempt = launch(strategy);
+      launch: async (strategy) => {
+        const attempt = await launch(strategy);
         if (state().running === "new") {
           w.quitIgnored = true;
           for (const p of w.procs) w.unkillable.add(p.pid);
@@ -449,7 +461,7 @@ describe("install: database restore failures (P1-2)", () => {
     const launch = d.launch;
     const r = await runInstall({
       ...d,
-      launch: (strategy) => {
+      launch: async (strategy) => {
         // Corrupt the snapshot while the new build runs.
         const snap = listSnapshots(join(w.data, "backups"))[0];
         if (snap && state().target === "new") writeFileSync(join(snap.dir, "apollo.db"), "not a SQLite database");
@@ -990,8 +1002,8 @@ describe("relaunch: strategies, and launched vs never launched", () => {
     let launchedAt = 0;
     const r = await runInstall({
       ...d,
-      launch: (strategy) => {
-        const a = d.launch(strategy);
+      launch: async (strategy) => {
+        const a = await d.launch(strategy);
         if (state().running === "new" && !launchedAt) launchedAt = w.t;
         return a;
       },
@@ -1015,8 +1027,8 @@ describe("relaunch: strategies, and launched vs never launched", () => {
     let launchedAt = 0;
     const r = await runInstall({
       ...d,
-      launch: (strategy) => {
-        const a = d.launch(strategy);
+      launch: async (strategy) => {
+        const a = await d.launch(strategy);
         if (state().running === "new" && !launchedAt) launchedAt = w.t;
         return a;
       },
@@ -1032,14 +1044,57 @@ describe("relaunch: strategies, and launched vs never launched", () => {
 
   it("nothing launches at all: rolled back, and both failures say so, with every attempt in the result", async () => {
     const { w, deps, result } = world({});
-    w.dropped = new Set(["open", "open-new", "exec"]);
+    w.dropped = new Set(["open", "open-new"]);
+    w.exec = "enoent";
     const r = await runInstall(deps());
     expect(r.status).toBe("failed");
-    expect(r.error).toMatch(/The new build is not healthy: it never launched \(\d+ attempt\(s\): open → open-new → exec\).*previous build is back with its database, but it never launched/);
+    // Why it never launched travels with the failure: the last attempt, ENOENT included.
+    expect(r.error).toMatch(/The new build is not healthy: it never launched \(\d+ attempt\(s\): open → open-new → exec; last: exec: .*error: spawn .*ENOENT.*nothing launched\).*previous build is back with its database, but it never launched/);
     const attempts = result().launches;
+    expect(attempts.filter((a) => a.strategy === "exec").every((a) => /ENOENT/.test(a.error ?? ""))).toBe(true);
     expect(attempts.length).toBeGreaterThanOrEqual(6);
     expect(attempts.every((a) => a.launched === false)).toBe(true);
     // Bounded: about one attempt per launch window, per relaunch budget.
     expect(attempts.length).toBeLessThanOrEqual(2 * (TIMING.relaunchTimeoutMs / TIMING.launchWindowMs + 1));
+  });
+});
+
+describe("relaunch review: exec evidence and errors", () => {
+  it("an exec'd build that dies before anyone looks is 'launched but unhealthy': rolled back at once, not relaunched", async () => {
+    const { w, deps, state, result } = world({ next: { name: "new", schema: 19, health: "good" } });
+    // LaunchServices does nothing for the new build; its executable starts and dies at once.
+    const d = deps();
+    let rollbackLogged = false;
+    const r = await runInstall({
+      ...d,
+      launch: async (strategy) => {
+        const target = state().target;
+        w.dropped = target === "new" ? new Set(["open", "open-new"]) : new Set();
+        w.exec = target === "new" ? "dies" : "launches";
+        return d.launch(strategy);
+      },
+      log: (line) => {
+        if (/rolling back/.test(line)) rollbackLogged = true;
+        d.log(line);
+      },
+    });
+    expect(rollbackLogged).toBe(true);
+    expect(r.status).toBe("rolled-back");
+    expect(r.error).toMatch(/launched but did not answer/);
+    // One exec of the new build, then the old build's launch: no more exec attempts.
+    expect(w.launches).toEqual(["open", "open-new", "exec", "open"]);
+    const exec = result().launches.find((a) => a.strategy === "exec")!;
+    expect(exec).toMatchObject({ spawned: true, pid: 4242, status: 1, launched: true });
+    expect(state()).toMatchObject({ target: "old", running: "old" });
+  });
+
+  it("an exec that cannot spawn records why, in the log and the result", async () => {
+    const { w, deps, result } = world({});
+    w.dropped = new Set(["open", "open-new"]);
+    w.exec = "enoent";
+    await runInstall(deps());
+    const exec = result().launches.find((a) => a.strategy === "exec")!;
+    expect(exec).toMatchObject({ spawned: false, launched: false, error: expect.stringMatching(/ENOENT/) });
+    expect(w.logs.some((l) => /launch \d+: exec: .*error: spawn .*ENOENT.*nothing launched/.test(l))).toBe(true);
   });
 });

@@ -288,12 +288,17 @@ export interface LaunchAttempt {
   readonly strategy: LaunchStrategy;
   readonly command: string;
   readonly args: ReadonlyArray<string>;
-  /** Exit status (`open`), or null for a spawned executable that keeps running. */
+  /** Exit status (`open`, or an executable that exited at once), or null for one that keeps running. */
   readonly status: number | null;
   readonly signal: string | null;
   readonly stderr: string;
   readonly error: string | null;
   readonly pid: number | null;
+  /**
+   * The attempt is known to have created the app's process (exec: the spawn succeeded). That
+   * is evidence of a launch even if the process is gone by the time anyone looks.
+   */
+  readonly spawned: boolean;
   /** Filled in afterwards: whether the app's processes appeared after this attempt. */
   readonly launched?: boolean;
 }
@@ -301,7 +306,8 @@ export interface LaunchAttempt {
 export const describeAttempt = (a: LaunchAttempt): string =>
   [
     `${a.strategy}: ${a.command} ${a.args.join(" ")}`,
-    a.status !== null ? `exit ${a.status}` : a.pid !== null ? `pid ${a.pid}` : null,
+    a.pid !== null ? `pid ${a.pid}` : null,
+    a.status !== null ? (a.spawned ? `exited at once with ${a.status}` : `exit ${a.status}`) : null,
     a.signal ? `signal ${a.signal}` : null,
     a.error ? `error: ${a.error}` : null,
     // Even with exit 0: LaunchServices explains itself on stderr when it does not launch.
@@ -312,24 +318,42 @@ export const describeAttempt = (a: LaunchAttempt): string =>
     .join("; ");
 
 /** Runs one launch attempt for real. `openBin` is a parameter so tests can use a fake `open`. */
-export const launchApp = (
+/** How long an exec attempt watches its process for an immediate exit, to record it. */
+export const EXEC_EXIT_WATCH_MS = 1000;
+
+export const launchApp = async (
   app: string,
   strategy: LaunchStrategy,
   env: Record<string, string>,
-  o: { readonly openBin?: string; readonly executable?: string } = {},
-): LaunchAttempt => {
+  o: { readonly openBin?: string; readonly executable?: string; readonly exitWatchMs?: number } = {},
+): Promise<LaunchAttempt> => {
   if (strategy === "exec") {
     const command = o.executable ?? join(app, "Contents", "MacOS", bundleExecutable(app));
+    const base = { strategy, command, args: [] as Array<string>, status: null, signal: null, stderr: "" };
+    let child: ReturnType<typeof spawn>;
     try {
-      const child = spawn(command, [], { detached: true, stdio: "ignore", env, cwd: "/" });
-      // An exec failure (ENOENT, EACCES) arrives as an event; it is recorded by the caller's
-      // launch check (no process appears), and must not crash the installer.
-      child.on("error", () => {});
-      child.unref();
-      return { strategy, command, args: [], status: null, signal: null, stderr: "", error: null, pid: child.pid ?? null };
+      child = spawn(command, [], { detached: true, stdio: "ignore", env, cwd: "/" });
     } catch (error) {
-      return { strategy, command, args: [], status: null, signal: null, stderr: "", error: error instanceof Error ? error.message : String(error), pid: null };
+      return { ...base, error: error instanceof Error ? error.message : String(error), pid: null, spawned: false };
     }
+    // A failed exec (ENOENT, EACCES) arrives as an "error" event, a successful one as "spawn":
+    // wait for whichever comes, so the attempt records why, or that a process was created.
+    const started = await new Promise<{ ok: true } | { ok: false; error: string }>((resolve) => {
+      child.once("spawn", () => resolve({ ok: true }));
+      child.once("error", (error) => resolve({ ok: false, error: error.message }));
+    });
+    child.on("error", () => {});
+    if (!started.ok) return { ...base, error: started.error, pid: child.pid ?? null, spawned: false };
+    // Record an immediate exit (a build that dies at once), without waiting on a healthy one.
+    const exited = await new Promise<{ code: number | null; signal: string | null } | null>((resolve) => {
+      const timer = setTimeout(() => resolve(null), o.exitWatchMs ?? EXEC_EXIT_WATCH_MS);
+      child.once("exit", (code, signal) => {
+        clearTimeout(timer);
+        resolve({ code, signal });
+      });
+    });
+    child.unref();
+    return { ...base, status: exited?.code ?? null, signal: exited?.signal ?? null, error: null, pid: child.pid ?? null, spawned: true };
   }
   const command = o.openBin ?? "/usr/bin/open";
   const args = strategy === "open-new" ? ["-n", "-a", app] : ["-a", app];
@@ -343,6 +367,8 @@ export const launchApp = (
     stderr: (r.stderr ?? "").trim(),
     error: r.error ? r.error.message : null,
     pid: null,
+    // `open` gives no pid: whether it launched is seen in the process list.
+    spawned: false,
   };
 };
 
@@ -352,7 +378,7 @@ export const launchInstalled = (
   strategy: LaunchStrategy,
   inherited: NodeJS.ProcessEnv = process.env,
   o: { readonly openBin?: string; readonly executable?: string } = {},
-): LaunchAttempt => launchApp(app, strategy, launchEnv(inherited), o);
+): Promise<LaunchAttempt> => launchApp(app, strategy, launchEnv(inherited), o);
 
 /** CFBundleExecutable from the bundle's Info.plist ("apollo" for Apollo). */
 const bundleExecutable = (app: string): string => {
@@ -372,7 +398,7 @@ export type LaunchOutcome =
  * is "launched but unhealthy", returned at once: launching it again would not help.
  */
 export const launchUntilHealthy = async (deps: {
-  readonly launch: (strategy: LaunchStrategy) => LaunchAttempt;
+  readonly launch: (strategy: LaunchStrategy) => Promise<LaunchAttempt>;
   /** Whether the app's processes are running: null when that cannot be told. */
   readonly running: () => boolean | null;
   readonly healthy: () => Promise<boolean>;
@@ -391,15 +417,16 @@ export const launchUntilHealthy = async (deps: {
     const strategy = strategies[Math.min(i, strategies.length - 1)]!;
     let attempt: LaunchAttempt;
     try {
-      attempt = deps.launch(strategy);
+      attempt = await deps.launch(strategy);
     } catch (error) {
-      attempt = { strategy, command: "?", args: [], status: null, signal: null, stderr: "", error: error instanceof Error ? error.message : String(error), pid: null };
+      attempt = { strategy, command: "?", args: [], status: null, signal: null, stderr: "", error: error instanceof Error ? error.message : String(error), pid: null, spawned: false };
     }
     // Wait for a sign of life: the app's processes (looked for first: `open` returns once the
     // process exists, so even an app that dies quickly is seen), or an answer.
-    let launched = false;
+    // A process the attempt itself created is a launch, however fast it exited.
+    let launched = attempt.spawned;
     const windowEnd = Math.min(deps.now() + deps.launchWindowMs, deadline);
-    for (;;) {
+    for (; !launched; ) {
       if (deps.running() === true) {
         launched = true;
         break;

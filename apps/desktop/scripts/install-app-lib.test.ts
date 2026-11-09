@@ -226,7 +226,7 @@ describe("health", () => {
 
 describe("launching the app", () => {
   const app = "/A/Apollo.app";
-  const attempt = (strategy: LaunchStrategy, stderr = ""): LaunchAttempt => ({ strategy, command: "x", args: [], status: 0, signal: null, stderr, error: null, pid: null });
+  const attempt = (strategy: LaunchStrategy, stderr = ""): LaunchAttempt => ({ strategy, command: "x", args: [], status: 0, signal: null, stderr, error: null, pid: null, spawned: false });
 
   it("launches with a Finder-like environment: nothing inherited that could redirect the app", () => {
     const env = launchEnv({
@@ -252,7 +252,7 @@ describe("launching the app", () => {
     const tried: Array<LaunchStrategy> = [];
     let up = false;
     const r = await launchUntilHealthy({
-      launch: (s) => {
+      launch: async (s) => {
         tried.push(s);
         if (s === "exec") up = true;
         return attempt(s);
@@ -273,7 +273,7 @@ describe("launching the app", () => {
   it("keeps using the last strategy, until the budget runs out: never launched", async () => {
     const clock = fakeClock();
     const tried: Array<LaunchStrategy> = [];
-    const r = await launchUntilHealthy({ launch: (s) => (tried.push(s), attempt(s)), running: () => false, healthy: async () => false, ...clock, log: () => {}, timeoutMs: 120_000, launchWindowMs: 10_000, startupGraceMs: 60_000 });
+    const r = await launchUntilHealthy({ launch: async (s) => (tried.push(s), attempt(s)), running: () => false, healthy: async () => false, ...clock, log: () => {}, timeoutMs: 120_000, launchWindowMs: 10_000, startupGraceMs: 60_000 });
     expect(r).toMatchObject({ ok: false, why: "never-launched" });
     expect(tried.slice(0, 4)).toEqual(["open", "open-new", "exec", "exec"]);
     expect(tried.length).toBeGreaterThanOrEqual(10);
@@ -290,7 +290,7 @@ describe("launching the app", () => {
       if (++polls > 10_000) throw new Error("runaway: the running app was launched again and again");
       return true;
     };
-    const r = await launchUntilHealthy({ launch: (s) => (launches++, attempt(s)), running, healthy: async () => false, ...clock, log: () => {}, timeoutMs: 120_000, launchWindowMs: 10_000, startupGraceMs: 60_000 });
+    const r = await launchUntilHealthy({ launch: async (s) => (launches++, attempt(s)), running, healthy: async () => false, ...clock, log: () => {}, timeoutMs: 120_000, launchWindowMs: 10_000, startupGraceMs: 60_000 });
     expect(r).toMatchObject({ ok: false, why: "launched-unhealthy" });
     expect(launches).toBe(1);
     expect(clock.now()).toBeGreaterThanOrEqual(60_000);
@@ -300,7 +300,7 @@ describe("launching the app", () => {
   it("launched, then exited: 'launched-unhealthy' at once", async () => {
     const clock = fakeClock();
     let polls = 0;
-    const r = await launchUntilHealthy({ launch: (s) => attempt(s), running: () => ++polls === 1, healthy: async () => false, ...clock, log: () => {}, timeoutMs: 120_000, launchWindowMs: 10_000, startupGraceMs: 60_000 });
+    const r = await launchUntilHealthy({ launch: async (s) => attempt(s), running: () => ++polls === 1, healthy: async () => false, ...clock, log: () => {}, timeoutMs: 120_000, launchWindowMs: 10_000, startupGraceMs: 60_000 });
     expect(r).toMatchObject({ ok: false, why: "launched-unhealthy" });
     expect(clock.now()).toBeLessThan(2000);
   });
@@ -308,7 +308,7 @@ describe("launching the app", () => {
   it("a process list that cannot be read is 'not seen yet', not 'launched'", async () => {
     const clock = fakeClock();
     const tried: Array<LaunchStrategy> = [];
-    const r = await launchUntilHealthy({ launch: (s) => (tried.push(s), attempt(s)), running: () => null, healthy: async () => tried.length >= 2, ...clock, log: () => {}, timeoutMs: 120_000, launchWindowMs: 10_000, startupGraceMs: 60_000 });
+    const r = await launchUntilHealthy({ launch: async (s) => (tried.push(s), attempt(s)), running: () => null, healthy: async () => tried.length >= 2, ...clock, log: () => {}, timeoutMs: 120_000, launchWindowMs: 10_000, startupGraceMs: 60_000 });
     expect(r.ok).toBe(true);
     expect(tried).toEqual(["open", "open-new"]);
   });
@@ -317,19 +317,19 @@ describe("launching the app", () => {
     expect(describeAttempt({ ...attempt("open", "LSOpenURLsWithRole() failed"), command: "/usr/bin/open", args: ["-a", app], launched: false })).toBe(
       "open: /usr/bin/open -a /A/Apollo.app; exit 0; stderr: LSOpenURLsWithRole() failed; nothing launched",
     );
-    expect(describeAttempt({ strategy: "exec", command: "/A/Apollo.app/Contents/MacOS/apollo", args: [], status: null, signal: null, stderr: "", error: null, pid: 77, launched: true })).toBe(
+    expect(describeAttempt({ strategy: "exec", command: "/A/Apollo.app/Contents/MacOS/apollo", args: [], status: null, signal: null, stderr: "", error: null, pid: 77, spawned: true, launched: true })).toBe(
       "exec: /A/Apollo.app/Contents/MacOS/apollo ; pid 77; launched",
     );
   });
 
-  it("launchApp runs open (and open -n) with the given environment and keeps its stderr", () => {
+  it("launchApp runs open (and open -n) with the given environment and keeps its stderr", async () => {
     const dir = tmp("fake-open");
     const out = join(dir, "calls");
     const fakeOpen = join(dir, "open");
     writeFileSync(fakeOpen, `#!/bin/sh\necho "args=$* RUN_AS_NODE=\${ELECTRON_RUN_AS_NODE:-unset} PATH=$PATH" >> ${out}\necho "LSOpenURLsWithRole() failed" >&2\nexit 0\n`, { mode: 0o755 });
     const env = launchEnv({ HOME: "/Users/me", ELECTRON_RUN_AS_NODE: "1" });
-    const a = launchApp(app, "open", env, { openBin: fakeOpen });
-    const b = launchApp(app, "open-new", env, { openBin: fakeOpen });
+    const a = await launchApp(app, "open", env, { openBin: fakeOpen });
+    const b = await launchApp(app, "open-new", env, { openBin: fakeOpen });
     expect(a).toMatchObject({ strategy: "open", command: fakeOpen, args: ["-a", app], status: 0, stderr: "LSOpenURLsWithRole() failed", error: null });
     expect(b).toMatchObject({ strategy: "open-new", args: ["-n", "-a", app], status: 0 });
     expect(readFileSync(out, "utf8").trim().split("\n")).toEqual([
@@ -338,12 +338,12 @@ describe("launching the app", () => {
     ]);
   });
 
-  it("launchInstalled (what the installer calls) never passes the inherited environment on", () => {
+  it("launchInstalled (what the installer calls) never passes the inherited environment on", async () => {
     const dir = tmp("fake-open");
     const out = join(dir, "calls");
     const fakeOpen = join(dir, "open");
     writeFileSync(fakeOpen, `#!/bin/sh\necho "RUN_AS_NODE=\${ELECTRON_RUN_AS_NODE:-unset} PORT=\${APOLLO_PORT:-unset} BUNDLE=\${__CFBundleIdentifier:-unset}" >> ${out}\n`, { mode: 0o755 });
-    launchInstalled(app, "open", { HOME: "/Users/me", ELECTRON_RUN_AS_NODE: "1", APOLLO_PORT: "5", __CFBundleIdentifier: "dev.apollo.desktop" }, { openBin: fakeOpen });
+    await launchInstalled(app, "open", { HOME: "/Users/me", ELECTRON_RUN_AS_NODE: "1", APOLLO_PORT: "5", __CFBundleIdentifier: "dev.apollo.desktop" }, { openBin: fakeOpen });
     expect(readFileSync(out, "utf8").trim()).toBe("RUN_AS_NODE=unset PORT=unset BUNDLE=unset");
   });
 
@@ -357,13 +357,40 @@ describe("launching the app", () => {
       '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>fakeexe</string></dict></plist>',
     );
     writeFileSync(join(bundle, "Contents", "MacOS", "fakeexe"), `#!/bin/sh\necho "ran RUN_AS_NODE=\${ELECTRON_RUN_AS_NODE:-unset} PORT=\${APOLLO_PORT:-unset}" > ${out}\n`, { mode: 0o755 });
-    const a = launchApp(bundle, "exec", launchEnv({ HOME: "/Users/me", ELECTRON_RUN_AS_NODE: "1", APOLLO_PORT: "1" }));
-    expect(a).toMatchObject({ strategy: "exec", command: join(bundle, "Contents", "MacOS", "fakeexe"), status: null, error: null });
+    const a = await launchApp(bundle, "exec", launchEnv({ HOME: "/Users/me", ELECTRON_RUN_AS_NODE: "1", APOLLO_PORT: "1" }), { exitWatchMs: 2000 });
+    // This executable writes a line and exits at once: recorded as spawned, with its exit status.
+    expect(a).toMatchObject({ strategy: "exec", command: join(bundle, "Contents", "MacOS", "fakeexe"), status: 0, error: null, spawned: true });
     expect(a.pid).toBeGreaterThan(0);
     for (let i = 0; i < 50 && !existsSync(out); i++) await new Promise((r) => setTimeout(r, 50));
     expect(readFileSync(out, "utf8").trim()).toBe("ran RUN_AS_NODE=unset PORT=unset");
-    // A missing executable is an attempt that launched nothing, not a crash.
-    expect(() => launchApp(join(dir, "Missing.app"), "exec", {})).not.toThrow();
+    // A missing executable is an attempt that launched nothing, with the reason, not a crash.
+    const missing = await launchApp(join(dir, "Missing.app"), "exec", {});
+    expect(missing).toMatchObject({ spawned: false, error: expect.stringMatching(/ENOENT/) });
+    expect(describeAttempt({ ...missing, launched: false })).toMatch(/error: spawn .*ENOENT; nothing launched/);
+  });
+
+  it("a real executable that exits at once is a launch (spawned, with a pid): 'launched-unhealthy', not 'never launched'", async () => {
+    const dir = tmp("fast-exit");
+    const exe = join(dir, "dies");
+    writeFileSync(exe, "#!/bin/sh\nexit 3\n", { mode: 0o755 });
+    const clock = fakeClock();
+    let launches = 0;
+    const r = await launchUntilHealthy({
+      launch: (s) => (launches++, launchApp(join(dir, "X.app"), s, {}, { executable: exe, exitWatchMs: 2000 })),
+      // It is gone before anyone looks, every time.
+      running: () => false,
+      healthy: async () => false,
+      ...clock,
+      log: () => {},
+      timeoutMs: 120_000,
+      launchWindowMs: 10_000,
+      startupGraceMs: 60_000,
+      strategies: ["exec"],
+    });
+    expect(r).toMatchObject({ ok: false, why: "launched-unhealthy" });
+    expect(launches).toBe(1);
+    expect(r.attempts[0]).toMatchObject({ spawned: true, status: 3, launched: true });
+    expect(r.attempts[0]!.pid).toBeGreaterThan(0);
   });
 });
 describe("bundles", () => {
