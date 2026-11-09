@@ -14,7 +14,7 @@ import * as Store from "../Store.ts";
 import { type Release, recommendBackend, selectAssets } from "./Engine.ts";
 import { modelShape, parseGgufHeader } from "./Gguf.ts";
 import { parseCudaVersion, parseListDevices, parseNvidiaSmi } from "./Hardware.ts";
-import { LocalModels, layer as localModelsLayer, loadProgressOf, reapOrphans, toLocalModel } from "./LocalModels.ts";
+import { LocalModels, layer as localModelsLayer, loadProgressOf, reapOrphans, serverArgs, toLocalModel } from "./LocalModels.ts";
 import { bitsOf, fitOf, groupQuants, memoryBudget, memoryNeeded, pickQuant } from "./Lookup.ts";
 
 const GIB = 1024 ** 3;
@@ -364,7 +364,51 @@ describe("orphaned llama-servers", () => {
   );
 });
 
+describe("llama-server arguments", () => {
+  const flag = (args: ReadonlyArray<string>, name: string) => {
+    const i = args.indexOf(name);
+    return i < 0 ? undefined : args[i + 1];
+  };
+
+  it("lets --fit size the context without a cap, and caps it with --ctx-size", () => {
+    const free = serverArgs({ port: 1, apiKey: "k", maxContextTokens: null });
+    expect(flag(free, "--fit-ctx")).toBe("65536");
+    expect(free).not.toContain("--ctx-size");
+
+    const capped = serverArgs({ port: 1, apiKey: "k", maxContextTokens: 131_072 });
+    expect(flag(capped, "--ctx-size")).toBe("131072");
+    // The floor --fit may shrink to stays what the agent needs.
+    expect(flag(capped, "--fit-ctx")).toBe("65536");
+    // Everything else is unchanged.
+    expect(capped.filter((a) => a !== "--ctx-size" && a !== "131072")).toEqual(free);
+  });
+});
+
 describe("managed llama-server", () => {
+  it.live("starts with the context cap, and restarts to apply a new one", () =>
+    Effect.gen(function* () {
+      const local = yield* LocalModels;
+      const settings = yield* ProviderSettings.ProviderSettings;
+      const launches = Effect.map(local.logs, (lines) => lines.filter((line) => line.startsWith("$ llama-server")));
+      // Apollo starts the server on its own; without a cap, --fit sizes the context.
+      yield* local.startServer;
+      expect((yield* launches).at(-1)).not.toContain("--ctx-size");
+      const before = (yield* launches).length;
+
+      yield* settings.update({ llamacpp: { maxContextTokens: 131_072 } });
+      yield* local.restartServer;
+      expect((yield* local.state).server.status).toBe("running");
+      expect(yield* launches).toHaveLength(before + 1);
+      expect((yield* launches).at(-1)).toContain("--ctx-size 131072");
+
+      // A stopped server stays stopped; the next start picks the setting up.
+      yield* local.stopServer;
+      yield* local.restartServer;
+      expect((yield* local.state).server.status).toBe("stopped");
+      expect(yield* launches).toHaveLength(before + 1);
+    }).pipe(Effect.provide(managedLayer())),
+  );
+
   it.live(
     "starts the server, downloads a model, and hands sessions a connection",
     () =>
