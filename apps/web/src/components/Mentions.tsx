@@ -121,9 +121,22 @@ export function WithMentions({ text }: { text: string }) {
 }
 
 /** A message from another of the user's bots: collapsed to its first line, opened on click. */
-export function PeerMessage({ botId, text }: { botId: string | undefined; text: string }) {
+export function PeerMessage({
+  botId,
+  text,
+  searchKey,
+  forceOpen = false,
+}: {
+  botId: string | undefined;
+  text: string;
+  /** Marks the message's text for conversation search. */
+  searchKey?: string;
+  /** Opened while search shows a match inside it. */
+  forceOpen?: boolean;
+}) {
   const bot = useApp((s) => (botId ? s.bots.get(botId as BotId) : undefined));
-  const [open, setOpen] = useState(false);
+  const [toggled, setOpen] = useState(false);
+  const open = toggled || forceOpen;
   const first = text.trim().split("\n").find((l) => l.trim())?.replace(/^[#*>\-\s]+/, "") ?? "";
   return (
     <div className="animate-fade-up overflow-hidden rounded-xl border border-zinc-800/80 bg-zinc-900/40">
@@ -139,7 +152,7 @@ export function PeerMessage({ botId, text }: { botId: string | undefined; text: 
         <ChevronDown className={cx("size-3.5 shrink-0 text-zinc-500 transition-transform duration-200", open && "rotate-180")} />
       </button>
       <Collapse open={open}>
-        <div className="markdown border-t border-zinc-800/80 px-3.5 py-2.5 text-sm leading-relaxed text-zinc-200">
+        <div className="markdown border-t border-zinc-800/80 px-3.5 py-2.5 text-sm leading-relaxed text-zinc-200" data-search-text={searchKey}>
           <MarkdownText>{text}</MarkdownText>
         </div>
       </Collapse>

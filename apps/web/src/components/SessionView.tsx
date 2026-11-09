@@ -20,6 +20,7 @@ import {
   MoreHorizontal,
   Paperclip,
   Network,
+  Search,
   Settings2,
   ShieldAlert,
   Sparkles,
@@ -29,6 +30,9 @@ import {
 import {
   cardsTick,
   currentChangesKey,
+  findMatches,
+  type SearchMatch,
+  stepMatch,
   hasCards,
   initialCards,
   isCompacting,
@@ -71,9 +75,12 @@ import { BotAvatar } from "./Sidebar.tsx";
 import { MentionMenu, PeerMessage, useMentions, WithMentions } from "./Mentions.tsx";
 import { DayDivider, groupByDay, MessageTime } from "./DayGroups.tsx";
 import { MessageRail, type RailTurn } from "./MessageRail.tsx";
+import { clearSearchHighlights, ConversationSearchBar, showSearchMatches } from "./ConversationSearch.tsx";
 import { Badge, Button, Collapse, cx, IconButton, Menu, ModelChip, providerName, StatusDot, statusLabel, Tooltip } from "./ui.tsx";
 
 export type PanelKind = "knowledge" | "schedules" | "browser" | "changes";
+
+const findShortcut = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘F" : "Ctrl+F";
 
 function ApprovalItem({
   item,
@@ -198,8 +205,10 @@ function BrainOff() {
  * A message from the orchestrator or from Apollo (worker reports, job and PR updates):
  * collapsed to its first line, with the rest rendered as markdown when opened.
  */
-function SystemMessage({ author, text }: { author: string; text: string }) {
-  const [open, setOpen] = useState(false);
+function SystemMessage({ author, text, searchKey, forceOpen }: { author: string; text: string; searchKey: string; forceOpen: boolean }) {
+  const [toggled, setOpen] = useState(false);
+  // Opened while search shows a match inside it.
+  const open = toggled || forceOpen;
   const { first, body } = systemMessageParts(text);
   return (
     <div className="animate-fade-up rounded-xl border border-zinc-800/80 bg-zinc-900/40 text-sm">
@@ -211,12 +220,14 @@ function SystemMessage({ author, text }: { author: string; text: string }) {
       >
         {author === "bot" ? <Network className="size-3.5 shrink-0 text-zinc-500" /> : <Info className="size-3.5 shrink-0 text-zinc-500" />}
         <span className="shrink-0 text-[11px] font-medium text-zinc-500">{author === "bot" ? "Orchestrator" : "Apollo"}</span>
-        <span className="min-w-0 flex-1 truncate text-xs text-zinc-300">{first}</span>
+        <span className="min-w-0 flex-1 truncate text-xs text-zinc-300" data-search-text={searchKey}>
+          {first}
+        </span>
         {body ? <ChevronDown className={cx("size-3.5 shrink-0 text-zinc-500 transition-transform duration-200", open && "rotate-180")} /> : null}
       </button>
       {body ? (
         <Collapse open={open}>
-          <div className="markdown border-t border-zinc-800/80 px-3.5 py-2.5 text-sm leading-relaxed text-zinc-300">
+          <div className="markdown border-t border-zinc-800/80 px-3.5 py-2.5 text-sm leading-relaxed text-zinc-300" data-search-text={searchKey}>
             <MarkdownText>{body}</MarkdownText>
           </div>
         </Collapse>
@@ -232,6 +243,7 @@ function Item({
   sessionId,
   onOpenChanges,
   cards,
+  searchCurrent,
 }: {
   item: Block;
   respond: Responders;
@@ -239,6 +251,8 @@ function Item({
   sessionId: Session["id"];
   onOpenChanges: () => void;
   cards: ChangesCards;
+  /** Search's current match is in this block: show it whole. */
+  searchCurrent: boolean;
 }) {
   switch (item.kind) {
     case "changes":
@@ -267,8 +281,8 @@ function Item({
     case "activity":
       return <ActivityGroup block={item} live={live} />;
     case "user":
-      if (item.author === "peer") return <PeerMessage botId={item.fromBotId} text={item.text} />;
-      if (item.author !== "user") return <SystemMessage author={item.author} text={item.text} />;
+      if (item.author === "peer") return <PeerMessage botId={item.fromBotId} text={item.text} searchKey={item.key} forceOpen={searchCurrent} />;
+      if (item.author !== "user") return <SystemMessage author={item.author} text={item.text} searchKey={item.key} forceOpen={searchCurrent} />;
       return (
         <div className="group animate-fade-up scroll-mt-12 space-y-1.5 pt-2" data-turn={item.key}>
           {item.attachments?.length ? <MessageAttachments sessionId={sessionId} attachments={item.attachments} /> : null}
@@ -281,6 +295,7 @@ function Item({
                   "max-w-[85%] rounded-2xl rounded-br-md bg-zinc-800 px-3.5 py-2 text-sm whitespace-pre-wrap text-zinc-100 transition-opacity",
                   item.excluded && "opacity-45",
                 )}
+                data-search-text={item.key}
               >
                 <WithMentions text={item.text} />
               </div>
@@ -295,7 +310,10 @@ function Item({
       }
       return (
         <div className="group animate-fade-up">
-          <div className={cx("markdown py-1 text-sm leading-relaxed text-zinc-200 transition-opacity", item.excluded && "opacity-45")}>
+          <div
+            className={cx("markdown py-1 text-sm leading-relaxed text-zinc-200 transition-opacity", item.excluded && "opacity-45")}
+            data-search-text={item.key}
+          >
             <MarkdownText>{item.text}</MarkdownText>
             {item.streaming ? <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse rounded-sm bg-zinc-400 align-middle" /> : null}
           </div>
@@ -316,7 +334,9 @@ function Item({
       return (
         <div className={cx("flex items-start gap-1.5 px-2 text-xs", item.level === "error" ? "text-red-400" : "text-zinc-500")}>
           {item.level === "error" ? <CircleAlert className="mt-px size-3.5 shrink-0" /> : <Info className="mt-px size-3.5 shrink-0" />}
-          <span className="min-w-0">{item.message}</span>
+          <span className="min-w-0" data-search-text={item.key}>
+            {item.message}
+          </span>
         </div>
       );
     case "turn-end":
@@ -819,7 +839,40 @@ export function SessionView({
   const foldOlderDays = blocks.length > 30;
   const [toggledDays, setToggledDays] = useState<ReadonlySet<string>>(new Set());
   useEffect(() => setToggledDays(new Set()), [session.id]);
+  // Search inside the conversation (Cmd/Ctrl+F). The transcript holds the whole session
+  // (it replays from the first event), so folded days and collapsed messages are searched too.
+  // `index` counts matches in conversation order; a new query starts at the most recent one.
+  const [search, setSearch] = useState<{ readonly query: string; readonly index: number } | null>(null);
+  const searchInput = useRef<HTMLInputElement>(null);
+  const searchQuery = search?.query ?? "";
+  const matches = useMemo(() => (search ? findMatches(blocks, searchQuery) : []), [blocks, search !== null, searchQuery]);
+  const matchIndex = Math.min(search?.index ?? 0, Math.max(matches.length - 1, 0));
+  const currentMatch: SearchMatch | null = matches[matchIndex] ?? null;
+  const matchDay = currentMatch ? (days.find((day) => day.blocks.some(({ block }) => block.key === currentMatch.key))?.key ?? null) : null;
+  // Set by the user's own search actions: only those move the conversation, not streamed output.
+  const scrollToMatch = useRef(false);
+  const openSearch = () => {
+    setSearch((current) => current ?? { query: "", index: Number.POSITIVE_INFINITY });
+    requestAnimationFrame(() => {
+      searchInput.current?.focus();
+      searchInput.current?.select();
+    });
+  };
+  const closeSearch = () => setSearch(null);
+  useEffect(() => setSearch(null), [session.id]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        openSearch();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   const isDayOpen = (key: string, index: number) => {
+    // The day holding the current match opens while search shows it.
+    if (key === matchDay) return true;
     const byDefault = !foldOlderDays || index === days.length - 1;
     return toggledDays.has(key) ? !byDefault : byDefault;
   };
@@ -929,6 +982,31 @@ export function SessionView({
     setActionError(null);
   }, [session.id]);
 
+  // Highlights matches on the page and brings the current one into view; re-runs as the page
+  // changes (streamed output, a day opening) but only scrolls after a search action.
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!search || !container) return clearSearchHighlights();
+    const scroll = scrollToMatch.current;
+    scrollToMatch.current = false;
+    if (scroll) stick.current = false;
+    let tries = 0;
+    let frame = 0;
+    // The match's day or message may still be mounting: retry for a few frames.
+    const run = () => {
+      if (!showSearchMatches(container, searchQuery, currentMatch, scroll) && tries++ < 20) frame = requestAnimationFrame(run);
+    };
+    frame = requestAnimationFrame(run);
+    // Opening a day or message animates its height: place the match again once it settles.
+    const settle = scroll ? setTimeout(() => showSearchMatches(container, searchQuery, currentMatch, true), 320) : undefined;
+    return () => {
+      cancelAnimationFrame(frame);
+      clearTimeout(settle);
+    };
+    // `search` changes on every search action (stepping onto the same lone match scrolls again too).
+  }, [search, currentMatch?.key, currentMatch?.occurrence, items, toggledDays]);
+  useEffect(() => clearSearchHighlights, []);
+
   const act = (f: Parameters<typeof rpc>[0]) => {
     setActionError(null);
     rpc(f).catch((e) => setActionError(errorMessage(e)));
@@ -1028,6 +1106,12 @@ export function SessionView({
 
         <div className="flex items-center gap-0.5 border-l border-zinc-800/80 pl-2">
           <IconButton
+            icon={Search}
+            label={`Search in conversation (${findShortcut})`}
+            active={search !== null}
+            onClick={() => (search ? closeSearch() : openSearch())}
+          />
+          <IconButton
             icon={GitCompareArrows}
             label={openPullRequests > 0 ? `Changes and pull requests (${openPullRequests} open)` : "Changes and pull requests"}
             active={panel === "changes"}
@@ -1105,6 +1189,24 @@ export function SessionView({
       ) : null}
 
       <div className="relative flex min-h-0 flex-1 flex-col">
+      {search ? (
+        <ConversationSearchBar
+          query={search.query}
+          index={matchIndex}
+          count={matches.length}
+          inputRef={searchInput}
+          onQuery={(query) => {
+            scrollToMatch.current = true;
+            setSearch({ query, index: Number.POSITIVE_INFINITY });
+          }}
+          onStep={(step) => {
+            if (matches.length === 0) return;
+            scrollToMatch.current = true;
+            setSearch({ query: search.query, index: stepMatch(matchIndex, step, matches.length) });
+          }}
+          onClose={closeSearch}
+        />
+      ) : null}
       {railTurns.length >= 3 ? <MessageRail turns={railTurns} scrollRef={scrollRef} onJump={jumpToTurn} /> : null}
       <div
         ref={scrollRef}
@@ -1142,6 +1244,7 @@ export function SessionView({
                   sessionId={session.id}
                   onOpenChanges={() => panel !== "changes" && onTogglePanel("changes")}
                   cards={cards}
+                  searchCurrent={currentMatch?.key === block.key}
                 />
               );
               // One day: no dividers. Several: a divider per day, earlier days folded when the chat is long.

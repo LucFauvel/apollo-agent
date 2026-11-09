@@ -10,7 +10,8 @@ export function CodeBlock({ code, lang }: { code: string; lang: string | null })
   const [copied, setCopied] = useState(false);
   return (
     <div className="code-block group/code relative">
-      <div className="flex items-center justify-between px-3 pt-1.5 text-[10.5px] text-zinc-500">
+      {/* Chrome, not content: conversation search skips it. */}
+      <div className="flex items-center justify-between px-3 pt-1.5 text-[10.5px] text-zinc-500" data-search-skip="">
         <span className="font-mono">{lang ?? ""}</span>
         <button
           type="button"
