@@ -23,7 +23,7 @@
  * (not enabled in a fresh data dir). It runs the real packaged binary, not a simulation.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { MIGRATIONS, SCHEMA_VERSION } from "../../../server/src/Database.ts";
@@ -61,6 +61,12 @@ if (!existsSync(app)) throw new Error(`no app at ${app}`);
 const info = JSON.parse(readFileSync(join(app, "Contents", "Resources", "build-info.json"), "utf8")) as BuildInfo;
 const executable = join(app, "Contents", "MacOS", sh("/usr/bin/plutil", ["-extract", "CFBundleExecutable", "raw", "-o", "-", join(app, "Contents", "Info.plist")]).stdout.trim() || "apollo");
 const serverEntry = join(app, "Contents", "Resources", "server", "server.mjs");
+/**
+ * How the server's path shows up in `ps`: Electron reports its resolved path (/var → /private/var)
+ * and the case can differ from the bundle name on disk (APFS is case-insensitive), so compare that way.
+ */
+const normalizePath = (p: string) => p.toLowerCase().replace(/^\/private\//, "/");
+const serverNeedle = normalizePath(realpathSync(join(app, "Contents", "Resources", "server")) + "/server.mjs");
 console.log(`▸ Smoke-testing ${info.version ?? "?"} (${info.commit.slice(0, 10)}, schema ${info.schemaVersion}) from ${app}`);
 if (info.schemaVersion !== SCHEMA_VERSION) {
   console.log(`  (this checkout's schema is ${SCHEMA_VERSION}; seeding with this checkout's migrations ${seedVersions.join(", ")})`);
@@ -71,7 +77,7 @@ const serverPids = () =>
     .stdout.split("\n")
     .flatMap((line) => {
       const m = /^\s*(\d+)\s+(.*)$/.exec(line);
-      return m && m[2]!.includes(serverEntry) ? [Number(m[1])] : [];
+      return m && normalizePath(m[2]!.replaceAll(" /private/", " /")).includes(serverNeedle) ? [Number(m[1])] : [];
     });
 
 const healthOnce = async (): Promise<string | null> => {
