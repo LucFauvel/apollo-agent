@@ -486,6 +486,10 @@ const followStatus = (serverUrl: string) => {
   setInterval(() => void poll(), 2000).unref();
 };
 
+// A separate Chromium profile, and with it a separate single-instance lock: the release smoke
+// test (scripts/release/smoke.ts) launches a packaged copy next to a running Apollo.
+if (process.env.APOLLO_USER_DATA_DIR) app.setPath("userData", resolve(process.env.APOLLO_USER_DATA_DIR));
+
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {

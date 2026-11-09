@@ -8,8 +8,9 @@ import { ServerConfig } from "./Config.ts";
 
 /**
  * Ordered schema migrations. Append only: never edit a migration that has shipped.
+ * Exported for the release smoke test, which seeds a database at an old version.
  */
-const MIGRATIONS: ReadonlyArray<string> = [
+export const MIGRATIONS: ReadonlyArray<string> = [
   `
   create table bots (
     id text primary key,

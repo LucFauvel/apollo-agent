@@ -833,6 +833,14 @@ export interface BuildInfo {
   readonly branch: string | null;
   readonly schemaVersion: number;
   readonly builtAt: string;
+  /** Stamped version (scripts/release/version.ts); absent in builds made before stamping existed. */
+  readonly version?: string;
+  /** `release` (tag build), `nightly` (main build in CI) or `local` (install:app, package). */
+  readonly channel?: "release" | "nightly" | "local";
+  /** CFBundleVersion, when the build stamped one. */
+  readonly bundleVersion?: string;
+  /** process.arch of the machine that built it (the tailnet addon is built for that arch only). */
+  readonly arch?: string;
 }
 
 export interface InstallResult {

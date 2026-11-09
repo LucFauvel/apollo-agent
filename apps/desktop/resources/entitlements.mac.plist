@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for Developer ID release builds only (scripts/release/build-release.ts
+  with APOLLO_CODESIGN=developer-id). Local install:app and ad-hoc CI builds run without the
+  hardened runtime and do not use this file.
+  - allow-jit / allow-unsigned-executable-memory: V8 (Electron) needs them.
+  - device.audio-input: dictation; without it the microphone is silently denied under the hardened runtime.
+  UNVERIFIED until the first Developer ID build: whether the tailnet .node addon also needs
+  com.apple.security.cs.disable-library-validation (electron-builder signs it with the app's team,
+  which should make it unnecessary).
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+</dict>
+</plist>
