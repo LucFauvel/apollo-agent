@@ -9,14 +9,21 @@
  * SHA256SUMS. The same build path as `pnpm package`/`install:app` (build:package, then
  * electron-builder), with the version stamped on the command line: nothing is committed.
  *
- * Code signing (APOLLO_CODESIGN):
- *  - `adhoc` (default): `identity: "-"`, no hardened runtime. NOT RELEASABLE: Gatekeeper blocks
- *    it once quarantined and macOS forgets permissions (microphone) on every update. Files get
- *    an `-adhoc` suffix and the manifest says `codeSigning.kind: "adhoc"`.
- *  - `developer-id`: electron-builder imports CSC_LINK/CSC_KEY_PASSWORD (a "Developer ID
- *    Application" .p12), hardened runtime with resources/entitlements.mac.plist, and notarizes
- *    when APPLE_API_KEY/APPLE_API_KEY_ID/APPLE_API_ISSUER are set. Needs APOLLO_TEAM_ID (pinned
- *    and verified after the build). UNTESTED until the Developer ID certificate exists.
+ * Code signing (APOLLO_CODESIGN), the REAL release path being `developer-id`:
+ *  - `developer-id`: electron-builder imports CSC_LINK (base64 of the "Developer ID Application"
+ *    .p12) with CSC_KEY_PASSWORD into a temporary keychain it creates and deletes itself, signs
+ *    with the hardened runtime and resources/entitlements.mac.plist, and notarizes the app with
+ *    notarytool (stapled). Notarization is mandatory in this mode, with either an App Store
+ *    Connect API key (APPLE_API_KEY = path to the .p8, APPLE_API_KEY_ID, APPLE_API_ISSUER) or,
+ *    as the documented variant, APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID. The DMG
+ *    is then notarized and stapled too (xcrun notarytool / stapler). APOLLO_TEAM_ID is pinned and
+ *    checked after the build. UNTESTED end to end until the Developer ID certificate exists (P0).
+ *  - `adhoc` (default when nothing is set): EXPLICIT FALLBACK for builds that cannot reach the
+ *    `release` environment's secrets (forks, PRs, nightly main builds). `identity: "-"`, no
+ *    hardened runtime. NOT RELEASABLE: Gatekeeper blocks it once quarantined and macOS forgets
+ *    permissions (microphone) on every update. Files get an `-adhoc` suffix and the manifest says
+ *    `codeSigning.kind: "adhoc"`. A `release` channel build refuses this mode unless
+ *    APOLLO_ALLOW_ADHOC_RELEASE=1.
  *
  * Verification after the build (any failure exits 1, nothing is written to <dir>):
  * the zip re-extracts with `ditto -x -k`, `codesign --verify --deep --strict` passes, the
@@ -52,16 +59,33 @@ if (!/^[1-9]\d*$/.test(bundleVersion)) fail(`APOLLO_BUILD_NUMBER=${bundleVersion
 const commit = env.APOLLO_BUILD_COMMIT || fail("APOLLO_BUILD_COMMIT is not set");
 const signingMode = env.APOLLO_CODESIGN || "adhoc";
 if (signingMode !== "adhoc" && signingMode !== "developer-id") fail(`APOLLO_CODESIGN=${signingMode} is not adhoc or developer-id`);
+if (signingMode === "adhoc" && channel === "release" && env.APOLLO_ALLOW_ADHOC_RELEASE !== "1") {
+  fail("a release build must be signed with Developer ID (APOLLO_CODESIGN=developer-id); see RELEASE-SETUP.md");
+}
 const team = signingMode === "developer-id" ? env.APOLLO_TEAM_ID || fail("developer-id signing needs APOLLO_TEAM_ID") : null;
 if (signingMode === "developer-id" && (!env.CSC_LINK || !env.CSC_KEY_PASSWORD)) fail("developer-id signing needs CSC_LINK and CSC_KEY_PASSWORD");
-const notarize = signingMode === "developer-id" && Boolean(env.APPLE_API_KEY && env.APPLE_API_KEY_ID && env.APPLE_API_ISSUER);
+/** notarytool credentials, as arguments; null in adhoc mode. Mirrors electron-builder's own env lookup. */
+const notaryArgs: Array<string> | null = (() => {
+  if (signingMode !== "developer-id") return null;
+  if (env.APPLE_API_KEY && env.APPLE_API_KEY_ID && env.APPLE_API_ISSUER) {
+    if (!existsSync(env.APPLE_API_KEY)) fail(`APPLE_API_KEY must be the path of the .p8 file (${env.APPLE_API_KEY} does not exist)`);
+    return ["--key", env.APPLE_API_KEY, "--key-id", env.APPLE_API_KEY_ID, "--issuer", env.APPLE_API_ISSUER];
+  }
+  if (env.APPLE_ID && env.APPLE_APP_SPECIFIC_PASSWORD && env.APPLE_TEAM_ID) {
+    return ["--apple-id", env.APPLE_ID, "--password", env.APPLE_APP_SPECIFIC_PASSWORD, "--team-id", env.APPLE_TEAM_ID];
+  }
+  return fail("developer-id builds are notarized: set APPLE_API_KEY (.p8 path) + APPLE_API_KEY_ID + APPLE_API_ISSUER, or APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID");
+})();
 const codeSigning: CodeSigning = team ? { kind: "developer-id", team } : { kind: "adhoc" };
 // CFBundleShortVersionString must be numeric; the full (pre-release) version is in build-info.json.
 const shortVersion = /^(\d+\.\d+\.\d+)/.exec(version)?.[1] ?? fail(`APOLLO_BUILD_VERSION=${version} does not start with X.Y.Z`);
 
-const run = (command: string, args: ReadonlyArray<string>, extraEnv: NodeJS.ProcessEnv = {}, cwd = desktopDir) => {
-  console.log(`▸ ${command} ${args.join(" ")}`);
-  const r = spawnSync(command, args, { cwd, stdio: "inherit", env: { ...env, ...extraEnv } });
+/** Runs a command; `extraEnv` entries set to undefined are removed (an EMPTY CSC_LINK makes electron-builder read the cwd as a certificate). */
+const run = (command: string, args: ReadonlyArray<string>, extraEnv: NodeJS.ProcessEnv = {}, cwd = desktopDir, shown = args) => {
+  console.log(`▸ ${command} ${shown.join(" ")}`);
+  const merged = { ...env, ...extraEnv };
+  for (const [k, v] of Object.entries(extraEnv)) if (v === undefined) delete merged[k];
+  const r = spawnSync(command, args, { cwd, stdio: "inherit", env: merged });
   if (r.status !== 0) fail(`${command} failed (${r.signal ?? `exit ${r.status}`})`);
 };
 const capture = (command: string, args: ReadonlyArray<string>) => {
@@ -95,10 +119,21 @@ run(
           "-c.mac.hardenedRuntime=true",
           "-c.mac.entitlements=resources/entitlements.mac.plist",
           "-c.mac.entitlementsInherit=resources/entitlements.mac.plist",
-          `-c.mac.notarize=${notarize}`,
+          "-c.mac.notarize=true",
         ]),
   ],
-  signingMode === "adhoc" ? { CSC_IDENTITY_AUTO_DISCOVERY: "false", CSC_LINK: "", CSC_KEY_PASSWORD: "" } : {},
+  signingMode === "adhoc"
+    ? {
+        CSC_IDENTITY_AUTO_DISCOVERY: "false",
+        CSC_LINK: undefined,
+        CSC_KEY_PASSWORD: undefined,
+        APPLE_API_KEY: undefined,
+        APPLE_API_KEY_ID: undefined,
+        APPLE_API_ISSUER: undefined,
+        APPLE_ID: undefined,
+        APPLE_APP_SPECIFIC_PASSWORD: undefined,
+      }
+    : {},
 );
 
 const appPath = join(builderOut, `mac-${ARCH}`, "Apollo.app");
@@ -113,6 +148,13 @@ const zipPath = join(staging, `${base}.zip`);
 const dmgPath = join(staging, `${base}.dmg`);
 run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, zipPath]);
 copyFileSync(join(builderOut, dmg), dmgPath);
+if (notaryArgs) {
+  // electron-builder notarized and stapled the app; the DMG around it gets its own ticket.
+  const hidden = notaryArgs.map((a, i) => (i % 2 === 1 ? "***" : a));
+  run("xcrun", ["notarytool", "submit", dmgPath, ...notaryArgs, "--wait", "--timeout", "45m"], {}, desktopDir, ["notarytool", "submit", dmgPath, ...hidden, "--wait"]);
+  run("xcrun", ["stapler", "staple", dmgPath]);
+  run("xcrun", ["stapler", "validate", dmgPath]);
+}
 
 // 4. Verify what was zipped, not what is on disk.
 const check = mkdtempSync(join(tmpdir(), "apollo-verify-"));
@@ -136,10 +178,10 @@ if (!existsSync(join(app, "Contents", "Resources", "native", "apollo_tailnet.nod
 if (team) {
   if (!new RegExp(`^TeamIdentifier=${team}$`, "m").test(details)) problems.push(`TeamIdentifier is not ${team}:\n${details}`);
   if (!/flags=.*runtime/.test(details)) problems.push("hardened runtime is off");
-  if (notarize) {
-    const gk = capture("spctl", ["-a", "-vv", "-t", "exec", app]);
-    if (!gk.ok) problems.push(`spctl rejects the notarized app:\n${gk.out}`);
-  }
+  const gk = capture("spctl", ["-a", "-vv", "-t", "exec", app]);
+  if (!gk.ok || !/source=Notarized Developer ID/.test(gk.out)) problems.push(`spctl does not accept it as notarized:\n${gk.out}`);
+  const staple = capture("xcrun", ["stapler", "validate", app]);
+  if (!staple.ok) problems.push(`no stapled ticket on the app:\n${staple.out}`);
 } else if (!/Signature=adhoc/.test(details)) problems.push(`expected an ad-hoc signature:\n${details}`);
 const minMacos = plist("LSMinimumSystemVersion") || "unknown";
 rmSync(check, { recursive: true, force: true });
