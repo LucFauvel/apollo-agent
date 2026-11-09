@@ -1,0 +1,30 @@
+# Typecheck + tests (AGENTS.md "Checks") on every PR and every push to main.
+# No secrets, read-only token: safe for fork PRs (which still need Luc's approval to run,
+# see RELEASE-SETUP.md). Never switch this to pull_request_target.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    name: Typecheck and test
+    # macOS like the release builds: some desktop scripts shell out to macOS tools.
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - run: pnpm typecheck
+      - run: pnpm test

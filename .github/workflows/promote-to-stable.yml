@@ -1,0 +1,76 @@
+# Promote a signed release candidate (published prerelease from desktop.yml) to the stable,
+# "latest" release. NO rebuild: the exact bytes that were smoke-tested, notarized and signed
+# become stable, after a full re-verification. Same-commit rule: the candidate's commit must
+# also have a successful nightly (Desktop workflow on a push to main).
+#
+# Dispatch it from main (Actions → Promote to stable → Run workflow), optionally with a tag;
+# empty = the newest prerelease.
+name: Promote to stable
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release candidate tag (vX.Y.Z). Empty = the newest prerelease."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: promote-to-stable
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.tag || 'newest prerelease' }}
+    # The workflow file that runs is main's, never a branch's.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # flip prerelease → latest
+      actions: read   # find the nightly run of the same commit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - name: Install minisign
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq minisign && minisign -v
+      - name: Pick the candidate
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="$INPUT_TAG"
+          if [[ -z "$tag" ]]; then
+            tag="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --json tagName,isPrerelease,isDraft,publishedAt \
+              --jq '[.[] | select(.isPrerelease and (.isDraft | not))] | sort_by(.publishedAt) | last | .tagName // ""')"
+            [[ -n "$tag" ]] || { echo "::error::No published prerelease to promote."; exit 1; }
+          fi
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "::error::'$tag' is not a release tag"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Verify (signature, hashes, tag on main, same-commit nightly)
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_MINISIGN_PUBLIC_KEY: ${{ vars.RELEASE_MINISIGN_PUBLIC_KEY }}
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          [[ -n "$RELEASE_MINISIGN_PUBLIC_KEY" ]] || { echo "::error::Repository variable RELEASE_MINISIGN_PUBLIC_KEY is not set. See RELEASE-SETUP.md."; exit 1; }
+          node apps/desktop/scripts/release/verify-release.ts --tag "$TAG" --stage promote --dir "$RUNNER_TEMP/release"
+      - name: Promote
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          VERSION: ${{ steps.verify.outputs.version }}
+          COMMIT: ${{ steps.verify.outputs.commit }}
+        run: |
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+          echo "### Apollo ${VERSION} (${COMMIT}) is now the stable release" >> "$GITHUB_STEP_SUMMARY"

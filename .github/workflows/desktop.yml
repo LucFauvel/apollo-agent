@@ -1,0 +1,275 @@
+# Desktop (macOS arm64) builds and releases. See RELEASE-SETUP.md.
+#
+#  push to main → "nightly": ad-hoc signed (the explicit no-secrets fallback), smoke-tested,
+#                 uploaded as a 14-day run artifact. NEVER a release.
+#  push tag v*  → release-build: tag must be vX.Y.Z on origin/main; Developer ID signed + notarized
+#                 with the `release-build` environment's secrets (no reviewer; v* tags only);
+#                 smoke-tested against old databases (failure = no draft).
+#               → draft-release: a DRAFT GitHub Release with the zip, dmg, apollo-update.json, SHA256SUMS.
+#               → sign-and-publish (`release` environment, Luc = required reviewer: THE human gate):
+#                 re-verifies the draft, signs apollo-update.json with minisign, attests provenance,
+#                 publishes the release as a PRERELEASE (release candidate; never "latest").
+#               → promote-to-stable.yml (manual) makes it the stable "latest" release, no rebuild.
+#  manual       → same as a main push (dispatch it on main).
+name: Desktop
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  nightly:
+    name: Nightly build (ad-hoc, artifact only)
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags + history: version and CFBundleVersion come from them
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          native: "true"
+      - name: Stamp version
+        id: stamp
+        run: node apps/desktop/scripts/release/stamp.ts
+      - name: Build (ad-hoc signed, NOT releasable)
+        env:
+          APOLLO_BUILD_VERSION: ${{ steps.stamp.outputs.version }}
+          APOLLO_BUILD_CHANNEL: ${{ steps.stamp.outputs.channel }}
+          APOLLO_BUILD_NUMBER: ${{ steps.stamp.outputs.bundle_version }}
+          APOLLO_BUILD_COMMIT: ${{ steps.stamp.outputs.commit }}
+          APOLLO_CODESIGN: adhoc
+        run: |
+          echo "::warning title=Unsigned nightly::Nightly builds are ad-hoc signed and not releasable (Developer ID signing runs only for v* tags, in the release environment)."
+          node apps/desktop/scripts/release/build-release.ts --out "$RUNNER_TEMP/dist"
+      - name: Smoke test (packaged app against old databases)
+        run: node apps/desktop/scripts/release/smoke.ts --zip "$RUNNER_TEMP"/dist/*.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: apollo-desktop-${{ steps.stamp.outputs.version }}
+          path: ${{ runner.temp }}/dist
+          retention-days: 14
+          if-no-files-found: error
+      - name: Summary
+        env:
+          VERSION: ${{ steps.stamp.outputs.version }}
+        run: |
+          {
+            echo "### Nightly ${VERSION} (ad-hoc signed — not releasable)"
+            echo '```'
+            cat "$RUNNER_TEMP/dist/SHA256SUMS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release-build:
+    name: Release build (Developer ID, notarized)
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-15
+    timeout-minutes: 150
+    # Developer ID + App Store Connect secrets. No reviewer (the approval gate is on signing the
+    # manifest below); the environment's deployment policy admits v* tags only.
+    environment: release-build
+    outputs:
+      version: ${{ steps.stamp.outputs.version }}
+    steps:
+      - name: Check release secrets
+        env:
+          RELEASE_DEVELOPER_ID_P12: ${{ secrets.RELEASE_DEVELOPER_ID_P12 }}
+          RELEASE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.RELEASE_DEVELOPER_ID_P12_PASSWORD }}
+          RELEASE_ASC_KEY_ID: ${{ secrets.RELEASE_ASC_KEY_ID }}
+          RELEASE_ASC_ISSUER_ID: ${{ secrets.RELEASE_ASC_ISSUER_ID }}
+          RELEASE_ASC_KEY_P8: ${{ secrets.RELEASE_ASC_KEY_P8 }}
+        run: |
+          missing=()
+          for name in RELEASE_DEVELOPER_ID_P12 RELEASE_DEVELOPER_ID_P12_PASSWORD RELEASE_ASC_KEY_ID RELEASE_ASC_ISSUER_ID RELEASE_ASC_KEY_P8; do
+            [[ -n "${!name}" ]] || missing+=("$name")
+          done
+          if (( ${#missing[@]} )); then
+            echo "::error title=Release secrets missing::Missing in the 'release-build' environment: ${missing[*]}. A release build must be Developer ID signed and notarized; nothing was built. See RELEASE-SETUP.md."
+            { echo "### Release build not started"; echo "Missing secrets in the \`release-build\` environment: \`${missing[*]}\`"; echo "See RELEASE-SETUP.md."; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "All release secrets are present."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          native: "true"
+      - name: Typecheck and test
+        run: pnpm typecheck && pnpm test
+      - name: Stamp version (refuses malformed tags and tags not on origin/main)
+        id: stamp
+        run: node apps/desktop/scripts/release/stamp.ts
+      - name: Write the App Store Connect key for notarytool
+        env:
+          RELEASE_ASC_KEY_P8: ${{ secrets.RELEASE_ASC_KEY_P8 }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/asc"
+          # Accept the .p8 as pasted (PEM) or base64 of the file.
+          if [[ "$RELEASE_ASC_KEY_P8" == *"BEGIN PRIVATE KEY"* ]]; then
+            printf '%s\n' "$RELEASE_ASC_KEY_P8" > "$RUNNER_TEMP/asc/AuthKey.p8"
+          else
+            printf '%s' "$RELEASE_ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc/AuthKey.p8"
+          fi
+          grep -q "BEGIN PRIVATE KEY" "$RUNNER_TEMP/asc/AuthKey.p8" || { echo "::error::RELEASE_ASC_KEY_P8 is not a .p8 private key (PEM or base64 of it)"; exit 1; }
+      - name: Build, sign (Developer ID) and notarize
+        env:
+          APOLLO_BUILD_VERSION: ${{ steps.stamp.outputs.version }}
+          APOLLO_BUILD_CHANNEL: ${{ steps.stamp.outputs.channel }}
+          APOLLO_BUILD_NUMBER: ${{ steps.stamp.outputs.bundle_version }}
+          APOLLO_BUILD_COMMIT: ${{ steps.stamp.outputs.commit }}
+          APOLLO_CODESIGN: developer-id
+          APOLLO_TEAM_ID: ${{ vars.APOLLO_TEAM_ID || 'XA3R5NAN2C' }}
+          # electron-builder imports the base64 .p12 into a temporary keychain it deletes afterwards.
+          CSC_LINK: ${{ secrets.RELEASE_DEVELOPER_ID_P12 }}
+          CSC_KEY_PASSWORD: ${{ secrets.RELEASE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_API_KEY: ${{ runner.temp }}/asc/AuthKey.p8
+          APPLE_API_KEY_ID: ${{ secrets.RELEASE_ASC_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.RELEASE_ASC_ISSUER_ID }}
+        run: node apps/desktop/scripts/release/build-release.ts --out "$RUNNER_TEMP/dist"
+      - name: Remove the App Store Connect key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc"
+      - name: Smoke test (gate for the draft release)
+        run: node apps/desktop/scripts/release/smoke.ts --zip "$RUNNER_TEMP"/dist/*.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: apollo-desktop-release-${{ github.ref_name }}
+          path: ${{ runner.temp }}/dist
+          retention-days: 30
+          if-no-files-found: error
+
+  draft-release:
+    name: Draft GitHub Release
+    needs: release-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # only this job can write, and only to create the draft
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: apollo-desktop-release-${{ github.ref_name }}
+          path: dist
+      - name: Verify artifacts against the manifest
+        env:
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.release-build.outputs.version }}
+        run: |
+          cd dist
+          sha256sum --check --strict SHA256SUMS
+          jq -e --arg v "$VERSION" --arg c "$GITHUB_SHA" \
+            '.version == $v and .commit == $c and .channel == "release" and .codeSigning.kind == "developer-id"' \
+            apollo-update.json > /dev/null || { echo "::error::apollo-update.json does not match ${TAG} / ${GITHUB_SHA}"; cat apollo-update.json; exit 1; }
+          [[ "v${VERSION}" == "${TAG}" ]] || { echo "::error::stamped ${VERSION} != tag ${TAG}"; exit 1; }
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.release-build.outputs.version }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::A release for ${TAG} already exists. Releases are never re-uploaded: delete the draft by hand or tag a new version."
+            exit 1
+          fi
+          {
+            echo "Apollo ${VERSION} for macOS (Apple silicon), built from ${GITHUB_SHA} by run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            echo
+            echo "Developer ID signed and notarized; smoke-tested against old databases before this draft was created."
+            echo
+            echo "**Draft:** published as a release candidate once Luc approves the signing job; promote-to-stable makes it the stable release."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } > notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "Apollo ${VERSION}" --notes-file notes.md dist/*
+          echo "Draft release ${TAG} created." >> "$GITHUB_STEP_SUMMARY"
+
+  sign-and-publish:
+    name: Sign the manifest and publish (approval)
+    needs: [release-build, draft-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # THE human gate: Luc approves this job. RELEASE_MINISIGN_SECRET exists only here.
+    environment: release
+    permissions:
+      contents: write     # upload the signature, publish the draft
+      id-token: write     # build provenance attestation (Sigstore)
+      attestations: write
+    steps:
+      - name: Check signing configuration
+        env:
+          RELEASE_MINISIGN_SECRET: ${{ secrets.RELEASE_MINISIGN_SECRET }}
+          RELEASE_MINISIGN_PUBLIC_KEY: ${{ vars.RELEASE_MINISIGN_PUBLIC_KEY }}
+        run: |
+          missing=()
+          [[ -n "$RELEASE_MINISIGN_SECRET" ]] || missing+=("secret RELEASE_MINISIGN_SECRET")
+          [[ -n "$RELEASE_MINISIGN_PUBLIC_KEY" ]] || missing+=("variable RELEASE_MINISIGN_PUBLIC_KEY")
+          if (( ${#missing[@]} )); then
+            echo "::error title=Signing not configured::Missing in the 'release' environment: ${missing[*]}. The draft stays a draft. See RELEASE-SETUP.md."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the tag and origin/main, to re-check where the tag points
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - name: Install minisign
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq minisign && minisign -v
+      - name: Re-verify the draft (tag on main, manifest, hashes, Developer ID, unsigned)
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_MINISIGN_PUBLIC_KEY: ${{ vars.RELEASE_MINISIGN_PUBLIC_KEY }}
+        run: node apps/desktop/scripts/release/verify-release.ts --tag "$GITHUB_REF_NAME" --stage sign --dir "$RUNNER_TEMP/release"
+      - name: Sign apollo-update.json (minisign)
+        env:
+          RELEASE_MINISIGN_SECRET: ${{ secrets.RELEASE_MINISIGN_SECRET }}
+          RELEASE_MINISIGN_PASSWORD: ${{ secrets.RELEASE_MINISIGN_PASSWORD }}
+          RELEASE_MINISIGN_PUBLIC_KEY: ${{ vars.RELEASE_MINISIGN_PUBLIC_KEY }}
+        run: |
+          umask 077
+          key="$RUNNER_TEMP/minisign/apollo.key"
+          mkdir -p "$(dirname "$key")"
+          trap 'rm -rf "$RUNNER_TEMP/minisign"' EXIT
+          printf '%s\n' "$RELEASE_MINISIGN_SECRET" > "$key"
+          dir="$RUNNER_TEMP/release"
+          # minisign reads the key password from stdin (empty line for a key made with -W).
+          printf '%s\n' "$RELEASE_MINISIGN_PASSWORD" | minisign -S -s "$key" -m "$dir/apollo-update.json" \
+            -t "$(cat "$dir/.trusted-comment")" -x "$dir/apollo-update.json.minisig" > /dev/null
+          # The public key configured for the app must verify what was just signed.
+          minisign -V -P "$RELEASE_MINISIGN_PUBLIC_KEY" -m "$dir/apollo-update.json" -x "$dir/apollo-update.json.minisig"
+      - name: Attest build provenance (audit only; the app trusts minisign)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/release/*.zip
+            ${{ runner.temp }}/release/*.dmg
+            ${{ runner.temp }}/release/apollo-update.json
+      - name: Upload the signature and publish as a release candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.verify.outputs.version }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "$RUNNER_TEMP/release/apollo-update.json.minisig"
+          # Prerelease: never "latest", so no updater is offered it until promote-to-stable.
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
+          echo "### Apollo ${VERSION} published as a release candidate (signed). Run promote-to-stable to make it the stable release." >> "$GITHUB_STEP_SUMMARY"
