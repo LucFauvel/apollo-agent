@@ -142,7 +142,7 @@ describe("clearing turns from the Changes panel", () => {
   /** What the panel shows: W's section or not, and what it offers to bring back. */
   const shows = (state: PanelState) => {
     const view = panelView(state)!;
-    return { section: view.sessions.length > 0, cleared: view.cleared.flatMap((c) => c.seqs).sort((a, b) => a - b) };
+    return { section: view.sessions.length > 0, cleared: view.undoable.flatMap((c) => c.seqs).sort((a, b) => a - b) };
   };
   const fetchFor = (sessionId: string) => {
     const fetchId = cardsTick();
@@ -188,7 +188,9 @@ describe("clearing turns from the Changes panel", () => {
   });
 
   it("takes the undo line away at once, and shows the section again from the server's answer", () => {
-    let s = loaded(A, 7, 9);
+    const cleared = clearSection(loaded(A), A);
+    const accepted = fetchFor(A);
+    let s = run(cleared.state, settled(A, cleared.ids[0], 7, true), settled(A, cleared.ids[1], 9, true), accepted.sent, accepted.answer(7, 9));
     expect(shows(s)).toEqual({ section: false, cleared: [7, 9] });
     const ids = [cardsTick(), cardsTick()] as const;
     s = run(s, requested(A, ids[0], 7, false), requested(A, ids[1], 9, false));
@@ -197,7 +199,7 @@ describe("clearing turns from the Changes panel", () => {
     const f = fetchFor(A);
     s = run(s, f.sent, f.answer());
     expect(shows(s)).toEqual({ section: true, cleared: [] });
-    expect(s.epoch).toBe(2);
+    expect(s.epoch).toBe(4);
   });
 
   it("never lets a failed request overwrite what the server said since", () => {
@@ -218,7 +220,8 @@ describe("clearing turns from the Changes panel", () => {
     const older = fetchFor(A);
     const newer = fetchFor(A);
     let s = run(initialPanel(A), older.sent, newer.sent, newer.answer(7, 9), older.answer());
-    expect(shows(s)).toEqual({ section: false, cleared: [7, 9] });
+    expect(shows(s)).toEqual({ section: false, cleared: [] });
+    expect(panelView(s)!.anyCleared).toBe(true);
     const third = fetchFor(A);
     const fourth = fetchFor(A);
     s = run(s, third.sent, fourth.sent, third.answer(7, 9), fourth.answer());
@@ -274,7 +277,8 @@ describe("clearing turns from the Changes panel", () => {
     expect(shows(s)).toEqual({ section: true, cleared: [] });
     const reconnect = fetchFor(A);
     s = run(s, reconnect.sent, reconnect.answer(9));
-    expect(shows(s)).toEqual({ section: true, cleared: [9] });
+    expect(shows(s)).toEqual({ section: true, cleared: [] });
+    expect(panelView(s)!.anyCleared).toBe(true);
   });
 
   it("keys requests by session: the same seq in two sessions are two things", () => {
@@ -290,7 +294,85 @@ describe("clearing turns from the Changes panel", () => {
     const { cleared: _, ...withoutCleared } = old;
     const legacy = { sessions: old.sessions.map(({ turns: __, ...section }) => section) } satisfies typeof withoutCleared;
     const s = run(initialPanel(A), f.sent, { type: "fetched", sessionId: A, fetchId: f.sent.fetchId, changes: legacy });
-    expect(panelView(s)).toEqual({ sessions: legacy.sessions, cleared: [] });
+    expect(panelView(s)).toEqual({ sessions: legacy.sessions, undoable: [], anyCleared: false });
+  });
+
+  // Clearing is durable; its undo lives only as long as the viewing that cleared.
+  it("offers no undo on a new viewing, while what was cleared stays hidden", () => {
+    const { ids, state } = clearSection(loaded(A), A);
+    const f = fetchFor(A);
+    let s = run(state, settled(A, ids[0], 7, true), settled(A, ids[1], 9, true), f.sent, f.answer(7, 9));
+    expect(shows(s)).toEqual({ section: false, cleared: [7, 9] });
+    // The panel closes and opens again (a remount), or the phone leaves and comes back to the screen.
+    s = loaded(A, 7, 9);
+    expect(shows(s)).toEqual({ section: false, cleared: [] });
+    expect(panelView(s)!.anyCleared).toBe(true);
+    // Switching session and back is a new viewing too.
+    s = run(clearSection(loaded(A), A).state, { type: "reset", sessionId: B }, { type: "reset", sessionId: A });
+    const again = fetchFor(A);
+    s = run(s, again.sent, again.answer(7, 9));
+    expect(shows(s)).toEqual({ section: false, cleared: [] });
+  });
+
+  it("offers an undo only for what this viewing cleared, not for what was cleared before or elsewhere", () => {
+    // 9 was cleared before this viewing (or from another window); this one clears 7.
+    let s = loaded(A, 9);
+    const id = cardsTick();
+    s = run(s, requested(A, id, 7, true));
+    expect(shows(s)).toEqual({ section: false, cleared: [7] });
+    const f = fetchFor(A);
+    s = run(s, settled(A, id, 7, true), f.sent, f.answer(7, 9));
+    expect(shows(s)).toEqual({ section: false, cleared: [7] });
+    // Another window brings 7 back: the line goes, with nothing left to undo.
+    const g = fetchFor(A);
+    s = run(s, g.sent, g.answer(9));
+    expect(shows(s)).toEqual({ section: true, cleared: [] });
+  });
+
+  it("keeps the undo line through refetches and a failed undo, and drops it when the request fails", () => {
+    let { ids, state: s } = clearSection(loaded(A), A);
+    // The clear of 9 fails: 9 comes back, with no line for it.
+    s = run(s, settled(A, ids[1], 9, false));
+    expect(shows(s)).toEqual({ section: true, cleared: [7] });
+    const f = fetchFor(A);
+    s = run(s, settled(A, ids[0], 7, true), f.sent, f.answer(7));
+    expect(shows(s)).toEqual({ section: true, cleared: [7] });
+    const undo = cardsTick();
+    s = run(s, requested(A, undo, 7, false), settled(A, undo, 7, false));
+    expect(shows(s)).toEqual({ section: true, cleared: [7] });
+    // Cleared again after an undo: offered again.
+    const again = cardsTick();
+    const g = fetchFor(A);
+    s = run(s, requested(A, cardsTick(), 7, false), requested(A, again, 7, true), settled(A, again, 7, true), g.sent, g.answer(7));
+    expect(shows(s)).toEqual({ section: true, cleared: [7] });
+  });
+
+  it("offers each cleared session its own line, from one viewing", () => {
+    const two: ChangesOverview = {
+      sessions: ["W", "X"].map((id) => ({ ...server().sessions[0]!, sessionId: id, title: id.toLowerCase(), turns: [7] })),
+      cleared: [],
+    };
+    const f = fetchFor(A);
+    let s = run(initialPanel(A), f.sent, { type: "fetched", sessionId: A, fetchId: f.sent.fetchId, changes: two });
+    s = run(s, requested(A, cardsTick(), 7, true), { type: "requested", sessionId: A, id: cardsTick(), key: dismissKey("X", 7), dismissed: true });
+    expect(panelView(s)!.undoable).toEqual([
+      { sessionId: "W", title: "w", seqs: [7] },
+      { sessionId: "X", title: "x", seqs: [7] },
+    ]);
+    expect(panelView(s)!.sessions).toEqual([]);
+  });
+
+  it("drops the undo lines when the viewing ends without a remount (the phone app went to the background)", () => {
+    const { ids, state } = clearSection(loaded(A), A);
+    let s = run(state, { type: "forgetUndo", sessionId: B });
+    expect(shows(s)).toEqual({ section: false, cleared: [7, 9] });
+    s = run(s, { type: "forgetUndo", sessionId: A });
+    expect(shows(s)).toEqual({ section: false, cleared: [] });
+    // Requests in flight still settle, without bringing a line back; the turns stay cleared.
+    const f = fetchFor(A);
+    s = run(s, settled(A, ids[0], 7, true), settled(A, ids[1], 9, true), f.sent, f.answer(7, 9));
+    expect(shows(s)).toEqual({ section: false, cleared: [] });
+    expect(panelView(s)!.anyCleared).toBe(true);
   });
 });
 

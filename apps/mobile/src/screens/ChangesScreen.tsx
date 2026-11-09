@@ -12,7 +12,7 @@ import type {
   SessionId,
 } from "@apollo/contracts";
 import { useEffect, useMemo, useReducer, useState } from "react";
-import { ActivityIndicator, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, AppState, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useApollo } from "../AppState.tsx";
 import { errorMessage } from "../connection.ts";
@@ -72,6 +72,12 @@ export function ChangesScreen({
   const insets = useSafeAreaInsets();
   useEffect(() => dispatch({ type: "reset", sessionId: session.id }), [session.id]);
   const own = panel.sessionId === session.id ? panel : initialPanel(session.id);
+  // Leaving the app ends this viewing: what was cleared stays cleared, its undo lines go.
+  useEffect(() => {
+    const sessionId = session.id;
+    const sub = AppState.addEventListener("change", (next) => next === "background" && dispatch({ type: "forgetUndo", sessionId }));
+    return () => sub.remove();
+  }, [session.id]);
 
   useEffect(() => {
     const sessionId = session.id;
@@ -151,7 +157,7 @@ export function ChangesScreen({
             <View style={styles.emptyIcon}>
               <GitCompareArrowsIcon size={22} color={colors.faint} strokeWidth={1.5} />
             </View>
-            <Text style={styles.emptyTitle}>{overview.cleared.length > 0 ? "Nothing left to review" : "No changes yet"}</Text>
+            <Text style={styles.emptyTitle}>{overview.anyCleared ? "Nothing left to review" : "No changes yet"}</Text>
             <Text style={styles.emptyText}>
               Files the agents change in git repositories show up here after each turn, grouped by the functions and types they touch.
             </Text>
@@ -173,13 +179,13 @@ export function ChangesScreen({
             </View>
           </FadeIn>
         ))}
-        {overview && overview.cleared.length > 0 ? (
+        {overview && overview.undoable.length > 0 ? (
           <View style={{ gap: 6 }}>
-            {overview.cleared.map((cleared) => (
+            {overview.undoable.map((cleared) => (
               <ClearedLine
                 key={cleared.sessionId}
                 cleared={cleared}
-                titled={overview.cleared.length > 1 || cleared.sessionId !== session.id}
+                titled={overview.undoable.length > 1 || cleared.sessionId !== session.id}
                 onUndo={() => setCleared(cleared.sessionId, cleared.seqs, false)}
               />
             ))}
@@ -229,7 +235,7 @@ function SectionHeader({ changes, titled, onOpen, onClear }: { changes: SessionC
   );
 }
 
-/** What was cleared from the screen, per session: a way back. */
+/** What this visit to the screen cleared, per session: a way back until it is left. */
 function ClearedLine({ cleared, titled, onUndo }: { cleared: ClearedChanges; titled: boolean; onUndo: () => void }) {
   const n = cleared.seqs.length;
   return (

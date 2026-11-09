@@ -112,7 +112,7 @@ export function ChangesPanel({
         {error ? <div className="rounded-lg border border-red-900/50 bg-red-950/30 px-3 py-2 text-xs text-red-300">{error}</div> : null}
         {overview === null && !error ? <PanelSkeleton /> : null}
         {overview && overview.sessions.length === 0 ? (
-          <EmptyState icon={GitCompareArrows} title={overview.cleared.length > 0 ? "Nothing left to review" : "No changes yet"}>
+          <EmptyState icon={GitCompareArrows} title={overview.anyCleared ? "Nothing left to review" : "No changes yet"}>
             Files the agents change in git repositories show up here after each turn, grouped by the functions and types
             they touch.
           </EmptyState>
@@ -131,13 +131,13 @@ export function ChangesPanel({
             ))}
           </section>
         ))}
-        {overview && overview.cleared.length > 0 ? (
+        {overview && overview.undoable.length > 0 ? (
           <div className="space-y-1">
-            {overview.cleared.map((cleared) => (
+            {overview.undoable.map((cleared) => (
               <ClearedLine
                 key={cleared.sessionId}
                 cleared={cleared}
-                titled={overview.cleared.length > 1 || cleared.sessionId !== session.id}
+                titled={overview.undoable.length > 1 || cleared.sessionId !== session.id}
                 onUndo={() => setCleared(cleared.sessionId, cleared.seqs, false)}
               />
             ))}
@@ -183,7 +183,7 @@ function SectionHeader({ changes, titled, onOpen, onClear }: { changes: SessionC
   );
 }
 
-/** What was cleared from the panel, per session: a way back. */
+/** What this viewing of the panel cleared, per session: a way back while it stays open. */
 function ClearedLine({ cleared, titled, onUndo }: { cleared: ClearedChanges; titled: boolean; onUndo: () => void }) {
   const n = cleared.seqs.length;
   return (
