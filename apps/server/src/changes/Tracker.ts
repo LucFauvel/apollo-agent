@@ -556,8 +556,8 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
    * one of `worktrees` (workers' own), the baseline is where its branch left the branch it
    * was created from, so others' work on that branch (merged locally, not pushed) stays out,
    * as long as that record still describes the checkout (see resolveBaseline).
-   * HEAD is read before and after the snapshot; when it moved (a commit or checkout in the
-   * meantime), it starts over, so the history and the files describe one state of the
+   * HEAD (its commit and branch) is read before and after the snapshot; when either moved (a
+   * commit, or a checkout even of another branch at the same commit), it starts over, so the history and the files describe one state of the
    * repository. `signal` stops it, and the git processes it runs.
    */
   const report = async (
@@ -582,9 +582,12 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
 
     for (let attempt = 1; ; attempt++) {
       const head = await headOf(repo, signal);
-      const baseline = await resolveBaseline(repo, head.commit, ref, signal, worktree);
+      const baseline = await resolveBaseline(repo, head.commit, ref, signal, worktree, head.branch);
       const tree = await snapshot(repo, signal);
-      if ((await headCommit(repo, signal)) !== head.commit) {
+      // The commit and the branch the baseline was picked for must both still be HEAD's: a
+      // checkout of another branch at the same commit would mix two branches' reports.
+      const now = await headOf(repo, signal);
+      if (now.commit !== head.commit || now.branch !== head.branch) {
         if (attempt < MAX_REPORT_ATTEMPTS) continue;
         throw new Error(`HEAD kept moving in ${repo} while reading it; ask again once it settles`);
       }

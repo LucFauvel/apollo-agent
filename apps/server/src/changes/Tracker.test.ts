@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -252,6 +252,38 @@ describe("change tracker", () => {
           ],
         ]);
         expect(await lines(tracker, "c", app.dir, "a.ts")).toEqual(["del export const value = 1;", "add export const value = 2;"]);
+      },
+      GIT_HEAVY,
+    );
+
+    it(
+      "measures a resolution in a file the other side renamed from the source's content",
+      async () => {
+        const { tracker } = setup();
+        const app = repo("app");
+        app.git("branch", "-M", "main");
+        const body = (value: number) =>
+          `export const value = ${value};\n${Array.from({ length: 20 }, (_, n) => `export const stable${n} = ${n};\n`).join("")}`;
+        writeFileSync(join(app.dir, "a.ts"), body(0));
+        commit(app.git, "base");
+        app.git("checkout", "-qb", "side");
+        app.git("mv", "a.ts", "b.ts");
+        writeFileSync(join(app.dir, "b.ts"), body(2));
+        commit(app.git, "side renames");
+        app.git("checkout", "-q", "main");
+        writeFileSync(join(app.dir, "a.ts"), body(1));
+        commit(app.git, "main");
+        await nextSecond();
+        await tracker.turnStarted("rn", 1, app.dir);
+        expect(() => app.git("merge", "-q", "side")).toThrow();
+        rmSync(join(app.dir, "a.ts"), { force: true });
+        writeFileSync(join(app.dir, "b.ts"), body(3));
+        commit(app.git, "resolved");
+        const done = await tracker.turnCompleted("rn");
+        // Only the resolved line is the turn's; the move itself came with the other side.
+        expect(done?.repos.map((r) => r.files.map((f) => [f.path, f.status, f.additions, f.deletions]))).toEqual([[["b.ts", "modified", 1, 1]]]);
+        const diff = await tracker.file("rn", app.dir, "b.ts");
+        expect(diff?.symbols.map((s) => [s.name, s.change, s.additions, s.deletions])).toEqual([["value", "modified", 1, 1]]);
       },
       GIT_HEAVY,
     );
@@ -838,6 +870,95 @@ describe("change tracker", () => {
         work.git("checkout", "-q", "main");
         wt("merge", "-q", "--no-edit", "feature-base");
         expect(await files()).toEqual(["other.ts", "theirs.ts"]);
+      },
+      GIT_HEAVY,
+    );
+
+    it(
+      "never takes a base branch that absorbed the worker's own merge, a conflict it resolved",
+      async () => {
+        const { tracker } = setup();
+        const work = cloned();
+        work.git("checkout", "-qb", "side");
+        writeFileSync(join(work.dir, "store.ts"), "export class Store { side = 1 }\n");
+        work.git("commit", "-qam", "side");
+        work.git("checkout", "-q", "main");
+        writeFileSync(join(work.dir, "store.ts"), "export class Store { main = 1 }\n");
+        work.git("commit", "-qam", "main");
+        const base = work.git("rev-parse", "HEAD").trim();
+        work.git("update-ref", "refs/remotes/origin/main", base);
+        work.git("branch", "feature-base");
+        const path = join(realpathSync(mkdtempSync(join(tmpdir(), "apollo-wt-"))), "wt");
+        work.git("worktree", "add", "-q", "-b", "worker", path, "feature-base");
+        const wt = (...args: Array<string>) => execFileSync("git", args, { cwd: path, encoding: "utf8", stdio: "pipe" });
+        // The worker's only commit: a merge whose conflict it resolved (taking the other side).
+        expect(() => wt("merge", "-q", "side")).toThrow();
+        wt("checkout", "--theirs", "store.ts");
+        wt("add", "-A");
+        wt("commit", "-q", "--no-edit");
+        work.git("checkout", "-q", "feature-base");
+        work.git("merge", "-q", "--ff-only", "worker");
+        const hint = { repoPath: work.dir, path, branch: "worker", baseRef: base, baseBranch: "feature-base" };
+        const { repo: changes, report } = await tracker.report(path, undefined, undefined, [hint]);
+        expect(changes.files.map((f) => f.path)).toEqual(["store.ts"]);
+        expect(report.base.commit).toBe(base);
+      },
+      GIT_HEAVY,
+    );
+
+    it(
+      "never mixes two branches in one report when HEAD switches branch at the same commit",
+      async () => {
+        const { tracker } = setup();
+        const work = cloned();
+        const base = work.git("rev-parse", "HEAD").trim();
+        work.git("branch", "feature-base");
+        const path = join(realpathSync(mkdtempSync(join(tmpdir(), "apollo-wt-"))), "wt");
+        work.git("worktree", "add", "-q", "-b", "worker", path, "feature-base");
+        const wt = (...args: Array<string>) => execFileSync("git", args, { cwd: path, encoding: "utf8", stdio: "pipe" });
+        writeFileSync(join(path, "mine.ts"), "export const mine = 1;\n");
+        wt("add", "-A");
+        wt("commit", "-qm", "mine");
+        work.git("branch", "different", wt("rev-parse", "HEAD").trim());
+        const hint = { repoPath: work.dir, path, branch: "worker", baseRef: base, baseBranch: "feature-base" };
+        expect((await tracker.report(path, undefined, undefined, [hint])).repo.files.map((f) => f.path)).toEqual(["mine.ts"]);
+        // After the report has read HEAD and its branch, at the next branch read, the worktree
+        // switches to `different` (same commit).
+        const spawn = childProcess.spawn;
+        let reads = 0;
+        childProcess.spawn = ((command: string, args: ReadonlyArray<string>, options: object) => {
+          if (command === "git" && args[0] === "symbolic-ref" && args.at(-1) === "HEAD" && ++reads === 2) wt("checkout", "-q", "different");
+          return spawn(command, args, options);
+        }) as typeof childProcess.spawn;
+        syncBuiltinESMExports();
+        try {
+          const { repo: changes, report } = await tracker.report(path, undefined, undefined, [hint]);
+          // Read again from the start: one branch throughout (`different`, which did nothing of its own).
+          expect([report.head.branch, report.base.ref, changes.files.map((f) => f.path)]).toEqual(["different", "start of different", []]);
+        } finally {
+          childProcess.spawn = spawn;
+          syncBuiltinESMExports();
+        }
+        // Switched there and back between the reads: the baseline is still picked for the
+        // branch read with the commit, never for the one seen in between.
+        wt("checkout", "-q", "worker");
+        reads = 0;
+        childProcess.spawn = ((command: string, args: ReadonlyArray<string>, options: object) => {
+          if (command === "git" && args[0] === "symbolic-ref" && args.at(-1) === "HEAD") {
+            if (++reads === 2) wt("checkout", "-q", "different");
+            if (reads === 3) wt("checkout", "-q", "worker");
+          }
+          return spawn(command, args, options);
+        }) as typeof childProcess.spawn;
+        syncBuiltinESMExports();
+        try {
+          const { repo: changes, report } = await tracker.report(path, undefined, undefined, [hint]);
+          expect([report.head.branch, changes.files.map((f) => f.path)]).toEqual(["worker", ["mine.ts"]]);
+          expect(report.base.ref).not.toBe("start of different");
+        } finally {
+          childProcess.spawn = spawn;
+          syncBuiltinESMExports();
+        }
       },
       GIT_HEAVY,
     );

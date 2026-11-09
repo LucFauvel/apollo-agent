@@ -259,6 +259,24 @@ const rawDiff = async (gitDir: string, a: string, b: string, signal?: AbortSigna
   return entries;
 };
 
+/** Renames between two trees (git's own detection), by destination: the source path and its entry. */
+const renamesBetween = async (gitDir: string, a: string, b: string) => {
+  const out = await inGitDir(gitDir, ["diff", "--no-ext-diff", "--raw", "-M", "--no-abbrev", "-z", a, b]);
+  const renames = new Map<string, { path: string; mode: string; object: string }>();
+  const s = out.split("\0");
+  for (let i = 0; i < s.length; ) {
+    const meta = s[i++]!;
+    if (!meta.startsWith(":")) break;
+    const [srcMode, , src, , status] = meta.slice(1).split(" ");
+    if (status?.startsWith("R") || status?.startsWith("C")) {
+      const from = s[i++]!;
+      const to = s[i++]!;
+      if (status.startsWith("R")) renames.set(to, { path: from, mode: srcMode!, object: src! });
+    } else i++;
+  }
+  return renames;
+};
+
 const sameChange = (x: RawEntry, y: RawEntry | undefined) =>
   y !== undefined && x.srcMode === y.srcMode && x.dstMode === y.dstMode && x.src === y.src && x.dst === y.dst;
 
@@ -368,6 +386,17 @@ export const ownBaseline = async (
   const imported = [...changed].filter(
     ([path, entry]) => !authored.has(path) && !uncommitted.has(path) && (born || sameChange(entry, moved!.get(path))),
   );
+  // A path the turn made its own that arrived through an imported rename (a conflict resolved
+  // in a file the other side moved): its baseline is the source's content, not nothing.
+  const gone = new Set(imported.filter(([, e]) => e.dstMode === "000000").map(([path]) => path));
+  const created = [...changed].filter(([path, e]) => e.srcMode === "000000" && !imported.some(([p]) => p === path));
+  if (gone.size > 0 && created.length > 0) {
+    const renames = await renamesBetween(gitDir, start, after.tree);
+    for (const [path] of created) {
+      const from = renames.get(path);
+      if (from && gone.has(from.path)) imported.push([path, { srcMode: "000000", dstMode: from.mode, src: "", dst: from.object }]);
+    }
+  }
   if (imported.length === 0) return start;
   const scratch = mkdtempSync(join(tmpdir(), "apollo-baseline-"));
   try {
@@ -474,11 +503,14 @@ const isAncestor = (repo: string, a: string, b: string, signal?: AbortSignal) =>
  * branch`, `checkout -b` and `worktree add -b` write "branch: Created from ..."; an expired
  * or cloned log does not).
  */
-const branchStart = async (repo: string, signal?: AbortSignal): Promise<{ branch: string | null; start: string | null }> => {
-  const branch = await git(repo, ["symbolic-ref", "-q", "--short", "HEAD"], undefined, signal).then(
-    (s) => s.trim() || null,
-    (error) => (signal?.aborted ? Promise.reject(error) : null),
-  );
+const branchStart = async (repo: string, pinned: string | null | undefined, signal?: AbortSignal): Promise<{ branch: string | null; start: string | null }> => {
+  const branch =
+    pinned !== undefined
+      ? pinned
+      : await git(repo, ["symbolic-ref", "-q", "--short", "HEAD"], undefined, signal).then(
+          (s) => s.trim() || null,
+          (error) => (signal?.aborted ? Promise.reject(error) : null),
+        );
   if (!branch) return { branch, start: null };
   const log = await git(repo, ["reflog", "show", "--format=%H%x09%gs", `refs/heads/${branch}`, "--"], undefined, signal).catch((error) =>
     signal?.aborted ? Promise.reject(error) : "",
@@ -487,10 +519,14 @@ const branchStart = async (repo: string, signal?: AbortSignal): Promise<{ branch
   return { branch, start: sha && subject?.startsWith("branch: Created from") ? sha : null };
 };
 
-/** How many of the branch's own commits since `start` (first parents, merges aside) are not in `base`. */
+/**
+ * How many of the branch's own commits since `start` (its first parents) are not in `base`.
+ * Merges count: one may hold a conflict resolution or an edit, and telling which would take
+ * more than this guard needs (refusing a nearer baseline only shows more).
+ */
 const ownCommitsOutside = async (repo: string, head: string, start: string, base: string | null, signal?: AbortSignal) =>
   Number(
-    (await git(repo, ["rev-list", "--count", "--first-parent", "--no-merges", head, `^${start}`, ...(base ? [`^${base}`] : []), "--"], undefined, signal)).trim(),
+    (await git(repo, ["rev-list", "--count", "--first-parent", head, `^${start}`, ...(base ? [`^${base}`] : []), "--"], undefined, signal)).trim(),
   );
 
 /**
@@ -514,6 +550,9 @@ const ownCommitsOutside = async (repo: string, head: string, start: string, base
  *
  * Never to a commit that contains any of the branch's own commits since it started: that
  * would hide its work (its base branch merged it, say).
+ *
+ * `branch` is HEAD's branch as read with `head` (null when detached), so that both describe
+ * one state; the caller checks that neither moved. Read here when not given.
  */
 export const resolveBaseline = async (
   repo: string,
@@ -521,6 +560,7 @@ export const resolveBaseline = async (
   ref?: string,
   signal?: AbortSignal,
   worker?: WorkerFork,
+  branch?: string | null,
 ): Promise<Baseline> => {
   const wanted = ref?.trim();
   if (ref !== undefined && (!wanted || wanted.startsWith("-") || wanted.length > MAX_REF_LENGTH)) {
@@ -549,18 +589,18 @@ export const resolveBaseline = async (
     if (chosen.commit === head) return { ...chosen, tree: await treeOf(repo, head, signal) };
     // Each fork: where to compare, how to show it, and where the branch's own work starts.
     const forks: Array<{ ref: string; label: string; start: string }> = [];
-    const { branch, start } = await branchStart(repo, signal);
-    if (branch && start) forks.push({ ref: start, label: `start of ${branch}`, start });
+    const { branch: onBranch, start } = await branchStart(repo, branch, signal);
+    if (onBranch && start) forks.push({ ref: start, label: `start of ${onBranch}`, start });
     const recorded = worker && (await verifyCommit(repo, worker.baseRef, signal));
     if (
       worker &&
       recorded &&
-      branch === worker.branch &&
+      onBranch === worker.branch &&
       (start === null || start === recorded) &&
       (await isAncestor(repo, recorded, head, signal))
     ) {
       if (worker.baseBranch) forks.push({ ref: `refs/heads/${worker.baseBranch}`, label: worker.baseBranch, start: recorded });
-      forks.push({ ref: recorded, label: `start of ${branch}`, start: recorded });
+      forks.push({ ref: recorded, label: `start of ${onBranch}`, start: recorded });
     }
     for (const fork of forks) {
       const at = await verifyCommit(repo, fork.ref, signal);
