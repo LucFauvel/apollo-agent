@@ -121,26 +121,46 @@ export default function App() {
         ) : (
           <AppStateProvider connection={connection}>
             <AvatarSync pairing={pairing} />
-            {open ? (
-              <SwipeBack key={open} onBack={() => setOpen(null)}>
-                <ChatScreen sessionId={open} onBack={() => setOpen(null)} onOpenSession={setOpen} />
-              </SwipeBack>
-            ) : settings ? (
-              <SwipeBack key="settings" onBack={() => setSettings(false)}>
-                <SettingsScreen
-                  pairing={pairing}
-                  onBack={() => setSettings(false)}
-                  onUnpair={() => {
-                    setSettings(false);
-                    unpair();
-                  }}
-                />
-              </SwipeBack>
-            ) : (
-              <SlideIn key="home" from="left">
-                <HomeScreen onOpen={setOpen} onSettings={() => setSettings(true)} />
-              </SlideIn>
-            )}
+            {/* Home stays under the screens pushed over it, so going back slides to it. The
+                stack has a padding-free parent so the pushed screens fill exactly what Home does. */}
+            <View style={styles.fill}>
+              <View
+                style={styles.fill}
+                importantForAccessibility={open || settings ? "no-hide-descendants" : "auto"}
+                accessibilityElementsHidden={Boolean(open || settings)}
+              >
+                <SlideIn key="home" from="left">
+                  <HomeScreen onOpen={setOpen} onSettings={() => setSettings(true)} />
+                </SlideIn>
+              </View>
+              {settings ? (
+                <View
+                  style={StyleSheet.absoluteFill}
+                  importantForAccessibility={open ? "no-hide-descendants" : "auto"}
+                  accessibilityElementsHidden={Boolean(open)}
+                >
+                  <SwipeBack key="settings" onBack={() => setSettings(false)}>
+                    {(back) => (
+                      <SettingsScreen
+                        pairing={pairing}
+                        onBack={back}
+                        onUnpair={() => {
+                          setSettings(false);
+                          unpair();
+                        }}
+                      />
+                    )}
+                  </SwipeBack>
+                </View>
+              ) : null}
+              {open ? (
+                <View style={StyleSheet.absoluteFill}>
+                  <SwipeBack key={open} onBack={() => setOpen(null)}>
+                    {(back) => <ChatScreen sessionId={open} onBack={back} onOpenSession={setOpen} />}
+                  </SwipeBack>
+                </View>
+              ) : null}
+            </View>
           </AppStateProvider>
         )}
       </SafeAreaView>
@@ -150,6 +170,7 @@ export default function App() {
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.bg },
+  fill: { flex: 1 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 });
 

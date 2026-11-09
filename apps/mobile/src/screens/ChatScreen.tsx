@@ -28,6 +28,7 @@ import {
 } from "react";
 import {
   Animated,
+  Easing,
   Linking,
   Platform,
   Pressable,
@@ -117,11 +118,24 @@ export function ChatScreen({
   const insets = useSafeAreaInsets();
   const keyboard = useKeyboardInset(insets.bottom, () => setTimeout(() => scroll.current?.scrollToEnd({ animated: true }), 50));
 
+  // A button back to the latest message, once scrolled up a good way from it.
+  const [farFromBottom, setFarFromBottom] = useState(false);
+  const jumpShown = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(jumpShown, { toValue: farFromBottom ? 1 : 0, duration: 160, easing: Easing.out(Easing.quad), useNativeDriver: true }).start();
+  }, [farFromBottom, jumpShown]);
+  const jumpToBottom = () => {
+    atBottom.current = true;
+    setFarFromBottom(false);
+    scroll.current?.scrollToEnd({ animated: true });
+  };
+
   useEffect(() => {
     dispatch({ type: "reset", sessionId });
     lastSeq.current = 0;
     openedAt.current = Date.now();
     atBottom.current = true;
+    setFarFromBottom(false);
   }, [sessionId]);
 
   // Resumes after the last event seen, so a reconnect does not reload the conversation.
@@ -310,6 +324,7 @@ export function ChatScreen({
         <ConversationToggle active={talking} onToggle={() => setTalking((t) => !t)} />
       </View>
 
+      <View style={{ flex: 1 }}>
       <ScrollView
         ref={scroll}
         style={{ flex: 1 }}
@@ -318,9 +333,11 @@ export function ChatScreen({
         keyboardDismissMode="interactive"
         keyboardShouldPersistTaps="handled"
         onScroll={({ nativeEvent: e }) => {
-          atBottom.current =
-            e.contentOffset.y + e.layoutMeasurement.height >=
-            e.contentSize.height - 120;
+          const fromBottom = e.contentSize.height - (e.contentOffset.y + e.layoutMeasurement.height);
+          atBottom.current = fromBottom <= 120;
+          // Half a screen up (at least a few lines): far enough to want a way back.
+          const far = fromBottom > Math.max(240, e.layoutMeasurement.height / 2);
+          setFarFromBottom((was) => (was === far ? was : far));
         }}
         onContentSizeChange={() => {
           if (atBottom.current && Date.now() > holdUntil.current)
@@ -392,6 +409,24 @@ export function ChatScreen({
           </View>
         ) : null}
       </ScrollView>
+        <Animated.View
+          pointerEvents={farFromBottom ? "box-none" : "none"}
+          style={[
+            styles.jump,
+            { opacity: jumpShown, transform: [{ translateY: jumpShown.interpolate({ inputRange: [0, 1], outputRange: [8, 0] }) }] },
+          ]}
+        >
+          <Pressable
+            onPress={jumpToBottom}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel="Scroll to the latest message"
+            style={({ pressed }) => [styles.jumpButton, pressed && { opacity: 0.6 }]}
+          >
+            <ChevronDownIcon size={18} color={colors.textSoft} />
+          </Pressable>
+        </Animated.View>
+      </View>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {talking ? <ConversationBar session={session} onEnd={() => setTalking(false)} /> : null}
@@ -458,21 +493,25 @@ export function ChatScreen({
       {browser && session ? (
         <View style={StyleSheet.absoluteFill}>
           <SwipeBack onBack={() => setBrowser(null)}>
-            <BrowserScreen botId={session.botId} tabId={browser.tabId} handoff={browser.handoff} onBack={() => setBrowser(null)} />
+            {(back) => <BrowserScreen botId={session.botId} tabId={browser.tabId} handoff={browser.handoff} onBack={back} />}
           </SwipeBack>
         </View>
       ) : null}
       {changesOpen && session ? (
         <View style={StyleSheet.absoluteFill}>
           <SwipeBack onBack={() => setChangesOpen(false)}>
-            <ChangesScreen
-              session={session}
-              onBack={() => setChangesOpen(false)}
-              onOpenSession={(id) => {
-                setChangesOpen(false);
-                if (id !== sessionId) onOpenSession(id);
-              }}
-            />
+            {(back) => (
+              <ChangesScreen
+                session={session}
+                onBack={back}
+                onOpenSession={(id) => {
+                  // This conversation's own section: just go back to it.
+                  if (id === sessionId) return back();
+                  setChangesOpen(false);
+                  onOpenSession(id);
+                }}
+              />
+            )}
           </SwipeBack>
         </View>
       ) : null}
@@ -1298,5 +1337,22 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   stop: { backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border },
+  // Over the transcript's bottom edge, so it never covers the composer (lifted with it).
+  jump: { position: "absolute", bottom: 10, alignSelf: "center" },
+  jumpButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.panel,
+    borderWidth: 1,
+    borderColor: colors.border,
+    shadowColor: "#000",
+    shadowOpacity: 0.4,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 4,
+  },
   disabled: { opacity: 0.35 },
 });

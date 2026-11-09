@@ -1,6 +1,7 @@
 import { createContext, type ReactNode, useContext, useEffect, useMemo, useRef, useState } from "react";
 import {
   Animated,
+  BackHandler,
   Easing,
   type GestureResponderEvent,
   Keyboard,
@@ -101,52 +102,80 @@ export function FadeIn({
 }
 
 /**
- * A screen that slides in from the right and goes back when swiped right from the
- * left edge, like iOS navigation. Starting at the edge leaves sideways scrolling
- * (code blocks, tables) alone.
+ * A screen pushed over the previous one, like a native navigation stack: it slides in from
+ * the right, and slides back out (revealing the screen under it) when it goes back, by a
+ * swipe right from the left edge, Android's back button, or the screen's own back action,
+ * `children(back)`. Starting the swipe at the edge leaves sideways scrolling (code blocks,
+ * tables) alone. Render it over the previous screen (absolutely filled) so the pop shows it.
  */
-export function SwipeBack({ children, onBack }: { children: ReactNode; onBack: () => void }) {
+export function SwipeBack({ children, onBack }: { children: ReactNode | ((back: () => void) => ReactNode); onBack: () => void }) {
   const { width } = useWindowDimensions();
-  const enter = useRef(new Animated.Value(0)).current;
+  const widthRef = useRef(width);
+  widthRef.current = width;
+  // 1 while off screen to the right (before entering), 0 once in.
+  const enter = useRef(new Animated.Value(1)).current;
   const drag = useRef(new Animated.Value(0)).current;
   const back = useRef(onBack);
   back.current = onBack;
+  // Once going back, stay gone: a second tap or back press must not go back twice.
+  const leaving = useRef(false);
 
   useEffect(() => {
-    Animated.timing(enter, { toValue: 1, duration: 240, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
+    Animated.timing(enter, { toValue: 0, duration: 280, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
   }, [enter]);
+
+  /** Slides the screen out to the right, then goes back. */
+  const leave = useMemo(
+    () => () => {
+      if (leaving.current) return;
+      leaving.current = true;
+      Keyboard.dismiss();
+      enter.stopAnimation();
+      Animated.timing(drag, { toValue: widthRef.current, duration: 220, easing: Easing.out(Easing.quad), useNativeDriver: true }).start(
+        () => back.current(),
+      );
+    },
+    [drag, enter],
+  );
+
+  // Android's back button (and back gesture): the latest screen registered handles it first.
+  useEffect(() => {
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      leave();
+      return true;
+    });
+    return () => sub.remove();
+  }, [leave]);
 
   const responder = useMemo(() => {
     const claims = (_: GestureResponderEvent, g: PanResponderGestureState) =>
-      g.moveX - g.dx < EDGE && g.dx > 8 && Math.abs(g.dx) > Math.abs(g.dy) * 1.5;
+      !leaving.current && g.moveX - g.dx < EDGE && g.dx > 8 && Math.abs(g.dx) > Math.abs(g.dy) * 1.5;
     return PanResponder.create({
       onMoveShouldSetPanResponderCapture: claims,
       onMoveShouldSetPanResponder: claims,
       onPanResponderMove: (_, g) => drag.setValue(Math.max(0, g.dx)),
       onPanResponderRelease: (_, g) => {
-        if (g.dx > width * 0.33 || g.vx > 0.5) {
-          Animated.timing(drag, { toValue: width, duration: 180, easing: Easing.out(Easing.quad), useNativeDriver: true }).start(
-            () => back.current(),
-          );
-        } else {
-          Animated.spring(drag, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start();
-        }
+        if (g.dx > width * 0.33 || g.vx > 0.5) leave();
+        else Animated.spring(drag, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start();
       },
       onPanResponderTerminate: () => Animated.spring(drag, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start(),
       onPanResponderTerminationRequest: () => false,
     });
-  }, [drag, width]);
+  }, [drag, width, leave]);
 
   return (
     <Animated.View
       {...responder.panHandlers}
       style={{
         flex: 1,
-        opacity: Animated.multiply(enter, drag.interpolate({ inputRange: [0, width], outputRange: [1, 0.6], extrapolate: "clamp" })),
-        transform: [{ translateX: Animated.add(enter.interpolate({ inputRange: [0, 1], outputRange: [36, 0] }), drag) }],
+        shadowColor: "#000",
+        shadowOpacity: 0.35,
+        shadowRadius: 12,
+        shadowOffset: { width: -4, height: 0 },
+        transform: [{ translateX: Animated.add(Animated.multiply(enter, width), drag) }],
       }}
     >
-      {children}
+      {typeof children === "function" ? children(leave) : children}
     </Animated.View>
   );
 }
