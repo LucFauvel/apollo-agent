@@ -138,7 +138,8 @@ export interface Provider {
   /**
    * A few words naming a conversation that opens with `text`, from a small fast model
    * (one request, no tools, nothing saved). `environment` overrides the CLI's (an
-   * account's folder). Absent where that is not cheap.
+   * account's folder). Absent where that is not cheap. Only asked for this provider's own
+   * sessions, so a message never goes to a provider the user did not pick for it.
    */
   readonly generateTitle?: (
     text: string,
