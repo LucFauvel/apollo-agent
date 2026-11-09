@@ -9,7 +9,7 @@
  */
 import { execFileSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
-import { resolveStamp } from "./version.ts";
+import { parseReleaseTag, resolveStamp } from "./version.ts";
 
 const git = (...args: Array<string>) => execFileSync("git", args, { encoding: "utf8" }).trim();
 
@@ -21,6 +21,8 @@ if (process.env.GITHUB_SHA && process.env.GITHUB_SHA !== commit) {
 if (git("rev-parse", "--is-shallow-repository") === "true") throw new Error("shallow clone: check out with fetch-depth: 0");
 
 if (ref?.startsWith("refs/tags/")) {
+  const tag = ref.slice("refs/tags/".length);
+  if (!parseReleaseTag(tag)) throw new Error(`tag ${tag} is not a release tag (expected vMAJOR.MINOR.PATCH, e.g. v0.1.0)`);
   // Exit status 1 = not an ancestor; anything else is an error. Both fail the build.
   try {
     execFileSync("git", ["merge-base", "--is-ancestor", commit, "origin/main"]);
