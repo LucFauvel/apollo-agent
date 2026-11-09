@@ -1,20 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  findInSegments,
-  findMatches,
-  findOccurrences,
-  markdownPlainText,
-  searchableText,
-  stepMatch,
-  toBlocks,
-  type TranscriptItem,
-} from "../src/index.ts";
-
-const user = (key: string, text: string, author = "user"): TranscriptItem =>
-  ({ kind: "user", key, text, author, seq: 1 }) as unknown as TranscriptItem;
-const said = (key: string, text: string): TranscriptItem => ({ kind: "assistant", key, text, streaming: false, seq: 2 }) as unknown as TranscriptItem;
-const tool = (key: string, output: string): TranscriptItem =>
-  ({ kind: "tool", key, name: "Bash", summary: output, output, isError: false }) as unknown as TranscriptItem;
+import { findInSegments, findOccurrences, matchAt, stepMatch, toResults } from "../src/index.ts";
 
 describe("conversation search", () => {
   it("matches case-insensitively, without overlaps", () => {
@@ -31,7 +16,7 @@ describe("conversation search", () => {
 
   it("finds nothing for an empty or blank query", () => {
     expect(findOccurrences("anything", "")).toEqual([]);
-    expect(findMatches(toBlocks([said("1", "hello")]), "   ")).toEqual([]);
+    expect(findOccurrences("anything", " \n\t")).toEqual([]);
   });
 
   it("keeps offsets right when lowercasing changes a string's length", () => {
@@ -39,29 +24,22 @@ describe("conversation search", () => {
     const text = "İstanbul Search";
     const [[start, end]] = findOccurrences(text, "search") as [[number, number]];
     expect(text.slice(start, end)).toBe("Search");
+    expect(findOccurrences("A😀B", "😀")).toEqual([[1, 3]]);
   });
 
-  it("searches every message of the conversation in order, skipping tool activity", () => {
-    const blocks = toBlocks([user("u1", "Deploy the API"), tool("t1", "api deployed"), said("a1", "The **API** is up. Check the API logs."), user("u2", "thanks")]);
-    expect(findMatches(blocks, "api")).toEqual([
+  it("numbers matches across blocks in conversation order", () => {
+    const results = toResults([
+      ["u1", 1],
+      ["t1", 0],
+      ["a1", 2],
+    ]);
+    expect(results.total).toBe(3);
+    expect([0, 1, 2, 3].map((i) => matchAt(results, i))).toEqual([
       { key: "u1", occurrence: 0 },
       { key: "a1", occurrence: 0 },
       { key: "a1", occurrence: 1 },
+      null,
     ]);
-  });
-
-  it("matches rendered markdown, not its syntax or link targets", () => {
-    expect(markdownPlainText("## Title\n- **bold** and `code`\n> [the docs](https://example.com/x)")).toBe("Title\nbold and code\nthe docs");
-    const blocks = toBlocks([said("a1", "See [the docs](https://example.com/docs) for **foo bar**.")]);
-    expect(findMatches(blocks, "example.com")).toEqual([]);
-    expect(findMatches(blocks, "foo bar")).toEqual([{ key: "a1", occurrence: 0 }]);
-  });
-
-  it("searches system messages whole and skips silent runs", () => {
-    const blocks = toBlocks([user("s1", "[Apollo] Worker finished\nIt fixed the **login** bug", "system"), said("a1", "[SILENT]")]);
-    expect(searchableText(blocks[0]!)).toBe("Worker finished\nIt fixed the login bug");
-    expect(searchableText(blocks[1]!)).toBeNull();
-    expect(findMatches(blocks, "login")).toEqual([{ key: "s1", occurrence: 0 }]);
   });
 
   it("finds a match split across text nodes", () => {
@@ -71,6 +49,7 @@ describe("conversation search", () => {
     expect(findInSegments(["ab", "cd"], "ab")).toEqual([{ start: { segment: 0, offset: 0 }, end: { segment: 0, offset: 2 } }]);
     // One that starts exactly at a segment boundary begins in the next segment.
     expect(findInSegments(["ab", "", "cd"], "cd")).toEqual([{ start: { segment: 2, offset: 0 }, end: { segment: 2, offset: 2 } }]);
+    expect(findInSegments(["fo", "o ", "bar"], "o b")).toEqual([{ start: { segment: 1, offset: 0 }, end: { segment: 2, offset: 1 } }]);
   });
 
   it("steps through matches, wrapping both ways", () => {
@@ -78,5 +57,44 @@ describe("conversation search", () => {
     expect(stepMatch(2, 1, 3)).toBe(0);
     expect(stepMatch(0, -1, 3)).toBe(2);
     expect(stepMatch(0, 1, 0)).toBe(0);
+  });
+});
+
+describe("reviewer round 1 repros (search logic)", () => {
+  it("reviewer round 1 repro: every counted match covers a non-empty range of whole characters (İ vs i)", () => {
+    for (const [text, query] of [
+      ["İ", "i"],
+      ["İstanbul", "i"],
+      ["xİy", "İ"],
+      ["ﬁne", "fi"],
+    ] as const) {
+      for (const [start, end] of findOccurrences(text, query)) {
+        expect(end).toBeGreaterThan(start);
+        // The matched slice, lowercased, is what was searched for: no partial characters.
+        expect(text.slice(start, end).toLowerCase()).toBe(query.toLowerCase());
+      }
+    }
+    expect(findOccurrences("İ", "i")).toEqual([]);
+    expect(findOccurrences("xİy", "İ")).toEqual([[1, 2]]);
+  });
+
+  it("reviewer round 1 repro: contextual final sigma matches (ΟΣ vs ος)", () => {
+    expect(findOccurrences("ΟΣ", "ος")).toEqual([[0, 2]]);
+    expect(findOccurrences("ΟΔΟΣ ΟΔΟΣ", "οδος")).toEqual([
+      [0, 4],
+      [5, 9],
+    ]);
+    expect(findOccurrences("σοφος", "ΣΟΦΟΣ")).toEqual([[0, 5]]);
+  });
+
+  it("reviewer round 1 repro: mapping matches onto text nodes is linear, not quadratic", () => {
+    const nodes = Array<string>(64_000).fill("a ");
+    const started = performance.now();
+    const found = findInSegments(nodes, "a");
+    const elapsed = performance.now() - started;
+    expect(found).toHaveLength(64_000);
+    expect(found[63_999]).toEqual({ start: { segment: 63_999, offset: 0 }, end: { segment: 63_999, offset: 1 } });
+    // Quadratic lookup took ~1.4 s here; linear takes a few ms.
+    expect(elapsed).toBeLessThan(250);
   });
 });

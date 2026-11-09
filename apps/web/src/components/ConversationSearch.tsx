@@ -24,18 +24,32 @@ const textNodes = (root: Element) => {
   return nodes;
 };
 
-/** Ranges of `query` in one rendered element's text. */
-const rangesIn = (element: Element, query: string) => {
-  const nodes = textNodes(element);
-  return findInSegments(
-    nodes.map((n) => n.data),
-    query,
-  ).map(({ start, end }) => {
-    const range = document.createRange();
-    range.setStart(nodes[start.segment]!, start.offset);
-    range.setEnd(nodes[end.segment]!, end.offset);
-    return range;
-  });
+/** The keys of an event, and where it happened. */
+export interface ShortcutEvent {
+  readonly key: string;
+  readonly metaKey: boolean;
+  readonly ctrlKey: boolean;
+  readonly altKey: boolean;
+  readonly shiftKey: boolean;
+  readonly defaultPrevented: boolean;
+  readonly target: EventTarget | null;
+}
+
+/** An open modal dialog (see Modal in ui.tsx). */
+const MODAL = '[aria-modal="true"]';
+
+/**
+ * Whether a key press opens conversation search (Cmd/Ctrl+F). Never while a dialog is
+ * open or for a press inside one: the dialog keeps the keys and the focus. Nor when
+ * something else already handled the press.
+ */
+export const opensSearch = (e: ShortcutEvent, root: ParentNode): boolean => {
+  if (e.defaultPrevented) return false;
+  if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey || e.key.toLowerCase() !== "f") return false;
+  if (root.querySelector(MODAL)) return false;
+  const target = e.target as Partial<Element> | null;
+  if (typeof target?.closest === "function" && target.closest(`[role="dialog"], ${MODAL}`)) return false;
+  return true;
 };
 
 export const clearSearchHighlights = () => {
@@ -43,40 +57,67 @@ export const clearSearchHighlights = () => {
   highlights()?.delete(CURRENT);
 };
 
+/** At most this many matches are painted at once (the current one always is). */
+export const PAINT_LIMIT = 2000;
+
 /**
- * Highlights every rendered match and the current one, and scrolls the current one into
- * view. Returns false while the current match's message is not on the page yet (its day
- * or message is still opening).
+ * Highlights the current match and the others on or near the screen, and scrolls the
+ * current one into view. The work is bounded: elements more than a screen away are
+ * skipped (their highlights come with the next call, on scroll), at most PAINT_LIMIT
+ * ranges are built, and no call takes all of them as arguments. Returns false while the
+ * current match is not on the page yet (its day or message is still opening).
  */
 export const showSearchMatches = (container: HTMLElement, query: string, current: SearchMatch | null, scroll: boolean): boolean => {
+  const box = container.getBoundingClientRect();
+  const margin = box.height;
   const all: Array<Range> = [];
   let currentRange: Range | null = null;
   let currentElement: HTMLElement | null = null;
-  const seen = new Map<string, number>();
+  // Matches in earlier elements of the current match's message.
+  let before = 0;
   for (const element of container.querySelectorAll<HTMLElement>(`[${SEARCH_TEXT_ATTR}]`)) {
-    const key = element.getAttribute(SEARCH_TEXT_ATTR)!;
-    const ranges = rangesIn(element, query);
-    all.push(...ranges);
-    if (current && key === current.key) {
-      currentElement ??= element;
-      const before = seen.get(key) ?? 0;
-      const wanted = current.occurrence - before;
-      if (wanted >= 0 && wanted < ranges.length) currentRange = ranges[wanted]!;
-      // Rendered text can differ slightly from what was counted: fall back to the message's last match.
-      else if (ranges.length > 0 && !currentRange) currentRange = ranges.at(-1)!;
+    const isCurrent = current !== null && element.getAttribute(SEARCH_TEXT_ATTR) === current.key;
+    if (!isCurrent) {
+      if (all.length >= PAINT_LIMIT) continue;
+      const rect = element.getBoundingClientRect();
+      if (rect.bottom < box.top - margin || rect.top > box.bottom + margin) continue;
     }
-    seen.set(key, (seen.get(key) ?? 0) + ranges.length);
+    const nodes = textNodes(element);
+    const points = findInSegments(
+      nodes.map((n) => n.data),
+      query,
+    );
+    const range = (i: number) => {
+      const { start, end } = points[i]!;
+      const r = document.createRange();
+      r.setStart(nodes[start.segment]!, start.offset);
+      r.setEnd(nodes[end.segment]!, end.offset);
+      return r;
+    };
+    let from = 0;
+    if (isCurrent) {
+      currentElement ??= element;
+      const wanted = current.occurrence - before;
+      before += points.length;
+      if (wanted >= 0 && wanted < points.length) {
+        currentRange = range(wanted);
+        // Paint the matches around the current one.
+        from = Math.max(0, wanted - Math.floor((PAINT_LIMIT - all.length) / 2));
+      }
+    }
+    for (let i = from; i < points.length && all.length < PAINT_LIMIT; i++) all.push(range(i));
   }
   const registry = highlights();
   if (registry) {
-    registry.set(ALL, new Highlight(...all));
+    const painted = new Highlight();
+    for (const r of all) painted.add(r);
+    registry.set(ALL, painted);
     if (currentRange) registry.set(CURRENT, new Highlight(currentRange));
     else registry.delete(CURRENT);
   }
-  if (current && !currentElement) return false;
+  if (current && !currentRange) return false;
   if (scroll && currentElement) {
     const target = currentRange?.getBoundingClientRect() ?? currentElement.getBoundingClientRect();
-    const box = container.getBoundingClientRect();
     if (target.top < box.top + 48 || target.bottom > box.bottom - 24) {
       container.scrollTo({ top: container.scrollTop + target.top - box.top - container.clientHeight / 2 + target.height / 2 });
     }
@@ -89,6 +130,7 @@ export function ConversationSearchBar({
   query,
   index,
   count,
+  pending,
   inputRef,
   onQuery,
   onStep,
@@ -97,6 +139,8 @@ export function ConversationSearchBar({
   query: string;
   index: number;
   count: number;
+  /** Still preparing the conversation or catching up with typing: no count yet. */
+  pending: boolean;
   inputRef: RefObject<HTMLInputElement | null>;
   onQuery: (query: string) => void;
   onStep: (step: 1 | -1) => void;
@@ -135,8 +179,11 @@ export function ConversationSearchBar({
         spellCheck={false}
         className="w-52 bg-transparent py-1 text-sm text-zinc-100 placeholder:text-zinc-500 focus:outline-none"
       />
-      <span className={cx("min-w-12 shrink-0 text-right text-[11px] tabular-nums", searching && count === 0 ? "text-red-300/80" : "text-zinc-500")} aria-live="polite">
-        {searching ? (count === 0 ? "No results" : `${index + 1} of ${count}`) : ""}
+      <span
+        className={cx("min-w-12 shrink-0 text-right text-[11px] tabular-nums", searching && !pending && count === 0 ? "text-red-300/80" : "text-zinc-500")}
+        aria-live="polite"
+      >
+        {!searching ? "" : pending && count === 0 ? "Searching…" : count === 0 ? "No results" : `${index + 1} of ${count}`}
       </span>
       <span className="mx-0.5 h-4 w-px bg-zinc-800" />
       <IconButton icon={ChevronUp} label="Previous match (Shift+Enter)" size="sm" disabled={count === 0} onClick={() => onStep(-1)} />

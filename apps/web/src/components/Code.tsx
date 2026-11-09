@@ -1,10 +1,13 @@
 import { codePlainColor, highlightCode } from "@apollo/client";
 import { Check, Copy } from "lucide-react";
-import { type ReactNode, useMemo, useState } from "react";
+import { isValidElement, type ReactNode, useMemo, useState } from "react";
 import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 /** A fenced code block, highlighted, with its language and a copy button. */
+/** The text a highlighted code block shows: its lines' spans, a newline between lines. */
+const codeText = (lines: ReturnType<typeof highlightCode>) => lines.map((line) => line.map((span) => span.text).join("")).join("\n");
+
 export function CodeBlock({ code, lang }: { code: string; lang: string | null }) {
   const lines = useMemo(() => highlightCode(code, lang), [code, lang]);
   const [copied, setCopied] = useState(false);
@@ -72,11 +75,44 @@ const components: Components = {
     ),
 };
 
+const remarkPlugins = [remarkGfm];
+
 /** Markdown as Apollo shows it in conversations: GitHub-flavored, with highlighted code. */
 export function MarkdownText({ children }: { children: string }) {
   return (
-    <Markdown remarkPlugins={[remarkGfm]} components={components}>
+    <Markdown remarkPlugins={remarkPlugins} components={components}>
       {children}
     </Markdown>
   );
 }
+
+// The components above use no hooks, so they can be called to see what they render.
+const plainComponents = new Set<unknown>(Object.values(components));
+
+/**
+ * The text `MarkdownText` puts on the page (its text nodes, in order, joined), without what
+ * conversation search skips (a code block's language and copy button). Computed from the
+ * very element tree React renders, so search counts exactly what is shown: no link targets,
+ * image alt text or markdown syntax, entities decoded, code kept literally.
+ */
+export const markdownShownText = (markdown: string): string => {
+  const out: Array<string> = [];
+  const walk = (node: ReactNode): void => {
+    if (node === null || node === undefined || typeof node === "boolean") return;
+    if (typeof node === "string" || typeof node === "number" || typeof node === "bigint") {
+      out.push(String(node));
+      return;
+    }
+    if (typeof node === "object" && Symbol.iterator in node) {
+      for (const child of node as Iterable<ReactNode>) walk(child);
+      return;
+    }
+    if (!isValidElement(node)) return;
+    const props = node.props as { children?: ReactNode; code?: string; lang?: string | null };
+    if (node.type === CodeBlock) out.push(codeText(highlightCode(props.code ?? "", props.lang ?? null)));
+    else if (plainComponents.has(node.type)) walk((node.type as (props: unknown) => ReactNode)(props));
+    else walk(props.children);
+  };
+  walk(Markdown({ children: markdown, remarkPlugins, components }));
+  return out.join("");
+};
