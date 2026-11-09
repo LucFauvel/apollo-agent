@@ -123,11 +123,23 @@ const make = Effect.gen(function* () {
    * machine (and its DNS name) to whatever name the node announces at start, and paired
    * phones reach Apollo at the DNS name from their QR code: a name that followed the
    * network would strand them after the next restart (an update, a reboot).
+   *
+   * The first choice keeps the name an existing node already announces (phones may be
+   * paired at it); only a node that never signed in gets one from the computer's name.
+   * If the existing name cannot be read, this start announces what Apollo used to
+   * (`os.hostname()`), and nothing is saved, so the next start tries again.
    */
   const machineName = Effect.gen(function* () {
     const saved = yield* store.getSetting(HOSTNAME_SETTING);
     if (saved) return saved;
-    const chosen = nodeHostname(computerName());
+    const existing = yield* Effect.promise(() =>
+      invoke<{ readonly hostname?: string | null }>("savedHostname", { dir: stateDir }).then(
+        (result) => ({ ok: true as const, hostname: typeof result?.hostname === "string" ? result.hostname : null }),
+        () => ({ ok: false as const, hostname: null }),
+      ),
+    );
+    if (!existing.ok) return nodeHostname(hostname());
+    const chosen = existing.hostname || nodeHostname(computerName());
     yield* store.setSetting(HOSTNAME_SETTING, chosen);
     return chosen;
   });

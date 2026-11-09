@@ -28,6 +28,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +36,7 @@ import (
 	"unsafe"
 
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/logger"
@@ -119,6 +121,15 @@ func ApolloTailnetCall(cMethod, cArgs *C.char) *C.char {
 		return result(struct{}{}, nil)
 	case "logout":
 		return result(struct{}{}, logout())
+	case "savedHostname":
+		var a struct {
+			Dir string `json:"dir"`
+		}
+		if err := json.Unmarshal(args, &a); err != nil {
+			return result(nil, err)
+		}
+		name, err := savedHostname(a.Dir)
+		return result(map[string]*string{"hostname": nonEmpty(name)}, err)
 	case "peer":
 		var a struct {
 			Port int `json:"port"`
@@ -209,6 +220,47 @@ func stopLocked() {
 		srv = nil
 	}
 	cfg = startArgs{}
+}
+
+// savedHostname is the machine name a node in dir last announced (the Hostname of its
+// current profile's prefs), or "" when dir holds no signed-in node. It only reads the
+// state file: nothing is created, and no key material leaves this function.
+func savedHostname(dir string) (string, error) {
+	if dir == "" {
+		return "", errors.New("dir is required")
+	}
+	bs, err := os.ReadFile(filepath.Join(dir, "tailscaled.state"))
+	if errors.Is(err, os.ErrNotExist) || (err == nil && len(bs) == 0) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	var state map[ipn.StateKey][]byte // tsnet's FileStore format: values are base64 in JSON.
+	if err := json.Unmarshal(bs, &state); err != nil {
+		return "", fmt.Errorf("reading node state: %w", err)
+	}
+	// Where the node's prefs are: the profile tailscaled starts with (on Windows, the
+	// server-mode one), or the single pre-profiles key of old state files.
+	var prefsKey ipn.StateKey
+	for _, k := range []ipn.StateKey{ipn.CurrentProfileStateKey, ipn.ServerModeStartKey} {
+		if v := state[k]; len(v) > 0 {
+			prefsKey = ipn.StateKey(v)
+			break
+		}
+	}
+	if prefsKey == "" {
+		prefsKey = ipn.LegacyGlobalDaemonStateKey
+	}
+	raw := state[prefsKey]
+	if len(raw) == 0 {
+		return "", nil
+	}
+	var prefs struct{ Hostname string }
+	if err := json.Unmarshal(raw, &prefs); err != nil {
+		return "", fmt.Errorf("reading node prefs: %w", err)
+	}
+	return prefs.Hostname, nil
 }
 
 // logout signs the node out of the tailnet and forgets its state.
