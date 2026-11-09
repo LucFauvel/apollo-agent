@@ -140,28 +140,58 @@ export const reduceCards = (state: CardsState, action: CardsAction): CardsState 
 
 // --- the Changes panel: clearing a session's turns, and bringing them back ---------------
 
-export type PanelState = SyncedState<ChangesOverview>;
-export type PanelAction = SyncedAction<ChangesOverview>;
-export const initialPanel = (sessionId: string): PanelState => initialSynced(sessionId);
-export const reducePanel = (state: PanelState, action: PanelAction): PanelState => reduceSynced(state, action);
+/**
+ * Clearing is durable (the server keeps it), but the way back is not: only what this viewing
+ * of the panel cleared offers an undo, and a new viewing (a remount, another session, the
+ * phone going to the background) starts with none. Nothing accumulates across viewings.
+ */
+export interface PanelState extends SyncedState<ChangesOverview> {
+  /** What this viewing asked to clear (`dismissKey`s): the only things it offers to bring back. */
+  readonly clearedHere: ReadonlySet<string>;
+}
+export type PanelAction =
+  | SyncedAction<ChangesOverview>
+  /** The viewing is over without the panel going away (the phone app went to the background): drop its undo lines. */
+  | { readonly type: "forgetUndo"; readonly sessionId: string };
+export const initialPanel = (sessionId: string): PanelState => ({ ...initialSynced<ChangesOverview>(sessionId), clearedHere: new Set() });
+export const reducePanel = (state: PanelState, action: PanelAction): PanelState => {
+  if (action.type === "reset") return initialPanel(action.sessionId);
+  if (action.sessionId !== state.sessionId) return state;
+  if (action.type === "forgetUndo") return state.clearedHere.size === 0 ? state : { ...state, clearedHere: new Set() };
+  const synced = reduceSynced(state, action);
+  const clearedHere =
+    action.type === "requested" && action.dismissed && !state.clearedHere.has(action.key) ? new Set(state.clearedHere).add(action.key) : state.clearedHere;
+  return synced === state && clearedHere === state.clearedHere ? state : { ...synced, clearedHere };
+};
 
 /** What a request clears: the FilesChanged event at `seq` of a session (the panel spans several). */
 export const dismissKey = (sessionId: string, seq: number) => `${sessionId}\0${seq}`;
 
+export interface PanelView {
+  readonly sessions: ReadonlyArray<SessionChanges>;
+  /** What this viewing cleared and is still cleared, by session: each offers an undo. */
+  readonly undoable: ReadonlyArray<ClearedChanges>;
+  /** Whether anything is cleared at all (here, elsewhere or before): "nothing left" rather than "nothing yet". */
+  readonly anyCleared: boolean;
+}
+
 /**
  * What the Changes panel shows: the server's overview with the requests in flight laid
  * over. A section whose turns are all being cleared is hidden at once (the server's answer
- * leaves them out of what it shows); what is cleared, by session, offers an undo.
+ * leaves them out of what it shows); what this viewing cleared, by session, offers an undo.
  */
-export const panelView = (state: PanelState): { readonly sessions: ReadonlyArray<SessionChanges>; readonly cleared: ReadonlyArray<ClearedChanges> } | null => {
+export const panelView = (state: PanelState): PanelView | null => {
   const server = state.server;
   if (!server) return null;
   const dismissed = (sessionId: string, seq: number, onServer: boolean) => state.pending.get(dismissKey(sessionId, seq))?.dismissed ?? onServer;
-  const cleared = new Map<string, { sessionId: string; title: string; seqs: Array<number> }>();
+  let anyCleared = false;
+  const undoable = new Map<string, { sessionId: string; title: string; seqs: Array<number> }>();
   const add = (sessionId: string, title: string, seq: number) => {
-    const entry = cleared.get(sessionId) ?? { sessionId, title, seqs: [] };
+    anyCleared = true;
+    if (!state.clearedHere.has(dismissKey(sessionId, seq))) return;
+    const entry = undoable.get(sessionId) ?? { sessionId, title, seqs: [] };
     entry.seqs.push(seq);
-    cleared.set(sessionId, entry);
+    undoable.set(sessionId, entry);
   };
   for (const c of server.cleared ?? []) for (const seq of c.seqs) if (dismissed(c.sessionId, seq, true)) add(c.sessionId, c.title, seq);
   const sessions = server.sessions.filter((section) => {
@@ -170,5 +200,5 @@ export const panelView = (state: PanelState): { readonly sessions: ReadonlyArray
     for (const seq of clearing) add(section.sessionId, section.title, seq);
     return turns.length === 0 || clearing.length < turns.length;
   });
-  return { sessions, cleared: [...cleared.values()] };
+  return { sessions, undoable: [...undoable.values()], anyCleared };
 };
