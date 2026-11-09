@@ -370,15 +370,26 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
    * from its origin (onto a vacated path too: an approximation); a vacated path nothing
    * holds, deleted. Counts and the diff are of the latest span that touched that file (for
    * a vacated path, the span that deleted the file that had it, under whatever path then).
-   * A file that ends as it was before the first span that touched it is not shown at all.
+   * A file the shown spans changed and then changed back is not shown at all: only when
+   * nothing else touched it in between (each span that changed it starts where the previous
+   * one left it), so a later span undoing what a cleared turn or someone else did still shows.
    *
    * This keeps the cleared turn's entries out (rows, notes, summaries), not every line it
    * wrote: a diff over a later span shows what that span changed, so a line the cleared turn
    * wrote shows there as deleted (a later turn deleting it) or as context (a later turn
    * editing next to it). Hiding those would mean misstating what the shown turns did.
    */
+  const changedBack = async (path: string, touches: ReadonlyArray<Span> | null) => {
+    if (!touches || touches.length < 2) return false; // one span's own diff already leaves such a file out
+    const same = (a: string, b: string) => samePathIn(touches[0]!.gitDir, a, path, b, path);
+    if (!(await same(touches[0]!.before, touches.at(-1)!.after))) return false;
+    for (let i = 1; i < touches.length; i++) if (!(await same(touches[i - 1]!.after, touches[i]!.before))) return false;
+    return true;
+  };
+
   const composeFiles = async (list: ReadonlyArray<Span>): Promise<Map<string, Composed>> => {
-    type Live = { origin: string | null; first: Span; span: Span; changed: ChangedFile };
+    /** `touches`: the spans that modified it in place, oldest first (null once renamed). */
+    type Live = { origin: string | null; touches: Array<Span> | null; span: Span; changed: ChangedFile };
     const live = new Map<string, Live>();
     const vacated = new Map<string, { span: Span; changed: ChangedFile }>();
     for (const span of list) {
@@ -386,17 +397,17 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
         if (changed.status === "renamed" && changed.oldPath !== null) {
           const moved = live.get(changed.oldPath);
           live.delete(changed.oldPath);
-          live.set(changed.path, { origin: moved ? moved.origin : changed.oldPath, first: moved ? moved.first : span, span, changed });
+          live.set(changed.path, { origin: moved ? moved.origin : changed.oldPath, touches: null, span, changed });
         } else if (changed.status === "deleted") {
           const gone = live.get(changed.path);
           live.delete(changed.path);
           const origin = gone ? gone.origin : changed.path;
           if (origin !== null) vacated.set(origin, { span, changed });
         } else if (changed.status === "added") {
-          live.set(changed.path, { origin: null, first: span, span, changed });
+          live.set(changed.path, { origin: null, touches: [span], span, changed });
         } else {
           const kept = live.get(changed.path);
-          live.set(changed.path, { origin: kept ? kept.origin : changed.path, first: kept ? kept.first : span, span, changed });
+          live.set(changed.path, { origin: kept ? kept.origin : changed.path, touches: kept ? kept.touches && [...kept.touches, span] : [span], span, changed });
         }
       }
     }
@@ -404,7 +415,7 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
     for (const [path, file] of live) {
       // Changed in one span, changed back in a later one: nothing to show (one span's own diff
       // already leaves such a file out).
-      if (file.origin === path && file.first !== file.span && (await samePathIn(file.span.gitDir, file.first.before, path, file.span.after, path))) continue;
+      if (file.origin === path && (await changedBack(path, file.touches))) continue;
       const status = file.origin === null ? (vacated.has(path) ? "modified" : "added") : file.origin === path ? "modified" : "renamed";
       const oldPath = status === "renamed" ? file.origin : null;
       files.set(path, { file: { ...file.changed, path, status, oldPath }, span: file.span, changed: file.changed });
@@ -543,7 +554,8 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
    * Everything that differs in the repository around `path` from its baseline (see
    * `resolveBaseline`): commits since the merge base and the working tree as it is now. In
    * one of `worktrees` (workers' own), the baseline is where its branch left the branch it
-   * was created from, so others' work on that branch (merged locally, not pushed) stays out.
+   * was created from, so others' work on that branch (merged locally, not pushed) stays out,
+   * as long as that record still describes the checkout (see resolveBaseline).
    * HEAD is read before and after the snapshot; when it moved (a commit or checkout in the
    * meantime), it starts over, so the history and the files describe one state of the
    * repository. `signal` stops it, and the git processes it runs.
@@ -557,7 +569,8 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
     const repo = await repoRoot(path, signal);
     if (!repo) throw new Error(`${path} is not in a git repository`);
     const gitDir = await commonGitDir(repo, signal);
-    // A worker's own worktree: its work is what it did since the branch it was created from.
+    // A worker's own worktree: its work is what it did since the branch it was created from
+    // (when that record still describes the checkout: see resolveBaseline).
     const real = (p: string) => {
       try {
         return realpathSync(p);
@@ -566,12 +579,10 @@ export const makeChangeTracker = (db: DatabaseSync, home: string) => {
       }
     };
     const worktree = worktrees.find((w) => real(w.path) === real(repo));
-    const forks = worktree
-      ? [...(worktree.baseBranch ? [{ ref: `refs/heads/${worktree.baseBranch}`, label: worktree.baseBranch }] : []), { ref: worktree.baseRef, label: `start of ${worktree.branch}` }]
-      : [];
+
     for (let attempt = 1; ; attempt++) {
       const head = await headOf(repo, signal);
-      const baseline = await resolveBaseline(repo, head.commit, ref, signal, forks);
+      const baseline = await resolveBaseline(repo, head.commit, ref, signal, worktree);
       const tree = await snapshot(repo, signal);
       if ((await headCommit(repo, signal)) !== head.commit) {
         if (attempt < MAX_REPORT_ATTEMPTS) continue;
