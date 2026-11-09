@@ -119,6 +119,16 @@ export function SwipeBack({ children, onBack }: { children: ReactNode | ((back: 
   back.current = onBack;
   // Once going back, stay gone: a second tap or back press must not go back twice.
   const leaving = useRef(false);
+  // An exit's completion belongs to this screen: once it is gone (replaced by another
+  // conversation, say), stopping its animation must not navigate whatever is there now.
+  const mounted = useRef(true);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+    },
+    [],
+  );
+  const stayIn = () => Animated.spring(drag, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start();
 
   useEffect(() => {
     Animated.timing(enter, { toValue: 0, duration: 280, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
@@ -132,9 +142,17 @@ export function SwipeBack({ children, onBack }: { children: ReactNode | ((back: 
       Keyboard.dismiss();
       enter.stopAnimation();
       Animated.timing(drag, { toValue: widthRef.current, duration: 220, easing: Easing.out(Easing.quad), useNativeDriver: true }).start(
-        () => back.current(),
+        ({ finished }) => {
+          if (!mounted.current) return;
+          if (finished) return back.current();
+          // Stopped while still here (nothing in this screen interrupts an exit, see the
+          // gesture below): come back in, and let the next back try again.
+          leaving.current = false;
+          stayIn();
+        },
       );
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [drag, enter],
   );
 
@@ -153,12 +171,18 @@ export function SwipeBack({ children, onBack }: { children: ReactNode | ((back: 
     return PanResponder.create({
       onMoveShouldSetPanResponderCapture: claims,
       onMoveShouldSetPanResponder: claims,
-      onPanResponderMove: (_, g) => drag.setValue(Math.max(0, g.dx)),
-      onPanResponderRelease: (_, g) => {
-        if (g.dx > width * 0.33 || g.vx > 0.5) leave();
-        else Animated.spring(drag, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start();
+      // Once an exit started (Android's back during a drag), the gesture leaves it alone.
+      onPanResponderMove: (_, g) => {
+        if (!leaving.current) drag.setValue(Math.max(0, g.dx));
       },
-      onPanResponderTerminate: () => Animated.spring(drag, { toValue: 0, useNativeDriver: true, bounciness: 0 }).start(),
+      onPanResponderRelease: (_, g) => {
+        if (leaving.current) return;
+        if (g.dx > width * 0.33 || g.vx > 0.5) leave();
+        else stayIn();
+      },
+      onPanResponderTerminate: () => {
+        if (!leaving.current) stayIn();
+      },
       onPanResponderTerminationRequest: () => false,
     });
   }, [drag, width, leave]);

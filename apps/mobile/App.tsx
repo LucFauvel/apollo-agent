@@ -155,7 +155,8 @@ export default function App() {
               ) : null}
               {open ? (
                 <View style={StyleSheet.absoluteFill}>
-                  <SwipeBack key={open} onBack={() => setOpen(null)}>
+                  {/* Closes this conversation only if it is still the one open. */}
+                  <SwipeBack key={open} onBack={() => setOpen((current) => (current === open ? null : current))}>
                     {(back) => <ChatScreen sessionId={open} onBack={back} onOpenSession={setOpen} />}
                   </SwipeBack>
                 </View>

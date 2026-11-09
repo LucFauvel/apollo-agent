@@ -82,6 +82,9 @@ const reducer = (state: TranscriptState, action: Action): TranscriptState =>
     ? { sessionId: action.sessionId, lastSeq: 0, items: [] }
     : reduceTranscript(state, action.event);
 
+/** Longest our own animated scroll to the latest message takes (iOS and Android: ~250–300 ms). */
+const OWN_SCROLL_MS = 600;
+
 /** A conversation: its live transcript, cards that need the user, and a message box. */
 export function ChatScreen({
   sessionId,
@@ -107,6 +110,21 @@ export function ChatScreen({
   // Follow new output only while the user is at the bottom, and never because a row opened.
   const atBottom = useRef(true);
   const holdUntil = useRef(0);
+  /**
+   * Until when scroll events are our own scrolling to the latest message, not the user's:
+   * they must not turn following off half-way (output arriving meanwhile is caught up with
+   * by `onContentSizeChange`). The user dragging, or reaching the bottom, ends it early.
+   */
+  const ownScrollUntil = useRef(0);
+  // While the user's finger is on the transcript, nothing scrolls it for them.
+  const dragging = useRef(false);
+  /** Scrolls to the latest message, and follows new output from there. */
+  const toLatest = (animated: boolean) => {
+    atBottom.current = true;
+    ownScrollUntil.current = Date.now() + OWN_SCROLL_MS;
+    setFarFromBottom(false);
+    scroll.current?.scrollToEnd({ animated });
+  };
   const hold = useMemo(
     () => () => void (holdUntil.current = Date.now() + 700),
     [],
@@ -116,7 +134,7 @@ export function ChatScreen({
   const lastSeq = useRef(0);
   // Lift the conversation and the message box above the keyboard, and show the latest message.
   const insets = useSafeAreaInsets();
-  const keyboard = useKeyboardInset(insets.bottom, () => setTimeout(() => scroll.current?.scrollToEnd({ animated: true }), 50));
+  const keyboard = useKeyboardInset(insets.bottom, () => setTimeout(() => toLatest(true), 50));
 
   // A button back to the latest message, once scrolled up a good way from it.
   const [farFromBottom, setFarFromBottom] = useState(false);
@@ -124,11 +142,7 @@ export function ChatScreen({
   useEffect(() => {
     Animated.timing(jumpShown, { toValue: farFromBottom ? 1 : 0, duration: 160, easing: Easing.out(Easing.quad), useNativeDriver: true }).start();
   }, [farFromBottom, jumpShown]);
-  const jumpToBottom = () => {
-    atBottom.current = true;
-    setFarFromBottom(false);
-    scroll.current?.scrollToEnd({ animated: true });
-  };
+  const jumpToBottom = () => toLatest(true);
 
   useEffect(() => {
     dispatch({ type: "reset", sessionId });
@@ -170,7 +184,7 @@ export function ChatScreen({
     setError(null);
     const id = ++outboxId.current;
     setOutbox((o) => [...o, { id, text: value }]);
-    setTimeout(() => scroll.current?.scrollToEnd({ animated: true }), 50);
+    setTimeout(() => toLatest(true), 50);
     connection
       .rpc((c) => c["sessions.send"]({ sessionId, text: value }))
       .catch((e) => {
@@ -332,16 +346,28 @@ export function ChatScreen({
         scrollEventThrottle={64}
         keyboardDismissMode="interactive"
         keyboardShouldPersistTaps="handled"
+        onScrollBeginDrag={() => {
+          // The user takes over from any scrolling of ours.
+          dragging.current = true;
+          ownScrollUntil.current = 0;
+        }}
+        onScrollEndDrag={() => {
+          dragging.current = false;
+        }}
         onScroll={({ nativeEvent: e }) => {
           const fromBottom = e.contentSize.height - (e.contentOffset.y + e.layoutMeasurement.height);
+          if (Date.now() < ownScrollUntil.current) {
+            // On its way down: still following. Arrived: later events are the user's again.
+            if (fromBottom <= 120) ownScrollUntil.current = 0;
+            return;
+          }
           atBottom.current = fromBottom <= 120;
           // Half a screen up (at least a few lines): far enough to want a way back.
           const far = fromBottom > Math.max(240, e.layoutMeasurement.height / 2);
           setFarFromBottom((was) => (was === far ? was : far));
         }}
         onContentSizeChange={() => {
-          if (atBottom.current && Date.now() > holdUntil.current)
-            scroll.current?.scrollToEnd({ animated: true });
+          if (atBottom.current && !dragging.current && Date.now() > holdUntil.current) toLatest(true);
         }}
       >
         <ScrollHold.Provider value={hold}>
