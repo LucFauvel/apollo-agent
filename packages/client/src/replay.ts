@@ -18,6 +18,12 @@ export const replayTiming: ReplayTiming = { flushMs: 16, quietMs: 150, maxMs: 20
 
 export type ReplayBuffer<E> = {
   readonly push: (event: E) => void;
+  /**
+   * Stops it, dropping the events it still holds: they were never handed to `onBatch`.
+   * Contract: the owner counts an event as applied only once `onBatch` handed it over, and
+   * resumes a stream (a replaced connection) after the last event applied, never after the
+   * last one pushed, so nothing dropped here goes missing.
+   */
   readonly dispose: () => void;
 };
 

@@ -32,13 +32,41 @@ describe("replayBuffer", () => {
   });
 
   it("flushes the last replayed events before saying it caught up", () => {
-    const { buffer, log } = make();
+    const log: Array<string> = [];
+    // The quiet period ends before the pending flush would have.
+    const buffer = replayBuffer<number>({
+      onBatch: (events) => log.push(`batch ${events.join(",")}`),
+      onCaughtUp: () => log.push("caught up"),
+      timing: { quietMs: 5, flushMs: 16 },
+    });
     buffer.push(1);
-    vi.advanceTimersByTime(16);
     buffer.push(2);
-    // The quiet period ends before this event's flush would have.
-    vi.advanceTimersByTime(150);
-    expect(log).toEqual(["batch 1", "batch 2", "caught up"]);
+    vi.advanceTimersByTime(5);
+    expect(log).toEqual(["batch 1,2", "caught up"]);
+  });
+
+  it("waits for quiet after the latest event, not the first", () => {
+    const { buffer, log } = make();
+    for (let i = 0; i < 10; i++) {
+      buffer.push(i);
+      vi.advanceTimersByTime(100);
+    }
+    expect(log).not.toContain("caught up");
+    vi.advanceTimersByTime(50);
+    expect(log.at(-1)).toBe("caught up");
+  });
+
+  it("at the cap, every event pushed so far (the one crossing it too) is handed over before it says so", () => {
+    const { buffer, batches, log } = make();
+    let t = 0;
+    while (!log.includes("caught up")) {
+      buffer.push(t);
+      vi.advanceTimersByTime(50);
+      t += 50;
+    }
+    const before = batches.slice(0, log.indexOf("caught up")).flat();
+    expect(before).toEqual(Array.from({ length: before.length }, (_, i) => i * 50));
+    expect(before.at(-1)).toBe(2000);
   });
 
   it("catches up after maxMs even when events never stop (a working session)", () => {
@@ -70,6 +98,16 @@ describe("replayBuffer", () => {
     buffer.push(3);
     vi.advanceTimersByTime(500);
     expect(log).toEqual(["batch 1", "caught up", "batch 2,3"]);
+  });
+
+  it("dispose drops what it holds: the owner resumes after the last event handed over", () => {
+    const { buffer, batches } = make();
+    buffer.push(1);
+    vi.advanceTimersByTime(16);
+    buffer.push(2);
+    buffer.dispose();
+    vi.advanceTimersByTime(5000);
+    expect(batches.flat()).toEqual([1]);
   });
 
   it("does nothing once disposed", () => {

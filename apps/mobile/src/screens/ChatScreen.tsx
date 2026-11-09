@@ -127,8 +127,15 @@ export function ChatScreen({
   const dragging = useRef(false);
   // Earlier blocks show only when the user scrolled up to them, never from our scrolling.
   const userScrolled = useRef(false);
-  /** Scrolls to the latest message, and follows new output from there. */
+  const viewport = useRef(0);
+  const contentHeight = useRef(0);
+  /**
+   * Scrolls to the latest message, and follows new output from there. Every scroll of ours
+   * goes through here, including deferred ones (keyboard, send): while the user's finger is
+   * on the transcript it does nothing, and following stays as their scrolling left it.
+   */
   const toLatest = (animated: boolean) => {
+    if (dragging.current) return;
     userScrolled.current = false;
     atBottom.current = true;
     ownScrollUntil.current = Date.now() + OWN_SCROLL_MS;
@@ -147,9 +154,20 @@ export function ChatScreen({
   const [loaded, setLoaded] = useState(false);
   const loadedRef = useRef(false);
   const reveal = useRef(new Animated.Value(0)).current;
-  // The first block shown (see WINDOW), fixed once loaded; null: the latest WINDOW blocks.
-  const [firstShown, setFirstShown] = useState<number | null>(null);
-  const lastSeq = useRef(0);
+  /**
+   * The window's first block, by key (see WINDOW), fixed once loaded. A key, not an index:
+   * a `/clear` empties the transcript, and the next messages must not inherit an old
+   * position. null, or a key no longer there: the latest WINDOW blocks (pinned again by
+   * the effect below as soon as there is a block).
+   */
+  const [firstKey, setFirstKey] = useState<string | null>(null);
+  /**
+   * Two cursors. `received`: the last event handed to the replay buffer (skips repeats).
+   * `applied`: the last one in the transcript, where a new stream resumes: events still
+   * in the buffer when it is disposed (the connection replaced) are fetched again.
+   */
+  const received = useRef(0);
+  const applied = useRef(0);
   // Lift the conversation and the message box above the keyboard, and show the latest message.
   const insets = useSafeAreaInsets();
   const keyboard = useKeyboardInset(insets.bottom, () => setTimeout(() => toLatest(true), 50));
@@ -164,12 +182,13 @@ export function ChatScreen({
 
   useEffect(() => {
     dispatch({ type: "reset", sessionId });
-    lastSeq.current = 0;
+    received.current = 0;
+    applied.current = 0;
     atBottom.current = true;
     userScrolled.current = false;
     loadedRef.current = false;
     setLoaded(false);
-    setFirstShown(null);
+    setFirstKey(null);
     reveal.setValue(0);
     setFarFromBottom(false);
   }, [sessionId, reveal]);
@@ -180,8 +199,13 @@ export function ChatScreen({
   looksEmptyRef.current = looksEmpty;
   // Resumes after the last event seen, so a reconnect does not reload the conversation.
   useEffect(() => {
+    // What this buffer still holds is not applied: a new stream starts after `applied`.
+    received.current = applied.current;
     const buffer = replayBuffer<Event>({
-      onBatch: (events) => dispatch({ type: "events", events }),
+      onBatch: (events) => {
+        applied.current = Math.max(applied.current, events.at(-1)!.seq);
+        dispatch({ type: "events", events });
+      },
       onCaughtUp: () => {
         loadedRef.current = true;
         setLoaded(true);
@@ -189,10 +213,10 @@ export function ChatScreen({
       timing: looksEmptyRef.current ? { emptyMs: 300 } : {},
     });
     const stop = connection.follow(
-      (client) => client["sessions.events"]({ sessionId, afterSeq: lastSeq.current }),
+      (client) => client["sessions.events"]({ sessionId, afterSeq: applied.current }),
       (event) => {
-        if (event.seq <= lastSeq.current) return;
-        lastSeq.current = event.seq;
+        if (event.seq <= received.current) return;
+        received.current = event.seq;
         buffer.push(event);
       },
     );
@@ -232,14 +256,19 @@ export function ChatScreen({
   const items = transcript.items;
   const blocks = useMemo(() => toBlocks(items), [items]);
   const latestStart = Math.max(0, blocks.length - WINDOW);
-  // Clamped: `/clear` empties the conversation.
-  const start = firstShown === null ? latestStart : Math.min(firstShown, latestStart);
+  const pinnedAt = useMemo(() => (firstKey === null ? -1 : blocks.findIndex((b) => b.key === firstKey)), [blocks, firstKey]);
+  const start = pinnedAt >= 0 ? pinnedAt : latestStart;
   const shown = useMemo(() => (start === 0 ? blocks : blocks.slice(start)), [blocks, start]);
-  const showEarlier = () => setFirstShown(Math.max(0, start - WINDOW));
-  // Loaded: fix the window where it is, sit at the latest message, then show it all.
+  const showEarlier = () => setFirstKey(blocks[Math.max(0, start - WINDOW)]?.key ?? null);
+  // Once loaded, the window stays where it starts (new blocks add to it), from its first
+  // block on: also after a `/clear`, and for history arriving only after an empty wait.
+  const pinKey = pinnedAt < 0 ? (blocks[latestStart]?.key ?? null) : null;
+  useEffect(() => {
+    if (loaded && pinKey !== null) setFirstKey(pinKey);
+  }, [loaded, pinKey]);
+  // Loaded: sit at the latest message, then show it all.
   useEffect(() => {
     if (!loaded) return;
-    setFirstShown((first) => first ?? latestStart);
     toLatest(false);
     const frame = requestAnimationFrame(() =>
       Animated.timing(reveal, { toValue: 1, duration: 140, easing: Easing.out(Easing.quad), useNativeDriver: true }).start(),
@@ -431,9 +460,15 @@ export function ChatScreen({
           // Near the top after the user scrolled up: show earlier blocks (same target per render).
           if (userScrolled.current && start > 0 && e.contentOffset.y < 400) showEarlier();
         }}
-        onContentSizeChange={() => {
+        onLayout={(e) => {
+          viewport.current = e.nativeEvent.layout.height;
+        }}
+        onContentSizeChange={(_, height) => {
+          // More than a screen at once (history arriving late): jump, not a long scroll down.
+          const burst = height - contentHeight.current > viewport.current;
+          contentHeight.current = height;
           if (!loadedRef.current) toLatest(false);
-          else if (atBottom.current && !dragging.current && Date.now() > holdUntil.current) toLatest(true);
+          else if (atBottom.current && !dragging.current && Date.now() > holdUntil.current) toLatest(!burst);
         }}
       >
         {/* A real native view (never flattened), and no extra gap while empty. */}
