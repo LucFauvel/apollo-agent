@@ -15,10 +15,13 @@ const MAX_BUFFER = 64 * 1024 * 1024;
 export class GitError extends Error {
   readonly code: number | null;
   readonly stderr: string;
-  constructor(message: string, code: number | null, stderr: string) {
+  /** What it wrote before failing (some commands, like `merge-tree`, report in their exit code). */
+  readonly stdout: string;
+  constructor(message: string, code: number | null, stderr: string, stdout = "") {
     super(message);
     this.code = code;
     this.stderr = stderr;
+    this.stdout = stdout;
   }
 }
 
@@ -35,16 +38,20 @@ export const STOP_DEADLINE_MS = 2_000;
  * a descendant still holds open is not waited for), or within STOP_DEADLINE_MS of stopping it
  * even if it cannot be confirmed gone; a kill that fails is reported, not ignored.
  */
-const git = (cwd: string, args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv, signal?: AbortSignal) =>
+const git = (cwd: string, args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv, signal?: AbortSignal, input?: string) =>
   new Promise<string>((resolvePromise, reject) => {
     if (signal?.aborted) return reject(abortError(signal));
     const command = `git ${args[0] ?? ""}`;
     const child = spawn("git", [...args], {
       cwd,
       env: { ...process.env, ...env, GIT_OPTIONAL_LOCKS: "0" },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
+    if (input !== undefined) {
+      child.stdin!.on("error", () => {}); // git exiting early is reported by its exit code
+      child.stdin!.end(input);
+    }
     const out: Array<Buffer> = [];
     const err: Array<Buffer> = [];
     let size = 0;
@@ -59,8 +66,8 @@ const git = (cwd: string, args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv, 
       for (const timer of timers) clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
       // Nothing more is read: a pipe a descendant kept open must not keep this call alive.
-      child.stdout.destroy();
-      child.stderr.destroy();
+      child.stdout!.destroy();
+      child.stderr!.destroy();
       if ("value" in outcome) resolvePromise(outcome.value);
       else reject(outcome.error);
     };
@@ -86,14 +93,14 @@ const git = (cwd: string, args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv, 
       if (size > MAX_BUFFER) stop(new GitError(`${command} wrote more than ${MAX_BUFFER} bytes`, null, ""));
       else into.push(chunk);
     };
-    child.stdout.on("data", collect(out));
-    child.stderr.on("data", collect(err));
+    child.stdout!.on("data", collect(out));
+    child.stderr!.on("data", collect(err));
 
     const finish = (code: number | null) => {
       const stdout = Buffer.concat(out).toString("utf8");
       const stderr = Buffer.concat(err).toString("utf8").trim();
       if (stopped) settle({ error: stopped });
-      else if (code !== 0) settle({ error: new GitError(stderr || `${command} exited with ${code}`, code, stderr) });
+      else if (code !== 0) settle({ error: new GitError(stderr || `${command} exited with ${code}`, code, stderr, stdout) });
       else settle({ value: stdout });
     };
     child.once("error", (error) => settle({ error: stopped ?? new GitError(error.message, null, "") }));
@@ -101,6 +108,8 @@ const git = (cwd: string, args: ReadonlyArray<string>, env?: NodeJS.ProcessEnv, 
     child.once("exit", (code) => later(EXIT_DRAIN_MS, () => finish(code)));
     child.once("close", (code) => finish(code));
   });
+
+const gitWithInput = (cwd: string, args: ReadonlyArray<string>, input: string, env?: NodeJS.ProcessEnv) => git(cwd, args, env, undefined, input);
 
 /**
  * Kills a process and, outside Windows, every process in its group. Returns why it could
@@ -224,6 +233,215 @@ export const diffFiles = async (gitDir: string, before: string, after: string, s
   return files.sort((a, b) => a.path.localeCompare(b.path));
 };
 
+// --- what a turn changed itself, apart from what moving HEAD brought in ----------------
+
+/** One path of a raw diff: mode and object on each side ("000000" and zeros when absent). */
+interface RawEntry {
+  readonly srcMode: string;
+  readonly dstMode: string;
+  readonly src: string;
+  readonly dst: string;
+}
+
+/** The paths that differ between two trees, without rename detection. */
+const rawDiff = async (gitDir: string, a: string, b: string, signal?: AbortSignal): Promise<Map<string, RawEntry>> => {
+  const entries = new Map<string, RawEntry>();
+  if (a === b) return entries;
+  const out = await inGitDir(gitDir, ["diff", "--no-ext-diff", "--raw", "--no-renames", "--no-abbrev", "-z", a, b], signal);
+  const s = out.split("\0");
+  for (let i = 0; i + 1 < s.length; i += 2) {
+    const meta = s[i]!;
+    const path = s[i + 1]!;
+    if (!meta.startsWith(":")) break;
+    const [srcMode, dstMode, src, dst] = meta.slice(1).split(" ");
+    entries.set(path, { srcMode: srcMode!, dstMode: dstMode!, src: src!, dst: dst! });
+  }
+  return entries;
+};
+
+/** Renames between two trees (git's own detection), by destination: the source path and its entry. */
+const renamesBetween = async (gitDir: string, a: string, b: string) => {
+  const out = await inGitDir(gitDir, ["diff", "--no-ext-diff", "--raw", "-M", "--no-abbrev", "-z", a, b]);
+  const renames = new Map<string, { path: string; mode: string; object: string }>();
+  const s = out.split("\0");
+  for (let i = 0; i < s.length; ) {
+    const meta = s[i++]!;
+    if (!meta.startsWith(":")) break;
+    const [srcMode, , src, , status] = meta.slice(1).split(" ");
+    if (status?.startsWith("R") || status?.startsWith("C")) {
+      const from = s[i++]!;
+      const to = s[i++]!;
+      if (status.startsWith("R")) renames.set(to, { path: from, mode: srcMode!, object: src! });
+    } else i++;
+  }
+  return renames;
+};
+
+const sameChange = (x: RawEntry, y: RawEntry | undefined) =>
+  y !== undefined && x.srcMode === y.srcMode && x.dstMode === y.dstMode && x.src === y.src && x.dst === y.dst;
+
+/** When HEAD's oldest reflog entry was written (unix seconds), or null without a reflog. */
+const firstReflogTime = async (repo: string) => {
+  const out = await git(repo, ["reflog", "show", "--date=unix", "--format=%gd", "HEAD"]).catch(() => "");
+  const match = /@\{(\d+)\}/.exec(out.trim().split("\n").at(-1) ?? "");
+  return match ? Number(match[1]) : null;
+};
+
+/** A snapshot with the commit HEAD was at when it was taken (null without commits). */
+export interface Snapshot {
+  readonly tree: string;
+  readonly head: string | null;
+}
+
+const treeOfIn = (gitDir: string, commit: string) => inGitDir(gitDir, ["rev-parse", `${commit}^{tree}`]).then((s) => s.trim());
+
+/** More commits than this made in one turn (a large rebase): every path they touch is the turn's, unfiltered. */
+const MAX_OWN_COMMITS = 200;
+
+/**
+ * The paths the turn's own commits changed themselves. A commit with one parent: what it
+ * changed. A merge: what differs from the merge git makes on its own (`merge-tree`), so a
+ * conflict resolved in any way (even by taking one side whole) or an edit made in the merge
+ * is the turn's, and what one side brought in cleanly is not. When that cannot be told (a
+ * root commit, an octopus, an older git), everything that differs from any parent is.
+ */
+/**
+ * What a two-parent merge commit holds beyond the merge git makes on its own (`merge-tree`):
+ * a conflict resolved (in any way, even by taking one side whole) or an edit. Empty for a
+ * clean merge; null when that cannot be told (not two parents, merge-tree unavailable).
+ */
+const mergeOwnDelta = async (gitDir: string, parents: ReadonlyArray<string>, tree: string, signal?: AbortSignal) => {
+  if (parents.length !== 2) return null;
+  const merged = await inGitDir(gitDir, ["merge-tree", "--write-tree", "-z", "--no-messages", parents[0]!, parents[1]!], signal).catch((error) =>
+    // Exit 1: conflicts, with the tree (conflict markers in it) written all the same.
+    error instanceof GitError && error.code === 1 ? error.stdout : signal?.aborted ? Promise.reject(error) : null,
+  );
+  const auto = merged?.split("\0")[0]?.trim();
+  return auto && /^[0-9a-f]{40,64}$/.test(auto) ? rawDiff(gitDir, auto, tree, signal) : null;
+};
+
+const ownPaths = async (gitDir: string, commits: ReadonlyArray<{ sha: string; parents: ReadonlyArray<string> }>) => {
+  const paths = new Set<string>();
+  const add = (diff: Map<string, RawEntry>) => {
+    for (const path of diff.keys()) paths.add(path);
+  };
+  for (const { sha, parents } of commits) {
+    const tree = await treeOfIn(gitDir, sha);
+    if (parents.length === 0) {
+      add(await rawDiff(gitDir, await inGitDir(gitDir, ["hash-object", "-t", "tree", "/dev/null"]).then((s) => s.trim()), tree));
+      continue;
+    }
+    const delta = await mergeOwnDelta(gitDir, parents, tree);
+    if (delta) {
+      add(delta);
+      continue;
+    }
+    for (const parent of parents) add(await rawDiff(gitDir, await treeOfIn(gitDir, parent), tree));
+  }
+  return paths;
+};
+
+/**
+ * The tree a turn's own changes are measured from. What moving HEAD onto commits that
+ * existed before the turn brought in (a clone, checkout, pull, reset, or a clean merge of
+ * finished work) is not the turn's; everything it caused itself is:
+ *
+ * - every path a commit made during the turn changed (see `ownPaths`), however its content
+ *   compares with older commits;
+ * - uncommitted work (a path that differs from HEAD at the end);
+ * - in a repository that existed before the turn, a path whose change is not exactly what
+ *   HEAD's move did to it (uncommitted work before the turn, committed or discarded since).
+ *
+ * In a repository the turn created (cloned, initialized: `mayBeNew` when first seen
+ * mid-turn), there is no meaningful "before": the baseline is the last commit HEAD's first
+ * parents reach that the turn did not make (what it checked out), or the empty tree.
+ * Elsewhere it is `before`. Paths brought in are then taken as they are `after`.
+ * `startedAt` is when the turn started, in unix seconds.
+ */
+export const ownBaseline = async (
+  repo: string,
+  gitDir: string,
+  before: Snapshot,
+  after: Snapshot,
+  startedAt: number,
+  mayBeNew: boolean,
+): Promise<string> => {
+  if (!after.head || before.tree === after.tree) return before.tree;
+  const born = before.head === null || (mayBeNew && ((await firstReflogTime(repo)) ?? 0) >= startedAt);
+  if (!born && before.head === after.head) return before.tree;
+  // The commits the turn made: reachable now, not before, committed since it started.
+  const listed = await inGitDir(gitDir, ["rev-list", "--parents", `--since=@${startedAt}`, after.head, ...(before.head ? [`^${before.head}`] : []), "--"]);
+  const commits = listed
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [sha, ...parents] = line.trim().split(" ");
+      return { sha: sha!, parents };
+    });
+  if (commits.length > MAX_OWN_COMMITS) return before.tree;
+  const own = new Map(commits.map((c) => [c.sha, c]));
+  let start = before.tree;
+  if (born) {
+    let at: string | undefined = after.head;
+    while (at && own.has(at)) at = own.get(at)!.parents[0];
+    start = at ? await treeOfIn(gitDir, at) : await inGitDir(gitDir, ["hash-object", "-t", "tree", "/dev/null"]).then((s) => s.trim());
+  }
+  const changed = await rawDiff(gitDir, start, after.tree);
+  if (changed.size === 0) return start;
+  const authored = await ownPaths(gitDir, commits);
+  const headTree = await treeOfIn(gitDir, after.head);
+  const uncommitted = await rawDiff(gitDir, headTree, after.tree);
+  const moved = born ? null : await rawDiff(gitDir, await treeOfIn(gitDir, before.head!), headTree);
+  const imported = [...changed].filter(
+    ([path, entry]) => !authored.has(path) && !uncommitted.has(path) && (born || sameChange(entry, moved!.get(path))),
+  );
+  // Renames git sees from the start to the end, where they touch the turn's own work. Any
+  // doubt here leaves a file shown whole (added, deleted): more to read, nothing hidden.
+  const isImported = new Set(imported.map(([path]) => path));
+  const gone = imported.filter(([, e]) => e.dstMode === "000000").map(([path]) => path);
+  const created = [...changed].filter(([path, e]) => e.srcMode === "000000" && !isImported.has(path)).map(([path]) => path);
+  const ownGone = [...changed].filter(([path, e]) => e.dstMode === "000000" && authored.has(path)).map(([path]) => path);
+  const renames = (gone.length > 0 && created.length > 0) || ownGone.length > 0 ? await renamesBetween(gitDir, start, after.tree) : new Map();
+  // - An own file (a conflict resolved in it) that the other side of the turn's own merge
+  //   brought under this path by a rename: measured from the rename's source, not from
+  //   nothing. Only when that imported side really has the path (a commit the turn did not
+  //   make, parent of one it made): a similar file the turn created is its own, added.
+  if (gone.length > 0 && created.length > 0) {
+    const importedParents = [...new Set(commits.flatMap((c) => c.parents).filter((p) => !own.has(p)))];
+    for (const path of created) {
+      const from = renames.get(path);
+      if (!from || !gone.includes(from.path)) continue;
+      const brought = await Promise.all(importedParents.map((p) => inGitDir(gitDir, ["cat-file", "-e", `${p}:${path}`]).then(() => true, () => false)));
+      if (brought.some(Boolean)) imported.push([path, { srcMode: "000000", dstMode: from.mode, src: "", dst: from.object }]);
+    }
+  }
+  // - An own edit to a file that an imported rename then moved: the destination is not
+  //   imported whole (that would hide the edit), so the file shows as moved, with the edit.
+  if (ownGone.length > 0) {
+    const carried = new Set([...renames].filter(([, from]) => ownGone.includes(from.path)).map(([to]) => to));
+    for (let i = imported.length - 1; i >= 0; i--) if (carried.has(imported[i]![0])) imported.splice(i, 1);
+  }
+  if (imported.length === 0) return start;
+  const scratch = mkdtempSync(join(tmpdir(), "apollo-baseline-"));
+  try {
+    const env = { GIT_INDEX_FILE: join(scratch, "index") };
+    await git(tmpdir(), ["--git-dir", gitDir, "read-tree", start], env);
+    const zeros = "0".repeat(start.length);
+    const info = imported.map(([path, e]) => (e.dstMode === "000000" ? `0 ${zeros}\t${path}` : `${e.dstMode} ${e.dst}\t${path}`)).join("\0");
+    await gitWithInput(tmpdir(), ["--git-dir", gitDir, "update-index", "-z", "--index-info"], `${info}\0`, env);
+    return (await git(tmpdir(), ["--git-dir", gitDir, "write-tree"], env)).trim();
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+};
+
+/** Whether a path has the same mode and content in two trees. */
+export const samePathIn = async (gitDir: string, a: string, pathA: string, b: string, pathB: string) => {
+  const entry = (tree: string, path: string) => inGitDir(gitDir, ["ls-tree", "-z", tree, "--", path]).then((s) => s.split("\t")[0] ?? "", () => null);
+  const [x, y] = await Promise.all([entry(a, pathA), entry(b, pathB)]);
+  return x !== null && x !== "" && x === y;
+};
+
 /** The unified diff of one file between two snapshots. */
 export const diffFile = (gitDir: string, before: string, after: string, path: string, oldPath: string | null) =>
   inGitDir(gitDir, ["diff", "--no-ext-diff", "--no-color", "-M", "-U3", before, after, "--", ...(oldPath ? [oldPath] : []), path]);
@@ -285,6 +503,72 @@ export interface Baseline {
 const DEFAULT_BASES = ["origin/main", "origin/master", "@{upstream}", "main", "master"];
 
 /**
+ * What Apollo recorded when it created a worker's worktree: its branch, the commit it was
+ * created at, and the branch that commit was on.
+ */
+export interface WorkerFork {
+  readonly branch: string;
+  readonly baseRef: string;
+  readonly baseBranch: string | null;
+}
+
+/** Whether `a` is an ancestor of `b` (or the same commit). */
+const isAncestor = (repo: string, a: string, b: string, signal?: AbortSignal) =>
+  git(repo, ["merge-base", "--is-ancestor", a, b], undefined, signal).then(
+    () => true,
+    (error) => {
+      if (error instanceof GitError && error.code === 1) return false;
+      throw error;
+    },
+  );
+
+/**
+ * HEAD's branch, and the commit it was created at when its reflog still says so (`git
+ * branch`, `checkout -b` and `worktree add -b` write "branch: Created from ..."; an expired
+ * or cloned log does not).
+ */
+const branchStart = async (repo: string, pinned: string | null | undefined, signal?: AbortSignal): Promise<{ branch: string | null; start: string | null }> => {
+  const branch =
+    pinned !== undefined
+      ? pinned
+      : await git(repo, ["symbolic-ref", "-q", "--short", "HEAD"], undefined, signal).then(
+          (s) => s.trim() || null,
+          (error) => (signal?.aborted ? Promise.reject(error) : null),
+        );
+  if (!branch) return { branch, start: null };
+  const log = await git(repo, ["reflog", "show", "--format=%H%x09%gs", `refs/heads/${branch}`, "--"], undefined, signal).catch((error) =>
+    signal?.aborted ? Promise.reject(error) : "",
+  );
+  const [sha, subject] = (log.trim().split("\n").at(-1) ?? "").split("\t");
+  return { branch, start: sha && subject?.startsWith("branch: Created from") ? sha : null };
+};
+
+/**
+ * Whether `base` contains work of the branch's own since `start` (its first parents): a
+ * commit, or a merge holding a conflict resolution or an edit (see `mergeOwnDelta`; one
+ * that cannot be told counts). A clean merge does not: a base branch that absorbed it is
+ * still a fair baseline, and refusing it could hide a later commit that undoes what it
+ * brought in.
+ */
+const baseHoldsOwnWork = async (repo: string, head: string, start: string, base: string, signal?: AbortSignal) => {
+  const list = (...args: Array<string>) => git(repo, ["rev-list", "--first-parent", "--parents", head, `^${start}`, ...args, "--"], undefined, signal);
+  const outside = new Set((await list(`^${base}`)).split("\n").map((line) => line.split(" ")[0]));
+  const contained = (await list())
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.trim().split(" "))
+    .filter(([sha]) => !outside.has(sha));
+  if (contained.length === 0) return false;
+  const gitDir = await commonGitDir(repo, signal);
+  for (const [sha, ...parents] of contained) {
+    if (parents.length < 2) return true;
+    const delta = await mergeOwnDelta(gitDir, parents, await treeOf(repo, sha!, signal), signal);
+    if (delta === null || delta.size > 0) return true;
+  }
+  return false;
+};
+
+/**
  * The baseline of a full diff at commit `head` (HEAD, read once by the caller): the merge
  * base of `head` with `ref` or, by default, with the first of the origin's default branch
  * (`origin/HEAD`), `origin/main`, `origin/master`, the branch's upstream, `main`, `master`
@@ -292,8 +576,31 @@ const DEFAULT_BASES = ["origin/main", "origin/master", "@{upstream}", "main", "m
  * work then, and the ref says "HEAD"). The merge base keeps others' later commits on that
  * branch out. An explicit `ref` without shared history is refused: there is nothing honest
  * to compare against.
+ *
+ * By default, work that HEAD's branch started from rather than did is left out too: the
+ * baseline moves to a nearer merge base (shown with its own label) with
+ *
+ * - the commit the branch was created at (its reflog), or
+ * - for a worker's worktree (`worker`, what Apollo recorded), the branch it was created from
+ *   as that branch is now (work merged in from it since is not the worker's either), and
+ *   its recorded start. Only when it provably describes this checkout: HEAD is on the
+ *   worker's branch, the recorded start is an ancestor of HEAD, and the branch's reflog, if
+ *   it still says where the branch was created, says the same.
+ *
+ * Never to a commit that contains any of the branch's own commits since it started: that
+ * would hide its work (its base branch merged it, say).
+ *
+ * `branch` is HEAD's branch as read with `head` (null when detached), so that both describe
+ * one state; the caller checks that neither moved. Read here when not given.
  */
-export const resolveBaseline = async (repo: string, head: string | null, ref?: string, signal?: AbortSignal): Promise<Baseline> => {
+export const resolveBaseline = async (
+  repo: string,
+  head: string | null,
+  ref?: string,
+  signal?: AbortSignal,
+  worker?: WorkerFork,
+  branch?: string | null,
+): Promise<Baseline> => {
   const wanted = ref?.trim();
   if (ref !== undefined && (!wanted || wanted.startsWith("-") || wanted.length > MAX_REF_LENGTH)) {
     throw new Error(`"${ref.slice(0, 80)}" is not a git ref`);
@@ -316,7 +623,32 @@ export const resolveBaseline = async (repo: string, head: string | null, ref?: s
     const target = await verifyCommit(repo, candidate, signal);
     if (!target) continue;
     const base = target === head ? head : await mergeBase(repo, head, target, signal);
-    if (base) return { ref: candidate, commit: base, tree: await treeOf(repo, base, signal) };
+    if (!base) continue;
+    let chosen = { ref: candidate, commit: base };
+    if (chosen.commit === head) return { ...chosen, tree: await treeOf(repo, head, signal) };
+    // Each fork: where to compare, how to show it, and where the branch's own work starts.
+    const forks: Array<{ ref: string; label: string; start: string }> = [];
+    const { branch: onBranch, start } = await branchStart(repo, branch, signal);
+    if (onBranch && start) forks.push({ ref: start, label: `start of ${onBranch}`, start });
+    const recorded = worker && (await verifyCommit(repo, worker.baseRef, signal));
+    if (
+      worker &&
+      recorded &&
+      onBranch === worker.branch &&
+      (start === null || start === recorded) &&
+      (await isAncestor(repo, recorded, head, signal))
+    ) {
+      if (worker.baseBranch) forks.push({ ref: `refs/heads/${worker.baseBranch}`, label: worker.baseBranch, start: recorded });
+      forks.push({ ref: recorded, label: `start of ${onBranch}`, start: recorded });
+    }
+    for (const fork of forks) {
+      const at = await verifyCommit(repo, fork.ref, signal);
+      const nearer = at && (at === head ? head : await mergeBase(repo, head, at, signal));
+      if (!nearer || nearer === chosen.commit || !(await isAncestor(repo, chosen.commit, nearer, signal))) continue;
+      if (await baseHoldsOwnWork(repo, head, fork.start, nearer, signal)) continue;
+      chosen = { ref: fork.label, commit: nearer };
+    }
+    return { ...chosen, tree: await treeOf(repo, chosen.commit, signal) };
   }
   return { ref: "HEAD", commit: head, tree: await treeOf(repo, head, signal) };
 };

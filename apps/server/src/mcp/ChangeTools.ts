@@ -56,7 +56,8 @@ const SemanticDiff = Tool.make("apollo_semantic_diff", {
   description: [
     SEMANTIC_DIFF_ONLY_WHEN_ASKED,
     "Shows the user the full semantic diff of one git repository: everything that differs from its baseline",
-    "(commits since the merge base with the default/origin branch, or with `base`, plus uncommitted and untracked work),",
+    "(commits since the merge base with the default/origin branch, or with `base`, plus uncommitted and untracked work;",
+    "a branch created from another one, such as a worker's worktree, is compared with where it left that branch),",
     "whichever turn or session made it, grouped by function, class and type with workers' explanations.",
     "The report goes to the user's screen as a card in this conversation; you get only its counts back, not the diff.",
     "`request`: the user's words asking for it, quoted from their message that started this turn (Apollo checks, and refuses in turns",

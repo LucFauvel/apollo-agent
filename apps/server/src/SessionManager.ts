@@ -1302,10 +1302,12 @@ const make = Effect.gen(function* () {
         const refused = unrequested(yield* store.currentTurn(id), input.request);
         if (refused) return yield* invalid(`Not shown: ${refused}.`);
         const path = input.repo ? (isAbsolute(input.repo) ? input.repo : join(session.cwd, input.repo)) : session.cwd;
+        // A worker's own worktree is compared with the branch it was created from (see report).
+        const worktrees = (yield* store.listSessions(session.botId)).flatMap((s) => (s.worktree ? [s.worktree] : []));
         // Hitting the bound interrupts this, which aborts the signal: the git processes are
         // killed and no further step starts.
         const result = yield* Effect.tryPromise({
-          try: (signal) => changeTracker.report(path, input.base, signal),
+          try: (signal) => changeTracker.report(path, input.base, signal, worktrees),
           catch: (error) => invalid((error as Error).message),
         }).pipe(
           Effect.timeoutOrElse({
