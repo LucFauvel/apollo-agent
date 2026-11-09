@@ -25,7 +25,7 @@ import {
   listSnapshots,
   pruneSnapshots,
   readMarker,
-  relaunchUntilHealthy,
+  launchUntilHealthy,
   releaseLock,
   restorePrevious,
   restoreSnapshot,
@@ -39,6 +39,8 @@ import {
   type Bundles,
   type FileOps,
   type InstallResult,
+  type LaunchAttempt,
+  type LaunchStrategy,
   type Marker,
   type Options,
   type ResultStatus,
@@ -51,7 +53,12 @@ export interface Proc {
 }
 
 export interface Timing {
+  /** Overall budget for getting the app to answer /health. */
   readonly relaunchTimeoutMs: number;
+  /** After a launch attempt, how long to wait for the app's processes before escalating. */
+  readonly launchWindowMs: number;
+  /** Once the app runs, how long it gets to answer /health before it counts as unhealthy. */
+  readonly startupGraceMs: number;
   /** Health checks after the first answer, `stableIntervalMs` apart, all of which must pass. */
   readonly stableSamples: number;
   readonly stableIntervalMs: number;
@@ -65,6 +72,8 @@ export interface Timing {
 
 export const TIMING: Timing = {
   relaunchTimeoutMs: 2 * 60_000,
+  launchWindowMs: 10_000,
+  startupGraceMs: 60_000,
   stableSamples: 3,
   stableIntervalMs: 5000,
   quitGraceMs: 30_000,
@@ -110,8 +119,8 @@ export interface Deps {
   readonly busy: () => Array<string>;
   /** Builds the app and stages it at `bundles.staged`. */
   readonly build: () => Promise<BuildInfo>;
-  /** `open` the installed app (one attempt). */
-  readonly open: () => void;
+  /** One attempt at launching the installed app with the given strategy, recorded. */
+  readonly launch: (strategy: LaunchStrategy) => LaunchAttempt;
   /** Whether a server of the installed app answers /health now. */
   readonly healthy: () => Promise<boolean>;
   /** From here on, SIGTERM/SIGHUP/SIGINT are ignored. */
@@ -140,6 +149,7 @@ class Run {
   build: BuildInfo | null = null;
   snapshot: string | null = null;
   previousSchema: number | null = null;
+  launches: Array<LaunchAttempt> = [];
   readonly startedAt: string;
   readonly d: Deps;
 
@@ -164,6 +174,7 @@ class Run {
       log: this.d.env.logPath,
       pid: this.d.env.pid,
       snapshot: this.snapshot,
+      launches: this.launches,
     };
   }
 
@@ -304,23 +315,51 @@ const safeHealthy = (d: Deps) => async () => {
   }
 };
 
-/** Opens until /health answers, then requires it to stay healthy for a while. */
-const launchAndVerify = async (run: Run): Promise<boolean> => {
+type Launched = { readonly ok: true } | { readonly ok: false; readonly why: string };
+
+/**
+ * Launches the installed app (escalating strategies) until /health answers, then requires
+ * it to stay healthy for a while. Says why when it fails: never launched, launched but not
+ * healthy, or did not stay up.
+ */
+const launchAndVerify = async (run: Run): Promise<Launched> => {
   const { d } = run;
   const t = d.env.timing;
   const healthy = safeHealthy(d);
-  const open = () => {
-    try {
-      d.open();
-    } catch (e) {
-      d.log(`  (open failed: ${message(e)})`);
-    }
-  };
-  if (!(await relaunchUntilHealthy({ open, healthy, sleep: d.sleep, now: d.now, log: d.log, timeoutMs: t.relaunchTimeoutMs }))) return false;
+  const outcome = await launchUntilHealthy({
+    launch: (strategy) => d.launch(strategy),
+    // Any Apollo process counts as "it launched"; unreadable (null) as "not seen yet".
+    running: () => {
+      const procs = listApollo(d);
+      return procs === null ? null : procs.length > 0;
+    },
+    healthy,
+    sleep: d.sleep,
+    now: d.now,
+    log: d.log,
+    timeoutMs: t.relaunchTimeoutMs,
+    launchWindowMs: t.launchWindowMs,
+    startupGraceMs: t.startupGraceMs,
+  });
+  run.launches.push(...outcome.attempts);
+  run.record();
+  if (!outcome.ok) {
+    const n = outcome.attempts.length;
+    return {
+      ok: false,
+      why:
+        outcome.why === "never-launched"
+          ? `it never launched (${n} attempt(s): ${[...new Set(outcome.attempts.map((a) => a.strategy))].join(" → ")})`
+          : "it launched but did not answer /health",
+    };
+  }
   d.log(`  /health answers; checking it stays up (${t.stableSamples} × ${t.stableIntervalMs / 1000} s)`);
   const stable = await staysHealthy({ healthy, sleep: d.sleep, samples: t.stableSamples, intervalMs: t.stableIntervalMs });
-  if (!stable) d.log("  It stopped answering");
-  return stable;
+  if (!stable) {
+    d.log("  It stopped answering");
+    return { ok: false, why: "it answered /health, then stopped" };
+  }
+  return { ok: true };
 };
 
 type DbOutcome = { readonly ok: true } | { readonly ok: false; readonly error: string };
@@ -435,9 +474,9 @@ const reopenUnchanged = async (run: Run, error: string): Promise<InstallResult> 
   if (run.d.env.options.noOpen) return run.finish("failed", `${error}. Nothing was changed.`);
   run.at("reopen");
   const up = await launchAndVerify(run);
-  return up
+  return up.ok
     ? run.finish("failed", `${error}. Nothing was changed; Apollo is running again.`)
-    : run.finish("failed", `${error}. Nothing was changed, but Apollo does not answer /health after reopening.`, `Open ${run.b.target} and check its log.`);
+    : run.finish("failed", `${error}. Nothing was changed, but after reopening ${up.why}.`, `Open ${run.b.target} and check its log.`);
 };
 
 type SwapProgress = "none" | "target-moved" | "staged-moved";
@@ -472,8 +511,9 @@ const rollback = async (run: Run, reason: string, progress: SwapProgress): Promi
     if (!db.ok) return run.finish("failed", `${reason}; the previous build is back, but ${db.error}. Nothing was opened.`, run.manual());
     run.clearMarker();
     run.at("rollback-relaunch");
-    if (await launchAndVerify(run)) return run.finish("rolled-back", reason);
-    return run.finish("failed", `${reason}; the previous build is back with its database, but does not answer /health either`, `Open ${b.target} and check its log.`);
+    const up = await launchAndVerify(run);
+    if (up.ok) return run.finish("rolled-back", reason);
+    return run.finish("failed", `${reason}; the previous build is back with its database, but ${up.why}`, `Open ${b.target} and check its log (launch attempts are in the result file).`);
   } catch (e) {
     return run.finish("failed", `${reason}; the rollback failed: ${message(e)}. Nothing was opened.`, run.manual());
   }
@@ -556,7 +596,8 @@ const recover = async (run: Run, marker: (Marker & Partial<MarkerData>) | null):
     const db = ensureDatabase(run, bundleSchema(d.files, b.target), { rollback: false, interrupted: false });
     if (!db.ok) return run.finish("failed", `Recovery: ${db.error}. Nothing was opened.`, run.manual());
     run.at("relaunch");
-    if (await launchAndVerify(run)) {
+    const up = await launchAndVerify(run);
+    if (up.ok) {
       try {
         d.files.remove(b.previous);
       } catch (e) {
@@ -566,7 +607,7 @@ const recover = async (run: Run, marker: (Marker & Partial<MarkerData>) | null):
       run.stage = "resumed";
       return run.finish("ok", "An earlier install was finished (its build is healthy); run install:app again to install this checkout");
     }
-    return rollback(run, "The build an earlier install left is not healthy", "staged-moved");
+    return rollback(run, `The build an earlier install left is not healthy: ${up.why}`, "staged-moved");
   }
 
   const schema = bundleSchema(d.files, b.target) ?? run.previousSchema;
@@ -575,8 +616,9 @@ const recover = async (run: Run, marker: (Marker & Partial<MarkerData>) | null):
   run.clearMarker();
   run.stage = "recovered";
   if (options.noOpen) return run.finish("rolled-back", "Recovered an interrupted install (not opened: --no-open); run install:app again to update");
-  if (await launchAndVerify(run)) return run.finish("rolled-back", "Recovered an interrupted install; run install:app again to update");
-  return run.finish("failed", "Recovered an interrupted install, but Apollo does not answer /health", `Open ${b.target} and check its log.`);
+  const up = await launchAndVerify(run);
+  if (up.ok) return run.finish("rolled-back", "Recovered an interrupted install; run install:app again to update");
+  return run.finish("failed", `Recovered an interrupted install, but ${up.why}`, `Open ${b.target} and check its log.`);
 };
 
 // ---------------------------------------------------------------------------------------
@@ -677,7 +719,8 @@ const install = async (run: Run): Promise<InstallResult> => {
       return run.finish("ok");
     }
     run.at("relaunch");
-    if (!(await launchAndVerify(run))) return await rollback(run, "The new build did not stay healthy", progress);
+    const up = await launchAndVerify(run);
+    if (!up.ok) return await rollback(run, `The new build is not healthy: ${up.why}`, progress);
     run.at("healthy");
     try {
       d.files.remove(b.previous);

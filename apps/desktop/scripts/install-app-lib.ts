@@ -6,6 +6,7 @@
  * state machine that uses these, is install-app-engine.ts.
  */
 import { createHash, randomBytes } from "node:crypto";
+import { spawn, spawnSync } from "node:child_process";
 import { constants, copyFileSync, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -256,34 +257,181 @@ export const isHealthyResponse = (status: number, body: string): boolean => {
   }
 };
 
-/** Delays between `open` attempts: quick at first, then every few seconds. */
-export const backoff = (attempt: number): number => Math.min(1000 * 2 ** attempt, 8000);
+// ---------------------------------------------------------------------------------------
+// Launching the app
 
 /**
- * Opens the app until its server answers /health, or the deadline passes. `open` again
- * after a force-quit can be a no-op while LaunchServices still sees the dying instance,
- * so one `open` is not enough: retry it until the app is really up.
+ * The environment the app is launched with: what a Finder or Dock launch would give, and
+ * nothing the installer inherited. `open` forwards its caller's environment to the app, and
+ * the installer runs inside an Apollo session, whose environment has ELECTRON_RUN_AS_NODE=1
+ * (from the server process): with it, Electron starts as plain Node and exits at once, so
+ * every launch silently did nothing (`open` still exits 0). APOLLO_*, NODE_OPTIONS and the
+ * like would redirect the app too. Allowlist, rather than strip what is known to be bad.
  */
-export const relaunchUntilHealthy = async (deps: {
-  readonly open: () => void;
+const LAUNCH_ENV_ALLOWED = /^(HOME|USER|LOGNAME|SHELL|TMPDIR|LANG|LC_[A-Z]+|__CF_USER_TEXT_ENCODING|SSH_AUTH_SOCK)$/;
+export const LAUNCHD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin";
+export const launchEnv = (env: NodeJS.ProcessEnv): Record<string, string> => ({
+  ...Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => LAUNCH_ENV_ALLOWED.test(e[0]) && typeof e[1] === "string")),
+  PATH: LAUNCHD_PATH,
+});
+
+/**
+ * How to launch, in escalating order: LaunchServices (`open -a`), a new LaunchServices
+ * instance (`open -n -a`, in case it still sees a dying one), then the bundle's executable
+ * directly, bypassing LaunchServices.
+ */
+export type LaunchStrategy = "open" | "open-new" | "exec";
+export const LAUNCH_STRATEGIES: ReadonlyArray<LaunchStrategy> = ["open", "open-new", "exec"];
+
+/** One launch attempt, as recorded in the log and the result file. */
+export interface LaunchAttempt {
+  readonly strategy: LaunchStrategy;
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+  /** Exit status (`open`), or null for a spawned executable that keeps running. */
+  readonly status: number | null;
+  readonly signal: string | null;
+  readonly stderr: string;
+  readonly error: string | null;
+  readonly pid: number | null;
+  /** Filled in afterwards: whether the app's processes appeared after this attempt. */
+  readonly launched?: boolean;
+}
+
+export const describeAttempt = (a: LaunchAttempt): string =>
+  [
+    `${a.strategy}: ${a.command} ${a.args.join(" ")}`,
+    a.status !== null ? `exit ${a.status}` : a.pid !== null ? `pid ${a.pid}` : null,
+    a.signal ? `signal ${a.signal}` : null,
+    a.error ? `error: ${a.error}` : null,
+    // Even with exit 0: LaunchServices explains itself on stderr when it does not launch.
+    a.stderr ? `stderr: ${a.stderr}` : null,
+    a.launched === undefined ? null : a.launched ? "launched" : "nothing launched",
+  ]
+    .filter(Boolean)
+    .join("; ");
+
+/** Runs one launch attempt for real. `openBin` is a parameter so tests can use a fake `open`. */
+export const launchApp = (
+  app: string,
+  strategy: LaunchStrategy,
+  env: Record<string, string>,
+  o: { readonly openBin?: string; readonly executable?: string } = {},
+): LaunchAttempt => {
+  if (strategy === "exec") {
+    const command = o.executable ?? join(app, "Contents", "MacOS", bundleExecutable(app));
+    try {
+      const child = spawn(command, [], { detached: true, stdio: "ignore", env, cwd: "/" });
+      // An exec failure (ENOENT, EACCES) arrives as an event; it is recorded by the caller's
+      // launch check (no process appears), and must not crash the installer.
+      child.on("error", () => {});
+      child.unref();
+      return { strategy, command, args: [], status: null, signal: null, stderr: "", error: null, pid: child.pid ?? null };
+    } catch (error) {
+      return { strategy, command, args: [], status: null, signal: null, stderr: "", error: error instanceof Error ? error.message : String(error), pid: null };
+    }
+  }
+  const command = o.openBin ?? "/usr/bin/open";
+  const args = strategy === "open-new" ? ["-n", "-a", app] : ["-a", app];
+  const r = spawnSync(command, args, { encoding: "utf8", env, timeout: 30_000 });
+  return {
+    strategy,
+    command,
+    args,
+    status: r.status,
+    signal: r.signal ?? null,
+    stderr: (r.stderr ?? "").trim(),
+    error: r.error ? r.error.message : null,
+    pid: null,
+  };
+};
+
+/** How the installer launches Apollo: always with the clean environment, never the inherited one. */
+export const launchInstalled = (
+  app: string,
+  strategy: LaunchStrategy,
+  inherited: NodeJS.ProcessEnv = process.env,
+  o: { readonly openBin?: string; readonly executable?: string } = {},
+): LaunchAttempt => launchApp(app, strategy, launchEnv(inherited), o);
+
+/** CFBundleExecutable from the bundle's Info.plist ("apollo" for Apollo). */
+const bundleExecutable = (app: string): string => {
+  const r = spawnSync("/usr/bin/plutil", ["-extract", "CFBundleExecutable", "raw", "-o", "-", join(app, "Contents", "Info.plist")], { encoding: "utf8" });
+  const name = r.status === 0 ? r.stdout.trim() : "";
+  return name || basename(app, ".app").toLowerCase();
+};
+
+export type LaunchOutcome =
+  | { readonly ok: true; readonly attempts: ReadonlyArray<LaunchAttempt> }
+  | { readonly ok: false; readonly why: "never-launched" | "launched-unhealthy"; readonly attempts: ReadonlyArray<LaunchAttempt> };
+
+/**
+ * Launches the app until its server answers /health. Each attempt escalates to the next
+ * strategy if no process of the app appeared within `launchWindowMs`. Once the app is
+ * running, it gets `startupGraceMs` to answer; if it exits or does not answer by then, that
+ * is "launched but unhealthy", returned at once: launching it again would not help.
+ */
+export const launchUntilHealthy = async (deps: {
+  readonly launch: (strategy: LaunchStrategy) => LaunchAttempt;
+  /** Whether the app's processes are running: null when that cannot be told. */
+  readonly running: () => boolean | null;
   readonly healthy: () => Promise<boolean>;
   readonly sleep: (ms: number) => Promise<void>;
   readonly now: () => number;
   readonly log: (line: string) => void;
   readonly timeoutMs: number;
-}): Promise<boolean> => {
+  readonly launchWindowMs: number;
+  readonly startupGraceMs: number;
+  readonly strategies?: ReadonlyArray<LaunchStrategy>;
+}): Promise<LaunchOutcome> => {
+  const strategies = deps.strategies ?? LAUNCH_STRATEGIES;
   const deadline = deps.now() + deps.timeoutMs;
-  for (let attempt = 0; ; attempt++) {
-    deps.log(`  open (attempt ${attempt + 1})`);
-    deps.open();
-    // Several health checks per attempt: launching takes a few seconds by itself.
-    const nextOpen = Math.min(deps.now() + backoff(attempt) + 4000, deadline);
-    do {
-      if (await deps.healthy()) return true;
+  const attempts: Array<LaunchAttempt> = [];
+  for (let i = 0; deps.now() < deadline; i++) {
+    const strategy = strategies[Math.min(i, strategies.length - 1)]!;
+    let attempt: LaunchAttempt;
+    try {
+      attempt = deps.launch(strategy);
+    } catch (error) {
+      attempt = { strategy, command: "?", args: [], status: null, signal: null, stderr: "", error: error instanceof Error ? error.message : String(error), pid: null };
+    }
+    // Wait for a sign of life: the app's processes (looked for first: `open` returns once the
+    // process exists, so even an app that dies quickly is seen), or an answer.
+    let launched = false;
+    const windowEnd = Math.min(deps.now() + deps.launchWindowMs, deadline);
+    for (;;) {
+      if (deps.running() === true) {
+        launched = true;
+        break;
+      }
+      if (await deps.healthy()) {
+        attempts.push({ ...attempt, launched: true });
+        deps.log(`  launch ${attempts.length}: ${describeAttempt(attempts.at(-1)!)}; /health answers`);
+        return { ok: true, attempts };
+      }
+      if (deps.now() >= windowEnd) break;
       await deps.sleep(1000);
-    } while (deps.now() < nextOpen);
-    if (deps.now() >= deadline) return deps.healthy();
+    }
+    attempts.push({ ...attempt, launched });
+    deps.log(`  launch ${attempts.length}: ${describeAttempt(attempts.at(-1)!)}`);
+    if (!launched) continue;
+    // It runs: give it time to start, but do not launch it again.
+    const graceEnd = Math.min(deps.now() + deps.startupGraceMs, deadline);
+    for (;;) {
+      if (await deps.healthy()) return { ok: true, attempts };
+      if (deps.running() === false) {
+        deps.log("  The app exited before answering /health");
+        return { ok: false, why: "launched-unhealthy", attempts };
+      }
+      if (deps.now() >= graceEnd) {
+        deps.log(`  The app runs but did not answer /health within ${deps.startupGraceMs / 1000} s`);
+        return { ok: false, why: "launched-unhealthy", attempts };
+      }
+      await deps.sleep(1000);
+    }
   }
+  deps.log(`  Nothing launched after ${attempts.length} attempt(s) (${[...new Set(attempts.map((a) => a.strategy))].join(", ")})`);
+  return { ok: false, why: "never-launched", attempts };
 };
 
 /** Healthy now and still healthy over `samples` more checks `intervalMs` apart: one answer is not enough. */
@@ -674,6 +822,8 @@ export interface InstallResult {
   readonly pid: number;
   /** The database copy taken before the swap (restored on rollback). */
   readonly snapshot: string | null;
+  /** Every launch attempt of this run (strategy, command, exit status, stderr, whether it launched). */
+  readonly launches: ReadonlyArray<LaunchAttempt>;
 }
 
 /** Written whole, then renamed into place: a reader never sees half a file. */

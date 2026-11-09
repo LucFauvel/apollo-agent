@@ -43,6 +43,7 @@ import {
   childArgs,
   healthUrls,
   isHealthyResponse,
+  launchInstalled,
   lockHolder,
   parseArgs,
   plan,
@@ -342,10 +343,9 @@ const deps: Deps = {
   isInstaller,
   busy: () => busySessions(dbPath),
   build,
-  open: () => {
-    const r = spawnSync("open", ["-a", target], { encoding: "utf8", timeout: 30_000 });
-    if (r.status !== 0) log(`  open failed (${r.status}): ${(r.stderr ?? "").trim()}`);
-  },
+  // A clean, Finder-like environment: the session's ELECTRON_RUN_AS_NODE=1 made every launch
+  // a silent no-op (see launchEnv). Each attempt is logged and kept in the result file.
+  launch: (strategy) => launchInstalled(target, strategy),
   healthy,
   holdSignals: () => {
     if (holding) return;

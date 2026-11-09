@@ -11,9 +11,20 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { runInstall, TIMING, type Deps, type Proc } from "./install-app-engine.ts";
-import { listSnapshots, parseArgs, realFileOps, realSqliteOps, takeSnapshot, type BuildInfo, type FileOps, type InstallResult } from "./install-app-lib.ts";
+import {
+  listSnapshots,
+  parseArgs,
+  realFileOps,
+  realSqliteOps,
+  takeSnapshot,
+  type BuildInfo,
+  type FileOps,
+  type InstallResult,
+  type LaunchAttempt,
+  type LaunchStrategy,
+} from "./install-app-lib.ts";
 
-type Health = "good" | "bad" | "flash";
+type Health = "good" | "bad" | "flash" | "dies";
 interface Spec {
   readonly name: string;
   readonly schema: number;
@@ -73,6 +84,12 @@ const world = (o: {
     app: null as { spec: Spec; healthCalls: number } | null,
     opens: 0,
     swallowOpens: 0,
+    /** Strategies that silently do nothing (as `open` with ELECTRON_RUN_AS_NODE=1 did). */
+    dropped: new Set<LaunchStrategy>(),
+    /** stderr `open` prints (even with exit 0). */
+    openStderr: "",
+    launches: [] as Array<LaunchStrategy>,
+    apolloCalls: 0,
     quitIgnored: false,
     respawnOnQuit: false,
     unkillable: new Set<number>(),
@@ -129,7 +146,11 @@ const world = (o: {
       if (w.t >= w.busyUntil) w.busy = [];
     },
     log: (line) => void w.logs.push(line),
-    apollo: () => [...w.procs],
+    apollo: () => {
+      // A loop that never sleeps would spin on this: fail the test instead of hanging the worker.
+      if (++w.apolloCalls > 100_000) throw Object.assign(new Error("runaway: process list read 100000 times"), { runaway: true });
+      return [...w.procs];
+    },
     requestQuit: () => {
       if (w.quitIgnored) return;
       w.stop();
@@ -149,12 +170,22 @@ const world = (o: {
       w.builds++;
       return makeBundle(bundles.staged, w.next);
     },
-    open: () => {
+    launch: (strategy): LaunchAttempt => {
       w.opens++;
-      if (w.swallowOpens > 0) return void w.swallowOpens--;
-      if (w.app) return;
+      w.launches.push(strategy);
+      const attempt: LaunchAttempt =
+        strategy === "exec"
+          ? { strategy, command: join(bundles.target, "Contents", "MacOS", "apollo"), args: [], status: null, signal: null, stderr: "", error: null, pid: 4242 }
+          : { strategy, command: "/usr/bin/open", args: strategy === "open-new" ? ["-n", "-a", bundles.target] : ["-a", bundles.target], status: 0, signal: null, stderr: w.openStderr, error: null, pid: null };
+      if (w.dropped.has(strategy)) return attempt;
+      if (w.swallowOpens > 0) {
+        w.swallowOpens--;
+        return attempt;
+      }
+      if (w.app) return attempt;
       const spec = specOf(bundles.target);
       if (spec) w.start(spec);
+      return attempt;
     },
     healthy: async () => {
       if (!w.app) return false;
@@ -162,6 +193,7 @@ const world = (o: {
       if (w.app.spec.health === "good") return true;
       if (w.app.spec.health === "flash" && w.app.healthCalls === 1) return true;
       if (w.app.spec.health === "flash") w.stop();
+      if (w.app?.spec.health === "dies") w.stop();
       return false;
     },
     holdSignals: () => {},
@@ -344,7 +376,7 @@ describe("install: rollback (P1-1, P2a)", () => {
     const { deps, state } = world({ installed: { name: "old", schema: 18, health: "bad" }, running: false, next: { name: "new", schema: 19, health: "bad" } });
     const r = await runInstall(deps());
     expect(r).toMatchObject({ status: "failed" });
-    expect(r.error).toMatch(/does not answer \/health either/);
+    expect(r.error).toMatch(/the previous build is back with its database, but it launched but did not answer \/health/);
     expect(state()).toMatchObject({ target: "old", db: 18, marker: null });
   });
 
@@ -359,15 +391,16 @@ describe("install: rollback (P1-1, P2a)", () => {
   it("a new build whose processes will not stop: nothing is rolled back over them, marker kept", async () => {
     const { w, deps, state } = world({ next: { name: "new", schema: 19, health: "bad" } });
     const d = deps();
-    const open = d.open;
+    const launch = d.launch;
     const r = await runInstall({
       ...d,
-      open: () => {
-        open();
+      launch: (strategy) => {
+        const attempt = launch(strategy);
         if (state().running === "new") {
           w.quitIgnored = true;
           for (const p of w.procs) w.unkillable.add(p.pid);
         }
+        return attempt;
       },
     });
     expect(r.status).toBe("failed");
@@ -413,14 +446,14 @@ describe("install: database restore failures (P1-2)", () => {
   it("a corrupt pre-update snapshot is refused; with no other usable one nothing is opened", async () => {
     const { w, deps, state } = world({ next: { name: "new", schema: 19, health: "bad" } });
     const d = deps();
-    const open = d.open;
+    const launch = d.launch;
     const r = await runInstall({
       ...d,
-      open: () => {
+      launch: (strategy) => {
         // Corrupt the snapshot while the new build runs.
         const snap = listSnapshots(join(w.data, "backups"))[0];
         if (snap && state().target === "new") writeFileSync(join(snap.dir, "apollo.db"), "not a SQLite database");
-        open();
+        return launch(strategy);
       },
     });
     expect(r.status).toBe("failed");
@@ -926,5 +959,87 @@ describe("round 4: the gate checks the database actually opened, on every branch
     expect(state()).toMatchObject({ target: "old", running: null, db: 19, marker: "rolling-back" });
     // Only the new build was ever opened.
     expect(w.opens).toBeGreaterThan(0);
+  });
+});
+
+describe("relaunch: strategies, and launched vs never launched", () => {
+  it("escalates open → open -n → the executable when nothing launches, and records every attempt", async () => {
+    const { w, deps, state, result } = world({});
+    w.dropped = new Set(["open", "open-new"]);
+    w.openStderr = "LSOpenURLsWithRole() failed with error -600";
+    const r = await runInstall(deps());
+    expect(r.status).toBe("ok");
+    expect(w.launches).toEqual(["open", "open-new", "exec"]);
+    expect(state()).toMatchObject({ target: "new", running: "new" });
+    const launches = result().launches;
+    expect(launches.map((a) => [a.strategy, a.launched])).toEqual([
+      ["open", false],
+      ["open-new", false],
+      ["exec", true],
+    ]);
+    expect(launches[0]).toMatchObject({ command: "/usr/bin/open", args: ["-a", w.bundles.target], status: 0, stderr: "LSOpenURLsWithRole() failed with error -600" });
+    expect(launches[1]!.args).toEqual(["-n", "-a", w.bundles.target]);
+    // stderr is kept in the log even though open exited 0.
+    expect(w.logs.some((l) => /launch 1: open: \/usr\/bin\/open -a .*exit 0; stderr: LSOpenURLsWithRole/.test(l))).toBe(true);
+  });
+
+  it("a build that launches but never answers is rolled back after one launch, not relaunched again and again", async () => {
+    const { w, deps, state } = world({ next: { name: "new", schema: 19, health: "bad" } });
+    const d = deps();
+    let rollbackAt = 0;
+    let launchedAt = 0;
+    const r = await runInstall({
+      ...d,
+      launch: (strategy) => {
+        const a = d.launch(strategy);
+        if (state().running === "new" && !launchedAt) launchedAt = w.t;
+        return a;
+      },
+      log: (line) => {
+        if (!rollbackAt && /rolling back/.test(line)) rollbackAt = w.t;
+        d.log(line);
+      },
+    });
+    expect(r.status).toBe("rolled-back");
+    expect(r.error).toMatch(/launched but did not answer \/health/);
+    // One launch of the new build, one of the old one.
+    expect(w.launches).toEqual(["open", "open"]);
+    expect(rollbackAt - launchedAt).toBeLessThanOrEqual(TIMING.startupGraceMs + 2000);
+    expect(state()).toMatchObject({ target: "old", running: "old" });
+  });
+
+  it("a build that exits right after launching is rolled back at once, without waiting out the grace", async () => {
+    const { w, deps, state } = world({ next: { name: "new", schema: 19, health: "dies" } });
+    const d = deps();
+    let rollbackAt = 0;
+    let launchedAt = 0;
+    const r = await runInstall({
+      ...d,
+      launch: (strategy) => {
+        const a = d.launch(strategy);
+        if (state().running === "new" && !launchedAt) launchedAt = w.t;
+        return a;
+      },
+      log: (line) => {
+        if (!rollbackAt && /rolling back/.test(line)) rollbackAt = w.t;
+        d.log(line);
+      },
+    });
+    expect(r.status).toBe("rolled-back");
+    expect(w.launches.filter((x, i) => i === 0 || x !== "open")).toEqual(["open"]);
+    expect(rollbackAt - launchedAt).toBeLessThan(5000);
+  });
+
+  it("nothing launches at all: rolled back, and both failures say so, with every attempt in the result", async () => {
+    const { w, deps, result } = world({});
+    w.dropped = new Set(["open", "open-new", "exec"]);
+    const r = await runInstall(deps());
+    expect(r.status).toBe("failed");
+    expect(r.error).toMatch(/The new build is not healthy: it never launched \(\d+ attempt\(s\): open → open-new → exec\).*previous build is back with its database, but it never launched/);
+    const attempts = result().launches;
+    expect(attempts.length).toBeGreaterThanOrEqual(6);
+    expect(attempts.every((a) => a.launched === false)).toBe(true);
+    // Bounded: about one attempt per launch window, per relaunch budget.
+    expect(attempts.length).toBeLessThanOrEqual(2 * (TIMING.relaunchTimeoutMs / TIMING.launchWindowMs + 1));
   });
 });
