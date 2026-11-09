@@ -57,6 +57,19 @@ const components: Components = {
     if (!lang && !text.includes("\n")) return <code>{children as ReactNode}</code>;
     return <CodeBlock code={text} lang={lang} />;
   },
+  // Links (written or autolinked bare URLs) open in the user's browser, never in place of the
+  // app: a new tab on the web, the system browser on desktop (its window-open handler).
+  // Only in-page anchors (footnotes) stay in place.
+  a: ({ node: _node, href, children, ...props }) =>
+    href?.startsWith("#") ? (
+      <a {...props} href={href}>
+        {children}
+      </a>
+    ) : (
+      <a {...props} href={href} target="_blank" rel="noopener noreferrer">
+        {children}
+      </a>
+    ),
 };
 
 /** Markdown as Apollo shows it in conversations: GitHub-flavored, with highlighted code. */

@@ -6,6 +6,7 @@ import { createServer } from "node:net";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, Menu, nativeImage, Notification, shell, Tray } from "electron";
+import { navigationDecision } from "./navigation.js";
 import { type PanelRow, TrayPanel } from "./trayPanel.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -189,7 +190,8 @@ const stopServer = () => {
   server = null;
 };
 
-const createWindow = async (url: string) => {
+/** `appOrigins`: where the UI and server are served from; only these load inside the window. */
+const createWindow = async (url: string, appOrigins: ReadonlyArray<string>) => {
   const window = new BrowserWindow({
     width: 1360,
     height: 860,
@@ -230,6 +232,14 @@ const createWindow = async (url: string) => {
     }
     void shell.openExternal(target);
     return { action: "deny" };
+  });
+  // The window itself never leaves the app: a link or script that would navigate it to
+  // another site opens in the user's browser instead (target-less links, location changes).
+  window.webContents.on("will-navigate", (event, target) => {
+    const decision = navigationDecision(target, appOrigins);
+    if (decision === "allow") return;
+    event.preventDefault();
+    if (decision === "external") void shell.openExternal(target);
   });
 
   await window.loadURL(url);
@@ -504,7 +514,7 @@ if (!app.requestSingleInstanceLock()) {
       const serverUrl = await startServer();
       if (tray) followStatus(serverUrl);
       const uiUrl = (devUrl ?? serverUrl).replace(/\/+$/, "");
-      await createWindow(`${uiUrl}/pair#token=${bootstrapToken}&label=Apollo%20Desktop`);
+      await createWindow(`${uiUrl}/pair#token=${bootstrapToken}&label=Apollo%20Desktop`, [new URL(uiUrl).origin, new URL(serverUrl).origin]);
     } catch (error) {
       console.error(error);
       stopServer();
