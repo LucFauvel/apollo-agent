@@ -36,6 +36,7 @@ import {
   type SlashCommand,
 } from "@apollo/contracts";
 import {
+  cleanTitle,
   makeClaudeProvider,
   makeAcpProviders,
   makeCodexProvider,
@@ -621,6 +622,66 @@ const make = Effect.gen(function* () {
       }
     });
 
+  // --- session titles --------------------------------------------------------
+  // A session the user starts without a title is named after its first message: at once
+  // from the message's opening words, then by the session's own provider in the background
+  // when it offers a cheap title (so a message never leaves for another provider than the
+  // one the user picked). A title the user writes is theirs: naming never replaces it.
+
+  /** Where the sessions still waiting for a first message are kept, across restarts. */
+  const UNTITLED_KEY = "sessions.untitled";
+  /** Started without a title, still waiting for a first message to be named from. */
+  const untitled = new Set<SessionId>();
+  {
+    const stored = yield* store.getSetting(UNTITLED_KEY);
+    const known = new Set((yield* store.listSessions()).map((s) => s.id));
+    try {
+      for (const id of JSON.parse(stored ?? "[]") as Array<SessionId>) if (known.has(id)) untitled.add(id);
+    } catch {
+      // A damaged list only costs automatic names.
+    }
+  }
+  const saveUntitled = Effect.suspend(() =>
+    store.setSetting(UNTITLED_KEY, untitled.size > 0 ? JSON.stringify([...untitled]) : null),
+  );
+  /** Titles being generated, by session: only the latest request for a session may apply. */
+  const naming = new Map<SessionId, symbol>();
+
+  /** The user gave the session a title: no automatic name replaces it from now on. */
+  const userTitled = (id: SessionId) =>
+    Effect.suspend(() => {
+      naming.delete(id);
+      return untitled.delete(id) ? saveUntitled : Effect.void;
+    });
+
+  /** The message's opening words, until the model's title arrives (or when it cannot). */
+  const provisionalTitle = (text: string) => cleanTitle(text.replace(/\s+/g, " "), 48) || "New session";
+
+  /**
+   * Asks the session's provider for a title, unless the user titles it first. The claim on
+   * the title is taken before this runs in the background, so a rename right after wins.
+   */
+  const nameSession = (session: Session, text: string, token: symbol) =>
+    Effect.gen(function* () {
+      const generate = providers[session.provider].generateTitle;
+      if (!generate) return;
+      const bot = yield* store.getBot(session.botId);
+      const account =
+        session.provider === "claude" && bot.claudeAccountId
+          ? accountEnvironment(config.dataDir, "claude", bot.claudeAccountId)
+          : session.provider === "codex" && bot.codexAccountId
+            ? accountEnvironment(config.dataDir, "codex", bot.codexAccountId)
+            : undefined;
+      const title = yield* generate(text, account).pipe(
+        Effect.tapCause(() => Effect.sync(() => naming.get(session.id) === token && naming.delete(session.id))),
+      );
+      // The user titled it meanwhile (or it is gone): leave it.
+      if (naming.get(session.id) !== token) return;
+      naming.delete(session.id);
+      const exists = yield* store.getSession(session.id).pipe(Effect.option);
+      if (Option.isSome(exists)) yield* updateSession(session.id, { title });
+    }).pipe(Effect.catchCause((cause) => Effect.logInfo(`session ${session.id} keeps its provisional title`, cause)));
+
   // --- public API ---------------------------------------------------------
 
   const send = (
@@ -640,6 +701,17 @@ const make = Effect.gen(function* () {
         const blocking = yield* localModels.value.downloadBlocking(target.model);
         if (blocking) {
           return yield* invalid(`${blocking} is still downloading. Send the message once the download finishes.`);
+        }
+      }
+      if (author === "user" && untitled.has(id) && text.trim()) {
+        untitled.delete(id);
+        yield* saveUntitled;
+        const provisional = provisionalTitle(text);
+        const named = target.title === provisional ? target : yield* updateSession(id, { title: provisional });
+        if (providers[named.provider].generateTitle) {
+          const token = Symbol(id);
+          naming.set(id, token);
+          yield* background(nameSession(named, text, token));
         }
       }
       if (author === "user") {
@@ -880,6 +952,8 @@ const make = Effect.gen(function* () {
   const updateSessionSettings = (input: UpdateSessionInput) =>
     Effect.gen(function* () {
       const current = yield* store.getSession(input.sessionId);
+      // Any title the user saves is theirs, even one equal to the automatic one.
+      if (input.title !== undefined && input.title.trim()) yield* userTitled(input.sessionId);
       const patch = {
         ...(input.title !== undefined && input.title.trim() ? { title: input.title.trim() } : {}),
         ...(input.model !== undefined ? { model: input.model?.trim() || null } : {}),
@@ -930,6 +1004,7 @@ const make = Effect.gen(function* () {
       yield* closeSession(id);
       const session = yield* store.getSession(id);
       removeAttachments(config.dataDir, id);
+      yield* userTitled(id);
       if (session.worktree) {
         yield* Effect.tryPromise(() => retireWorktree(session.worktree!)).pipe(
           Effect.catch((error) => Effect.logWarning(`could not remove the worktree of ${id}`, error)),
@@ -1383,15 +1458,21 @@ const make = Effect.gen(function* () {
       readonly author?: MessageAuthor;
     }) =>
       Effect.gen(function* () {
+        // No title: named after the first message (see nameSession).
+        const named = input.title.trim().length > 0;
         const session = yield* createSession({
           botId: input.botId,
-          title: input.title,
+          title: named ? input.title : provisionalTitle(input.prompt ?? ""),
           provider: input.provider,
           cwd: input.cwd,
           isolation: input.isolation,
           role: "worker",
           parentSessionId: input.parentSessionId ?? null,
         });
+        if (!named) {
+          untitled.add(session.id);
+          yield* saveUntitled;
+        }
         if (input.notifyParent && session.parentSessionId) yield* store.setNotifyParent(session.id, true);
         if (input.prompt && input.prompt.trim().length > 0) {
           yield* send(session.id, input.prompt, input.author ?? "user");

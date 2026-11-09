@@ -345,7 +345,8 @@ export function NewSessionDialog({
     rpc((c) =>
       c["sessions.create"]({
         botId: bot.id,
-        title: title || prompt.slice(0, 48),
+        // Empty: the server names it from the first message.
+        title: title.trim(),
         provider: selection(provider, model),
         cwd,
         ...(worktree ? { isolation: "worktree" as const } : {}),
@@ -368,7 +369,7 @@ export function NewSessionDialog({
           <Button variant="ghost" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" disabled={(!title.trim() && !prompt.trim()) || saving} onClick={create}>
+          <Button variant="primary" disabled={saving} onClick={create}>
             Start session
           </Button>
         </>
@@ -385,7 +386,7 @@ export function NewSessionDialog({
       />
       <div className="grid grid-cols-2 gap-3">
         <Field label="Title">
-          <input className={inputClass} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Fix flaky tests" autoFocus />
+          <input className={inputClass} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="From the first message" autoFocus />
         </Field>
         <Field label="Working directory">
           <input className={cx(inputClass, "font-mono text-xs")} value={cwd} onChange={(e) => setCwd(e.target.value)} />

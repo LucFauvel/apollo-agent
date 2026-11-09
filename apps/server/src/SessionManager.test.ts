@@ -4,7 +4,7 @@ import * as AppSettings from "./AppSettings.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AVATAR_SHAPES, type AgentEvent, type BotLimits, DEFAULT_BOT_LIMITS, type ProviderKind, type SessionId } from "@apollo/contracts";
-import type { Provider, ProviderSessionOptions } from "@apollo/providers";
+import { type Provider, ProviderError, type ProviderSessionOptions } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -30,6 +30,8 @@ const sent: Array<string> = [];
 const compactions: Array<string> = [];
 /** Attachments sent with each message, in order. */
 const sentFiles: Array<ReadonlyArray<{ path: string; name: string }>> = [];
+/** Every first message a provider was asked to name a session from. */
+const titleRequests: Array<string> = [];
 let skillReloads = 0;
 let modelListings = 0;
 let interrupts = 0;
@@ -53,6 +55,19 @@ const echoProvider = (kind: ProviderKind): Provider => ({
           { name: "Notion", kind: "connector" as const, status: "needs-auth" as const, tools: null },
           { name: "node_repl", kind: "mcp" as const, status: "connected" as const, tools: 4 },
         ]),
+      }
+    : {}),
+  // Claude names untitled sessions; "unnamed" makes it fail, "slow name" makes it take a while.
+  ...(kind === "claude"
+    ? {
+        generateTitle: (text: string) =>
+          Effect.suspend(() => {
+            titleRequests.push(text);
+            if (text.includes("unnamed")) return Effect.fail(new ProviderError({ provider: "claude", message: "no title" }));
+            return Effect.sleep(text.includes("slow name") ? "300 millis" : "10 millis").pipe(
+              Effect.as(`Named: ${text.split(/\s/)[0]}`),
+            );
+          }),
       }
     : {}),
   listModels: Effect.sync(() => {
@@ -127,7 +142,11 @@ const echoProvider = (kind: ProviderKind): Provider => ({
     }),
 });
 
-const layerWith = (budgetBytes: number) => SessionManager.layer.pipe(
+const layerWith = (
+  budgetBytes: number,
+  database: Layer.Layer<Database.Database, never, ServerConfig> = Database.layerMemory,
+  dir = dataDir,
+) => SessionManager.layer.pipe(
   Layer.provideMerge(
     Layer.succeed(SessionManager.Providers, {
       claude: echoProvider("claude"),
@@ -144,12 +163,12 @@ const layerWith = (budgetBytes: number) => SessionManager.layer.pipe(
   ),
   Layer.provideMerge(AppSettings.layer),
   Layer.provideMerge(Store.layer),
-  Layer.provideMerge(Database.layerMemory),
+  Layer.provideMerge(database),
   Layer.provideMerge(
     Layer.succeed(ServerConfig, {
       host: "127.0.0.1",
       port: 0,
-      dataDir,
+      dataDir: dir,
       webDistDir: null,
       baseUrl: "http://127.0.0.1:0",
       claudeExecutable: undefined,
@@ -304,6 +323,118 @@ describe("SessionManager", () => {
       expect(missing.message).toContain("attachment is missing");
     }).pipe(Effect.provide(layer)),
   );
+
+  it.live("names sessions started without a title from their first message", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      const title = (id: SessionId) => store.getSession(id).pipe(Effect.map((s) => s.title));
+
+      // With a first message: its opening words at once, then the model's title.
+      const prompted = yield* manager.createSession({
+        botId: bot.id,
+        title: "  ",
+        provider: { provider: "claude" },
+        prompt: "Refactor\nthe billing   service so invoices are retried when the payment provider times out",
+      });
+      expect(prompted.title).toBe("Refactor the billing service so invoices are…");
+      yield* Effect.sleep("100 millis");
+      expect(yield* title(prompted.id)).toBe("Named: Refactor");
+
+      // Without one: named from the first message the user sends, and only that one.
+      const empty = yield* manager.createSession({ botId: bot.id, title: "", provider: { provider: "claude" } });
+      expect(empty.title).toBe("New session");
+      yield* manager.send(empty.id, "Deploy the docs site", "user");
+      yield* Effect.sleep("100 millis");
+      expect(yield* title(empty.id)).toBe("Named: Deploy");
+      yield* manager.send(empty.id, "Something else entirely", "user");
+      yield* Effect.sleep("100 millis");
+      expect(yield* title(empty.id)).toBe("Named: Deploy");
+
+      // When the model cannot answer, the opening words stay.
+      const failed = yield* manager.createSession({ botId: bot.id, title: "", provider: { provider: "claude" }, prompt: "unnamed task" });
+      yield* Effect.sleep("100 millis");
+      expect(yield* title(failed.id)).toBe("unnamed task");
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("never sends a session's first message to another provider to name it", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      titleRequests.length = 0;
+      // Local and Codex sessions have no title generator of their own: Claude is not asked.
+      const local = yield* manager.createSession({
+        botId: bot.id,
+        title: "",
+        provider: { provider: "llamacpp" },
+        prompt: "LOCAL_ONLY payroll figures for review",
+      });
+      const codex = yield* manager.createSession({ botId: bot.id, title: "", provider: { provider: "codex" } });
+      yield* manager.send(codex.id, "CODEX_ONLY first message", "user");
+      yield* Effect.sleep("100 millis");
+      expect(titleRequests).toEqual([]);
+      expect((yield* store.getSession(local.id)).title).toBe("LOCAL_ONLY payroll figures for review");
+      expect((yield* store.getSession(codex.id)).title).toBe("CODEX_ONLY first message");
+      // A Claude session is named by Claude.
+      yield* manager.createSession({ botId: bot.id, title: "", provider: { provider: "claude" }, prompt: "Claude task" });
+      yield* Effect.sleep("100 millis");
+      expect(titleRequests).toEqual(["Claude task"]);
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("never replaces a title the user gave", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      const title = (id: SessionId) => store.getSession(id).pipe(Effect.map((s) => s.title));
+      titleRequests.length = 0;
+
+      // Given at the start.
+      const given = yield* manager.createSession({ botId: bot.id, title: "Mine", provider: { provider: "claude" }, prompt: "Ship it" });
+      // Renamed before the first message.
+      const early = yield* manager.createSession({ botId: bot.id, title: "", provider: { provider: "claude" } });
+      yield* manager.updateSessionSettings({ sessionId: early.id, title: "User chose this" });
+      yield* manager.send(early.id, "first message", "user");
+      // Renamed while the model thinks, to another title or to the very same words.
+      const renamed = yield* manager.createSession({ botId: bot.id, title: "", provider: { provider: "claude" }, prompt: "slow name please" });
+      yield* manager.updateSessionSettings({ sessionId: renamed.id, title: "Renamed" });
+      const kept = yield* manager.createSession({ botId: bot.id, title: "", provider: { provider: "claude" }, prompt: "slow name keep these words" });
+      yield* manager.updateSessionSettings({ sessionId: kept.id, title: "slow name keep these words" });
+      yield* Effect.sleep("500 millis");
+
+      expect(yield* title(given.id)).toBe("Mine");
+      expect(yield* title(early.id)).toBe("User chose this");
+      expect(yield* title(renamed.id)).toBe("Renamed");
+      expect(yield* title(kept.id)).toBe("slow name keep these words");
+      expect(titleRequests).toEqual(["slow name please", "slow name keep these words"]);
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("still names a session started empty after the server restarts", () => {
+    const dir = mkdtempSync(join(tmpdir(), "apollo-restart-"));
+    const onDisk = layerWith(1e9, Database.layer, dir);
+    return Effect.gen(function* () {
+      const id = yield* Effect.gen(function* () {
+        const manager = yield* SessionManager.SessionManager;
+        const bot = yield* createBot(manager);
+        return (yield* manager.createSession({ botId: bot.id, title: "", provider: { provider: "claude" } })).id;
+      }).pipe(Effect.provide(onDisk));
+      // A new server on the same database.
+      yield* Effect.gen(function* () {
+        const manager = yield* SessionManager.SessionManager;
+        const store = yield* Store.Store;
+        yield* manager.send(id, "Restarted before writing", "user");
+        yield* Effect.sleep("100 millis");
+        expect((yield* store.getSession(id)).title).toBe("Named: Restarted");
+        // Named once: the waiting list is empty again.
+        expect(yield* store.getSetting("sessions.untitled")).toBeNull();
+      }).pipe(Effect.provide(onDisk));
+    });
+  });
 
   it.live("gives workers their own git worktree, then merges or discards it", () =>
     Effect.gen(function* () {
