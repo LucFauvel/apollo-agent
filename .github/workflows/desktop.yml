@@ -1,11 +1,14 @@
-# Desktop (macOS arm64) builds and releases. See RELEASE-SETUP.md.
+# Desktop builds and releases: macOS arm64, Windows x64 and Windows arm64. See RELEASE-SETUP.md.
 #
-#  push to main → "nightly": ad-hoc signed (the explicit no-secrets fallback), smoke-tested,
-#                 uploaded as a 14-day run artifact. NEVER a release.
-#  push tag v*  → release-build: tag must be vX.Y.Z on origin/main; Developer ID signed + notarized
-#                 with the `release-build` environment's secrets (no reviewer; v* tags only);
-#                 smoke-tested against old databases (failure = no draft).
-#               → draft-release: a DRAFT GitHub Release with the zip, dmg, apollo-update.json, SHA256SUMS.
+#  push to main → nightlies: macOS ad-hoc signed, Windows unsigned (the explicit no-secrets
+#                 fallback); each smoke-tested (Windows arm64 on a native arm64 runner) and uploaded
+#                 as a 14-day run artifact. NEVER a release.
+#  push tag v*  → release builds (`release-build` environment, no reviewer; v* tags only): tag must
+#                 be vX.Y.Z on origin/main; macOS Developer ID signed + notarized; Windows unsigned
+#                 until Azure Trusted Signing is configured; every platform smoke-tested against old
+#                 databases (any failure = no draft).
+#               → draft-release: merges the platforms' partial manifests into apollo-update.json and
+#                 creates a DRAFT GitHub Release with every installer, the manifest and SHA256SUMS.
 #               → sign-and-publish (`release` environment, Luc = required reviewer: THE human gate):
 #                 re-verifies the draft, signs apollo-update.json with minisign, attests provenance,
 #                 publishes the release as a PRERELEASE (release candidate; never "latest").
@@ -27,9 +30,31 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  nightly:
-    name: Nightly build (ad-hoc, artifact only)
+  nightly-stamp:
+    name: Nightly version
     if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # One stamp for every platform of this run (the UTC date must not differ between builds).
+    outputs:
+      version: ${{ steps.stamp.outputs.version }}
+      channel: ${{ steps.stamp.outputs.channel }}
+      bundle_version: ${{ steps.stamp.outputs.bundle_version }}
+      commit: ${{ steps.stamp.outputs.commit }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - id: stamp
+        run: node apps/desktop/scripts/release/stamp.ts
+
+  nightly:
+    name: Nightly macOS arm64 (ad-hoc, artifact only)
+    needs: nightly-stamp
     runs-on: macos-15
     timeout-minutes: 90
     steps:
@@ -40,15 +65,12 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           native: "true"
-      - name: Stamp version
-        id: stamp
-        run: node apps/desktop/scripts/release/stamp.ts
       - name: Build (ad-hoc signed, NOT releasable)
         env:
-          APOLLO_BUILD_VERSION: ${{ steps.stamp.outputs.version }}
-          APOLLO_BUILD_CHANNEL: ${{ steps.stamp.outputs.channel }}
-          APOLLO_BUILD_NUMBER: ${{ steps.stamp.outputs.bundle_version }}
-          APOLLO_BUILD_COMMIT: ${{ steps.stamp.outputs.commit }}
+          APOLLO_BUILD_VERSION: ${{ needs.nightly-stamp.outputs.version }}
+          APOLLO_BUILD_CHANNEL: ${{ needs.nightly-stamp.outputs.channel }}
+          APOLLO_BUILD_NUMBER: ${{ needs.nightly-stamp.outputs.bundle_version }}
+          APOLLO_BUILD_COMMIT: ${{ needs.nightly-stamp.outputs.commit }}
           APOLLO_CODESIGN: adhoc
         run: |
           echo "::warning title=Unsigned nightly::Nightly builds are ad-hoc signed and not releasable (Developer ID signing runs only for v* tags, in the release environment)."
@@ -57,13 +79,13 @@ jobs:
         run: node apps/desktop/scripts/release/smoke.ts --zip "$RUNNER_TEMP"/dist/*.zip
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: apollo-desktop-${{ steps.stamp.outputs.version }}
+          name: apollo-desktop-${{ needs.nightly-stamp.outputs.version }}-darwin-arm64
           path: ${{ runner.temp }}/dist
           retention-days: 14
           if-no-files-found: error
       - name: Summary
         env:
-          VERSION: ${{ steps.stamp.outputs.version }}
+          VERSION: ${{ needs.nightly-stamp.outputs.version }}
         run: |
           {
             echo "### Nightly ${VERSION} (ad-hoc signed — not releasable)"
@@ -72,8 +94,79 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  nightly-windows:
+    name: Nightly Windows ${{ matrix.arch }} (unsigned, artifact only)
+    needs: nightly-stamp
+    # Both architectures build on x64: build.ps1 cross-builds the tailnet addon with llvm-mingw,
+    # and electron-builder packages win32-arm64 Electron from any host.
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            rust-target: x86_64-pc-windows-gnullvm
+          - arch: arm64
+            rust-target: aarch64-pc-windows-gnullvm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          native: "true"
+          rust-targets: ${{ matrix.rust-target }}
+      - uses: ./.github/actions/llvm-mingw
+      - name: Build (unsigned)
+        env:
+          APOLLO_BUILD_VERSION: ${{ needs.nightly-stamp.outputs.version }}
+          APOLLO_BUILD_CHANNEL: ${{ needs.nightly-stamp.outputs.channel }}
+          APOLLO_BUILD_NUMBER: ${{ needs.nightly-stamp.outputs.bundle_version }}
+          APOLLO_BUILD_COMMIT: ${{ needs.nightly-stamp.outputs.commit }}
+          ARCH: ${{ matrix.arch }}
+        run: node apps/desktop/scripts/release/build-release-win.ts --arch "$ARCH" --out "$RUNNER_TEMP/dist"
+      - name: Smoke test (x64; arm64 runs on an arm64 runner below)
+        if: matrix.arch == 'x64'
+        env:
+          APOLLO_BUILD_VERSION: ${{ needs.nightly-stamp.outputs.version }}
+          APOLLO_BUILD_COMMIT: ${{ needs.nightly-stamp.outputs.commit }}
+        run: node apps/desktop/scripts/release/smoke.ts --nsis "$RUNNER_TEMP"/dist/*-setup.exe --app-arg --disable-gpu
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: apollo-desktop-${{ needs.nightly-stamp.outputs.version }}-win32-${{ matrix.arch }}
+          path: ${{ runner.temp }}/dist
+          retention-days: 14
+          if-no-files-found: error
+
+  nightly-windows-arm64-smoke:
+    name: Nightly Windows arm64 smoke test
+    needs: [nightly-stamp, nightly-windows]
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: apollo-desktop-${{ needs.nightly-stamp.outputs.version }}-win32-arm64
+          path: ${{ runner.temp }}/dist
+      - name: Smoke test (packaged arm64 app against old databases)
+        env:
+          APOLLO_BUILD_VERSION: ${{ needs.nightly-stamp.outputs.version }}
+        run: node apps/desktop/scripts/release/smoke.ts --nsis "$RUNNER_TEMP"/dist/*-setup.exe --app-arg --disable-gpu
+
   release-build:
-    name: Release build (Developer ID, notarized)
+    name: Release macOS arm64 (Developer ID, notarized)
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-15
     timeout-minutes: 150
@@ -148,34 +241,121 @@ jobs:
         run: node apps/desktop/scripts/release/smoke.ts --zip "$RUNNER_TEMP"/dist/*.zip
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: apollo-desktop-release-${{ github.ref_name }}
+          name: apollo-desktop-release-${{ github.ref_name }}-darwin-arm64
           path: ${{ runner.temp }}/dist
           retention-days: 30
           if-no-files-found: error
 
+  release-build-windows:
+    name: Release Windows ${{ matrix.arch }} (unsigned until Azure Trusted Signing)
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    timeout-minutes: 120
+    environment: release-build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            rust-target: x86_64-pc-windows-gnullvm
+          - arch: arm64
+            rust-target: aarch64-pc-windows-gnullvm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          native: "true"
+          rust-targets: ${{ matrix.rust-target }}
+      - uses: ./.github/actions/llvm-mingw
+      - name: Stamp version (refuses malformed tags and tags not on origin/main)
+        id: stamp
+        run: node apps/desktop/scripts/release/stamp.ts
+      - name: Build (Authenticode via Azure Trusted Signing when configured, else unsigned)
+        env:
+          APOLLO_BUILD_VERSION: ${{ steps.stamp.outputs.version }}
+          APOLLO_BUILD_CHANNEL: ${{ steps.stamp.outputs.channel }}
+          APOLLO_BUILD_NUMBER: ${{ steps.stamp.outputs.bundle_version }}
+          APOLLO_BUILD_COMMIT: ${{ steps.stamp.outputs.commit }}
+          ARCH: ${{ matrix.arch }}
+          # Placeholders: all empty today, so the build is unsigned. Set all seven to sign (RELEASE-SETUP.md).
+          AZURE_TENANT_ID: ${{ secrets.RELEASE_AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.RELEASE_AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.RELEASE_AZURE_CLIENT_SECRET }}
+          APOLLO_AZURE_SIGN_ENDPOINT: ${{ vars.APOLLO_AZURE_SIGN_ENDPOINT }}
+          APOLLO_AZURE_SIGN_ACCOUNT: ${{ vars.APOLLO_AZURE_SIGN_ACCOUNT }}
+          APOLLO_AZURE_SIGN_PROFILE: ${{ vars.APOLLO_AZURE_SIGN_PROFILE }}
+          APOLLO_AZURE_SIGN_PUBLISHER: ${{ vars.APOLLO_AZURE_SIGN_PUBLISHER }}
+        run: |
+          [[ -n "$AZURE_CLIENT_SECRET" ]] || echo "::warning title=Unsigned Windows build::Azure Trusted Signing is not configured: the ${ARCH} installer is unsigned (SmartScreen warns). See RELEASE-SETUP.md."
+          node apps/desktop/scripts/release/build-release-win.ts --arch "$ARCH" --out "$RUNNER_TEMP/dist"
+      - name: Smoke test (gate for the draft release; arm64 runs on an arm64 runner below)
+        if: matrix.arch == 'x64'
+        env:
+          APOLLO_BUILD_VERSION: ${{ steps.stamp.outputs.version }}
+          APOLLO_BUILD_COMMIT: ${{ steps.stamp.outputs.commit }}
+        run: node apps/desktop/scripts/release/smoke.ts --nsis "$RUNNER_TEMP"/dist/*-setup.exe --app-arg --disable-gpu
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: apollo-desktop-release-${{ github.ref_name }}-win32-${{ matrix.arch }}
+          path: ${{ runner.temp }}/dist
+          retention-days: 30
+          if-no-files-found: error
+
+  release-smoke-windows-arm64:
+    name: Release Windows arm64 smoke test (gate)
+    needs: release-build-windows
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: apollo-desktop-release-${{ github.ref_name }}-win32-arm64
+          path: ${{ runner.temp }}/dist
+      - name: Smoke test (packaged arm64 app against old databases)
+        env:
+          APOLLO_BUILD_COMMIT: ${{ github.sha }}
+          TAG: ${{ github.ref_name }}
+        run: APOLLO_BUILD_VERSION="${TAG#v}" node apps/desktop/scripts/release/smoke.ts --nsis "$RUNNER_TEMP"/dist/*-setup.exe --app-arg --disable-gpu
+
   draft-release:
     name: Draft GitHub Release
-    needs: release-build
+    needs: [release-build, release-build-windows, release-smoke-windows-arm64]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write # only this job can write, and only to create the draft
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: apollo-desktop-release-${{ github.ref_name }}
-          path: dist
-      - name: Verify artifacts against the manifest
+          pattern: apollo-desktop-release-${{ github.ref_name }}-*
+          path: parts # one subdirectory per platform build
+      - name: Merge the platforms (re-hash every file; exactly darwin-arm64, win32-x64, win32-arm64)
         env:
           TAG: ${{ github.ref_name }}
           VERSION: ${{ needs.release-build.outputs.version }}
         run: |
-          cd dist
-          sha256sum --check --strict SHA256SUMS
-          jq -e --arg v "$VERSION" --arg c "$GITHUB_SHA" \
-            '.version == $v and .commit == $c and .channel == "release" and .codeSigning.kind == "developer-id"' \
-            apollo-update.json > /dev/null || { echo "::error::apollo-update.json does not match ${TAG} / ${GITHUB_SHA}"; cat apollo-update.json; exit 1; }
           [[ "v${VERSION}" == "${TAG}" ]] || { echo "::error::stamped ${VERSION} != tag ${TAG}"; exit 1; }
+          node apps/desktop/scripts/release/merge-manifests.ts --out dist --version "$VERSION" --commit "$GITHUB_SHA" parts/*
+          (cd dist && sha256sum --check --strict SHA256SUMS)
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -187,9 +367,10 @@ jobs:
             exit 1
           fi
           {
-            echo "Apollo ${VERSION} for macOS (Apple silicon), built from ${GITHUB_SHA} by run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            echo "Apollo ${VERSION} for macOS (Apple silicon) and Windows (x64, arm64), built from ${GITHUB_SHA} by run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
             echo
-            echo "Developer ID signed and notarized; smoke-tested against old databases before this draft was created."
+            echo "macOS: Developer ID signed and notarized. Windows: $(jq -r '[.assets[] | select(.platform == "win32") | "\(.arch) \(.codeSigning.kind)"] | join(", ")' dist/apollo-update.json) (unsigned installers make SmartScreen warn on first run)."
+            echo "Every platform was smoke-tested against old databases before this draft was created."
             echo
             echo "**Draft:** published as a release candidate once Luc approves the signing job; promote-to-stable makes it the stable release."
             echo
@@ -263,6 +444,7 @@ jobs:
           subject-path: |
             ${{ runner.temp }}/release/*.zip
             ${{ runner.temp }}/release/*.dmg
+            ${{ runner.temp }}/release/*.exe
             ${{ runner.temp }}/release/apollo-update.json
       - name: Upload the signature and publish as a release candidate
         env:

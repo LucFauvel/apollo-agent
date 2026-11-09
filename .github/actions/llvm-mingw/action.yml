@@ -1,0 +1,24 @@
+# llvm-mingw (https://github.com/mstorsjo/llvm-mingw), the C toolchain build.ps1 needs to build the
+# tailnet addon's Go c-archive and link the Rust gnullvm crate, for x64 and arm64 Windows.
+# Pinned release + SHA-256 (from the GitHub release asset digest); sets LLVM_MINGW.
+name: Set up llvm-mingw
+description: Download a pinned llvm-mingw (ucrt, x86_64 host), verify its SHA-256 and set LLVM_MINGW.
+runs:
+  using: composite
+  steps:
+    - name: llvm-mingw 20261104
+      shell: pwsh
+      env:
+        LLVM_MINGW_URL: https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/llvm-mingw-20261104-ucrt-x86_64.zip
+        LLVM_MINGW_SHA256: 552191b5754c49a5a20723276a6fc56541ea1922c4c50b7b669022333fc1b40f
+      run: |
+        $ErrorActionPreference = "Stop"
+        $zip = Join-Path $env:RUNNER_TEMP "llvm-mingw.zip"
+        Invoke-WebRequest -Uri $env:LLVM_MINGW_URL -OutFile $zip
+        $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+        if ($actual -ne $env:LLVM_MINGW_SHA256) { throw "llvm-mingw SHA-256 mismatch: $actual" }
+        $dest = Join-Path $env:RUNNER_TEMP "llvm-mingw"
+        Expand-Archive -Path $zip -DestinationPath $dest
+        $root = (Get-ChildItem $dest -Directory | Select-Object -First 1).FullName
+        & (Join-Path $root "bin\aarch64-w64-mingw32-clang.exe") --version | Select-Object -First 1
+        "LLVM_MINGW=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8

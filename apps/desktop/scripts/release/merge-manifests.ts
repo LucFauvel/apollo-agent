@@ -5,8 +5,9 @@
  *
  *   node apps/desktop/scripts/release/merge-manifests.ts --out <dir> --version X.Y.Z --commit <sha> <build dir>...
  *
- * A release must cover exactly RELEASE_TARGETS (manifest.ts); the merged manifest's version and
- * commit must be the ones given (the tag's).
+ * A release must cover exactly RELEASE_TARGETS (manifest.ts), be signed per RELEASE_SIGNING
+ * (release-checks.ts: macOS Developer ID; Windows Authenticode or, for now, unsigned), and its
+ * version and commit must be the ones given (the tag's).
  */
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -22,6 +23,7 @@ import {
   sha256File,
   SUMS_NAME,
 } from "./manifest.ts";
+import { RELEASE_SIGNING } from "./release-checks.ts";
 
 const args = process.argv.slice(2);
 const take = (name: string) => {
@@ -73,6 +75,10 @@ const merged = (() => {
 if (merged.version !== version) problems.push(`builds are version ${merged.version}, expected ${version}`);
 if (merged.commit !== commit) problems.push(`builds are from ${merged.commit}, expected ${commit}`);
 if (merged.channel !== "release") problems.push(`builds are channel ${merged.channel}, expected release`);
+for (const asset of merged.assets) {
+  const allowed = RELEASE_SIGNING[asset.platform];
+  if (!allowed.includes(asset.codeSigning.kind)) problems.push(`${asset.name} is ${asset.codeSigning.kind}: a ${asset.platform} release needs ${allowed.join(" or ")}`);
+}
 if (problems.length) {
   console.error(`✗ ${problems.join("\n  - ")}`);
   process.exit(1);

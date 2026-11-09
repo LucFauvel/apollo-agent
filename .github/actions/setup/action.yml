@@ -4,8 +4,11 @@ name: Set up Apollo toolchains
 description: Node (.node-version), pnpm (package.json packageManager), optionally Go + Rust for the native addons.
 inputs:
   native:
-    description: "Also set up Go (tailnet go.mod version) and Rust (aarch64-apple-darwin)."
+    description: "Also set up Go (tailnet go.mod version) and Rust (with rust-targets)."
     default: "false"
+  rust-targets:
+    description: "Space-separated Rust targets to add when native is true."
+    default: "aarch64-apple-darwin"
 runs:
   using: composite
   steps:
@@ -29,9 +32,12 @@ runs:
     - if: inputs.native == 'true'
       name: Rust
       shell: bash
+      env:
+        RUST_TARGETS: ${{ inputs.rust-targets }}
       run: |
         command -v rustup >/dev/null || { echo "::error::rustup is not on this runner image"; exit 1; }
-        rustup target add aarch64-apple-darwin
+        # shellcheck disable=SC2086 # a space-separated list on purpose
+        rustup target add $RUST_TARGETS
         cargo --version
     - name: pnpm install
       shell: bash
