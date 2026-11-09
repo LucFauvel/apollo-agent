@@ -4,7 +4,8 @@
  * installed app says what it is: `cat /Applications/Apollo.app/Contents/Resources/build-info.json`.
  *
  * CI stamps the version (scripts/release/stamp.ts) through APOLLO_BUILD_VERSION,
- * APOLLO_BUILD_CHANNEL and APOLLO_BUILD_NUMBER. Without them the build is a `local` one.
+ * APOLLO_BUILD_CHANNEL and APOLLO_BUILD_NUMBER (and APOLLO_BUILD_ARCH when cross-building).
+ * Without them the build is a `local` one.
  */
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -47,7 +48,8 @@ export const buildInfo = (env: NodeJS.ProcessEnv = process.env): BuildInfo => {
     schemaVersion: SCHEMA_VERSION,
     builtAt: new Date().toISOString(),
     ...stampFromEnv(env, commit),
-    arch: process.arch,
+    // The architecture the app is built FOR (a Windows x64 runner also builds arm64).
+    arch: env.APOLLO_BUILD_ARCH || process.arch,
   };
 };
 

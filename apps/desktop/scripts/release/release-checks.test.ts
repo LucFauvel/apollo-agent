@@ -4,18 +4,24 @@ import { checkRelease, type ReleaseFacts, trustedComment } from "./release-check
 
 const commit = "c".repeat(40);
 const manifest: Manifest = {
-  format: 1,
+  format: 2,
   version: "0.4.0",
   build: 412,
   commit,
   channel: "release",
   schemaVersion: 19,
-  minMacos: "13.0",
   publishedAt: "2026-11-08T00:00:00Z",
-  codeSigning: { kind: "developer-id", team: "XA3R5NAN2C" },
-  assets: [{ name: "Apollo-0.4.0-arm64.zip", arch: "arm64", size: 1, sha256: "1".repeat(64) }],
+  assets: [
+    { name: "Apollo-0.4.0-arm64.zip", platform: "darwin", arch: "arm64", kind: "zip", size: 1, sha256: "1".repeat(64), codeSigning: { kind: "developer-id", team: "XA3R5NAN2C" }, minOs: "13.0" },
+    { name: "Apollo-0.4.0-win-x64-unsigned-setup.exe", platform: "win32", arch: "x64", kind: "nsis", size: 1, sha256: "2".repeat(64), codeSigning: { kind: "unsigned" }, minOs: "10" },
+    { name: "Apollo-0.4.0-win-arm64-setup.exe", platform: "win32", arch: "arm64", kind: "nsis", size: 1, sha256: "3".repeat(64), codeSigning: { kind: "authenticode", publisher: "Luc Fauvel" }, minOs: "10" },
+  ],
   notes: "",
 };
+const withAsset = (i: number, patch: Partial<Manifest["assets"][number]>): Manifest => ({
+  ...manifest,
+  assets: manifest.assets.map((a, j) => (j === i ? ({ ...a, ...patch } as Manifest["assets"][number]) : a)),
+});
 const draft: ReleaseFacts = {
   tag: "v0.4.0",
   tagCommit: commit,
@@ -38,7 +44,9 @@ describe("checkRelease: sign", () => {
     ["tag off main", { onMain: false }, /not on origin\/main/],
     ["other commit", { tagCommit: "d".repeat(40) }, /manifest commit/],
     ["wrong version", { tag: "v0.4.1" }, /manifest version 0.4.0 != tag v0.4.1/],
-    ["ad-hoc build", { manifest: { ...manifest, codeSigning: { kind: "adhoc" } } }, /adhoc-signed/],
+    ["ad-hoc macOS build", { manifest: withAsset(0, { codeSigning: { kind: "adhoc" } }) }, /Apollo-0.4.0-arm64.zip is adhoc: a darwin release needs developer-id/],
+    ["a missing Windows arch", { manifest: { ...manifest, assets: manifest.assets.slice(0, 2) } }, /no win32-arm64 build/],
+    ["an extra target", { manifest: withAsset(2, { arch: "ia32" }) }, /unexpected win32-ia32 build/],
     ["nightly manifest", { manifest: { ...manifest, channel: "nightly" } }, /channel is nightly/],
     ["hash mismatch", { assetProblems: ["x.zip: sha256 a != manifest b"] }, /x.zip: sha256/],
     ["already published", { release: { isDraft: false, isPrerelease: true } }, /already published/],

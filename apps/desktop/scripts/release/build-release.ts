@@ -5,8 +5,9 @@
  *   APOLLO_BUILD_COMMIT=<sha> node apps/desktop/scripts/release/build-release.ts --out <dir>
  *
  * Output in <dir>: Apollo-<version>-arm64[-adhoc].zip (ditto, what the future updater consumes),
- * Apollo-<version>-arm64[-adhoc].dmg (for humans), apollo-update.json (manifest, unsigned) and
- * SHA256SUMS. The same build path as `pnpm package`/`install:app` (build:package, then
+ * Apollo-<version>-arm64[-adhoc].dmg (for humans), apollo-update.darwin-arm64.json (this
+ * platform's partial manifest, merged with the Windows ones by merge-manifests.ts) and SHA256SUMS.
+ * The same build path as `pnpm package`/`install:app` (build:package, then
  * electron-builder), with the version stamped on the command line: nothing is committed.
  *
  * Code signing (APOLLO_CODESIGN), the REAL release path being `developer-id`:
@@ -22,7 +23,7 @@
  *    `release` environment's secrets (forks, PRs, nightly main builds). `identity: "-"`, no
  *    hardened runtime. NOT RELEASABLE: Gatekeeper blocks it once quarantined and macOS forgets
  *    permissions (microphone) on every update. Files get an `-adhoc` suffix and the manifest says
- *    `codeSigning.kind: "adhoc"`. A `release` channel build refuses this mode unless
+ *    `codeSigning.kind: "adhoc"` on its assets. A `release` channel build refuses this mode unless
  *    APOLLO_ALLOW_ADHOC_RELEASE=1.
  *
  * Verification after the build (any failure exits 1, nothing is written to <dir>):
@@ -36,7 +37,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BuildInfo } from "../install-app-lib.ts";
-import { type CodeSigning, describeAsset, formatSums, type Manifest, MANIFEST_NAME, SUMS_NAME } from "./manifest.ts";
+import { type CodeSigning, describeAsset, formatSums, type Manifest, MANIFEST_FORMAT, partialManifestName, SUMS_NAME } from "./manifest.ts";
 
 const desktopDir = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const ARCH = "arm64";
@@ -187,25 +188,25 @@ const minMacos = plist("LSMinimumSystemVersion") || "unknown";
 rmSync(check, { recursive: true, force: true });
 if (problems.length) fail(`the built app does not check out:\n  - ${problems.join("\n  - ")}`);
 
-// 5. Manifest + SHA256SUMS (the manifest is signed later, locally, by `pnpm release:publish`).
-const assets = [await describeAsset(zipPath, ARCH), await describeAsset(dmgPath, ARCH)];
+// 5. Partial manifest (this platform's assets) + SHA256SUMS. The draft-release job merges the
+//    platforms' partial manifests into apollo-update.json, which the approval-gated job signs.
+const meta = { platform: "darwin", arch: ARCH, codeSigning, minOs: minMacos } as const;
+const assets = [await describeAsset(zipPath, { ...meta, kind: "zip" }), await describeAsset(dmgPath, { ...meta, kind: "dmg" })];
 const manifest: Manifest = {
-  format: 1,
+  format: MANIFEST_FORMAT,
   version,
   build: Number(bundleVersion),
   commit,
   channel,
   schemaVersion: info.schemaVersion,
-  minMacos,
   publishedAt: new Date().toISOString(),
-  codeSigning,
   assets,
   notes: "",
 };
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 for (const a of assets) copyFileSync(join(staging, a.name), join(outDir, a.name));
-writeFileSync(join(outDir, MANIFEST_NAME), `${JSON.stringify(manifest, null, 2)}\n`);
+writeFileSync(join(outDir, partialManifestName("darwin", ARCH)), `${JSON.stringify(manifest, null, 2)}\n`);
 writeFileSync(join(outDir, SUMS_NAME), formatSums(assets));
 rmSync(staging, { recursive: true, force: true });
 console.log(`✓ ${version} (${channel}, build ${bundleVersion}, ${codeSigning.kind}) → ${outDir}`);

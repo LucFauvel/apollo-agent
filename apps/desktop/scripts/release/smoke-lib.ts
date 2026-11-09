@@ -91,3 +91,54 @@ export const checkMigratedDatabase = (path: string, expectedVersion: number): Ar
     db.close();
   }
 };
+
+/**
+ * The server's base URL from the app's output: the HTTP server logs "Listening on http://…:<port>"
+ * once it is bound. Only loopback addresses count. Null until that line appears.
+ */
+export const serverUrlFromLog = (log: string): string | null => {
+  const m = /Listening on (http:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):\d{1,5})\b/.exec(log);
+  return m ? m[1]! : null;
+};
+
+export interface SmokeDirs {
+  readonly home: string;
+  readonly dataDir: string;
+  readonly userDataDir: string;
+  readonly screenshot: string;
+  readonly screenshotDelayMs: number;
+}
+
+/** Variables that would redirect or break the launched app (case-insensitive: Windows env keys are). */
+const LEAKY = /^(ELECTRON_|APOLLO_|NODE_OPTIONS$|NODE_PATH$)/i;
+
+/**
+ * The launched app's environment. macOS: install:app's allowlist (`launchEnv`). Windows: the
+ * runner's environment (Windows needs SystemRoot, PATH, TEMP…) without ELECTRON_*, APOLLO_* and
+ * NODE_* redirections. Both then point HOME (and USERPROFILE on Windows), the data dir, the
+ * Chromium profile and the screenshot into the throwaway directory.
+ */
+export const smokeEnv = (
+  platform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+  launchEnv: (env: NodeJS.ProcessEnv) => Record<string, string>,
+  dirs: SmokeDirs,
+): Record<string, string> => {
+  const base =
+    platform === "win32"
+      ? Object.fromEntries(Object.entries(env).filter((e): e is [string, string] => typeof e[1] === "string" && !LEAKY.test(e[0])))
+      : launchEnv(env);
+  const out: Record<string, string> = { ...base };
+  if (platform === "win32") {
+    for (const k of Object.keys(out)) if (/^(HOME|USERPROFILE)$/i.test(k)) delete out[k];
+    out.USERPROFILE = dirs.home;
+  }
+  return {
+    ...out,
+    HOME: dirs.home,
+    APOLLO_DATA_DIR: dirs.dataDir,
+    APOLLO_USER_DATA_DIR: dirs.userDataDir,
+    APOLLO_SCREENSHOT: dirs.screenshot,
+    APOLLO_SCREENSHOT_DELAY: String(dirs.screenshotDelayMs),
+  };
+};

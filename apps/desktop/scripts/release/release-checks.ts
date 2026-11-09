@@ -3,8 +3,18 @@
  * the stable channel (stage `promote`). Pure: verify-release.ts gathers the facts (git, gh,
  * hashes, minisign) and this decides. Every problem is reported, not just the first.
  */
-import type { Manifest } from "./manifest.ts";
+import { type CodeSigning, type Manifest, type Platform, RELEASE_TARGETS, targetsOf } from "./manifest.ts";
 import { formatSemVer, parseReleaseTag } from "./version.ts";
+
+/**
+ * Release signing policy per platform. macOS: Developer ID only (ad-hoc is never released).
+ * Windows: Authenticode, or UNSIGNED for now (no certificate yet; Luc's decision, see
+ * RELEASE-SETUP.md). Remove "unsigned" here once Azure Trusted Signing is set up.
+ */
+export const RELEASE_SIGNING: Record<Platform, ReadonlyArray<CodeSigning["kind"]>> = {
+  darwin: ["developer-id"],
+  win32: ["authenticode", "unsigned"],
+};
 
 export type Stage = "sign" | "promote";
 
@@ -34,7 +44,14 @@ export const checkRelease = (facts: ReleaseFacts, stage: Stage): Array<string> =
   if (version && m.version !== formatSemVer(version)) problems.push(`manifest version ${m.version} != tag ${facts.tag}`);
   if (facts.tagCommit && m.commit !== facts.tagCommit) problems.push(`manifest commit ${m.commit} != tag commit ${facts.tagCommit}`);
   if (m.channel !== "release") problems.push(`manifest channel is ${m.channel}, not release`);
-  if (m.codeSigning.kind !== "developer-id") problems.push(`the app is ${m.codeSigning.kind}-signed: only Developer ID builds are released`);
+  // Every platform build, exactly once; each signed as its platform's release policy requires.
+  const targets = targetsOf(m);
+  for (const t of RELEASE_TARGETS) if (!targets.includes(t)) problems.push(`no ${t} build in the manifest`);
+  for (const t of targets) if (!RELEASE_TARGETS.includes(t as `${Platform}-${string}`)) problems.push(`unexpected ${t} build in the manifest`);
+  for (const a of m.assets) {
+    const allowed = RELEASE_SIGNING[a.platform];
+    if (!allowed.includes(a.codeSigning.kind)) problems.push(`${a.name} is ${a.codeSigning.kind}: a ${a.platform} release needs ${allowed.join(" or ")}`);
+  }
   problems.push(...facts.assetProblems);
 
   if (stage === "sign") {

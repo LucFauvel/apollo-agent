@@ -17,6 +17,9 @@ extraResources:
     to: web
   - from: resources/tray
     to: tray
+  # Commit, schema and version of this build (scripts/write-build-info.ts), as on macOS.
+  - from: build/build-info.json
+    to: build-info.json
   # Apollo's own Tailscale node for this architecture (build.ps1).
   - from: ../server/native/tailnet/build/win-${arch}
     to: native
