@@ -6,6 +6,7 @@ import {
   latestChangesKey,
   reduceCards,
   reduceTranscript,
+  replayBuffer,
   summariesByTurn,
   withoutFullDiffs,
   isCompacting,
@@ -28,6 +29,7 @@ import {
 } from "react";
 import {
   Animated,
+  Easing,
   Linking,
   Platform,
   Pressable,
@@ -73,13 +75,22 @@ import {
 import { speak, stopSpeaking } from "../voice.ts";
 import { speakable } from "@apollo/client";
 
-type Action =
-  | { type: "event"; event: Parameters<typeof reduceTranscript>[1] }
-  | { type: "reset"; sessionId: SessionId };
+type Event = Parameters<typeof reduceTranscript>[1];
+type Action = { type: "events"; events: ReadonlyArray<Event> } | { type: "reset"; sessionId: SessionId };
 const reducer = (state: TranscriptState, action: Action): TranscriptState =>
   action.type === "reset"
     ? { sessionId: action.sessionId, lastSeq: 0, items: [] }
-    : reduceTranscript(state, action.event);
+    : action.events.reduce(reduceTranscript, state);
+
+/**
+ * How many of the latest blocks a conversation shows when it opens; scrolling up to the
+ * top shows as many more. Rendering a long history at once (markdown, highlighted code)
+ * is what froze the screen.
+ */
+const WINDOW = 40;
+
+/** Longest our own animated scroll to the latest message takes (iOS and Android: ~250–300 ms). */
+const OWN_SCROLL_MS = 600;
 
 /** A conversation: its live transcript, cards that need the user, and a message box. */
 export function ChatScreen({
@@ -106,38 +117,114 @@ export function ChatScreen({
   // Follow new output only while the user is at the bottom, and never because a row opened.
   const atBottom = useRef(true);
   const holdUntil = useRef(0);
+  /**
+   * Until when scroll events are our own scrolling to the latest message, not the user's:
+   * they must not turn following off half-way (output arriving meanwhile is caught up with
+   * by `onContentSizeChange`). The user dragging, or reaching the bottom, ends it early.
+   */
+  const ownScrollUntil = useRef(0);
+  // While the user's finger is on the transcript, nothing scrolls it for them.
+  const dragging = useRef(false);
+  // Earlier blocks show only when the user scrolled up to them, never from our scrolling.
+  const userScrolled = useRef(false);
+  const viewport = useRef(0);
+  const contentHeight = useRef(0);
+  /**
+   * Scrolls to the latest message, and follows new output from there. Every scroll of ours
+   * goes through here, including deferred ones (keyboard, send): while the user's finger is
+   * on the transcript it does nothing, and following stays as their scrolling left it.
+   */
+  const toLatest = (animated: boolean) => {
+    if (dragging.current) return;
+    userScrolled.current = false;
+    atBottom.current = true;
+    ownScrollUntil.current = Date.now() + OWN_SCROLL_MS;
+    setFarFromBottom(false);
+    scroll.current?.scrollToEnd({ animated });
+  };
   const hold = useMemo(
     () => () => void (holdUntil.current = Date.now() + 700),
     [],
   );
-  // Rows already there when the conversation opens appear at once; later ones fade in.
-  const openedAt = useRef(Date.now());
-  const lastSeq = useRef(0);
+  /**
+   * The history replayed when the conversation opens is loaded in batches, under a
+   * spinner, with the transcript hidden until it sits at the latest message: it appears
+   * there, without scrolling down to it. Rows already there appear at once; later ones fade in.
+   */
+  const [loaded, setLoaded] = useState(false);
+  const loadedRef = useRef(false);
+  const reveal = useRef(new Animated.Value(0)).current;
+  /**
+   * The window's first block, by key (see WINDOW), fixed once loaded. A key, not an index:
+   * a `/clear` empties the transcript, and the next messages must not inherit an old
+   * position. null, or a key no longer there: the latest WINDOW blocks (pinned again by
+   * the effect below as soon as there is a block).
+   */
+  const [firstKey, setFirstKey] = useState<string | null>(null);
+  /**
+   * Two cursors. `received`: the last event handed to the replay buffer (skips repeats).
+   * `applied`: the last one in the transcript, where a new stream resumes: events still
+   * in the buffer when it is disposed (the connection replaced) are fetched again.
+   */
+  const received = useRef(0);
+  const applied = useRef(0);
   // Lift the conversation and the message box above the keyboard, and show the latest message.
   const insets = useSafeAreaInsets();
-  const keyboard = useKeyboardInset(insets.bottom, () => setTimeout(() => scroll.current?.scrollToEnd({ animated: true }), 50));
+  const keyboard = useKeyboardInset(insets.bottom, () => setTimeout(() => toLatest(true), 50));
+
+  // A button back to the latest message, once scrolled up a good way from it.
+  const [farFromBottom, setFarFromBottom] = useState(false);
+  const jumpShown = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(jumpShown, { toValue: farFromBottom ? 1 : 0, duration: 160, easing: Easing.out(Easing.quad), useNativeDriver: true }).start();
+  }, [farFromBottom, jumpShown]);
+  const jumpToBottom = () => toLatest(true);
 
   useEffect(() => {
     dispatch({ type: "reset", sessionId });
-    lastSeq.current = 0;
-    openedAt.current = Date.now();
+    received.current = 0;
+    applied.current = 0;
     atBottom.current = true;
-  }, [sessionId]);
+    userScrolled.current = false;
+    loadedRef.current = false;
+    setLoaded(false);
+    setFirstKey(null);
+    reveal.setValue(0);
+    setFarFromBottom(false);
+  }, [sessionId, reveal]);
 
+  // A conversation with nothing in it yet answers with no event at all: do not wait long.
+  const looksEmpty = session ? session.completedTurns === 0 && !session.lastMessage : false;
+  const looksEmptyRef = useRef(looksEmpty);
+  looksEmptyRef.current = looksEmpty;
   // Resumes after the last event seen, so a reconnect does not reload the conversation.
-  useEffect(
-    () =>
-      connection.follow(
-        (client) =>
-          client["sessions.events"]({ sessionId, afterSeq: lastSeq.current }),
-        (event) => {
-          if (event.seq <= lastSeq.current) return;
-          lastSeq.current = event.seq;
-          dispatch({ type: "event", event });
-        },
-      ),
-    [connection, sessionId],
-  );
+  useEffect(() => {
+    // What this buffer still holds is not applied: a new stream starts after `applied`.
+    received.current = applied.current;
+    const buffer = replayBuffer<Event>({
+      onBatch: (events) => {
+        applied.current = Math.max(applied.current, events.at(-1)!.seq);
+        dispatch({ type: "events", events });
+      },
+      onCaughtUp: () => {
+        loadedRef.current = true;
+        setLoaded(true);
+      },
+      timing: looksEmptyRef.current ? { emptyMs: 300 } : {},
+    });
+    const stop = connection.follow(
+      (client) => client["sessions.events"]({ sessionId, afterSeq: applied.current }),
+      (event) => {
+        if (event.seq <= received.current) return;
+        received.current = event.seq;
+        buffer.push(event);
+      },
+    );
+    return () => {
+      stop();
+      buffer.dispose();
+    };
+  }, [connection, sessionId]);
 
   const working =
     session?.status === "running" || session?.status === "starting";
@@ -156,7 +243,7 @@ export function ChatScreen({
     setError(null);
     const id = ++outboxId.current;
     setOutbox((o) => [...o, { id, text: value }]);
-    setTimeout(() => scroll.current?.scrollToEnd({ animated: true }), 50);
+    setTimeout(() => toLatest(true), 50);
     connection
       .rpc((c) => c["sessions.send"]({ sessionId, text: value }))
       .catch((e) => {
@@ -168,6 +255,27 @@ export function ChatScreen({
 
   const items = transcript.items;
   const blocks = useMemo(() => toBlocks(items), [items]);
+  const latestStart = Math.max(0, blocks.length - WINDOW);
+  const pinnedAt = useMemo(() => (firstKey === null ? -1 : blocks.findIndex((b) => b.key === firstKey)), [blocks, firstKey]);
+  const start = pinnedAt >= 0 ? pinnedAt : latestStart;
+  const shown = useMemo(() => (start === 0 ? blocks : blocks.slice(start)), [blocks, start]);
+  const showEarlier = () => setFirstKey(blocks[Math.max(0, start - WINDOW)]?.key ?? null);
+  // Once loaded, the window stays where it starts (new blocks add to it), from its first
+  // block on: also after a `/clear`, and for history arriving only after an empty wait.
+  const pinKey = pinnedAt < 0 ? (blocks[latestStart]?.key ?? null) : null;
+  useEffect(() => {
+    if (loaded && pinKey !== null) setFirstKey(pinKey);
+  }, [loaded, pinKey]);
+  // Loaded: sit at the latest message, then show it all.
+  useEffect(() => {
+    if (!loaded) return;
+    toLatest(false);
+    const frame = requestAnimationFrame(() =>
+      Animated.timing(reveal, { toValue: 1, duration: 140, easing: Easing.out(Easing.quad), useNativeDriver: true }).start(),
+    );
+    return () => cancelAnimationFrame(frame);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded]);
   // Compaction can take minutes on a local model: say so instead of "Working…".
   const compacting = useMemo(() => isCompacting(items), [items]);
   // Hands-free voice conversation with this session.
@@ -204,7 +312,7 @@ export function ChatScreen({
   }, [userTexts]);
   const count = items.length;
   useEffect(() => {
-    if (count && Date.now() - openedAt.current > 1000) animateLayout(180);
+    if (count && loadedRef.current) animateLayout(180);
   }, [count]);
 
   // `@Name` asks another bot: suggest bots while a tag is being typed at the end.
@@ -310,33 +418,74 @@ export function ChatScreen({
         <ConversationToggle active={talking} onToggle={() => setTalking((t) => !t)} />
       </View>
 
+      <View style={{ flex: 1 }}>
+      <Animated.View
+        style={{ flex: 1, opacity: reveal }}
+        pointerEvents={loaded ? "auto" : "none"}
+        importantForAccessibility={loaded ? "auto" : "no-hide-descendants"}
+        accessibilityElementsHidden={!loaded}
+      >
       <ScrollView
         ref={scroll}
         style={{ flex: 1 }}
         contentContainerStyle={styles.transcript}
+        // Showing earlier blocks above keeps what is on screen where it is: anchored on the
+        // first block in view (index 0 is the header slot below, always there).
+        maintainVisibleContentPosition={{ minIndexForVisible: 1 }}
         scrollEventThrottle={64}
         keyboardDismissMode="interactive"
         keyboardShouldPersistTaps="handled"
-        onScroll={({ nativeEvent: e }) => {
-          atBottom.current =
-            e.contentOffset.y + e.layoutMeasurement.height >=
-            e.contentSize.height - 120;
+        onScrollBeginDrag={() => {
+          // The user takes over from any scrolling of ours.
+          dragging.current = true;
+          userScrolled.current = true;
+          ownScrollUntil.current = 0;
         }}
-        onContentSizeChange={() => {
-          if (atBottom.current && Date.now() > holdUntil.current)
-            scroll.current?.scrollToEnd({ animated: true });
+        onScrollEndDrag={() => {
+          dragging.current = false;
+        }}
+        onScroll={({ nativeEvent: e }) => {
+          const fromBottom = e.contentSize.height - (e.contentOffset.y + e.layoutMeasurement.height);
+          // Still loading: hidden, held at the latest message (see onContentSizeChange).
+          if (!loadedRef.current) return;
+          if (Date.now() < ownScrollUntil.current) {
+            // On its way down: still following. Arrived: later events are the user's again.
+            if (fromBottom <= 120) ownScrollUntil.current = 0;
+            return;
+          }
+          atBottom.current = fromBottom <= 120;
+          // Half a screen up (at least a few lines): far enough to want a way back.
+          const far = fromBottom > Math.max(240, e.layoutMeasurement.height / 2);
+          setFarFromBottom((was) => (was === far ? was : far));
+          // Near the top after the user scrolled up: show earlier blocks (same target per render).
+          if (userScrolled.current && start > 0 && e.contentOffset.y < 400) showEarlier();
+        }}
+        onLayout={(e) => {
+          viewport.current = e.nativeEvent.layout.height;
+        }}
+        onContentSizeChange={(_, height) => {
+          // More than a screen at once (history arriving late): jump, not a long scroll down.
+          const burst = height - contentHeight.current > viewport.current;
+          contentHeight.current = height;
+          if (!loadedRef.current) toLatest(false);
+          else if (atBottom.current && !dragging.current && Date.now() > holdUntil.current) toLatest(!burst);
         }}
       >
+        {/* A real native view (never flattened), and no extra gap while empty. */}
+        <View collapsable={false} style={start > 0 ? undefined : styles.noEarlier}>
+          {start > 0 ? (
+            <Pressable onPress={showEarlier} hitSlop={8} accessibilityRole="button" style={styles.earlier}>
+              <Text style={styles.earlierText}>Show earlier messages</Text>
+            </Pressable>
+          ) : null}
+        </View>
         <ScrollHold.Provider value={hold}>
-          {blocks.map((item, i) => (
-            <FadeIn
-              key={item.key}
-              animate={Date.now() - openedAt.current > 1000}
-            >
+          {shown.map((item, i) => (
+            <FadeIn key={item.key} animate={loadedRef.current}>
               <Item
                 item={item}
                 sessionId={sessionId}
-                live={busy && i === blocks.length - 1}
+                live={busy && start + i === blocks.length - 1}
                 onOpenChanges={() => setChangesOpen(true)}
                 cards={cards}
                 onOpenBrowser={(tabId, handoff) => setBrowser({ tabId, ...(handoff ? { handoff: { ...handoff, sessionId } } : {}) })}
@@ -392,6 +541,35 @@ export function ChatScreen({
           </View>
         ) : null}
       </ScrollView>
+      </Animated.View>
+        {!loaded ? (
+          <View style={styles.loading} pointerEvents="none">
+            <Spin>
+              <LoaderIcon size={14} color={colors.faint} />
+            </Spin>
+            <Pulse>
+              <Text style={styles.workingText}>Loading the conversation…</Text>
+            </Pulse>
+          </View>
+        ) : null}
+        <Animated.View
+          pointerEvents={farFromBottom ? "box-none" : "none"}
+          style={[
+            styles.jump,
+            { opacity: jumpShown, transform: [{ translateY: jumpShown.interpolate({ inputRange: [0, 1], outputRange: [8, 0] }) }] },
+          ]}
+        >
+          <Pressable
+            onPress={jumpToBottom}
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel="Scroll to the latest message"
+            style={({ pressed }) => [styles.jumpButton, pressed && { opacity: 0.6 }]}
+          >
+            <ChevronDownIcon size={18} color={colors.textSoft} />
+          </Pressable>
+        </Animated.View>
+      </View>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {talking ? <ConversationBar session={session} onEnd={() => setTalking(false)} /> : null}
@@ -458,21 +636,25 @@ export function ChatScreen({
       {browser && session ? (
         <View style={StyleSheet.absoluteFill}>
           <SwipeBack onBack={() => setBrowser(null)}>
-            <BrowserScreen botId={session.botId} tabId={browser.tabId} handoff={browser.handoff} onBack={() => setBrowser(null)} />
+            {(back) => <BrowserScreen botId={session.botId} tabId={browser.tabId} handoff={browser.handoff} onBack={back} />}
           </SwipeBack>
         </View>
       ) : null}
       {changesOpen && session ? (
         <View style={StyleSheet.absoluteFill}>
           <SwipeBack onBack={() => setChangesOpen(false)}>
-            <ChangesScreen
-              session={session}
-              onBack={() => setChangesOpen(false)}
-              onOpenSession={(id) => {
-                setChangesOpen(false);
-                if (id !== sessionId) onOpenSession(id);
-              }}
-            />
+            {(back) => (
+              <ChangesScreen
+                session={session}
+                onBack={back}
+                onOpenSession={(id) => {
+                  // This conversation's own section: just go back to it.
+                  if (id === sessionId) return back();
+                  setChangesOpen(false);
+                  onOpenSession(id);
+                }}
+              />
+            )}
           </SwipeBack>
         </View>
       ) : null}
@@ -1190,6 +1372,10 @@ const styles = StyleSheet.create({
   turnEndText: { color: colors.faint, fontSize: 11.5, maxWidth: "80%" },
   working: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 10, paddingVertical: 6 },
   workingText: { color: colors.muted, fontSize: 12.5 },
+  loading: { ...StyleSheet.absoluteFill, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10 },
+  earlier: { alignSelf: "center", paddingVertical: 6, paddingHorizontal: 12 },
+  earlierText: { color: colors.faint, fontSize: 12.5 },
+  noEarlier: { marginBottom: -12 }, // the transcript's gap
   // Approval, question and secret cards.
   card: {
     backgroundColor: "rgba(24,24,27,0.3)",
@@ -1298,5 +1484,22 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   stop: { backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border },
+  // Over the transcript's bottom edge, so it never covers the composer (lifted with it).
+  jump: { position: "absolute", bottom: 10, alignSelf: "center" },
+  jumpButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.panel,
+    borderWidth: 1,
+    borderColor: colors.border,
+    shadowColor: "#000",
+    shadowOpacity: 0.4,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 4,
+  },
   disabled: { opacity: 0.35 },
 });

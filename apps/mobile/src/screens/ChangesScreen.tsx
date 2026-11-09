@@ -109,6 +109,8 @@ export function ChangesScreen({
     }
   };
   const overview = useMemo(() => panelView(own), [own]);
+  // Servers that predate clearing from the panel send neither `cleared` nor sections' `turns`.
+  const canClear = own.server?.cleared !== undefined;
 
   const pullRequests = useMemo(() => {
     const ids = new Set(
@@ -182,6 +184,9 @@ export function ChangesScreen({
               />
             ))}
           </View>
+        ) : null}
+        {overview && overview.sessions.length > 0 && !canClear ? (
+          <Text style={styles.hint}>Update Apollo on your computer to clear changes from here.</Text>
         ) : null}
         <PullRequests pullRequests={pullRequests} />
       </ScrollView>
@@ -708,6 +713,7 @@ const styles = StyleSheet.create({
   body: { padding: 16, gap: 20 },
   loading: { paddingVertical: 40, alignItems: "center" },
   error: { color: RED, fontSize: 13 },
+  hint: { color: "#52525b", fontSize: 12, textAlign: "center" },
   empty: { alignItems: "center", paddingVertical: 40, paddingHorizontal: 24 },
   emptyIcon: {
     width: 44,
