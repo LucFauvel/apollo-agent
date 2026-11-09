@@ -41,15 +41,15 @@ import { isHealthyResponse, launchEnv, type BuildInfo } from "../install-app-lib
 import {
   checkMigratedDatabase,
   descendantsOf,
-  parsePs,
-  parseWinProcesses,
   portAccepts,
-  type Proc,
   processesUnder,
+  type ProcessList,
+  readProcessList,
   runSilentInstall,
   seedOldDatabase,
   serverUrlFromLog,
   smokeEnv,
+  survivorVerdict,
 } from "./smoke-lib.ts";
 
 const args = process.argv.slice(2);
@@ -136,18 +136,20 @@ if (info.schemaVersion !== SCHEMA_VERSION) {
   console.log(`  (this checkout's schema is ${SCHEMA_VERSION}; seeding with this checkout's migrations ${seedVersions.join(", ")})`);
 }
 
-/** Every process on the machine (ps on macOS, CIM on Windows); empty when the list can't be read. */
-const listProcesses = (): Array<Proc> => {
-  if (process.platform === "win32") {
-    const r = sh(
-      "powershell",
-      ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress"],
-      30_000,
-    );
-    return r.status === 0 ? parseWinProcesses(r.stdout) : [];
-  }
-  const r = sh("ps", ["-axo", "pid=,ppid=,command="]);
-  return r.status === 0 ? parsePs(r.stdout) : [];
+/**
+ * Every process on the machine (ps on macOS, CIM on Windows), or why it couldn't be read: an
+ * unreadable list is never taken for an empty one (readProcessList, survivorVerdict).
+ */
+const listProcesses = (): ProcessList => {
+  const r =
+    process.platform === "win32"
+      ? sh(
+          "powershell",
+          ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress"],
+          30_000,
+        )
+      : sh("ps", ["-axo", "pid=,ppid=,command="]);
+  return readProcessList(process.platform, r, process.pid);
 };
 /** The pids listening on a local TCP port. */
 const portOwners = (port: number): Array<number> => {
@@ -218,9 +220,19 @@ const runOnce = async (seedVersion: number): Promise<Array<string>> => {
   const deadline = Date.now() + timeoutMs;
   let url: string | null = null;
   let answered = false;
+  // The app's process tree, sampled while it runs. If it could never be read, a detached
+  // descendant could go unseen: that fails the run (unknown is not none).
+  let samples = 0;
+  let sampleError: string | null = null;
   const sample = () => {
     if (exit || child.pid === undefined) return;
-    for (const pid of descendantsOf(listProcesses(), child.pid)) tracked.add(pid);
+    const list = listProcesses();
+    if (!list.ok) {
+      sampleError = list.error;
+      return;
+    }
+    samples++;
+    for (const pid of descendantsOf(list.procs, child.pid)) tracked.add(pid);
   };
   if (child.pid !== undefined) tracked.add(child.pid);
   while (!answered && !exit && Date.now() < deadline) {
@@ -242,24 +254,32 @@ const runOnce = async (seedVersion: number): Promise<Array<string>> => {
     await exited;
   } else if ((exit as { code: number | null }).code !== 0) problems.push(`the app exited with ${JSON.stringify(exit)}`);
   // Nothing of the app may outlive it: no descendant, no process from its directory, and no
-  // listener on its server's port (healthy or NOT), once the shutdown grace has passed.
+  // listener on its server's port (healthy or NOT), once the shutdown grace has passed. An
+  // unreadable process list never counts as "nothing left" (survivorVerdict fails closed).
+  if (samples === 0) problems.push(`could not read the app's process tree while it ran (${sampleError ?? "no sample taken"}): its descendants can't be checked`);
   const port = url ? Number(new URL(url).port) : null;
-  let leftovers: Array<Proc> = [];
-  let listening = false;
   const settleBy = Date.now() + shutdownGraceMs;
+  let verdict: ReturnType<typeof survivorVerdict>;
+  let listening = false;
   for (;;) {
-    const procs = listProcesses();
-    leftovers = procs.filter((p) => p.pid !== process.pid && (tracked.has(p.pid) || processesUnder([p], appDirs, process.platform).length > 0));
     listening = port !== null && (await portAccepts(port));
-    if ((!leftovers.length && !listening) || Date.now() >= settleBy) break;
+    verdict = survivorVerdict({
+      list: listProcesses(),
+      tracked,
+      isAlive: alive,
+      appDirs,
+      platform: process.platform,
+      selfPid: process.pid,
+      listening,
+      port,
+      graceSeconds: shutdownGraceMs / 1000,
+    });
+    if (verdict.clean || Date.now() >= settleBy) break;
     await sleep(250);
   }
-  if (leftovers.length) {
-    problems.push(`processes still running ${shutdownGraceMs / 1000}s after the app exited: ${leftovers.map((p) => `${p.pid} (${p.command.slice(0, 160)})`).join("; ")}`);
-  }
-  if (listening) problems.push(`something still accepts connections on the server's port ${port} ${shutdownGraceMs / 1000}s after the app exited (pids ${portOwners(port!).join(", ") || "?"})`);
+  problems.push(...verdict.problems);
   // Clean up whatever survived, failure or not, so it can't leak into the next seed run.
-  for (const pid of new Set([...leftovers.map((p) => p.pid), ...(listening ? portOwners(port!) : [])])) killTree(pid);
+  for (const pid of new Set([...verdict.kill, ...(listening ? portOwners(port!) : [])])) killTree(pid);
   if (!existsSync(screenshot) || statSync(screenshot).size === 0) problems.push("no window screenshot: the UI did not load");
   problems.push(...checkMigratedDatabase(dbPath, info.schemaVersion));
   if (problems.length) console.error(`--- app log (seed ${seedVersion}) ---\n${readFileSync(logPath, "utf8").slice(-8000)}\n---`);
@@ -275,7 +295,9 @@ try {
   if (uninstall) {
     // After the uninstaller: nothing may still run from the install directory.
     await sleep(Math.min(shutdownGraceMs, 3000));
-    const survivors = processesUnder(listProcesses(), appDirs, process.platform, new Set([process.pid]));
+    const list = listProcesses();
+    if (!list.ok) failures.push(`could not list processes after uninstall (${list.error}): cannot confirm nothing runs from ${appDirs[0]}`);
+    const survivors = list.ok ? processesUnder(list.procs, appDirs, process.platform, new Set([process.pid])) : [];
     if (survivors.length) failures.push(`processes still running from ${appDirs[0]} after uninstall: ${survivors.map((p) => `${p.pid} (${p.command.slice(0, 160)})`).join("; ")}`);
     for (const p of survivors) killTree(p.pid);
   }

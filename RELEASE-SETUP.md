@@ -63,6 +63,9 @@ manual / tag v* ──── ios-testflight.yml  env release-build   apps/mobile
   running from its bundle / install directory, and nothing accepting connections on its server
   port, *whatever it answers* (an unhealthy server still listening fails). Survivors are killed
   and the run fails; on Windows nothing may run from the install dir after the uninstaller either.
+  A process list that can't be read (`ps`/CIM failing, timing out, or returning a list without
+  the smoke process itself) is never taken as "nothing left": the run fails closed, after still
+  reporting and killing what the other signals (live tracked pids, the port) can see.
   The Windows installer is started directly (no `cmd.exe`) with a verbatim `/S /D=<dir>`, so
   `&`, `^`, `%`… in a path are plain characters; a `"` or control character is refused. Verified locally on macOS on an
   ad-hoc build (1→19 and 18→19 pass; a build with a broken server bundle fails).

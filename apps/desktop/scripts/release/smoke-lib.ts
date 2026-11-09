@@ -261,3 +261,73 @@ export const runSilentInstall = <R>(
   const { file, args, options } = nsisInstallInvocation(installer, dir);
   return spawn(file, args, { ...options, timeout: 300_000 });
 };
+
+// ---------------------------------------------------------------------------------------
+// Unreadable process lists (review round 2): a process list that could not be read is never
+// evidence that nothing survived. Same rule as install:app (install-app.ts `processes()`): a
+// readable list always contains this very process; a failed command (non-zero exit, timeout,
+// spawn error) or output without our own pid is "couldn't look", not "nothing there".
+
+/** What spawnSync returned for the process-list command. */
+export interface CommandResult {
+  readonly status: number | null;
+  readonly signal: string | null;
+  readonly stdout: string | null;
+  readonly stderr: string | null;
+  readonly error?: Error;
+}
+
+export type ProcessList = { readonly ok: true; readonly procs: ReadonlyArray<Proc> } | { readonly ok: false; readonly error: string };
+
+export const readProcessList = (platform: NodeJS.Platform, r: CommandResult, selfPid: number): ProcessList => {
+  const tool = platform === "win32" ? "Get-CimInstance Win32_Process" : "ps";
+  const stderr = (r.stderr ?? "").trim().slice(0, 300);
+  if (r.error) return { ok: false, error: `${tool} could not run: ${r.error.message}` };
+  if (r.signal || r.status !== 0) return { ok: false, error: `${tool} failed (${r.signal ?? `exit ${r.status}`})${stderr ? `: ${stderr}` : ""}` };
+  let procs: Array<Proc>;
+  try {
+    procs = platform === "win32" ? parseWinProcesses(r.stdout ?? "") : parsePs(r.stdout ?? "");
+  } catch (error) {
+    return { ok: false, error: `${tool} output is unreadable: ${(error as Error).message}` };
+  }
+  if (!procs.some((p) => p.pid === selfPid)) return { ok: false, error: `${tool} returned an incomplete list (${procs.length} processes, not even this one)` };
+  return { ok: true, procs };
+};
+
+export interface SurvivorFacts {
+  readonly list: ProcessList;
+  /** Pids recorded as the app's descendants while it ran (plus the app itself). */
+  readonly tracked: ReadonlySet<number>;
+  /** Whether a pid is alive (signal 0): works even when the process list can't be read. */
+  readonly isAlive: (pid: number) => boolean;
+  readonly appDirs: ReadonlyArray<string>;
+  readonly platform: NodeJS.Platform;
+  readonly selfPid: number;
+  /** Something accepts connections on the server's port. */
+  readonly listening: boolean;
+  readonly port: number | null;
+  readonly graceSeconds: number;
+}
+
+/**
+ * Whether nothing of the app survived, and what to kill. With a readable list: no tracked
+ * descendant, no process from the app's directories, no listener. With an UNREADABLE list it is
+ * never clean (fail closed): the other signals (live tracked pids, the port) are still reported
+ * and acted on, but they can't prove that no unlisted process survived.
+ */
+export const survivorVerdict = (f: SurvivorFacts): { readonly clean: boolean; readonly problems: Array<string>; readonly kill: Array<number> } => {
+  const problems: Array<string> = [];
+  const describe = (p: Proc) => `${p.pid} (${p.command.slice(0, 160)})`;
+  let kill: Array<number>;
+  if (f.list.ok) {
+    const leftovers = f.list.procs.filter((p) => p.pid !== f.selfPid && (f.tracked.has(p.pid) || processesUnder([p], f.appDirs, f.platform).length > 0));
+    if (leftovers.length) problems.push(`processes still running ${f.graceSeconds}s after the app exited: ${leftovers.map(describe).join("; ")}`);
+    kill = leftovers.map((p) => p.pid);
+  } else {
+    problems.push(`could not list processes (${f.list.error}): cannot confirm that nothing of the app survived`);
+    kill = [...f.tracked].filter((pid) => pid !== f.selfPid && f.isAlive(pid));
+    if (kill.length) problems.push(`processes of the app still alive ${f.graceSeconds}s after it exited: ${kill.join(", ")}`);
+  }
+  if (f.listening) problems.push(`something still accepts connections on the server's port ${f.port} ${f.graceSeconds}s after the app exited`);
+  return { clean: problems.length === 0, problems, kill };
+};

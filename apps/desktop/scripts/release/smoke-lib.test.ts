@@ -13,7 +13,9 @@ import {
   parseWinProcesses,
   portAccepts,
   processesUnder,
+  readProcessList,
   runSilentInstall,
+  survivorVerdict,
   seedOldDatabase,
   serverUrlFromLog,
   smokeEnv,
@@ -191,5 +193,73 @@ describe("silent NSIS install (review P2-3)", () => {
     ["a relative installer", "setup.exe", dir],
   ])("refuses %s", (_, inst, target) => {
     expect(() => nsisInstallInvocation(inst, target)).toThrow();
+  });
+});
+
+describe("unreadable process lists are never empty ones (review round 2)", () => {
+  const self = 4242;
+  const ok = (stdout: string) => ({ status: 0, signal: null, stdout, stderr: "" });
+  const psOut = ` 1 0 /sbin/launchd\n ${self} 1 node smoke.ts\n 77 1 /tmp/x/Apollo.app/Contents/MacOS/apollo\n`;
+  const winOut = JSON.stringify([{ ProcessId: self, ParentProcessId: 1, CommandLine: "node smoke.ts" }]);
+
+  it("reads a list that contains this process", () => {
+    const mac = readProcessList("darwin", ok(psOut), self);
+    expect(mac.ok && mac.procs.map((p) => p.pid)).toEqual([1, self, 77]);
+    const win = readProcessList("win32", ok(winOut), self);
+    expect(win.ok && win.procs.map((p) => p.pid)).toEqual([self]);
+  });
+
+  it.each<[string, NodeJS.Platform, Parameters<typeof readProcessList>[1], RegExp]>([
+    ["macOS ps exiting non-zero", "darwin", { status: 1, signal: null, stdout: "", stderr: "ps: Operation not permitted" }, /ps failed \(exit 1\): ps: Operation not permitted/],
+    ["macOS ps timing out", "darwin", { status: null, signal: "SIGTERM", stdout: psOut, stderr: "" }, /ps failed \(SIGTERM\)/],
+    ["macOS ps that can't be spawned", "darwin", { status: null, signal: null, stdout: null, stderr: null, error: new Error("spawnSync ps ENOENT") }, /ps could not run: spawnSync ps ENOENT/],
+    ["macOS ps printing nothing with exit 0", "darwin", ok(""), /incomplete list \(0 processes/],
+    ["macOS ps printing noise without our pid", "darwin", ok("garbage\n 1 0 /sbin/launchd\n"), /incomplete list \(1 processes/],
+    ["Windows CIM exiting non-zero", "win32", { status: 1, signal: null, stdout: "", stderr: "Get-CimInstance : Access denied" }, /Get-CimInstance Win32_Process failed \(exit 1\): Get-CimInstance : Access denied/],
+    ["Windows CIM timing out", "win32", { status: null, signal: "SIGTERM", stdout: "", stderr: "" }, /failed \(SIGTERM\)/],
+    ["Windows CIM printing invalid JSON", "win32", ok("[{ProcessId: 1"), /output is unreadable/],
+    ["Windows CIM printing nothing", "win32", ok(""), /incomplete list \(0 processes/],
+  ])("%s is unreadable", (_, platform, result, pattern) => {
+    const list = readProcessList(platform, result, self);
+    expect(list.ok).toBe(false);
+    expect(!list.ok && list.error).toMatch(pattern);
+  });
+
+  const facts = {
+    tracked: new Set([100, 101]),
+    isAlive: (pid: number) => pid === 101,
+    appDirs: ["/tmp/x/Apollo.app"],
+    platform: "darwin" as const,
+    selfPid: self,
+    listening: false,
+    port: 5000,
+    graceSeconds: 3,
+  };
+
+  it("a readable list with nothing left is clean", () => {
+    const list = readProcessList("darwin", ok(` ${self} 1 node smoke.ts\n`), self);
+    expect(survivorVerdict({ ...facts, list })).toEqual({ clean: true, problems: [], kill: [] });
+  });
+
+  it("a readable list catches tracked descendants and app-directory processes", () => {
+    const list = readProcessList("darwin", ok(`${psOut} 101 1 node helper.mjs\n`), self);
+    const v = survivorVerdict({ ...facts, list });
+    expect(v.clean).toBe(false);
+    expect(v.kill.sort()).toEqual([101, 77]);
+  });
+
+  it("an unreadable list is never clean, even with a quiet port and no live tracked pid", () => {
+    const v = survivorVerdict({ ...facts, list: { ok: false, error: "ps failed (exit 1)" }, isAlive: () => false });
+    expect(v.clean).toBe(false);
+    expect(v.problems).toEqual(["could not list processes (ps failed (exit 1)): cannot confirm that nothing of the app survived"]);
+    expect(v.kill).toEqual([]);
+  });
+
+  it("an unreadable list still reports and kills live tracked pids and a listener (fallback signals)", () => {
+    const v = survivorVerdict({ ...facts, list: { ok: false, error: "ps failed (exit 1)" }, listening: true });
+    expect(v.clean).toBe(false);
+    expect(v.kill).toEqual([101]);
+    expect(v.problems.join("\n")).toMatch(/still alive 3s after it exited: 101/);
+    expect(v.problems.join("\n")).toMatch(/still accepts connections on the server's port 5000/);
   });
 });
