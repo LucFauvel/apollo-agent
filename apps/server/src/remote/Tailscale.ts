@@ -148,7 +148,10 @@ const make = Effect.gen(function* () {
       ),
     );
     if (!existing.ok) return nodeHostname(hostname());
-    const chosen = existing.hostname !== null && isMachineName(existing.hostname) ? existing.hostname : nodeHostname(computerName());
+    // Surrounding whitespace is not part of the name the tailnet knows the node by: keep
+    // the name itself, so a padded value does not rename the machine and strand phones.
+    const announced = existing.hostname?.trim() ?? null;
+    const chosen = announced !== null && isMachineName(announced) ? announced : nodeHostname(computerName());
     yield* store.setSetting(HOSTNAME_SETTING, chosen);
     return chosen;
   });

@@ -134,6 +134,17 @@ describe("the tailnet machine name", () => {
     expect(node.starts).toEqual(["apollo-devolutions652", "apollo-devolutions652"]);
   });
 
+  it("keeps a padded announced name, trimmed, instead of choosing a new one", async () => {
+    for (const padded of [" apollo-mac-lan", "apollo-mac-lan\n", "\tapollo-mac-lan  "]) {
+      settings.delete(HOSTNAME_SETTING);
+      nameWrites = [];
+      node.savedHostname = padded;
+      await startApollo();
+      expect(node.starts.at(-1)).toBe("apollo-mac-lan");
+      expect(nameWrites).toEqual(["apollo-mac-lan"]);
+    }
+  });
+
   it("when the existing name cannot be read, starts as before and decides next time", async () => {
     node.savedHostname = "fail";
     await startApollo();
