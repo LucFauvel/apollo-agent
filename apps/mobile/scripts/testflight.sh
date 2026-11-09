@@ -11,6 +11,13 @@
 # App Store profiles with the account signed in under Xcode → Settings → Accounts. No
 # development profiles, so the team needs no registered devices. Override the team
 # with APOLLO_TEAM_ID.
+#
+# CI (.github/workflows/ios-testflight.yml) runs this same script. It sets the App Store Connect
+# key through the environment (APOLLO_ASC_KEY_ID, APOLLO_ASC_ISSUER_ID, APOLLO_ASC_KEY_PATH,
+# the same contract as ~/.appstoreconnect/apollo.env), the build number (APOLLO_BUILD_NUMBER) and,
+# for manual signing with an imported Apple Distribution certificate, the App Store provisioning
+# profiles' names (APOLLO_PROFILE_APP, APOLLO_PROFILE_NSE). Without those, export signing stays
+# automatic, as it is locally.
 set -euo pipefail
 
 TEAM="${APOLLO_TEAM_ID:-XA3R5NAN2C}"
@@ -34,7 +41,9 @@ OUT="$(mktemp -d)"
 export LANG=en_US.UTF-8 # CocoaPods fails without a UTF-8 locale
 
 cd "$HERE"
-BUILD="$(date +%Y%m%d%H%M)"
+# UTC minute (YYYYMMDDHHMM), the same sequence as CI builds (apps/desktop/scripts/release/version.ts).
+BUILD="${APOLLO_BUILD_NUMBER:-$(date -u +%Y%m%d%H%M)}"
+[[ "$BUILD" =~ ^[0-9]{12}$ ]] || { echo "Build number must be YYYYMMDDHHMM, got: $BUILD" >&2; exit 1; }
 sed -i '' "s/\"buildNumber\": \"[0-9]*\"/\"buildNumber\": \"$BUILD\"/" app.json
 # The embedded Tailscale node (Go, tsnet) is a gitignored static library; build it once.
 # Delete modules/apollo-tailnet/ios/ApolloTailnet.xcframework to rebuild after Go changes.
@@ -61,6 +70,20 @@ codesign -f -s - --entitlements ios/Apollo/Apollo.entitlements "$APP"
 codesign -d --entitlements - "$APP" 2>/dev/null | grep -q aps-environment \
   || { echo "The archive has no push entitlement: check ios/Apollo/Apollo.entitlements" >&2; exit 1; }
 
+if [[ -n "${APOLLO_PROFILE_APP:-}" || -n "${APOLLO_PROFILE_NSE:-}" ]]; then
+  [[ -n "${APOLLO_PROFILE_APP:-}" && -n "${APOLLO_PROFILE_NSE:-}" ]] \
+    || { echo "Manual signing needs both APOLLO_PROFILE_APP and APOLLO_PROFILE_NSE" >&2; exit 1; }
+  BUNDLE_ID="$(node -p 'require("./app.json").expo.ios.bundleIdentifier')"
+  SIGNING="<key>signingStyle</key><string>manual</string>
+  <key>signingCertificate</key><string>Apple Distribution</string>
+  <key>provisioningProfiles</key><dict>
+    <key>$BUNDLE_ID</key><string>$APOLLO_PROFILE_APP</string>
+    <key>$BUNDLE_ID.NotificationService</key><string>$APOLLO_PROFILE_NSE</string>
+  </dict>"
+else
+  SIGNING="<key>signingStyle</key><string>automatic</string>"
+fi
+
 cat > "$OUT/ExportOptions.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -68,7 +91,7 @@ cat > "$OUT/ExportOptions.plist" <<PLIST
   <key>method</key><string>app-store-connect</string>
   <key>destination</key><string>upload</string>
   <key>teamID</key><string>$TEAM</string>
-  <key>signingStyle</key><string>automatic</string>
+  $SIGNING
   <key>uploadSymbols</key><true/>
   <key>manageAppVersionAndBuildNumber</key><false/>
 </dict></plist>

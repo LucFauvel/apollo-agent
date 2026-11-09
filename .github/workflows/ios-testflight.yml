@@ -1,0 +1,155 @@
+# iOS: archive and upload to TestFlight with apps/mobile/scripts/testflight.sh, the same script
+# Luc runs locally (same build steps, same success marker). No OTA / expo-updates: store builds only.
+#
+# Triggers: manual (Actions → iOS TestFlight → Run workflow, on main) and release tags v*.
+# Not on every main push: an archive is slow and TestFlight keeps every build.
+#
+# Secrets (environment `release-build`, see RELEASE-SETUP.md): Apple Distribution .p12 +
+# password, App Store Connect API key, App Store provisioning profiles for the app and its
+# notification service extension. Without the profiles, export signing falls back to automatic
+# (cloud-managed) signing with the API key, as the local flow does.
+name: iOS TestFlight
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-testflight
+  cancel-in-progress: false
+
+jobs:
+  testflight:
+    name: Archive and upload to TestFlight
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    # Must carry an Xcode that builds Expo SDK 58 / React Native 0.88 (Luc builds with Xcode 27).
+    # Check the runner image's Xcode list before the first run (RELEASE-SETUP.md, open questions).
+    runs-on: macos-26
+    timeout-minutes: 120
+    environment: release-build
+    env:
+      LANG: en_US.UTF-8
+    steps:
+      - name: Check iOS secrets
+        env:
+          RELEASE_APPLE_DISTRIBUTION_P12: ${{ secrets.RELEASE_APPLE_DISTRIBUTION_P12 }}
+          RELEASE_CERT_PASSWORD: ${{ secrets.RELEASE_CERT_PASSWORD }}
+          RELEASE_ASC_KEY_ID: ${{ secrets.RELEASE_ASC_KEY_ID }}
+          RELEASE_ASC_ISSUER_ID: ${{ secrets.RELEASE_ASC_ISSUER_ID }}
+          RELEASE_ASC_KEY_P8: ${{ secrets.RELEASE_ASC_KEY_P8 }}
+          RELEASE_IOS_PROFILE_APP: ${{ secrets.RELEASE_IOS_PROFILE_APP }}
+          RELEASE_IOS_PROFILE_NSE: ${{ secrets.RELEASE_IOS_PROFILE_NSE }}
+        run: |
+          missing=()
+          for name in RELEASE_APPLE_DISTRIBUTION_P12 RELEASE_CERT_PASSWORD RELEASE_ASC_KEY_ID RELEASE_ASC_ISSUER_ID RELEASE_ASC_KEY_P8; do
+            [[ -n "${!name}" ]] || missing+=("$name")
+          done
+          if [[ -n "$RELEASE_IOS_PROFILE_APP" && -z "$RELEASE_IOS_PROFILE_NSE" ]] || [[ -z "$RELEASE_IOS_PROFILE_APP" && -n "$RELEASE_IOS_PROFILE_NSE" ]]; then
+            missing+=("RELEASE_IOS_PROFILE_APP and RELEASE_IOS_PROFILE_NSE (set both or neither)")
+          fi
+          if (( ${#missing[@]} )); then
+            echo "::error title=iOS secrets missing::Missing in the 'release-build' environment: ${missing[*]}. Nothing was built or uploaded. See RELEASE-SETUP.md."
+            { echo "### TestFlight upload not started"; echo "Missing: \`${missing[*]}\`. See RELEASE-SETUP.md."; } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          [[ -n "$RELEASE_IOS_PROFILE_APP" ]] && echo "Signing: manual, with the provided App Store profiles." || echo "::notice::No provisioning profiles: export signing is automatic (cloud-managed) with the API key."
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+        with:
+          native: "true" # Go, for the embedded Tailscale node (modules/apollo-tailnet)
+      - name: Xcode
+        run: xcodebuild -version && xcrun --sdk iphoneos --show-sdk-version
+      - name: Import the Apple Distribution certificate into a temporary keychain
+        env:
+          RELEASE_APPLE_DISTRIBUTION_P12: ${{ secrets.RELEASE_APPLE_DISTRIBUTION_P12 }}
+          RELEASE_CERT_PASSWORD: ${{ secrets.RELEASE_CERT_PASSWORD }}
+        run: |
+          umask 077
+          keychain="$RUNNER_TEMP/apollo-signing.keychain-db"
+          kc_password="$(openssl rand -hex 24)"
+          printf '%s' "$RELEASE_APPLE_DISTRIBUTION_P12" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security create-keychain -p "$kc_password" "$keychain"
+          security set-keychain-settings -lut 7200 "$keychain"
+          security unlock-keychain -p "$kc_password" "$keychain"
+          security import "$RUNNER_TEMP/dist.p12" -k "$keychain" -P "$RELEASE_CERT_PASSWORD" -f pkcs12 -A -t cert \
+            -T /usr/bin/codesign -T /usr/bin/security -T /usr/bin/xcodebuild > /dev/null
+          rm -f "$RUNNER_TEMP/dist.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_password" "$keychain" > /dev/null
+          existing=()
+          while IFS= read -r line; do
+            line="${line//\"/}"; line="${line#"${line%%[![:space:]]*}"}"
+            [[ -n "$line" ]] && existing+=("$line")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          security find-identity -v -p codesigning "$keychain" | grep -q "Apple Distribution" \
+            || { echo "::error::The .p12 holds no 'Apple Distribution' identity"; exit 1; }
+          echo "APOLLO_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+      - name: Install the provisioning profiles
+        id: profiles
+        env:
+          RELEASE_IOS_PROFILE_APP: ${{ secrets.RELEASE_IOS_PROFILE_APP }}
+          RELEASE_IOS_PROFILE_NSE: ${{ secrets.RELEASE_IOS_PROFILE_NSE }}
+        run: |
+          [[ -n "$RELEASE_IOS_PROFILE_APP" ]] || { echo "No profiles: automatic export signing."; exit 0; }
+          install_profile() { # <base64> <output name>
+            local tmp="$RUNNER_TEMP/profile.mobileprovision" uuid name
+            printf '%s' "$1" | base64 --decode > "$tmp"
+            uuid="$(security cms -D -i "$tmp" | plutil -extract UUID raw -o - -)"
+            name="$(security cms -D -i "$tmp" | plutil -extract Name raw -o - -)"
+            for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+              mkdir -p "$dir" && cp "$tmp" "$dir/$uuid.mobileprovision"
+            done
+            rm -f "$tmp"
+            echo "$2=$name" >> "$GITHUB_OUTPUT"
+            echo "Installed profile '$name' ($uuid)"
+          }
+          install_profile "$RELEASE_IOS_PROFILE_APP" app
+          install_profile "$RELEASE_IOS_PROFILE_NSE" nse
+      - name: Write the App Store Connect key
+        env:
+          RELEASE_ASC_KEY_ID: ${{ secrets.RELEASE_ASC_KEY_ID }}
+          RELEASE_ASC_KEY_P8: ${{ secrets.RELEASE_ASC_KEY_P8 }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/asc"
+          key="$RUNNER_TEMP/asc/AuthKey_${RELEASE_ASC_KEY_ID}.p8"
+          if [[ "$RELEASE_ASC_KEY_P8" == *"BEGIN PRIVATE KEY"* ]]; then
+            printf '%s\n' "$RELEASE_ASC_KEY_P8" > "$key"
+          else
+            printf '%s' "$RELEASE_ASC_KEY_P8" | base64 --decode > "$key"
+          fi
+          grep -q "BEGIN PRIVATE KEY" "$key" || { echo "::error::RELEASE_ASC_KEY_P8 is not a .p8 private key (PEM or base64 of it)"; exit 1; }
+          echo "APOLLO_ASC_KEY_PATH=$key" >> "$GITHUB_ENV"
+      - name: Build number (UTC YYYYMMDDHHMM, same sequence as local builds)
+        id: build
+        run: |
+          n="$(node --input-type=module -e 'import { iosBuildNumber } from "./apps/desktop/scripts/release/version.ts"; console.log(iosBuildNumber(new Date()))')"
+          echo "number=$n" >> "$GITHUB_OUTPUT"
+          echo "Build $n"
+      - name: Archive and upload (apps/mobile/scripts/testflight.sh)
+        working-directory: apps/mobile
+        env:
+          APOLLO_TEAM_ID: ${{ vars.APOLLO_TEAM_ID || 'XA3R5NAN2C' }}
+          APOLLO_ASC_KEY_ID: ${{ secrets.RELEASE_ASC_KEY_ID }}
+          APOLLO_ASC_ISSUER_ID: ${{ secrets.RELEASE_ASC_ISSUER_ID }}
+          APOLLO_BUILD_NUMBER: ${{ steps.build.outputs.number }}
+          APOLLO_PROFILE_APP: ${{ steps.profiles.outputs.app }}
+          APOLLO_PROFILE_NSE: ${{ steps.profiles.outputs.nse }}
+        run: |
+          # app.json's buildNumber is edited in this checkout only; it is never committed.
+          bash scripts/testflight.sh --prebuild 2>&1 | tee "$RUNNER_TEMP/testflight.log"
+          grep -q "✓ Build ${APOLLO_BUILD_NUMBER} uploaded" "$RUNNER_TEMP/testflight.log" \
+            || { echo "::error::testflight.sh did not report the upload"; exit 1; }
+          echo "### TestFlight build ${APOLLO_BUILD_NUMBER} uploaded" >> "$GITHUB_STEP_SUMMARY"
+      - name: Clean up signing material
+        if: always()
+        run: |
+          [[ -n "${APOLLO_SIGNING_KEYCHAIN:-}" ]] && security delete-keychain "$APOLLO_SIGNING_KEYCHAIN" || true
+          rm -rf "$RUNNER_TEMP/asc" "$RUNNER_TEMP"/*.p12 "$RUNNER_TEMP"/*.mobileprovision
+          rm -f "$HOME/Library/MobileDevice/Provisioning Profiles"/*.mobileprovision "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"/*.mobileprovision
