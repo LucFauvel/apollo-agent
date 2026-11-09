@@ -305,6 +305,21 @@ const MAX_OWN_COMMITS = 200;
  * is the turn's, and what one side brought in cleanly is not. When that cannot be told (a
  * root commit, an octopus, an older git), everything that differs from any parent is.
  */
+/**
+ * What a two-parent merge commit holds beyond the merge git makes on its own (`merge-tree`):
+ * a conflict resolved (in any way, even by taking one side whole) or an edit. Empty for a
+ * clean merge; null when that cannot be told (not two parents, merge-tree unavailable).
+ */
+const mergeOwnDelta = async (gitDir: string, parents: ReadonlyArray<string>, tree: string, signal?: AbortSignal) => {
+  if (parents.length !== 2) return null;
+  const merged = await inGitDir(gitDir, ["merge-tree", "--write-tree", "-z", "--no-messages", parents[0]!, parents[1]!], signal).catch((error) =>
+    // Exit 1: conflicts, with the tree (conflict markers in it) written all the same.
+    error instanceof GitError && error.code === 1 ? error.stdout : signal?.aborted ? Promise.reject(error) : null,
+  );
+  const auto = merged?.split("\0")[0]?.trim();
+  return auto && /^[0-9a-f]{40,64}$/.test(auto) ? rawDiff(gitDir, auto, tree, signal) : null;
+};
+
 const ownPaths = async (gitDir: string, commits: ReadonlyArray<{ sha: string; parents: ReadonlyArray<string> }>) => {
   const paths = new Set<string>();
   const add = (diff: Map<string, RawEntry>) => {
@@ -316,16 +331,10 @@ const ownPaths = async (gitDir: string, commits: ReadonlyArray<{ sha: string; pa
       add(await rawDiff(gitDir, await inGitDir(gitDir, ["hash-object", "-t", "tree", "/dev/null"]).then((s) => s.trim()), tree));
       continue;
     }
-    if (parents.length === 2) {
-      const merged = await inGitDir(gitDir, ["merge-tree", "--write-tree", "-z", "--no-messages", parents[0]!, parents[1]!]).catch((error) =>
-        // Exit 1: conflicts, with the tree (conflict markers in it) written all the same.
-        error instanceof GitError && error.code === 1 ? error.stdout : null,
-      );
-      const auto = merged?.split("\0")[0]?.trim();
-      if (auto && /^[0-9a-f]{40,64}$/.test(auto)) {
-        add(await rawDiff(gitDir, auto, tree));
-        continue;
-      }
+    const delta = await mergeOwnDelta(gitDir, parents, tree);
+    if (delta) {
+      add(delta);
+      continue;
     }
     for (const parent of parents) add(await rawDiff(gitDir, await treeOfIn(gitDir, parent), tree));
   }
@@ -386,16 +395,31 @@ export const ownBaseline = async (
   const imported = [...changed].filter(
     ([path, entry]) => !authored.has(path) && !uncommitted.has(path) && (born || sameChange(entry, moved!.get(path))),
   );
-  // A path the turn made its own that arrived through an imported rename (a conflict resolved
-  // in a file the other side moved): its baseline is the source's content, not nothing.
-  const gone = new Set(imported.filter(([, e]) => e.dstMode === "000000").map(([path]) => path));
-  const created = [...changed].filter(([path, e]) => e.srcMode === "000000" && !imported.some(([p]) => p === path));
-  if (gone.size > 0 && created.length > 0) {
-    const renames = await renamesBetween(gitDir, start, after.tree);
-    for (const [path] of created) {
+  // Renames git sees from the start to the end, where they touch the turn's own work. Any
+  // doubt here leaves a file shown whole (added, deleted): more to read, nothing hidden.
+  const isImported = new Set(imported.map(([path]) => path));
+  const gone = imported.filter(([, e]) => e.dstMode === "000000").map(([path]) => path);
+  const created = [...changed].filter(([path, e]) => e.srcMode === "000000" && !isImported.has(path)).map(([path]) => path);
+  const ownGone = [...changed].filter(([path, e]) => e.dstMode === "000000" && authored.has(path)).map(([path]) => path);
+  const renames = (gone.length > 0 && created.length > 0) || ownGone.length > 0 ? await renamesBetween(gitDir, start, after.tree) : new Map();
+  // - An own file (a conflict resolved in it) that the other side of the turn's own merge
+  //   brought under this path by a rename: measured from the rename's source, not from
+  //   nothing. Only when that imported side really has the path (a commit the turn did not
+  //   make, parent of one it made): a similar file the turn created is its own, added.
+  if (gone.length > 0 && created.length > 0) {
+    const importedParents = [...new Set(commits.flatMap((c) => c.parents).filter((p) => !own.has(p)))];
+    for (const path of created) {
       const from = renames.get(path);
-      if (from && gone.has(from.path)) imported.push([path, { srcMode: "000000", dstMode: from.mode, src: "", dst: from.object }]);
+      if (!from || !gone.includes(from.path)) continue;
+      const brought = await Promise.all(importedParents.map((p) => inGitDir(gitDir, ["cat-file", "-e", `${p}:${path}`]).then(() => true, () => false)));
+      if (brought.some(Boolean)) imported.push([path, { srcMode: "000000", dstMode: from.mode, src: "", dst: from.object }]);
     }
+  }
+  // - An own edit to a file that an imported rename then moved: the destination is not
+  //   imported whole (that would hide the edit), so the file shows as moved, with the edit.
+  if (ownGone.length > 0) {
+    const carried = new Set([...renames].filter(([, from]) => ownGone.includes(from.path)).map(([to]) => to));
+    for (let i = imported.length - 1; i >= 0; i--) if (carried.has(imported[i]![0])) imported.splice(i, 1);
   }
   if (imported.length === 0) return start;
   const scratch = mkdtempSync(join(tmpdir(), "apollo-baseline-"));
@@ -520,14 +544,29 @@ const branchStart = async (repo: string, pinned: string | null | undefined, sign
 };
 
 /**
- * How many of the branch's own commits since `start` (its first parents) are not in `base`.
- * Merges count: one may hold a conflict resolution or an edit, and telling which would take
- * more than this guard needs (refusing a nearer baseline only shows more).
+ * Whether `base` contains work of the branch's own since `start` (its first parents): a
+ * commit, or a merge holding a conflict resolution or an edit (see `mergeOwnDelta`; one
+ * that cannot be told counts). A clean merge does not: a base branch that absorbed it is
+ * still a fair baseline, and refusing it could hide a later commit that undoes what it
+ * brought in.
  */
-const ownCommitsOutside = async (repo: string, head: string, start: string, base: string | null, signal?: AbortSignal) =>
-  Number(
-    (await git(repo, ["rev-list", "--count", "--first-parent", head, `^${start}`, ...(base ? [`^${base}`] : []), "--"], undefined, signal)).trim(),
-  );
+const baseHoldsOwnWork = async (repo: string, head: string, start: string, base: string, signal?: AbortSignal) => {
+  const list = (...args: Array<string>) => git(repo, ["rev-list", "--first-parent", "--parents", head, `^${start}`, ...args, "--"], undefined, signal);
+  const outside = new Set((await list(`^${base}`)).split("\n").map((line) => line.split(" ")[0]));
+  const contained = (await list())
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.trim().split(" "))
+    .filter(([sha]) => !outside.has(sha));
+  if (contained.length === 0) return false;
+  const gitDir = await commonGitDir(repo, signal);
+  for (const [sha, ...parents] of contained) {
+    if (parents.length < 2) return true;
+    const delta = await mergeOwnDelta(gitDir, parents, await treeOf(repo, sha!, signal), signal);
+    if (delta === null || delta.size > 0) return true;
+  }
+  return false;
+};
 
 /**
  * The baseline of a full diff at commit `head` (HEAD, read once by the caller): the merge
@@ -606,8 +645,7 @@ export const resolveBaseline = async (
       const at = await verifyCommit(repo, fork.ref, signal);
       const nearer = at && (at === head ? head : await mergeBase(repo, head, at, signal));
       if (!nearer || nearer === chosen.commit || !(await isAncestor(repo, chosen.commit, nearer, signal))) continue;
-      const own = await ownCommitsOutside(repo, head, fork.start, null, signal);
-      if ((await ownCommitsOutside(repo, head, fork.start, nearer, signal)) !== own) continue;
+      if (await baseHoldsOwnWork(repo, head, fork.start, nearer, signal)) continue;
       chosen = { ref: fork.label, commit: nearer };
     }
     return { ...chosen, tree: await treeOf(repo, chosen.commit, signal) };

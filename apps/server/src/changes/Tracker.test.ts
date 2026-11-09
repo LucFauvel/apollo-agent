@@ -289,6 +289,61 @@ describe("change tracker", () => {
     );
 
     it(
+      "follows its own edit through an imported rename, and never invents a past for a file it created",
+      async () => {
+        const body = (value: number) =>
+          `export const value = ${value};\n${Array.from({ length: 20 }, (_, n) => `export const stable${n} = ${n};\n`).join("")}`;
+        const changes = async (tracker: ReturnType<typeof setup>["tracker"], sessionId: string) =>
+          ((await tracker.sessionChanges(sessionId, "W")).section?.repos ?? []).flatMap((r) => r.files.map((f) => [f.path, f.status, f.oldPath, f.additions, f.deletions]));
+
+        // It edits a.ts and commits, then merges an older pure rename a.ts → b.ts: its edit
+        // now lives in b.ts and must show there (as a move, the conservative reading).
+        {
+          const { tracker } = setup();
+          const app = repo("app");
+          app.git("branch", "-M", "main");
+          writeFileSync(join(app.dir, "a.ts"), body(0));
+          commit(app.git, "base");
+          app.git("checkout", "-qb", "side");
+          app.git("mv", "a.ts", "b.ts");
+          commit(app.git, "pure rename");
+          app.git("checkout", "-q", "main");
+          await nextSecond();
+          await tracker.turnStarted("fw", 1, app.dir);
+          writeFileSync(join(app.dir, "a.ts"), body(1));
+          commit(app.git, "my edit");
+          app.git("merge", "-q", "side", "-m", "merge the rename");
+          await tracker.turnCompleted("fw");
+          expect(await changes(tracker, "fw")).toEqual([["b.ts", "renamed", "a.ts", 1, 1]]);
+          const diff = await tracker.file("fw", app.dir, "b.ts");
+          expect(diff?.symbols.map((s) => [s.name, s.change, s.additions, s.deletions])).toEqual([["value", "modified", 1, 1]]);
+        }
+
+        // Others deleted a.ts; it checks that out, then creates b.ts, much like the old a.ts:
+        // b.ts is its own new file, not a.ts moved.
+        {
+          const { tracker } = setup();
+          const app = repo("app");
+          app.git("branch", "-M", "main");
+          writeFileSync(join(app.dir, "a.ts"), body(0));
+          commit(app.git, "base");
+          app.git("checkout", "-qb", "side");
+          app.git("rm", "-q", "a.ts");
+          commit(app.git, "delete a.ts");
+          app.git("checkout", "-q", "main");
+          await nextSecond();
+          await tracker.turnStarted("nw", 1, app.dir);
+          app.git("checkout", "-q", "side");
+          writeFileSync(join(app.dir, "b.ts"), body(1));
+          commit(app.git, "create b.ts");
+          await tracker.turnCompleted("nw");
+          expect(await changes(tracker, "nw")).toEqual([["b.ts", "added", null, 21, 0]]);
+        }
+      },
+      GIT_HEAVY,
+    );
+
+    it(
       "measures a repository the turn cloned from what it checked out, committed edits included",
       async () => {
         const { tracker } = setup();
@@ -902,6 +957,35 @@ describe("change tracker", () => {
         const { repo: changes, report } = await tracker.report(path, undefined, undefined, [hint]);
         expect(changes.files.map((f) => f.path)).toEqual(["store.ts"]);
         expect(report.base.commit).toBe(base);
+      },
+      GIT_HEAVY,
+    );
+
+    it(
+      "takes a base branch that absorbed only a clean merge of the worker's, keeping a later own revert",
+      async () => {
+        const { tracker } = setup();
+        const work = cloned();
+        const base = work.git("rev-parse", "HEAD").trim();
+        work.git("update-ref", "refs/remotes/origin/main", base);
+        work.git("branch", "feature-base");
+        const path = join(realpathSync(mkdtempSync(join(tmpdir(), "apollo-wt-"))), "wt");
+        work.git("worktree", "add", "-q", "-b", "worker", path, "feature-base");
+        const wt = (...args: Array<string>) => execFileSync("git", args, { cwd: path, encoding: "utf8", stdio: "pipe" });
+        const original = readFileSync(join(work.dir, "store.ts"), "utf8");
+        // Others change store.ts on feature-base; the worker merges that cleanly (nothing of its
+        // own in the merge) and feature-base fast-forwards onto it.
+        work.git("checkout", "-q", "feature-base");
+        writeFileSync(join(work.dir, "store.ts"), "export class Store { theirs = 1 }\n");
+        work.git("commit", "-qam", "theirs");
+        wt("merge", "-q", "--no-ff", "feature-base", "-m", "clean merge");
+        work.git("merge", "-q", "--ff-only", "worker");
+        // Its own commit then puts store.ts back as it was at origin/main.
+        writeFileSync(join(path, "store.ts"), original);
+        wt("commit", "-qam", "revert theirs");
+        const hint = { repoPath: work.dir, path, branch: "worker", baseRef: base, baseBranch: "feature-base" };
+        const { repo: changes, report } = await tracker.report(path, undefined, undefined, [hint]);
+        expect([report.base.ref, changes.files.map((f) => [f.path, f.additions, f.deletions])]).toEqual(["feature-base", [["store.ts", 5, 1]]]);
       },
       GIT_HEAVY,
     );
