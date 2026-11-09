@@ -102,6 +102,123 @@ describe("change tracker", () => {
     expect(overview?.repos[0]?.files.map((f) => f.path)).toEqual(["a.ts", "b.ts"]);
   });
 
+  describe("only what the session's own work changed", () => {
+    /** Commits made before a turn must be older than its start (commit times are in seconds). */
+    const nextSecond = () => new Promise((resolve) => setTimeout(resolve, 1100));
+    const commit = (git: (...args: Array<string>) => string, message: string) => {
+      git("add", "-A");
+      git("commit", "-qm", message);
+    };
+    const paths = async (tracker: ReturnType<typeof setup>["tracker"], sessionId: string) =>
+      ((await tracker.sessionChanges(sessionId, "W")).section?.repos ?? []).map((r) => [r.name, r.files.map((f) => [f.path, f.status])]);
+
+    it(
+      "leaves out what moving HEAD onto existing commits brought in: a clone, a checkout, a pull, a merge",
+      async () => {
+        const { tracker } = setup();
+        const app = repo("app");
+        app.git("branch", "-M", "main");
+        app.git("checkout", "-qb", "feature");
+        for (const name of ["x", "y", "z"]) writeFileSync(join(app.dir, `${name}.ts`), `export const ${name} = 1;\n`);
+        commit(app.git, "feature");
+        app.git("checkout", "-q", "main");
+        await nextSecond();
+
+        // A review in its turn: clones (seen before its checkout fills it), checks out the
+        // feature, probes one file. Only the probe is its work, against what it checked out.
+        const home = realpathSync(mkdtempSync(join(tmpdir(), "apollo-home-")));
+        await tracker.turnStarted("r", 1, home);
+        const clone = join(home, "review");
+        execFileSync("git", ["clone", "-q", "--no-checkout", app.dir, clone]);
+        await tracker.toolStarted("r", `cd ${clone} && git checkout feature`);
+        execFileSync("git", ["checkout", "-q", "feature"], { cwd: clone });
+        writeFileSync(join(clone, "x.ts"), "export const x = 'probe';\n");
+        writeFileSync(join(clone, "probe.test.ts"), "// probe\n");
+        const review = await tracker.turnCompleted("r");
+        expect(review?.repos.map((r) => r.files.map((f) => [f.path, f.status]))).toEqual([
+          [
+            ["probe.test.ts", "added"],
+            ["x.ts", "modified"],
+          ],
+        ]);
+
+        // A worker commits its own change, then checks out and merges others' existing work:
+        // its commit is its work, the merge's other side is not.
+        await tracker.turnStarted("w", 1, app.dir);
+        writeFileSync(join(app.dir, "store.ts"), "export class Store {}\n");
+        commit(app.git, "mine");
+        app.git("merge", "-q", "--no-edit", "feature");
+        app.git("checkout", "-q", "feature");
+        app.git("checkout", "-q", "main");
+        await tracker.turnCompleted("w");
+        expect(await paths(tracker, "w")).toEqual([["app", [["store.ts", "modified"]]]]);
+      },
+      GIT_HEAVY,
+    );
+
+    it(
+      "keeps what a commit made in the turn changed, even through a merge it resolved",
+      async () => {
+        const { tracker } = setup();
+        const app = repo("app");
+        app.git("branch", "-M", "main");
+        app.git("checkout", "-qb", "side");
+        writeFileSync(join(app.dir, "store.ts"), "export class Store { side = 1 }\n");
+        commit(app.git, "side");
+        app.git("checkout", "-q", "main");
+        await nextSecond();
+        await tracker.turnStarted("m", 1, app.dir);
+        writeFileSync(join(app.dir, "store.ts"), "export class Store { main = 1 }\n");
+        commit(app.git, "main");
+        expect(() => app.git("merge", "-q", "side")).toThrow(); // a conflict
+        writeFileSync(join(app.dir, "store.ts"), "export class Store { both = 1 }\n");
+        app.git("add", "-A");
+        app.git("commit", "-q", "--no-edit");
+        await tracker.turnCompleted("m");
+        expect(await paths(tracker, "m")).toEqual([["app", [["store.ts", "modified"]]]]);
+      },
+      GIT_HEAVY,
+    );
+
+    it("leaves out what changed between its turns, and a file it changed back across them", async () => {
+      const { tracker } = setup();
+      const app = repo("app");
+      await tracker.turnStarted("g", 1, app.dir);
+      writeFileSync(join(app.dir, "a.ts"), "export const a = 1;\n");
+      writeFileSync(join(app.dir, "store.ts"), "export class Store {}\n");
+      await tracker.turnCompleted("g");
+      // Someone else, between the turns.
+      writeFileSync(join(app.dir, "theirs.ts"), "export const theirs = 1;\n");
+      await tracker.turnStarted("g", 2, app.dir);
+      writeFileSync(join(app.dir, "b.ts"), "export const b = 2;\n");
+      app.git("checkout", "--", "store.ts"); // its own change, undone
+      await tracker.turnCompleted("g");
+      expect(await paths(tracker, "g")).toEqual([
+        [
+          "app",
+          [
+            ["a.ts", "added"],
+            ["b.ts", "added"],
+          ],
+        ],
+      ]);
+      expect(await tracker.file("g", app.dir, "theirs.ts")).toBe(null);
+      expect(await tracker.file("g", app.dir, "store.ts")).toBe(null);
+    });
+
+    it("says what changed in a listed file without a changed line", async () => {
+      const { tracker } = setup();
+      const app = repo("app");
+      await tracker.turnStarted("x", 1, app.dir);
+      fs.chmodSync(join(app.dir, "store.ts"), 0o755);
+      await tracker.turnCompleted("x");
+      expect(await tracker.file("x", app.dir, "store.ts")).toMatchObject({
+        symbols: [],
+        omitted: "Only its file mode changed (100644 → 100755); no line changed",
+      });
+    });
+  });
+
   describe("turns cleared from the Changes panel", () => {
     type Setup = ReturnType<typeof setup>;
     /**
@@ -514,6 +631,54 @@ describe("change tracker", () => {
       expect(work.git("status", "--porcelain")).toContain("?? new.ts");
       db.close();
     }, GIT_HEAVY);
+
+    it(
+      "compares a branch with where it was created, and a worker's worktree with its base branch",
+      async () => {
+        const { tracker } = setup();
+        const work = cloned();
+        // The checkout is on a feature branch ahead of origin/main; a worker's worktree is
+        // created from it (as Apollo does). The feature's commits are not the worker's.
+        work.git("checkout", "-qb", "feature");
+        writeFileSync(join(work.dir, "feature.ts"), "export const feature = 1;\n");
+        work.git("add", "-A");
+        work.git("commit", "-qm", "feature");
+        const forked = work.git("rev-parse", "HEAD").trim();
+        const path = join(realpathSync(mkdtempSync(join(tmpdir(), "apollo-wt-"))), "wt");
+        work.git("worktree", "add", "-q", "-b", "apollo/worker-1a2b", path, forked);
+        const wt = (...args: Array<string>) => execFileSync("git", args, { cwd: path, encoding: "utf8" });
+        writeFileSync(join(path, "worker.ts"), "export const worker = 1;\n");
+        wt("add", "-A");
+        wt("commit", "-qm", "worker");
+        const one = await tracker.report(path);
+        expect(one.report.base).toMatchObject({ ref: "start of apollo/worker-1a2b", commit: forked });
+        expect([one.report.commitCount, one.repo.files.map((f) => f.path)]).toEqual([1, ["worker.ts"]]);
+
+        // The feature moves on and the worker merges it: with its session's worktree, its base
+        // branch's own work stays out.
+        writeFileSync(join(work.dir, "later.ts"), "export const later = 1;\n");
+        work.git("add", "-A");
+        work.git("commit", "-qm", "later");
+        wt("merge", "-q", "--no-edit", "feature");
+        const worktree = { repoPath: work.dir, path, branch: "apollo/worker-1a2b", baseRef: forked, baseBranch: "feature" };
+        const two = await tracker.report(path, undefined, undefined, [worktree]);
+        expect(two.report.base.ref).toBe("feature");
+        expect(two.repo.files.map((f) => f.path)).toEqual(["worker.ts"]);
+        // Without it, git alone knows where the branch started, not what came in since.
+        expect((await tracker.report(path)).repo.files.map((f) => f.path)).toEqual(["later.ts", "worker.ts"]);
+
+        // The checkout itself: a branch cloned from the origin keeps the origin's merge base.
+        work.git("checkout", "-q", "main");
+        writeFileSync(join(work.dir, "unpushed.ts"), "export const unpushed = 1;\n");
+        work.git("add", "-A");
+        work.git("commit", "-qm", "unpushed");
+        const main = await tracker.report(work.dir);
+        expect([main.report.base.ref, main.repo.files.map((f) => f.path)]).toEqual(["origin/main", ["unpushed.ts"]]);
+        // An explicit base is taken as asked.
+        expect((await tracker.report(path, "origin/main")).repo.files.map((f) => f.path)).toEqual(["feature.ts", "later.ts", "worker.ts"]);
+      },
+      GIT_HEAVY,
+    );
 
     it("takes an explicit base, and refuses one that is not a ref", async () => {
       const { tracker } = setup();
