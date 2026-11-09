@@ -28,3 +28,5 @@ jobs:
       - uses: ./.github/actions/setup
       - run: pnpm typecheck
       - run: pnpm test
+      # Real-process end-to-end tests (the release smoke test against scratch apps); macOS only.
+      - run: pnpm --filter @apollo/desktop test:e2e

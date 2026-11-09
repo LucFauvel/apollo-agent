@@ -1,10 +1,23 @@
+import { createServer } from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { MIGRATIONS, open, SCHEMA_VERSION } from "../../../server/src/Database.ts";
-import { checkMigratedDatabase, seedOldDatabase, serverUrlFromLog, smokeEnv } from "./smoke-lib.ts";
+import {
+  checkMigratedDatabase,
+  descendantsOf,
+  nsisInstallInvocation,
+  parsePs,
+  parseWinProcesses,
+  portAccepts,
+  processesUnder,
+  runSilentInstall,
+  seedOldDatabase,
+  serverUrlFromLog,
+  smokeEnv,
+} from "./smoke-lib.ts";
 
 const fresh = () => join(mkdtempSync(join(tmpdir(), "smoke-lib-")), "apollo.db");
 const versionOf = (path: string) => {
@@ -94,5 +107,89 @@ describe("smokeEnv", () => {
     expect(env.HOME).toBe("/t/home");
     expect(env.APOLLO_DATA_DIR).toBe("/t/data");
     for (const k of ["ELECTRON_RUN_AS_NODE", "electron_run_as_node", "APOLLO_PORT", "Apollo_Port", "NODE_OPTIONS"]) expect(env[k]).toBeUndefined();
+  });
+});
+
+describe("leftover detection (review P2-2)", () => {
+  it("parses ps and Windows CIM process lists", () => {
+    expect(parsePs("  1     0 /sbin/launchd\n 4242  4200 /private/var/x/Apollo.app/Contents/MacOS/apollo --flag\n")).toEqual([
+      { pid: 1, ppid: 0, command: "/sbin/launchd" },
+      { pid: 4242, ppid: 4200, command: "/private/var/x/Apollo.app/Contents/MacOS/apollo --flag" },
+    ]);
+    const json = JSON.stringify([
+      { ProcessId: 10, ParentProcessId: 4, ExecutablePath: "C:\\Temp\\installed\\apollo.exe", CommandLine: '"C:\\Temp\\installed\\apollo.exe" --type=gpu' },
+      { ProcessId: 11, ParentProcessId: 10, ExecutablePath: null, CommandLine: null },
+    ]);
+    expect(parseWinProcesses(json)).toEqual([
+      { pid: 10, ppid: 4, command: 'C:\\Temp\\installed\\apollo.exe "C:\\Temp\\installed\\apollo.exe" --type=gpu' },
+      { pid: 11, ppid: 10, command: "" },
+    ]);
+    expect(parseWinProcesses(JSON.stringify({ ProcessId: 5, ParentProcessId: 1, CommandLine: "x" }))).toEqual([{ pid: 5, ppid: 1, command: "x" }]);
+    expect(parseWinProcesses("")).toEqual([]);
+  });
+
+  it("follows the whole tree below the app", () => {
+    const procs = [
+      { pid: 100, ppid: 1, command: "app" },
+      { pid: 101, ppid: 100, command: "server" },
+      { pid: 102, ppid: 101, command: "grandchild" },
+      { pid: 200, ppid: 1, command: "unrelated" },
+    ];
+    expect([...descendantsOf(procs, 100)].sort()).toEqual([101, 102]);
+    expect(descendantsOf(procs, 200).size).toBe(0);
+  });
+
+  it("matches processes running from the app directory, whatever the case or /private prefix", () => {
+    const mac = parsePs(" 7 1 /private/var/folders/T/apollo-smoke-x/unpacked/apollo.app/Contents/MacOS/apollo\n 8 1 /usr/bin/other /var/folders/T/apollo-smoke-x/unpacked/Apollo.app.bak\n");
+    expect(processesUnder(mac, ["/var/folders/T/apollo-smoke-x/unpacked/Apollo.app"], "darwin").map((p) => p.pid)).toEqual([7]);
+    const win = [
+      { pid: 9, ppid: 1, command: "c:\\temp\\INSTALLED\\resources\\..\\apollo.exe" },
+      { pid: 10, ppid: 1, command: "C:\\temp\\installed-other\\x.exe" },
+    ];
+    expect(processesUnder(win, ["C:/Temp/installed"], "win32").map((p) => p.pid)).toEqual([9]);
+    expect(processesUnder(win, ["C:\\Temp\\installed"], "win32", new Set([9]))).toEqual([]);
+  });
+
+  it("sees a listener that answers 503 as still there, and a closed port as gone", async () => {
+    const server = createServer((_, res) => {
+      res.writeHead(503).end(JSON.stringify({ ok: false }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as { port: number }).port;
+    expect(await portAccepts(port)).toBe(true);
+    await new Promise<void>((r) => server.close(() => r()));
+    expect(await portAccepts(port)).toBe(false);
+  });
+});
+
+describe("silent NSIS install (review P2-3)", () => {
+  // Legal Windows paths full of cmd.exe metacharacters, spaces included.
+  const installer = "C:\\Down&loads\\a^b %PATH% (x)\\Apollo-1.2.3-win-x64-unsigned-setup.exe";
+  const dir = "C:\\Temp\\ci&whoami&rem\\apollo smoke ^%USERNAME%!|<>\\installed";
+
+  it("starts the installer directly, the paths verbatim and never through a shell", () => {
+    const calls: Array<{ file: string; args: ReadonlyArray<string>; options: Record<string, unknown> }> = [];
+    runSilentInstall((file, args, options) => calls.push({ file, args, options }), installer, dir);
+    expect(calls).toHaveLength(1);
+    const call = calls[0]!;
+    expect(call.file).toBe(installer);
+    expect(call.args).toEqual(["/S", `/D=${dir}`]);
+    expect(call.options.shell).toBe(false);
+    expect(call.options.windowsVerbatimArguments).toBe(true);
+    // argv[0] quoted by hand (verbatim mode quotes nothing); /D= stays last and unquoted for NSIS.
+    expect(call.options.argv0).toBe(`"${installer}"`);
+    const commandLine = [call.options.argv0, ...call.args].join(" ");
+    expect(commandLine).toBe(`"${installer}" /S /D=${dir}`);
+    expect(commandLine.endsWith(`/D=${dir}`)).toBe(true);
+  });
+
+  it.each([
+    ["a quote in the directory", installer, 'C:\\Temp\\a"b\\installed'],
+    ["a newline in the directory", installer, "C:\\Temp\\a\nb"],
+    ["a quote in the installer path", 'C:\\x"y\\setup.exe', dir],
+    ["a relative directory", installer, "installed"],
+    ["a relative installer", "setup.exe", dir],
+  ])("refuses %s", (_, inst, target) => {
+    expect(() => nsisInstallInvocation(inst, target)).toThrow();
   });
 });

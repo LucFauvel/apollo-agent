@@ -57,8 +57,14 @@ manual / tag v* ──── ios-testflight.yml  env release-build   apps/mobile
   memory with its search index, a skill), runs the packaged app's own executable in its
   screenshot mode (server → `/health` → UI loaded offscreen → capture → quit), finds the port in
   the server's own `Listening on http://127.0.0.1:<port>` line, asks `/health` from outside, and
-  requires a clean exit, the port to stop answering (no leftover server), a non-empty capture and
-  a database migrated to the build's schema with the seed intact. Verified locally on macOS on an
+  requires a clean exit, a non-empty capture and a database migrated to the build's schema with
+  the seed intact. **Nothing of the app may outlive it** (3 s grace): no process descended from it
+  (the tree is sampled while it runs, since a detached child is re-parented once it exits), none
+  running from its bundle / install directory, and nothing accepting connections on its server
+  port, *whatever it answers* (an unhealthy server still listening fails). Survivors are killed
+  and the run fails; on Windows nothing may run from the install dir after the uninstaller either.
+  The Windows installer is started directly (no `cmd.exe`) with a verbatim `/S /D=<dir>`, so
+  `&`, `^`, `%`… in a path are plain characters; a `"` or control character is refused. Verified locally on macOS on an
   ad-hoc build (1→19 and 18→19 pass; a build with a broken server bundle fails).
   **Gaps, on purpose stated loudly:** no tray, no visible window, no LaunchServices/Gatekeeper
   `open` launch or SmartScreen, no provider CLI (none on CI), no tailnet (off in a fresh data
