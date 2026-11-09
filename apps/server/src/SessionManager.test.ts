@@ -1,9 +1,9 @@
 import { execSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import * as AppSettings from "./AppSettings.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AVATAR_SHAPES, type AgentEvent, type BotLimits, DEFAULT_BOT_LIMITS, type ProviderKind, type SessionId } from "@apollo/contracts";
+import { type AppChange, AVATAR_SHAPES, type AgentEvent, type BotId, type BotLimits, DEFAULT_BOT_LIMITS, type ProviderKind, type SessionId } from "@apollo/contracts";
 import { type Provider, ProviderError, type ProviderSessionOptions } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
@@ -1010,6 +1010,110 @@ describe("SessionManager", () => {
       expect(sessions.some((s) => s.role === "reflection")).toBe(false);
     }).pipe(Effect.provide(layer)),
   );
+
+  it.live("deletes a bot with everything it owns, and nothing else", () => {
+    const dir = mkdtempSync(join(tmpdir(), "apollo-delete-bot-"));
+    return Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const db = yield* Database.Database;
+      const jobs = yield* Jobs.Jobs;
+      const seen: Array<AppChange> = [];
+      yield* Stream.runForEach(manager.changes, (change) => Effect.sync(() => void seen.push(change))).pipe(Effect.forkChild);
+      yield* Effect.sleep("20 millis");
+
+      const bot = yield* createBot(manager);
+      const other = yield* createBot(manager);
+      const repo = mkdtempSync(join(tmpdir(), "apollo-repo-"));
+      execSync("git init -q -b main && git config user.email t@example.com && git config user.name Test", { cwd: repo });
+      writeFileSync(join(repo, "README.md"), "hello\n");
+      execSync("git add -A && git commit -qm init", { cwd: repo });
+
+      // A worker in its own worktree with a conversation and an attachment, and an untitled one.
+      const worker = yield* manager.createSession({ botId: bot.id, title: "Feature", provider: { provider: "codex" }, cwd: repo, isolation: "worktree" });
+      yield* manager.send(worker.id, "hello", "user");
+      yield* waitIdle(manager, worker.id);
+      saveAttachment(dir, worker.id, "shot.png", "image/png", new Uint8Array([1, 2, 3]));
+      const untitled = yield* manager.createSession({ botId: bot.id, title: "", provider: { provider: "claude" } });
+      expect(yield* store.getSetting("sessions.untitled")).toContain(untitled.id);
+      const keptSession = yield* manager.createSession({ botId: other.id, title: "", provider: { provider: "claude" } });
+
+      // Memories, notes, a skill and a schedule of its own; and shared ones.
+      const memory = { kind: "fact" as const, tags: [], sourceSessionId: null };
+      yield* store.insertMemory({ ...memory, botId: bot.id, content: "The doomed bot's fact." });
+      yield* store.insertMemory({ ...memory, botId: null, content: "A fact every bot shares." });
+      yield* store.insertMemory({ ...memory, botId: other.id, content: "The other bot's fact." });
+      yield* store.setCoreMemory(bot.id, "notes", ["doomed notes"]);
+      yield* store.setCoreMemory(bot.id, "user", ["Luc prefers English"]);
+      yield* store.setCoreMemory(other.id, "notes", ["other notes"]);
+      yield* store.insertSkill({ botId: bot.id, name: "deploy", description: "d", body: "b", status: "active", sourceSessionId: null });
+      const now = Date.now();
+      const schedule = db.prepare(
+        `insert into schedules (id, bot_id, kind, name, prompt, spec, timezone, created_by, next_run_at, created_at, updated_at)
+         values (?, ?, 'heartbeat', 'tick', 'tick', 'every 1h', 'UTC', 'user', ?, ?, ?)`,
+      );
+      schedule.run("sch_doomed", bot.id, now + 3_600_000, now, now);
+      schedule.run("sch_kept", other.id, now + 3_600_000, now, now);
+
+      // A long-running job of the bot's worker: killed, and never reported.
+      const pidFile = join(dir, "job.pid");
+      const job = yield* jobs.start({ botId: bot.id, sessionId: worker.id }, { command: `echo $$ > ${pidFile}; exec sleep 30` });
+      for (let i = 0; i < 80 && !existsSync(pidFile); i++) yield* Effect.sleep("25 millis");
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      const alive = (p: number) => {
+        try {
+          process.kill(p, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      expect(alive(pid)).toBe(true);
+
+      const owned = (yield* store.listSessions(bot.id)).map((s) => s.id);
+      expect(owned).toHaveLength(3);
+      seen.length = 0;
+      yield* manager.deleteBot(bot.id);
+      yield* Effect.sleep("50 millis");
+
+      // Everything of the bot is gone.
+      expect((yield* store.listBots).map((b) => b.id)).toEqual([other.id]);
+      expect(yield* store.listSessions(bot.id)).toEqual([]);
+      const count = (sql: string, ...args: Array<string>) => (db.prepare(sql).get(...args) as { n: number }).n;
+      for (const id of owned) expect(count("select count(*) as n from session_events where session_id = ?", id)).toBe(0);
+      expect(count("select count(*) as n from memories where bot_id = ?", bot.id)).toBe(0);
+      expect(count("select count(*) as n from core_memory where scope = ?", bot.id)).toBe(0);
+      expect(count("select count(*) as n from skills where bot_id = ?", bot.id)).toBe(0);
+      expect(count("select count(*) as n from schedules where bot_id = ?", bot.id)).toBe(0);
+      expect(existsSync(join(dir, "attachments", worker.id))).toBe(false);
+      expect(existsSync(worker.worktree!.path)).toBe(false);
+      expect(yield* store.getSetting("sessions.untitled")).not.toContain(untitled.id);
+      expect(alive(pid)).toBe(false);
+      expect((yield* jobs.status({ botId: bot.id, sessionId: worker.id }, job.jobId).pipe(Effect.flip)).message).toContain("no background job");
+
+      // Each session's deletion, then the bot's, last.
+      const tags = seen.filter((c) => c._tag === "SessionDeleted" || c._tag === "BotDeleted");
+      expect(tags.slice(0, -1).map((c) => (c as { sessionId: SessionId }).sessionId).sort()).toEqual([...owned].sort());
+      expect(tags.at(-1)).toEqual({ _tag: "BotDeleted", botId: bot.id });
+      // The orchestrator goes after its workers.
+      expect((tags.at(-2) as { sessionId: SessionId }).sessionId).toBe(bot.mainSessionId);
+
+      // The shared profile, global memories and the other bot are untouched.
+      expect(yield* store.getCoreMemory(other.id)).toEqual({ user: ["Luc prefers English"], notes: ["other notes"] });
+      expect((yield* store.listMemories(other.id)).map((m) => m.content).sort()).toEqual(["A fact every bot shares.", "The other bot's fact."]);
+      expect((yield* store.getSession(keptSession.id)).botId).toBe(other.id);
+      expect(yield* store.getSetting("sessions.untitled")).toContain(keptSession.id);
+      expect(count("select count(*) as n from schedules where bot_id = ?", other.id)).toBe(1);
+      // The workspace folder stays.
+      expect(existsSync(bot.cwd)).toBe(true);
+      // The global profile can never be deleted with a bot.
+      expect((yield* Effect.flip(store.deleteCoreMemoryScope("global" as BotId))).code).toBe("invalid");
+
+      // An unknown (or already deleted) bot is a clean not_found.
+      const again = yield* Effect.flip(manager.deleteBot(bot.id));
+      expect(again.code).toBe("not_found");
+    }).pipe(Effect.provide(Jobs.layer.pipe(Layer.provideMerge(layerWith(1e9, Database.layerMemory, dir)))));
+  });
 
   it.live("refuses to delete a bot's orchestrator session", () =>
     Effect.gen(function* () {

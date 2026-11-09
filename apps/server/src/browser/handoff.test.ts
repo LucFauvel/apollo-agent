@@ -112,4 +112,34 @@ describe.skipIf(!executable)("browser handoff", () => {
       expect((yield* Fiber.join(second)).message).toMatch(/declined/);
     }).pipe(Effect.scoped, Effect.provide(layer)),
   );
+
+  it.live("closes a deleted bot's tabs and stops its agents waiting on the user", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const browser = yield* Browser.Browser;
+      const { url } = yield* page;
+      const create = (name: string) =>
+        manager.createBot({
+          name,
+          instructions: "",
+          cwd: "/tmp",
+          main: { provider: "claude" },
+          defaultWorker: { provider: "codex" },
+          runtimeMode: "full-access",
+          autoLearn: false,
+        });
+      const bot = yield* create("Doomed");
+      const other = yield* create("Kept");
+      yield* browser.open(bot.id, bot.mainSessionId, url, true);
+      yield* browser.open(bot.id, bot.mainSessionId, url, true);
+      const kept = yield* browser.open(other.id, other.mainSessionId, url, true);
+      const waiting = yield* browser.handoff(bot.id, bot.mainSessionId, undefined, "Sign in", 60_000).pipe(Effect.flip, Effect.forkChild);
+      yield* Effect.sleep("100 millis");
+
+      yield* manager.deleteBot(bot.id);
+      expect((yield* Fiber.join(waiting)).message).toMatch(/the bot was deleted/);
+      expect(yield* browser.list(bot.id)).toEqual([]);
+      expect((yield* browser.list(other.id)).map((t) => t.id)).toEqual([kept.tabId]);
+    }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
 });

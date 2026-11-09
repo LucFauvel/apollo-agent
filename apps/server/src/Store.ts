@@ -618,6 +618,18 @@ const makeStore = (db: DatabaseSync) => {
         );
         return Effect.succeed(clean);
       }),
+    /**
+     * Deletes a bot's own core memory (its notes), which has no foreign key to the bot.
+     * The shared user profile (scope "global") is never deleted here.
+     */
+    deleteCoreMemoryScope: (scope: BotId) =>
+      Effect.suspend(() => {
+        if ((scope as string) === "global") {
+          return Effect.fail(new ApolloError({ code: "invalid", message: "the shared user profile cannot be deleted with a bot" }));
+        }
+        run("delete from core_memory where scope = ?", scope);
+        return Effect.void;
+      }),
 
     // --- transcripts -------------------------------------------------------
     /** Keyword search over the messages of a bot's past sessions (not reflections). */

@@ -25,6 +25,8 @@ interface Job {
   readonly logPath: string;
   readonly startedAt: number;
   readonly notify: boolean;
+  /** Stopped because its bot was deleted: nobody is left to report to. */
+  orphaned: boolean;
   readonly process: ChildProcess;
   readonly log: WriteStream;
   readonly exited: Deferred.Deferred<void>;
@@ -143,6 +145,7 @@ const make = Effect.gen(function* () {
         logPath,
         startedAt: Date.now(),
         notify: input.notify ?? true,
+        orphaned: false,
         process: child,
         log: createWriteStream(logPath),
         exited: yield* Deferred.make<void>(),
@@ -166,7 +169,7 @@ const make = Effect.gen(function* () {
         // (Checked before releasing the waiters, which stop counting as they wake.)
         const waited = job.waiters > 0;
         runFork(Deferred.succeed(job.exited, undefined));
-        if (job.notify && !waited) runFork(report(job));
+        if (job.notify && !waited && !job.orphaned) runFork(report(job));
       };
       child.on("exit", (code, signal) => finish(code, signal));
       child.on("error", (error) => {
@@ -200,6 +203,41 @@ const make = Effect.gen(function* () {
       return status(job);
     });
 
+  /**
+   * Stops every running job of a deleted bot (SIGTERM, then SIGKILL after a grace period)
+   * and forgets them all; none reports back to its (deleted) session.
+   */
+  const stopForBot = (botId: BotId) =>
+    Effect.gen(function* () {
+      const owned = [...jobs.values()].filter((j) => j.botId === botId);
+      for (const job of owned) {
+        job.orphaned = true;
+        kill(job, "SIGTERM");
+      }
+      yield* Effect.forEach(
+        owned,
+        (job) =>
+          Deferred.await(job.exited).pipe(
+            Effect.timeoutOption("3 seconds"),
+            Effect.flatMap((done) => {
+              if (Option.isSome(done)) return Effect.void;
+              kill(job, "SIGKILL");
+              return Deferred.await(job.exited).pipe(Effect.timeoutOption("2 seconds"), Effect.asVoid);
+            }),
+          ),
+        { concurrency: "unbounded", discard: true },
+      );
+      for (const job of owned) {
+        jobs.delete(job.id);
+        try {
+          rmSync(job.logPath, { force: true });
+        } catch {
+          // Still held open (Windows): the folder is cleared on the next start.
+        }
+      }
+    });
+  yield* manager.onBotDeleted("background jobs", stopForBot);
+
   yield* Effect.addFinalizer(() =>
     Effect.sync(() => {
       for (const job of jobs.values()) kill(job, "SIGTERM");
@@ -209,6 +247,7 @@ const make = Effect.gen(function* () {
   return {
     start,
     stop,
+    stopForBot,
     status: (caller: JobCaller, jobId: string, lines?: number) => Effect.map(own(caller, jobId), (job) => status(job, lines)),
     /** Waits until the job ends or the timeout passes, then returns its status. */
     wait: (caller: JobCaller, jobId: string, timeoutSeconds: number, lines?: number) =>

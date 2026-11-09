@@ -217,6 +217,12 @@ const make = Effect.gen(function* () {
 
   const publish = (change: AppChange) => PubSub.publish(changes, change).pipe(Effect.asVoid);
 
+  /**
+   * Cleanups of services built on the manager (background jobs, browser tabs), run when a
+   * bot is deleted: they depend on the manager, so they register here instead.
+   */
+  const botCleanups: Array<{ readonly name: string; readonly run: (botId: BotId) => Effect.Effect<void> }> = [];
+
   const updateSession = (id: SessionId, patch: Parameters<typeof store.updateSession>[1]) =>
     store.updateSession(id, patch).pipe(
       Effect.tap((session) => publish({ _tag: "SessionUpserted", session })),
@@ -1237,11 +1243,45 @@ const make = Effect.gen(function* () {
         return bot;
       }),
 
+    /** Registers work to do when a bot is deleted (see `botCleanups`). */
+    onBotDeleted: (name: string, run: (botId: BotId) => Effect.Effect<void>) =>
+      Effect.sync(() => void botCleanups.push({ name, run })),
+
+    /**
+     * Deletes a bot and everything that belongs to it: its sessions (with their worktrees,
+     * attachments and logs), memories, notes, skills, schedules, running jobs and browser
+     * tabs. Its workspace folder, the shared user profile and global memories are kept.
+     */
     deleteBot: (botId: BotId) =>
       Effect.gen(function* () {
-        const sessions = yield* store.listSessions(botId);
-        yield* Effect.forEach(sessions, (s) => closeSession(s.id), { discard: true });
+        yield* store.getBot(botId); // not_found for an unknown bot, like the other bot calls
+        // Its sessions' reflections waiting in line would start on deleted sessions.
+        const owned = new Set((yield* store.listSessions(botId)).map((s) => s.id));
+        for (let i = reflectionQueue.length - 1; i >= 0; i--) if (owned.has(reflectionQueue[i]!)) reflectionQueue.splice(i, 1);
+        // Close every process first, so no turn starts a new worker meanwhile.
+        yield* Effect.forEach(owned, closeSession, { discard: true });
+        // Workers before the orchestrator; again if a session appeared meanwhile.
+        for (let pass = 0; pass < 3; pass++) {
+          const sessions = yield* store.listSessions(botId);
+          if (sessions.length === 0) break;
+          const ordered = [...sessions.filter((s) => s.role !== "main"), ...sessions.filter((s) => s.role === "main")];
+          yield* Effect.forEach(
+            ordered,
+            (s) =>
+              removeSession(s.id).pipe(
+                Effect.catchCause((cause) => Effect.logWarning(`could not remove session ${s.id} of deleted bot ${botId}`, cause)),
+              ),
+            { discard: true },
+          );
+        }
         yield* store.deleteBot(botId);
+        autonomousTurns.delete(botId);
+        for (const cleanup of botCleanups) {
+          yield* cleanup.run(botId).pipe(
+            Effect.catchCause((cause) => Effect.logWarning(`could not clean up ${cleanup.name} of deleted bot ${botId}`, cause)),
+          );
+        }
+        yield* store.deleteCoreMemoryScope(botId).pipe(Effect.ignore);
         yield* Effect.sync(() =>
           rmSync(pluginDir(config.dataDir, botId), { recursive: true, force: true }),
         ).pipe(Effect.ignore);
