@@ -294,6 +294,12 @@ const MIGRATIONS: ReadonlyArray<string> = [
   `,
 ];
 
+/**
+ * The schema version this code migrates a database to (`pragma user_version`). The desktop
+ * installer refuses to install code older than the database it would run against.
+ */
+export const SCHEMA_VERSION = MIGRATIONS.length;
+
 export class Database extends Context.Service<Database, DatabaseSync>()("apollo/Database") {}
 
 export const open = (path: string): DatabaseSync => {

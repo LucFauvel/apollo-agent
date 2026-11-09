@@ -18,6 +18,9 @@ extraResources:
     to: web
   - from: resources/tray
     to: tray
+  # Commit and schema version of this build (scripts/write-build-info.ts).
+  - from: build/build-info.json
+    to: build-info.json
   # Apollo's own Tailscale node, a Node-API addon (apps/server/native/tailnet/build.sh).
   - from: ../server/native/tailnet/build
     to: native
