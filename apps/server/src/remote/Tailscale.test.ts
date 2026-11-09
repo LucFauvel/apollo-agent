@@ -28,12 +28,15 @@ writeFileSync(addonPath, "never loaded: process.dlopen is replaced below");
 /** The native node, faked: what its state dir says it last announced, and each `start`. */
 let node: { savedHostname: string | null | "fail"; starts: Array<string>; dnsName: string | null };
 let settings: Map<string, string>;
+/** Every value written to the machine-name setting, in order. */
+let nameWrites: Array<string>;
 const platform = process.platform;
 
 beforeEach(() => {
   Object.defineProperty(process, "platform", { value: "darwin" });
   Object.assign(names, { host: "mac-lan", local: "DEVOLUTIONS652", localReads: 0 });
   settings = new Map([["remote.tailscale", "on"]]);
+  nameWrites = [];
   node = { savedHostname: null, starts: [], dnsName: null };
   vi.spyOn(process, "dlopen").mockImplementation((module: object) => {
     (module as { exports: unknown }).exports = {
@@ -73,7 +76,10 @@ afterEach(() => {
 const store = {
   getSetting: (key: string) => Effect.sync(() => settings.get(key) ?? null),
   setSetting: (key: string, value: string | null) =>
-    Effect.sync(() => void (value === null ? settings.delete(key) : settings.set(key, value))),
+    Effect.sync(() => {
+      if (key === HOSTNAME_SETTING && value !== null) nameWrites.push(value);
+      void (value === null ? settings.delete(key) : settings.set(key, value));
+    }),
 };
 
 /** Builds the real service, lets its automatic startup start the node, and reads it. */
@@ -141,11 +147,57 @@ describe("the tailnet machine name", () => {
   });
 });
 
+describe("a malformed machine name", () => {
+  const malformed = ["bad name 🐱", "a".repeat(64), "apollo-tail-", "   ", "Apollo-UPPER", "-apollo"];
+
+  it("announced by the node is never kept: a new node name is chosen and saved instead", async () => {
+    for (const bad of malformed) {
+      settings.delete(HOSTNAME_SETTING);
+      nameWrites = [];
+      node.savedHostname = bad;
+      await startApollo();
+      expect(node.starts.at(-1)).toBe("apollo-devolutions652");
+      expect(nameWrites).toEqual(["apollo-devolutions652"]);
+    }
+  });
+
+  it("saved by an earlier run is replaced by the node's valid name", async () => {
+    for (const bad of malformed) {
+      settings.set(HOSTNAME_SETTING, bad);
+      nameWrites = [];
+      node.savedHostname = "apollo-mac-lan";
+      await startApollo();
+      expect(node.starts.at(-1)).toBe("apollo-mac-lan");
+      expect(nameWrites).toEqual(["apollo-mac-lan"]);
+    }
+  });
+
+  it("does not stick once the node's state is repaired", async () => {
+    // An earlier build saved a bad name the node announced; the node is then repaired.
+    settings.set(HOSTNAME_SETTING, "bad name 🐱");
+    node.savedHostname = "fail";
+    await startApollo();
+    expect(node.starts).toEqual(["apollo-mac-lan"]);
+    node.savedHostname = "apollo-mac-lan";
+    names.host = "other-network";
+    await startApollo();
+    expect(node.starts).toEqual(["apollo-mac-lan", "apollo-mac-lan"]);
+    expect(settings.get(HOSTNAME_SETTING)).toBe("apollo-mac-lan");
+  });
+});
+
 describe("nodeHostname", () => {
   it("turns a computer name into a tailnet machine name", () => {
     expect(Tailscale.nodeHostname("Luc's MacBook.local")).toBe("apollo-luc-s-macbook");
     expect(Tailscale.nodeHostname("DEVOLUTIONS652")).toBe("apollo-devolutions652");
     expect(Tailscale.nodeHostname("DEVOLUTIONS652.LOCAL")).toBe("apollo-devolutions652");
     expect(Tailscale.nodeHostname("---")).toBe("apollo-desktop");
+  });
+
+  it("always makes a valid machine name", () => {
+    for (const name of ["Luc's MacBook.local", "Élodie 🐱", "🐱", "a".repeat(100), `${"a".repeat(39)}-z`, "-x-"]) {
+      expect(Tailscale.isMachineName(Tailscale.nodeHostname(name)), name).toBe(true);
+    }
+    expect(Tailscale.nodeHostname(`${"a".repeat(39)}-z`)).toBe(`apollo-${"a".repeat(39)}`);
   });
 });

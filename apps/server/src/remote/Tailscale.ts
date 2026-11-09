@@ -85,8 +85,15 @@ export const nodeHostname = (name: string) =>
     .replace(/\.local$/i, "")
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 40) || "desktop"}`;
+    .slice(0, 40)
+    .replace(/^-+|-+$/g, "") || "desktop"}`;
+
+/**
+ * Whether Apollo announces `name` as its machine name: one lowercase DNS label, which
+ * every `nodeHostname` result is. Names read back (the saved setting, the node's own
+ * state) must pass it too, so a malformed one is never kept.
+ */
+export const isMachineName = (name: string) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name);
 
 /**
  * Publishes Apollo to the user's tailnet through a Tailscale node that runs inside this
@@ -126,12 +133,14 @@ const make = Effect.gen(function* () {
    *
    * The first choice keeps the name an existing node already announces (phones may be
    * paired at it); only a node that never signed in gets one from the computer's name.
+   * A saved or announced name that is not a valid machine name is never kept: it is
+   * replaced as if absent, so a bad value saved once does not stick.
    * If the existing name cannot be read, this start announces what Apollo used to
    * (`os.hostname()`), and nothing is saved, so the next start tries again.
    */
   const machineName = Effect.gen(function* () {
     const saved = yield* store.getSetting(HOSTNAME_SETTING);
-    if (saved) return saved;
+    if (saved && isMachineName(saved)) return saved;
     const existing = yield* Effect.promise(() =>
       invoke<{ readonly hostname?: string | null }>("savedHostname", { dir: stateDir }).then(
         (result) => ({ ok: true as const, hostname: typeof result?.hostname === "string" ? result.hostname : null }),
@@ -139,7 +148,7 @@ const make = Effect.gen(function* () {
       ),
     );
     if (!existing.ok) return nodeHostname(hostname());
-    const chosen = existing.hostname || nodeHostname(computerName());
+    const chosen = existing.hostname !== null && isMachineName(existing.hostname) ? existing.hostname : nodeHostname(computerName());
     yield* store.setSetting(HOSTNAME_SETTING, chosen);
     return chosen;
   });
