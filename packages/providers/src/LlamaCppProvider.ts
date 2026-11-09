@@ -27,6 +27,8 @@ export interface LlamaCppProviderConfig {
   readonly review?: ClaudeBackend["review"];
   /** Whether sessions may start Claude Code subagents; read as each session opens. Off when absent. */
   readonly allowSubagents?: Effect.Effect<boolean>;
+  /** The user's context cap (`null`: none); read as each session opens. No cap when absent. */
+  readonly maxContextTokens?: Effect.Effect<number | null>;
 }
 
 /** Claude Code's tools that start a subagent (another run of the local model). */
@@ -120,6 +122,13 @@ export const llamaCppContextSize = (connection: LlamaCppConnection, model: strin
     // Older builds or proxies may not have /props; Claude Code then assumes its default.
     Effect.orElseSucceed(() => null),
   );
+
+/**
+ * The context Claude Code is told it has: llama-server's, lowered to the user's cap.
+ * With no measured size the cap alone (Claude Code would otherwise assume 200k).
+ */
+export const cappedContextSize = (measured: number | null, cap: number | null) =>
+  cap === null ? measured : measured === null ? cap : Math.min(measured, cap);
 
 type Block = { type: string; text?: string };
 type Message = { role: string; content: string | Array<Block> };
@@ -292,7 +301,8 @@ export const makeLlamaCppProvider = (config: LlamaCppProviderConfig): Provider =
         if (!models.some((m) => m.id === model)) {
           return yield* fail(`llama-server at ${connection.baseUrl} does not have the model ${model}`);
         }
-        const contextSize = yield* llamaCppContextSize(connection, model);
+        const cap = config.maxContextTokens ? yield* config.maxContextTokens : null;
+        const contextSize = cappedContextSize(yield* llamaCppContextSize(connection, model), cap);
         // Lives as long as the session.
         const proxy = yield* startProxy(connection);
         const subagents = config.allowSubagents ? yield* config.allowSubagents : false;

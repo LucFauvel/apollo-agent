@@ -7,7 +7,14 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { foldSystemMessages, llamaCppEnvironment, makeLlamaCppProvider, startProxy } from "../src/LlamaCppProvider.ts";
+import {
+  cappedContextSize,
+  foldSystemMessages,
+  llamaCppContextSize,
+  llamaCppEnvironment,
+  makeLlamaCppProvider,
+  startProxy,
+} from "../src/LlamaCppProvider.ts";
 import type { ProviderEmission } from "../src/Provider.ts";
 import { startFakeLlamaServer } from "./fixtures/fake-llama-server.ts";
 
@@ -45,6 +52,35 @@ describe("LlamaCppProvider", () => {
       expect(error.provider).toBe("llamacpp");
       expect(error.message).toContain("llama-server is not reachable at http://127.0.0.1:9");
     }),
+  );
+
+  it("caps the context Claude Code is told about at the user's limit", () => {
+    // Cap below the server's context: the cap wins, so compaction starts sooner.
+    expect(cappedContextSize(262_144, 131_072)).toBe(131_072);
+    // Cap above it: never claim more than llama-server has.
+    expect(cappedContextSize(65_536, 131_072)).toBe(65_536);
+    // No cap: what llama-server measured, as before.
+    expect(cappedContextSize(262_144, null)).toBe(262_144);
+    // Unknown server context: the cap alone, rather than Claude Code's 200k default.
+    expect(cappedContextSize(null, 131_072)).toBe(131_072);
+    expect(cappedContextSize(null, null)).toBeNull();
+  });
+
+  it.live("applies the cap to the measured context, or alone when there is none", () =>
+    Effect.gen(function* () {
+      const server = yield* fakeServer;
+      const measured = yield* llamaCppContextSize({ baseUrl: server.baseUrl, apiKey: null }, MODEL);
+      expect(measured).toBe(32768);
+      const env = (cap: number | null, size: number | null) =>
+        llamaCppEnvironment({ baseUrl: server.baseUrl, apiKey: null }, MODEL, cappedContextSize(size, cap)).CLAUDE_CODE_MAX_CONTEXT_TOKENS;
+      expect(env(16_384, measured)).toBe("16384");
+      expect(env(131_072, measured)).toBe("32768");
+      expect(env(null, measured)).toBe("32768");
+      const unknown = yield* llamaCppContextSize({ baseUrl: "http://127.0.0.1:9", apiKey: null }, MODEL);
+      expect(unknown).toBeNull();
+      expect(env(98_304, unknown)).toBe("98304");
+      expect(env(null, unknown)).toBeUndefined();
+    }).pipe(Effect.scoped),
   );
 
   it("never lets Anthropic credentials reach llama-server", () => {

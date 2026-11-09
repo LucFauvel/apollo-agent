@@ -117,7 +117,16 @@ export const layer = ApolloRpcs.toLayer(
       "app.projects": () => appSettings.projects,
       "providers.settings": () => providerSettings.view,
       "providers.updateSettings": (input) =>
-        providerSettings.update(input).pipe(Effect.tap(() => manager.refreshModels)),
+        Effect.gen(function* () {
+          const before = (yield* providerSettings.read).llamacpp;
+          const view = yield* providerSettings.update(input);
+          yield* manager.refreshModels;
+          // The context cap is a llama-server flag: a running managed server restarts to apply it.
+          if (before.mode === "managed" && view.llamacpp.mode === "managed" && before.maxContextTokens !== view.llamacpp.maxContextTokens) {
+            yield* localModels.restartServer;
+          }
+          return view;
+        }),
 
       "bots.create": (input) => manager.createBot(input),
       "bots.update": (input) => manager.updateBot(input),

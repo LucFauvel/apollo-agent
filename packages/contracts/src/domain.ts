@@ -626,6 +626,14 @@ export type ClaudeAuth = typeof ClaudeAuth.Type;
 export const LlamaCppMode = Schema.Literals(["managed", "external"]);
 export type LlamaCppMode = typeof LlamaCppMode.Type;
 
+/**
+ * Smallest context cap a llama.cpp session accepts. Claude Code compacts at its window
+ * minus ~33k tokens (20k reserved for the reply, 13k buffer), and its first prompt (system
+ * prompt, every tool, Apollo's instructions) is already 32-41k. At 64k it would compact
+ * on every turn; 96k leaves 25-30k for the conversation itself.
+ */
+export const LLAMACPP_MIN_CONTEXT_TOKENS = 98_304;
+
 /** Provider settings as the UI sees them. Keys are write-only: only whether one is saved. */
 export const ProviderSettings = Schema.Struct({
   claude: Schema.Struct({ auth: ClaudeAuth, apiKeySaved: Schema.Boolean }),
@@ -635,6 +643,11 @@ export const ProviderSettings = Schema.Struct({
     apiKeySaved: Schema.Boolean,
     /** Whether local models may start Claude Code subagents (off: one model at a time is all most machines run). */
     allowSubagents: Schema.Boolean,
+    /**
+     * Most tokens a local model session may use (`null`: the model's whole context). Smaller
+     * keeps turns fast and llama-server's KV cache small, at the cost of compacting sooner.
+     */
+    maxContextTokens: Schema.NullOr(Schema.Number),
   }),
 });
 export type ProviderSettings = typeof ProviderSettings.Type;
@@ -650,6 +663,8 @@ export const UpdateProviderSettingsInput = Schema.Struct({
       baseUrl: Schema.optional(Schema.String),
       apiKey: KeyUpdate,
       allowSubagents: Schema.optional(Schema.Boolean),
+      /** `null` removes the cap. At least `LLAMACPP_MIN_CONTEXT_TOKENS`. */
+      maxContextTokens: Schema.optional(Schema.NullOr(Schema.Number)),
     }),
   ),
 });

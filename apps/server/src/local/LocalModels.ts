@@ -140,12 +140,38 @@ export const toLocalModel = (m: RouterModel, download: Progress | undefined, loa
   };
 };
 
+/**
+ * The router's command line. Model processes inherit these flags. Without a cap, `--fit`
+ * sizes each model's context from its own (shrinking it to fit memory, never below what
+ * the agent needs). A cap sets `--ctx-size`, which `--fit` then leaves alone: no model
+ * allocates a KV cache beyond it (a model that would not fit moves layers to RAM instead).
+ */
+export const serverArgs = (options: { port: number; apiKey: string; maxContextTokens: number | null }) => {
+  const { port, apiKey, maxContextTokens: cap } = options;
+  return [
+    "--host", "127.0.0.1",
+    "--port", String(port),
+    "--api-key", apiKey,
+    "--no-webui",
+    "--sleep-idle-seconds", String(IDLE_SLEEP_SECONDS),
+    // Let --fit size each model, but never below what the agent needs (nor above the cap).
+    "--fit-ctx", String(cap === null ? TARGET_CONTEXT : Math.min(TARGET_CONTEXT, cap)),
+    ...(cap === null ? [] : ["--ctx-size", String(cap)]),
+    // An 8-bit KV cache halves its memory for a negligible quality cost.
+    "--cache-type-k", "q8_0",
+    "--cache-type-v", "q8_0",
+    // Unload idle models when a new one needs the memory.
+    "--models-memory-margin", "1024",
+  ];
+};
+
 const make = Effect.gen(function* () {
   const config = yield* ServerConfig;
   const store = yield* Store;
   const providerSettings = yield* ProviderSettings;
   const context = yield* Effect.context<never>();
   const runFork = Effect.runForkWith(context);
+  const runPromise = Effect.runPromiseWith(context);
 
   const root = join(config.dataDir, "llamacpp");
   const cacheDir = join(root, "models");
@@ -355,20 +381,8 @@ const make = Effect.gen(function* () {
   const launch = async () => {
     if (!engine) throw new Error("llama.cpp is not installed");
     port ??= await freePort();
-    const args = [
-      "--host", "127.0.0.1",
-      "--port", String(port),
-      "--api-key", apiKey,
-      "--no-webui",
-      "--sleep-idle-seconds", String(IDLE_SLEEP_SECONDS),
-      // Let --fit size each model, but never below what the agent needs.
-      "--fit-ctx", String(TARGET_CONTEXT),
-      // An 8-bit KV cache halves its memory for a negligible quality cost.
-      "--cache-type-k", "q8_0",
-      "--cache-type-v", "q8_0",
-      // Unload idle models when a new one needs the memory.
-      "--models-memory-margin", "1024",
-    ];
+    const { maxContextTokens } = (await runPromise(providerSettings.read)).llamacpp;
+    const args = serverArgs({ port, apiKey, maxContextTokens });
     logs.push(`$ llama-server ${args.map((a) => (a === apiKey ? "<key>" : a)).join(" ")}`);
     const process_ = spawn(serverBinary(engine), args, {
       env: { ...process.env, LLAMA_CACHE: cacheDir },
@@ -576,6 +590,14 @@ const make = Effect.gen(function* () {
       yield* requireRunning("start the server");
     }),
     stopServer: Effect.promise(stopServer),
+    /** Starts llama-server again with the current settings, if it is running (or starting). */
+    restartServer: Effect.promise(async () => {
+      if (!wanted) return;
+      logs.push("Restarting llama-server to apply new settings");
+      await stopServer();
+      restarts = 0;
+      await startServer().catch(() => undefined);
+    }),
 
     suggested: suggested[0] as Effect.Effect<ReadonlyArray<SuggestedModel>, Error>,
     search: (query: string) => searchModels(query),
