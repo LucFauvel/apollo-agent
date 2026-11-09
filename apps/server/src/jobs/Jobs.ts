@@ -204,27 +204,57 @@ const make = Effect.gen(function* () {
     });
 
   /**
-   * Stops every running job of a deleted bot (SIGTERM, then SIGKILL after a grace period)
-   * and forgets them all; none reports back to its (deleted) session.
+   * Whether anything of the job's process group still runs: the leader may be gone while
+   * what it started lives on. (Windows has no process groups: the leader alone.)
+   */
+  const groupAlive = (job: Job) => {
+    const pid = job.process.pid;
+    if (pid === undefined) return false;
+    if (process.platform === "win32") return job.endedAt === null;
+    try {
+      process.kill(-pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
+  };
+  const signalGroup = (job: Job, signal: NodeJS.Signals) => {
+    const pid = job.process.pid;
+    if (pid === undefined) return;
+    try {
+      if (process.platform === "win32") job.process.kill(signal);
+      else process.kill(-pid, signal);
+    } catch {
+      // Already gone.
+    }
+  };
+  /** Polls until the job's whole process group is gone, or the time is up. */
+  const groupGone = (job: Job, ms: number) =>
+    Effect.gen(function* () {
+      for (const end = Date.now() + ms; groupAlive(job) && Date.now() < end; ) yield* Effect.sleep("25 millis");
+      return !groupAlive(job);
+    });
+
+  /**
+   * Stops every job of a deleted bot, with everything each one started: SIGTERM to the
+   * process group, then SIGKILL to whatever of it is left after a grace period (even when
+   * the leader itself exited). None reports back to its (deleted) session; all are forgotten.
    */
   const stopForBot = (botId: BotId) =>
     Effect.gen(function* () {
       const owned = [...jobs.values()].filter((j) => j.botId === botId);
       for (const job of owned) {
         job.orphaned = true;
-        kill(job, "SIGTERM");
+        if (groupAlive(job)) signalGroup(job, "SIGTERM");
       }
       yield* Effect.forEach(
         owned,
         (job) =>
-          Deferred.await(job.exited).pipe(
-            Effect.timeoutOption("3 seconds"),
-            Effect.flatMap((done) => {
-              if (Option.isSome(done)) return Effect.void;
-              kill(job, "SIGKILL");
-              return Deferred.await(job.exited).pipe(Effect.timeoutOption("2 seconds"), Effect.asVoid);
-            }),
-          ),
+          Effect.gen(function* () {
+            if (yield* groupGone(job, 3000)) return;
+            signalGroup(job, "SIGKILL");
+            yield* groupGone(job, 2000);
+          }),
         { concurrency: "unbounded", discard: true },
       );
       for (const job of owned) {
