@@ -2,6 +2,7 @@ import {
   type ClaudeAuth,
   type ProviderKind,
   isDownloaded,
+  LLAMACPP_MIN_CONTEXT_TOKENS,
   type LlamaCppMode,
   type ModelOption,
   type ProviderSettings,
@@ -214,6 +215,86 @@ function ManagedSummary() {
   );
 }
 
+const K = 1024;
+/** Context caps offered as presets; anything else is entered as a custom value. */
+const CONTEXT_PRESETS = [96 * K, 128 * K, 192 * K];
+
+/**
+ * How many tokens a local model session may use. Saved as soon as it changes (like the
+ * subagents switch), since it restarts a managed llama-server.
+ */
+function ContextLimit({
+  value,
+  managed,
+  onChange,
+}: {
+  value: number | null;
+  managed: boolean;
+  onChange: (value: number | null) => void;
+}) {
+  const preset = value === null ? "none" : CONTEXT_PRESETS.includes(value) ? String(value) : "custom";
+  const [custom, setCustom] = useState(preset === "custom");
+  const [typed, setTyped] = useState(value === null ? "" : String(Math.round(value / K)));
+  useEffect(() => {
+    if (value !== null) setTyped(String(Math.round(value / K)));
+    if (value !== null && !CONTEXT_PRESETS.includes(value)) setCustom(true);
+  }, [value]);
+  const min = LLAMACPP_MIN_CONTEXT_TOKENS / K;
+  const typedK = Number(typed);
+  const typedValid = Number.isInteger(typedK) && typedK >= min;
+  const commit = () => {
+    if (typedValid && typedK * K !== value) onChange(typedK * K);
+  };
+  return (
+    <Field
+      label="Context limit"
+      hint={
+        <>
+          Smaller: faster turns, earlier compaction{managed ? " and less memory for llama-server" : ""}. Too small: compacts
+          often. At least {min}k: Claude Code's own prompt is 30-40k tokens.{" "}
+          {managed ? "Saving restarts llama-server; open" : "Open"} sessions keep their limit until they restart.
+        </>
+      }
+    >
+      <div className="flex items-center gap-2">
+        <select
+          className={inputClass}
+          value={custom ? "custom" : preset}
+          onChange={(e) => {
+            const next = e.target.value;
+            if (next === "custom") return setCustom(true);
+            setCustom(false);
+            onChange(next === "none" ? null : Number(next));
+          }}
+        >
+          <option value="none">No limit: the model's full context</option>
+          {CONTEXT_PRESETS.map((n) => (
+            <option key={n} value={String(n)}>
+              {n / K}k tokens
+            </option>
+          ))}
+          <option value="custom">Custom…</option>
+        </select>
+        {custom ? (
+          <span className="flex shrink-0 items-center gap-1.5">
+            <input
+              className={cx(inputClass, "w-24 font-mono text-xs", typed && !typedValid ? "border-red-500/60" : "")}
+              inputMode="numeric"
+              value={typed}
+              onChange={(e) => setTyped(e.target.value.replace(/[^0-9]/g, ""))}
+              onBlur={commit}
+              onKeyDown={(e) => e.key === "Enter" && commit()}
+              placeholder={String(min)}
+              title={`Thousands of tokens (k = 1024), at least ${min}`}
+            />
+            <span className="text-xs text-zinc-500">k</span>
+          </span>
+        ) : null}
+      </div>
+    </Field>
+  );
+}
+
 export function ProvidersDialog({ onClose, onLocalModels }: { onClose: () => void; onLocalModels: () => void }) {
   const [settings, setSettings] = useState<ProviderSettings | null>(null);
   const [auth, setAuth] = useState<ClaudeAuth>("subscription");
@@ -375,6 +456,13 @@ export function ProvidersDialog({ onClose, onLocalModels }: { onClose: () => voi
               label="Let local models start subagents"
               description="Each subagent is another run of the local model at the same time. Off: they hand work to Apollo workers instead."
             />
+            <ContextLimit
+              value={settings.llamacpp.maxContextTokens}
+              managed={mode === "managed"}
+              onChange={(maxContextTokens) =>
+                run(() => rpc((c) => c["providers.updateSettings"]({ llamacpp: { maxContextTokens } })).then((next) => setSettings(next)))
+              }
+            />
             {mode === "managed" ? (
               <div className="flex items-center gap-3 rounded-lg border border-zinc-800 bg-zinc-900/50 py-2 pr-2 pl-3 text-xs">
                 <span className="min-w-0 flex-1">
@@ -388,8 +476,8 @@ export function ProvidersDialog({ onClose, onLocalModels }: { onClose: () => voi
               <>
                 <p className="text-[11px] text-zinc-500">
                   Start it with{" "}
-                  <span className="font-mono text-zinc-400">llama-server -m model.gguf --jinja -c 65536</span>: a context
-                  of 64k tokens or more.
+                  <span className="font-mono text-zinc-400">llama-server -m model.gguf --jinja -c 131072</span>: a context
+                  of 96k tokens or more (Claude Code needs about 65k before it compacts).
                 </p>
                 <Field label="Server address">
                   <input
