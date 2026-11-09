@@ -431,26 +431,27 @@ describe("database snapshots", () => {
 });
 
 describe("lock", () => {
-  const gen = (dir: string, n: number) => join(dir, `${String(n).padStart(12, "0")}.json`);
-  const owners = (dir: string) => readdirSync(dir).filter((e) => e.endsWith(".json")).sort();
+  const gen = (dir: string, n: number) => join(dir, `${n}.json`);
+  const entries = (dir: string) => readdirSync(dir).sort((a, b) => parseInt(a) - parseInt(b) || a.localeCompare(b));
+  const me = (pid: number) => ({ pid, startedAt: `t${pid}` });
 
-  it("one holder at a time; a dead or reused pid is stale; release frees it", () => {
+  it("one holder at a time; a dead or reused pid is stale; release frees it; nothing is ever deleted", () => {
     const dir = join(tmp("lock"), "install-app.lock");
     const alive = new Set([1, 2]);
     const isInstaller = (pid: number) => alive.has(pid);
-    expect(acquireLock(dir, { pid: 1, startedAt: "a" }, isInstaller)).toEqual({ ok: true, generation: 1, tookOver: null });
-    expect(acquireLock(dir, { pid: 2, startedAt: "b" }, isInstaller)).toEqual({ ok: false, holder: { pid: 1, startedAt: "a" }, state: "alive" });
-    expect(lockHolder(dir, isInstaller)).toEqual({ holder: { pid: 1, startedAt: "a" }, state: "alive" });
-    releaseLock(dir, 1, { pid: 2, startedAt: "b" });
-    expect(owners(dir)).toHaveLength(1);
+    expect(acquireLock(dir, me(1), isInstaller)).toEqual({ ok: true, generation: 1, tookOver: null });
+    expect(acquireLock(dir, me(2), isInstaller)).toEqual({ ok: false, holder: me(1), state: "alive" });
+    expect(lockHolder(dir, isInstaller)).toEqual({ holder: me(1), state: "alive" });
+    // Only the owner can release.
+    releaseLock(dir, 1, me(2));
+    expect(lockHolder(dir, isInstaller)).toEqual({ holder: me(1), state: "alive" });
     alive.delete(1);
     expect(lockHolder(dir, isInstaller)).toBeNull();
-    expect(acquireLock(dir, { pid: 2, startedAt: "b" }, isInstaller)).toEqual({ ok: true, generation: 2, tookOver: { pid: 1, startedAt: "a" } });
-    // The stale generation is tidied away.
-    expect(owners(dir)).toEqual(["000000000002.json"]);
-    releaseLock(dir, 2, { pid: 2, startedAt: "b" });
-    expect(owners(dir)).toEqual([]);
-    expect(acquireLock(dir, { pid: 1, startedAt: "c" }, () => true)).toMatchObject({ ok: true });
+    expect(acquireLock(dir, me(2), isInstaller)).toEqual({ ok: true, generation: 2, tookOver: me(1) });
+    releaseLock(dir, 2, me(2));
+    expect(lockHolder(dir, isInstaller)).toBeNull();
+    expect(acquireLock(dir, me(1), () => true)).toMatchObject({ ok: true, generation: 3 });
+    expect(entries(dir)).toEqual(["1.json", "2.json", "2.released", "3.json"]);
   });
 
   it("stale takeover race: two contenders that both see the dead owner cannot both win", () => {
@@ -463,27 +464,86 @@ describe("lock", () => {
     const hooked: FileOps = {
       ...realFileOps,
       publishExclusive: (path, text) => {
-        b ??= acquireLock(dir, { pid: 2, startedAt: "b" }, isInstaller);
+        b ??= acquireLock(dir, me(2), isInstaller);
         return realFileOps.publishExclusive(path, text);
       },
     };
-    const a = acquireLock(dir, { pid: 1, startedAt: "a" }, isInstaller, hooked);
-    expect(b).toMatchObject({ ok: true });
-    expect(a).toEqual({ ok: false, holder: { pid: 2, startedAt: "b" }, state: "alive" });
-    expect(owners(dir)).toEqual(["000000000002.json"]);
+    const a = acquireLock(dir, me(1), isInstaller, hooked);
+    expect(b).toMatchObject({ ok: true, generation: 2 });
+    expect(a).toEqual({ ok: false, holder: me(2), state: "alive" });
   });
 
-  it("a slow contender with an old view publishes below the owner, sees it, and withdraws", () => {
+  it("reviewer round 3 repro: a released number is never reused, so a paused contender cannot unseat a live owner", () => {
+    const dir = join(tmp("lock"), "install-app.lock");
+    mkdirSync(dir);
+    writeFileSync(gen(dir, 1), JSON.stringify({ pid: 999, startedAt: "dead" }));
+    const live = new Set([1, 2, 3]);
+    const isInstaller = (pid: number) => live.has(pid);
+    let b: ReturnType<typeof acquireLock> | null = null;
+    let c: ReturnType<typeof acquireLock> | null = null;
+    // A reads generation 1 (dead) and picks 2, then pauses before publishing. Meanwhile B takes
+    // the lock and releases it, and C takes it and keeps it.
+    const paused: FileOps = {
+      ...realFileOps,
+      publishExclusive: (path, text) => {
+        if (!b) {
+          b = acquireLock(dir, me(2), isInstaller);
+          expect(b.ok).toBe(true);
+          releaseLock(dir, (b as { generation: number }).generation, me(2));
+          c = acquireLock(dir, me(3), isInstaller);
+        }
+        return realFileOps.publishExclusive(path, text);
+      },
+    };
+    const a = acquireLock(dir, me(1), isInstaller, paused);
+    expect(c).toMatchObject({ ok: true });
+    // C still owns the lock; A is refused; C's lock file is intact.
+    expect(a).toEqual({ ok: false, holder: me(3), state: "alive" });
+    expect(lockHolder(dir, isInstaller)).toEqual({ holder: me(3), state: "alive" });
+    expect(existsSync(gen(dir, (c as unknown as { generation: number }).generation))).toBe(true);
+  });
+
+  it("same-generation collision after a release: the contender is refused", () => {
+    const dir = join(tmp("lock"), "install-app.lock");
+    let b: ReturnType<typeof acquireLock> | null = null;
+    let c: ReturnType<typeof acquireLock> | null = null;
+    const paused: FileOps = {
+      ...realFileOps,
+      publishExclusive: (path, text) => {
+        if (!b) {
+          b = acquireLock(dir, me(2), () => true);
+          releaseLock(dir, (b as { generation: number }).generation, me(2));
+          c = acquireLock(dir, me(3), () => true);
+        }
+        return realFileOps.publishExclusive(path, text);
+      },
+    };
+    const a = acquireLock(dir, me(1), () => true, paused);
+    expect(c).toMatchObject({ ok: true });
+    expect(a).toMatchObject({ ok: false, holder: me(3) });
+  });
+
+  it("a slow contender with an old view publishes below the owner, sees it, and gives its number up", () => {
     const dir = join(tmp("lock"), "install-app.lock");
     mkdirSync(dir);
     writeFileSync(gen(dir, 3), JSON.stringify({ pid: 9, startedAt: "dead" }));
     writeFileSync(gen(dir, 5), JSON.stringify({ pid: 5, startedAt: "owner" }));
     let calls = 0;
-    // Its first look predates the owner's generation 5 (and generation 4 was tidied away).
-    const stale: FileOps = { ...realFileOps, list: (d) => (calls++ === 0 ? ["000000000003.json"] : realFileOps.list(d)) };
-    const r = acquireLock(dir, { pid: 2, startedAt: "slow" }, (pid) => pid === 5 || pid === 2, stale);
+    // Its first look predates the owner's generation 5.
+    const stale: FileOps = { ...realFileOps, list: (d) => (calls++ === 0 ? ["3.json"] : realFileOps.list(d)) };
+    const r = acquireLock(dir, me(2), (pid) => pid === 5 || pid === 2, stale);
     expect(r).toEqual({ ok: false, holder: { pid: 5, startedAt: "owner" }, state: "alive" });
-    expect(existsSync(gen(dir, 4))).toBe(false);
+    expect(existsSync(gen(dir, 4))).toBe(true);
+    expect(existsSync(join(dir, "4.released"))).toBe(true);
+  });
+
+  it("numbers are not bounded by a width", () => {
+    const dir = join(tmp("lock"), "install-app.lock");
+    mkdirSync(dir);
+    writeFileSync(gen(dir, 999999999999), JSON.stringify({ pid: 999, startedAt: "dead" }));
+    const isInstaller = (pid: number) => pid !== 999;
+    expect(acquireLock(dir, me(1), isInstaller)).toMatchObject({ ok: true, generation: 1000000000000 });
+    expect(acquireLock(dir, me(2), isInstaller)).toMatchObject({ ok: false, holder: me(1) });
   });
 
   it("an owner that cannot be checked, or a lock file that cannot be read, counts as held", () => {
@@ -493,11 +553,11 @@ describe("lock", () => {
     const cannotTell = () => {
       throw new Error("ps: EPERM");
     };
-    expect(acquireLock(dir, { pid: 1, startedAt: "a" }, cannotTell)).toEqual({ ok: false, holder: { pid: 7, startedAt: "x" }, state: "unknown" });
+    expect(acquireLock(dir, me(1), cannotTell)).toEqual({ ok: false, holder: { pid: 7, startedAt: "x" }, state: "unknown" });
     expect(lockHolder(dir, cannotTell)).toEqual({ holder: { pid: 7, startedAt: "x" }, state: "unknown" });
     writeFileSync(gen(dir, 2), "");
-    expect(acquireLock(dir, { pid: 1, startedAt: "a" }, () => false)).toEqual({ ok: false, holder: null, state: "unknown" });
-    expect(owners(dir)).toEqual(["000000000001.json", "000000000002.json"]);
+    expect(acquireLock(dir, me(1), () => false)).toEqual({ ok: false, holder: null, state: "unknown" });
+    expect(entries(dir)).toEqual(["1.json", "2.json"]);
   });
 
   it("publishing is atomic and exclusive, and leaves no temporary files", () => {
@@ -643,7 +703,7 @@ describe("install-app.ts --dry-run (real script, temporary data directory)", () 
     const dir = tmp("dry");
     mkdirSync(join(dir, "install-app.lock"));
     // This test runner is alive, so only ps can say whether it is install:app; ps fails.
-    writeFileSync(join(dir, "install-app.lock", "000000000001.json"), JSON.stringify({ pid: process.pid, startedAt: "x" }));
+    writeFileSync(join(dir, "install-app.lock", "1.json"), JSON.stringify({ pid: process.pid, startedAt: "x" }));
     expect(withPs("exit 1", dir).stdout).toMatch(new RegExp(`Refuse: the install lock is held by pid ${process.pid}, and whether it still runs cannot be told`));
   });
 

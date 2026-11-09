@@ -175,7 +175,7 @@ const world = (o: {
     running: w.app?.spec.name ?? null,
     db: existsSync(dbPath) ? dbVersion(dbPath) : null,
     marker: existsSync(join(data, "install-app.pending.json")) ? (JSON.parse(readFileSync(join(data, "install-app.pending.json"), "utf8")) as { phase: string }).phase : null,
-    lock: existsSync(join(data, "install-app.lock")) && readdirSync(join(data, "install-app.lock")).some((e) => e.endsWith(".json")),
+    lock: realFileOps.list(join(data, "install-app.lock")).some((e) => e.endsWith(".json") && !existsSync(join(data, "install-app.lock", e.replace(".json", ".released")))),
   });
   const result = () => JSON.parse(readFileSync(join(data, "logs", "install-app-last.result"), "utf8")) as InstallResult;
   return { w, deps, state, result, makeBundle };
@@ -560,7 +560,7 @@ describe("one install at a time (P1-4)", () => {
     const { w, deps, state } = world({});
     w.installers.add(77);
     mkdirSync(join(w.data, "install-app.lock"));
-    writeFileSync(join(w.data, "install-app.lock", "000000000001.json"), JSON.stringify({ pid: 77, startedAt: "earlier" }));
+    writeFileSync(join(w.data, "install-app.lock", "1.json"), JSON.stringify({ pid: 77, startedAt: "earlier" }));
     const r = await runInstall(deps());
     expect(r.status).toBe("aborted");
     expect(r.error).toMatch(/pid 77/);
@@ -572,7 +572,7 @@ describe("one install at a time (P1-4)", () => {
   it("a stale lock (process gone, or no longer an installer) is taken over", async () => {
     const { w, deps } = world({});
     mkdirSync(join(w.data, "install-app.lock"));
-    writeFileSync(join(w.data, "install-app.lock", "000000000001.json"), JSON.stringify({ pid: 77, startedAt: "earlier" }));
+    writeFileSync(join(w.data, "install-app.lock", "1.json"), JSON.stringify({ pid: 77, startedAt: "earlier" }));
     expect((await runInstall(deps())).status).toBe("ok");
     expect(w.logs.some((l) => /stale lock \(pid 77/.test(l))).toBe(true);
   });
@@ -821,5 +821,110 @@ describe("round 3: malformed snapshot metadata is skipped, not fatal", () => {
     expect(r.status).toBe("rolled-back");
     expect(w.logs.some((l) => /malformed/.test(l))).toBe(true);
     expect(state()).toMatchObject({ running: "old", db: 18 });
+  });
+});
+
+describe("round 4: reviewer round-3 repros (acceptance)", () => {
+  it("P1-2: a legacy build (no build-info) is not opened over a restored newer snapshot without --force; the marker stays", async () => {
+    // No active DB, no Apollo.app, previous = legacy schema-18 build without build-info,
+    // a valid retained schema-20 snapshot, no --force.
+    const env = world({ installed: null, previous: { name: "old", schema: 18, health: "good", info: false }, db: null, running: false });
+    const { w, deps, state } = env;
+    const src = join(w.root, "s20");
+    mkdirSync(src);
+    makeDb(join(src, "apollo.db"), 20);
+    takeSnapshot({ dbPath: join(src, "apollo.db"), backupsDir: join(w.data, "backups"), label: "s", now: 1 });
+    const r = await runInstall(deps());
+    expect(r.status).toBe("failed");
+    expect(r.error).toMatch(/does not say which database schema it reads/);
+    expect(r.manual).toBeTruthy();
+    expect(w.opens).toBe(0);
+    expect(state()).toMatchObject({ target: "old", running: null, marker: "rolling-back" });
+    // The override is explicit: with --force the same state is opened.
+    const forced = await runInstall({ ...deps(2), env: { ...deps(2).env, options: parseArgs(["--force"]) } });
+    expect(forced.status).toBe("rolled-back");
+    expect(state()).toMatchObject({ running: "old", marker: null });
+  });
+
+  it("P1-2: the same gate holds when the snapshot is restored onto a build that declares an older schema", async () => {
+    const env = world({ installed: null, previous: { name: "old", schema: 18, health: "good" }, db: null, running: false });
+    const src = join(env.w.root, "s20");
+    mkdirSync(src);
+    makeDb(join(src, "apollo.db"), 20);
+    takeSnapshot({ dbPath: join(src, "apollo.db"), backupsDir: join(env.w.data, "backups"), label: "s", now: 1 });
+    const r = await runInstall(env.deps());
+    expect(r.status).toBe("failed");
+    expect(env.w.opens).toBe(0);
+    expect(env.state()).toMatchObject({ marker: "rolling-back" });
+  });
+
+  it("P1-3: snapshots that cannot be listed are not 'no snapshots': nothing is opened, fresh state is not created, the marker stays", async () => {
+    // Pending new schema-19 build matching the marker, previous old schema-18, active DB missing,
+    // a valid retained schema-18 snapshot, marker phase verifying with no snapshot; listing the
+    // backups directory fails with EACCES.
+    const env = world({ running: false, db: 18 });
+    const { w, makeBundle, deps, state } = env;
+    const backups = join(w.data, "backups");
+    takeSnapshot({ dbPath: w.dbPath, backupsDir: backups, label: "pre", now: 50 });
+    realFileOps.remove(w.dbPath);
+    const info = makeBundle(w.bundles.staged, { name: "new", schema: 19, health: "good" });
+    realFileOps.rename(w.bundles.target, w.bundles.previous);
+    realFileOps.rename(w.bundles.staged, w.bundles.target);
+    writeFileSync(
+      join(w.data, "install-app.pending.json"),
+      JSON.stringify({ phase: "verifying", startedAt: "x", pid: 9, snapshot: null, previousSchema: 18, newBuild: `${info.commit}@${info.builtAt}` }),
+    );
+    w.faults.push((op, [path]) => op === "list" && path === backups);
+    const r = await runInstall(deps());
+    expect(r.status).toBe("failed");
+    expect(r.error).toMatch(/cannot be listed/);
+    expect(r.manual).toBeTruthy();
+    expect(w.opens).toBe(0);
+    expect(state()).toMatchObject({ target: "new", previous: "old", running: null, db: null, marker: "verifying" });
+    // Once the directory is readable, the retry restores the snapshot rather than starting fresh.
+    w.faults.length = 0;
+    const again = await runInstall(deps(2));
+    expect(again).toMatchObject({ status: "ok", stage: "resumed" });
+    expect(w.logs.some((l) => /Database restored from/.test(l))).toBe(true);
+    expect(state()).toMatchObject({ running: "new", db: 19, marker: null });
+  });
+
+  it("P1-3: an unreadable backup list with a database present and compatible changes nothing about it", async () => {
+    const { w, deps, state } = world({});
+    w.faults.push((op, [path]) => op === "list" && path === join(w.data, "backups"));
+    // Normal install: pruning cannot list either, which is only logged.
+    expect((await runInstall(deps())).status).toBe("ok");
+    expect(state()).toMatchObject({ target: "new", running: "new" });
+  });
+});
+
+describe("round 4: the gate checks the database actually opened, on every branch", () => {
+  it("a database that changes between the restore decision and the open is caught by the final check", async () => {
+    const env = world({ running: false, db: 18 });
+    const { w, makeBundle, deps, state } = env;
+    const info = makeBundle(w.bundles.staged, { name: "new", schema: 19, health: "good" });
+    realFileOps.rename(w.bundles.target, w.bundles.previous);
+    realFileOps.rename(w.bundles.staged, w.bundles.target);
+    writeFileSync(join(w.data, "install-app.pending.json"), JSON.stringify({ phase: "verifying", startedAt: "x", pid: 9, snapshot: null, previousSchema: 18, newBuild: `${info.commit}@${info.builtAt}` }));
+    const d = deps();
+    let reads = 0;
+    // The first look sees schema 18; by the time it is about to open, something wrote schema 20.
+    const sqlite = { ...d.sqlite, inspect: (p: string) => (p === w.dbPath && ++reads >= 2 ? { version: 20, ok: true } : d.sqlite.inspect(p)) };
+    const r = await runInstall({ ...d, sqlite });
+    expect(r.status).toBe("failed");
+    expect(r.error).toMatch(/schema 20, newer than/);
+    expect(w.opens).toBe(0);
+    expect(state()).toMatchObject({ marker: "verifying" });
+  });
+
+  it("an in-run rollback to a legacy build (no build-info) is not opened over the database the new build created", async () => {
+    // Not running and no database before: nothing tells which schema the old build reads.
+    const { w, deps, state } = world({ installed: { name: "old", schema: 18, health: "good", info: false }, db: null, running: false, next: { name: "new", schema: 19, health: "bad" } });
+    const r = await runInstall(deps());
+    expect(r.status).toBe("failed");
+    expect(r.error).toMatch(/does not say which database schema it reads/);
+    expect(state()).toMatchObject({ target: "old", running: null, db: 19, marker: "rolling-back" });
+    // Only the new build was ever opened.
+    expect(w.opens).toBeGreaterThan(0);
   });
 });

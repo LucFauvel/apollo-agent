@@ -339,21 +339,27 @@ const restoreDatabase = (
   const { d } = run;
   const { dbPath, backupsDir } = d.env;
   const current = d.sqlite.inspect(dbPath);
-  let retained: Array<string> = [];
+  // null: the backups could not be listed. That is never "there are none".
+  let retained: Array<string> | null;
   try {
     retained = listSnapshots(backupsDir, d.files).map((s) => s.dir);
   } catch (e) {
-    d.log(`  (cannot list snapshots: ${message(e)})`);
+    d.log(`  (cannot list snapshots in ${backupsDir}: ${message(e)})`);
+    retained = null;
+  }
+  if (current === null && o.restoreMissing === true && !o.interrupted && retained === null && run.snapshot === null) {
+    // Fresh state is only right when there is provably nothing to restore.
+    return { ok: false, error: `the database is missing and the snapshots in ${backupsDir} cannot be listed, so it cannot be told whether one should be restored` };
   }
   // A missing database is only "fresh state" when there is nothing to restore.
   const needed =
     current === null
-      ? o.interrupted || (o.restoreMissing === true && (retained.length > 0 || run.snapshot !== null))
+      ? o.interrupted || (o.restoreMissing === true && ((retained?.length ?? 0) > 0 || run.snapshot !== null))
       : o.interrupted || !current.ok || (schema !== null && current.version > schema);
   if (schema === null) d.log("  (the restored build does not say which schema it reads)");
   const candidates = [
     ...(run.snapshot && (o.rollback || needed) ? [run.snapshot] : []),
-    ...(needed ? retained.filter((dir) => dir !== run.snapshot) : []),
+    ...(needed ? (retained ?? []).filter((dir) => dir !== run.snapshot) : []),
   ];
   for (const dir of candidates) {
     const check = validateSnapshot(dir, d.files, d.sqlite);
@@ -381,6 +387,7 @@ const restoreDatabase = (
     return { ok: true };
   }
   const what = current === null ? "missing" : !current.ok ? "unreadable" : `at schema ${current.version}`;
+  if (retained === null) return { ok: false, error: `the database is ${what}, and the snapshots in ${backupsDir} cannot be listed to find one to restore` };
   return { ok: false, error: `the database is ${what} and no checked snapshot the build (schema ${schema ?? "unknown"}) can read exists` };
 };
 
@@ -390,10 +397,35 @@ const restoreDatabase = (
  */
 const ensureDatabase = (run: Run, schema: number | null, o: { readonly rollback: boolean; readonly interrupted: boolean }): DbOutcome => {
   const { d } = run;
-  if (schema === null && d.sqlite.inspect(d.env.dbPath) !== null && !d.env.options.force) {
-    return { ok: false, error: `${run.b.target} does not say which database schema it reads, so it is not opened over the current database (use --force if you know it is compatible)` };
+  const unknownSchema = `${run.b.target} does not say which database schema it reads, so it is not opened over`;
+  if (schema === null && !d.env.options.force) {
+    // Nothing can be checked against an unknown schema: only "no database, and provably
+    // nothing to restore" may go ahead without --force. Refuse before changing anything.
+    if (d.sqlite.inspect(d.env.dbPath) !== null) return { ok: false, error: `${unknownSchema} the current database (use --force if you know it is compatible)` };
+    let nothingToRestore = false;
+    try {
+      nothingToRestore = run.snapshot === null && listSnapshots(d.env.backupsDir, d.files).length === 0;
+    } catch (e) {
+      d.log(`  (cannot list snapshots: ${message(e)})`);
+    }
+    if (!nothingToRestore) return { ok: false, error: `${unknownSchema} a restored snapshot (use --force if you know it is compatible)` };
+    return { ok: true };
   }
-  return restoreDatabase(run, schema, { ...o, restoreMissing: true });
+  const restored = restoreDatabase(run, schema, { ...o, restoreMissing: true });
+  if (!restored.ok) return restored;
+  // The one gate, on the database that will actually be opened (as it is now, after any restore).
+  const final = d.sqlite.inspect(d.env.dbPath);
+  if (final === null) return { ok: true };
+  if (!final.ok) return { ok: false, error: `the database at ${d.env.dbPath} is not readable` };
+  if (schema === null) {
+    if (d.env.options.force) {
+      d.log(`  ${run.b.target} does not say which schema it reads; opening it over schema ${final.version} anyway (--force)`);
+      return { ok: true };
+    }
+    return { ok: false, error: `${unknownSchema} a database at schema ${final.version} (use --force if you know it is compatible)` };
+  }
+  if (final.version > schema) return { ok: false, error: `the database is at schema ${final.version}, newer than ${run.b.target} (schema ${schema})` };
+  return { ok: true };
 };
 
 /** Before the swap (Apollo stopped, nothing moved): put Apollo back as it was. */
@@ -436,7 +468,7 @@ const rollback = async (run: Run, reason: string, progress: SwapProgress): Promi
     } else {
       return run.finish("failed", `${reason}, and no app bundle is left`, run.manual());
     }
-    const db = restoreDatabase(run, run.previousSchema ?? bundleSchema(d.files, b.target), { rollback: true, interrupted: false });
+    const db = ensureDatabase(run, run.previousSchema ?? bundleSchema(d.files, b.target), { rollback: true, interrupted: false });
     if (!db.ok) return run.finish("failed", `${reason}; the previous build is back, but ${db.error}. Nothing was opened.`, run.manual());
     run.clearMarker();
     run.at("rollback-relaunch");

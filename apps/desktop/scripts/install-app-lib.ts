@@ -556,14 +556,18 @@ export type LockState = "alive" | "gone" | "unknown";
 export type IsInstaller = (pid: number) => boolean;
 
 /**
- * The lock is a directory of numbered generations, `<n>.json`, each published atomically
- * (whole, and only if that number is free). The highest generation is the current owner,
- * if it is alive. Taking over never deletes the current lock: the taker publishes the next
- * number, which only one contender can do, then checks nobody published above it (a slow
- * contender can only publish below the owner, sees it, and backs off).
+ * The lock is a directory of numbered generations. Nothing in it is ever deleted or
+ * overwritten, so a number, once used, can never be handed out again:
+ * - `<n>.json` is published atomically (whole, and only if that name is free) by the owner of n;
+ * - `<n>.released` is published when that owner is done (or withdraws).
+ * The owner is the highest n, unless it is released or its process is gone. To take over,
+ * a contender publishes highest+1: only one contender can, and then checks no higher number
+ * exists (one with a stale view finds the owner above it, releases its own number, and
+ * looks again). There is no cleanup: a few bytes per install.
  */
-const GENERATION = /^(\d{12})\.json$/;
-const generationFile = (dir: string, n: number) => join(dir, `${String(n).padStart(12, "0")}.json`);
+const GENERATION = /^(\d+)\.json$/;
+const generationFile = (dir: string, n: number) => join(dir, `${n}.json`);
+const releasedFile = (dir: string, n: number) => join(dir, `${n}.released`);
 const generations = (dir: string, files: FileOps) =>
   files
     .list(dir)
@@ -571,17 +575,18 @@ const generations = (dir: string, files: FileOps) =>
       const match = GENERATION.exec(entry);
       return match ? [Number(match[1])] : [];
     })
+    .filter((n) => Number.isSafeInteger(n))
     .sort((a, b) => a - b);
 
 const inspectGeneration = (dir: string, n: number, isInstaller: IsInstaller, files: FileOps): { readonly holder: LockHolder | null; readonly state: LockState } => {
-  const path = generationFile(dir, n);
+  if (files.exists(releasedFile(dir, n))) return { holder: null, state: "gone" };
   let holder: LockHolder;
   try {
-    holder = JSON.parse(files.readText(path)) as LockHolder;
+    holder = JSON.parse(files.readText(generationFile(dir, n))) as LockHolder;
     if (typeof holder?.pid !== "number") throw new Error("no pid");
   } catch {
-    // Published whole, so unreadable means released just now, or damaged: then refuse.
-    return { holder: null, state: files.exists(path) ? "unknown" : "gone" };
+    // Published whole and never removed: unreadable means damaged. Refuse rather than guess.
+    return { holder: null, state: "unknown" };
   }
   try {
     return { holder, state: isInstaller(holder.pid) ? "alive" : "gone" };
@@ -610,8 +615,7 @@ export const acquireLock = (dir: string, me: LockHolder, isInstaller: IsInstalle
   files.mkdir(dir);
   const text = `${JSON.stringify(me)}\n`;
   for (let attempt = 0; attempt < 10; attempt++) {
-    const seen = generations(dir, files);
-    const top = seen.at(-1) ?? 0;
+    const top = generations(dir, files).at(-1) ?? 0;
     let tookOver: LockHolder | null = null;
     if (top > 0) {
       const view = inspectGeneration(dir, top, isInstaller, files);
@@ -619,26 +623,27 @@ export const acquireLock = (dir: string, me: LockHolder, isInstaller: IsInstalle
       tookOver = view.holder;
     }
     const mine = top + 1;
+    if (!Number.isSafeInteger(mine)) throw new Error(`The lock in ${dir} has run out of numbers`);
     // Someone else published this number first: look again.
     if (!files.publishExclusive(generationFile(dir, mine), text)) continue;
     if (generations(dir, files).some((n) => n > mine)) {
-      // Published below the current owner (a stale view): withdraw.
-      files.remove(generationFile(dir, mine));
+      // Published below the current owner (a stale view): give the number up, for good.
+      files.publishExclusive(releasedFile(dir, mine), text);
       continue;
     }
-    // Lower generations belong to owners that are gone; tidy them.
-    for (const n of seen) if (n < mine) files.remove(generationFile(dir, n));
     return { ok: true, generation: mine, tookOver };
   }
   throw new Error(`Could not take the lock in ${dir}: too much contention`);
 };
 
+/** Marks our generation released. Nothing is deleted, so its number is never reused. */
 export const releaseLock = (dir: string, generation: number, me: LockHolder, files: FileOps = realFileOps): void => {
-  const path = generationFile(dir, generation);
   try {
-    if ((JSON.parse(files.readText(path)) as LockHolder).pid === me.pid) files.remove(path);
+    if ((JSON.parse(files.readText(generationFile(dir, generation))) as LockHolder).pid === me.pid) {
+      files.publishExclusive(releasedFile(dir, generation), `${JSON.stringify(me)}\n`);
+    }
   } catch {
-    // gone
+    // not ours
   }
 };
 
