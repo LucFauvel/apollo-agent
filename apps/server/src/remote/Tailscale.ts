@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,8 @@ import type { TailnetPeer } from "./TailnetPeer.ts";
 /** HTTPS port on the tailnet; not 443, so it never clashes with anything else on the node. */
 export const TAILNET_PORT = Number(process.env.APOLLO_TAILNET_PORT) || 8443;
 const SETTING = "remote.tailscale";
+/** The node's machine name on the tailnet, chosen once and then kept (see `machineName`). */
+const HOSTNAME_SETTING = "remote.tailscale.hostname";
 /** How often the node's state is re-read while it runs (login finished, reconnects). */
 const REFRESH_INTERVAL = "5 seconds";
 
@@ -59,14 +62,38 @@ const loadAddon = (path: string | undefined): { addon: Addon | null; problem: st
 const loopback = (address: string | undefined) =>
   address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
 
-/** A tailnet machine name from this computer's name: `Luc's MacBook.local` → `apollo-lucs-macbook`. */
-const nodeHostname = () =>
-  `apollo-${hostname()
-    .replace(/\.local$/, "")
+/**
+ * This computer's name as its user set it. On macOS, `os.hostname()` follows the network
+ * (a DHCP or reverse-DNS name such as `mac-lan` on one network, the Sharing name on
+ * another), so the Sharing "Local hostname" is read instead.
+ */
+const computerName = () => {
+  if (process.platform === "darwin") {
+    try {
+      const name = execFileSync("/usr/sbin/scutil", ["--get", "LocalHostName"], { encoding: "utf8", timeout: 2000 }).trim();
+      if (name) return name;
+    } catch {
+      // No LocalHostName set: fall back to the host name.
+    }
+  }
+  return hostname();
+};
+
+/** A tailnet machine name from a computer name: `Luc's MacBook.local` → `apollo-lucs-macbook`. */
+export const nodeHostname = (name: string) =>
+  `apollo-${name
+    .replace(/\.local$/i, "")
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 40) || "desktop"}`;
+    .slice(0, 40)
+    .replace(/^-+|-+$/g, "") || "desktop"}`;
+
+/**
+ * Whether Apollo announces `name` as its machine name: one lowercase DNS label, which
+ * every `nodeHostname` result is. Names read back (the saved setting, the node's own
+ * state) must pass it too, so a malformed one is never kept.
+ */
+export const isMachineName = (name: string) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name);
 
 /**
  * Publishes Apollo to the user's tailnet through a Tailscale node that runs inside this
@@ -98,8 +125,39 @@ const make = Effect.gen(function* () {
 
   const urlFor = (dnsName: string) => `https://${dnsName}:${TAILNET_PORT}`;
 
-  const startNode = () =>
-    invoke<NodeStatus>("start", { dir: stateDir, hostname: nodeHostname(), port: TAILNET_PORT, upstreamPort: config.port });
+  /**
+   * The node's machine name, chosen the first time and then kept. Tailscale renames the
+   * machine (and its DNS name) to whatever name the node announces at start, and paired
+   * phones reach Apollo at the DNS name from their QR code: a name that followed the
+   * network would strand them after the next restart (an update, a reboot).
+   *
+   * The first choice keeps the name an existing node already announces (phones may be
+   * paired at it); only a node that never signed in gets one from the computer's name.
+   * A saved or announced name that is not a valid machine name is never kept: it is
+   * replaced as if absent, so a bad value saved once does not stick.
+   * If the existing name cannot be read, this start announces what Apollo used to
+   * (`os.hostname()`), and nothing is saved, so the next start tries again.
+   */
+  const machineName = Effect.gen(function* () {
+    const saved = yield* store.getSetting(HOSTNAME_SETTING);
+    if (saved && isMachineName(saved)) return saved;
+    const existing = yield* Effect.promise(() =>
+      invoke<{ readonly hostname?: string | null }>("savedHostname", { dir: stateDir }).then(
+        (result) => ({ ok: true as const, hostname: typeof result?.hostname === "string" ? result.hostname : null }),
+        () => ({ ok: false as const, hostname: null }),
+      ),
+    );
+    if (!existing.ok) return nodeHostname(hostname());
+    // Surrounding whitespace is not part of the name the tailnet knows the node by: keep
+    // the name itself, so a padded value does not rename the machine and strand phones.
+    const announced = existing.hostname?.trim() ?? null;
+    const chosen = announced !== null && isMachineName(announced) ? announced : nodeHostname(computerName());
+    yield* store.setSetting(HOSTNAME_SETTING, chosen);
+    return chosen;
+  });
+
+  const startNode = (name: string) =>
+    invoke<NodeStatus>("start", { dir: stateDir, hostname: name, port: TAILNET_PORT, upstreamPort: config.port });
 
   /** Re-reads the node's state; `null` when the node is not running. */
   const refresh = async () => {
@@ -149,7 +207,8 @@ const make = Effect.gen(function* () {
         if (!addon) return yield* new ApolloError({ code: "invalid", message: problem ?? "Tailscale support is not available" });
         // Saved first: a node waiting for its first login keeps going, and is started again after a restart.
         yield* store.setSetting(SETTING, "on");
-        node = yield* Effect.tryPromise({ try: startNode, catch: (e) => fail(`Could not start Tailscale: ${(e as Error).message}`) });
+        const name = yield* machineName;
+        node = yield* Effect.tryPromise({ try: () => startNode(name), catch: (e) => fail(`Could not start Tailscale: ${(e as Error).message}`) });
       } else {
         yield* store.setSetting(SETTING, null);
         if (addon) yield* Effect.promise(() => invoke("stop").catch(() => undefined));
@@ -173,7 +232,8 @@ const make = Effect.gen(function* () {
   yield* Effect.gen(function* () {
     if (addon && (yield* enabledSetting)) {
       if (node.state === "NoState") {
-        node = yield* Effect.promise(() => startNode().catch((error: Error) => ({ ...STOPPED, error: error.message })));
+        const name = yield* machineName;
+        node = yield* Effect.promise(() => startNode(name).catch((error: Error) => ({ ...STOPPED, error: error.message })));
         lastError = node.error;
       } else {
         yield* Effect.promise(refresh);
