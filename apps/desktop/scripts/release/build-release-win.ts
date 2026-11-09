@@ -30,7 +30,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BuildInfo } from "../install-app-lib.ts";
-import { type CodeSigning, describeAsset, formatSums, type Manifest, MANIFEST_FORMAT, partialManifestName, SUMS_NAME } from "./manifest.ts";
+import { type CodeSigning, describeAsset, expectedAssetName, formatSums, type Manifest, MANIFEST_FORMAT, partialManifestName, SUMS_NAME } from "./manifest.ts";
 import { peMachine } from "./pe.ts";
 
 const desktopDir = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -136,7 +136,7 @@ if (info.commit !== commit) problems.push(`build-info commit ${info.commit} != $
 if (info.arch !== arch) problems.push(`build-info arch ${info.arch} != ${arch}`);
 if (info.dirty) problems.push("the working tree was dirty when build-info.json was written");
 const staging = mkdtempSync(join(tmpdir(), "apollo-release-win-"));
-const name = `Apollo-${version}-win-${arch}${codeSigning.kind === "unsigned" ? "-unsigned" : ""}-setup.exe`;
+const name = expectedAssetName(version, { platform: "win32", arch, kind: "nsis", codeSigning });
 const setupPath = join(staging, name);
 copyFileSync(join(builderOut, installer), setupPath);
 const authenticode = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", `(Get-AuthenticodeSignature -LiteralPath '${setupPath.replaceAll("'", "''")}').Status`], {

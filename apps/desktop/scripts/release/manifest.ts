@@ -23,6 +23,26 @@ export type AssetKind = "zip" | "dmg" | "nsis";
 /** Every release must carry exactly these platform/arch targets. */
 export const RELEASE_TARGETS: ReadonlyArray<`${Platform}-${string}`> = ["darwin-arm64", "win32-x64", "win32-arm64"];
 
+/**
+ * The one file name an asset may have, derived from what the manifest says it is: version,
+ * platform, arch, kind and signing. Builders name their files with it and every gate (merge,
+ * sign, promote) requires it, so a name can never disagree with its manifest entry, and an
+ * unsigned/ad-hoc file always says so in its name (the double marking):
+ *   macOS    Apollo-<version>-<arch>[-adhoc].<zip|dmg>
+ *   Windows  Apollo-<version>-win-<arch>[-unsigned]-setup.exe
+ */
+export const expectedAssetName = (version: string, a: Pick<ManifestAsset, "platform" | "arch" | "kind" | "codeSigning">): string =>
+  a.platform === "darwin"
+    ? `Apollo-${version}-${a.arch}${a.codeSigning.kind === "adhoc" ? "-adhoc" : ""}.${a.kind}`
+    : `Apollo-${version}-win-${a.arch}${a.codeSigning.kind === "unsigned" ? "-unsigned" : ""}-setup.exe`;
+
+/** Every asset whose name is not exactly expectedAssetName() of its own manifest entry. */
+export const assetNameProblems = (m: Pick<Manifest, "version" | "assets">): Array<string> =>
+  m.assets.flatMap((a) => {
+    const expected = expectedAssetName(m.version, a);
+    return a.name === expected ? [] : [`${a.name}: name disagrees with its entry (${a.platform}-${a.arch} ${a.kind}, ${a.codeSigning.kind}, version ${m.version}); expected ${expected}`];
+  });
+
 /** Name of a platform build's partial manifest, e.g. apollo-update.win32-x64.json. */
 export const partialManifestName = (platform: Platform, arch: string) => `apollo-update.${platform}-${arch}.json`;
 
@@ -173,6 +193,7 @@ export const mergeManifests = (parts: ReadonlyArray<Manifest>, required?: Readon
       seenNames.add(a.name);
     }
   }
+  for (const part of parts) problems.push(...assetNameProblems(part));
   if (required) {
     for (const t of required) if (!seenTargets.has(t)) problems.push(`missing build for ${t}`);
     for (const t of seenTargets) if (!required.includes(t)) problems.push(`unexpected build for ${t}`);
@@ -206,8 +227,8 @@ export const compareAssets = (
     else if (listed !== actual.sha256) problems.push(`${asset.name}: sha256 ${actual.sha256} != ${SUMS_NAME} ${listed}`);
   }
   const known = new Set([...manifest.assets.map((a) => a.name), MANIFEST_NAME, SUMS_NAME, SIGNATURE_NAME]);
-  // Each asset's name carries the manifest's version: no file of another build slips in.
-  for (const asset of manifest.assets) if (!asset.name.includes(`-${manifest.version}-`)) problems.push(`${asset.name}: name does not carry version ${manifest.version}`);
+  // Each name is exactly what its entry says it is (version, platform, arch, kind, signing).
+  problems.push(...assetNameProblems(manifest));
   for (const name of recomputed.keys()) if (!known.has(name)) problems.push(`${name}: in the release but not in the manifest`);
   for (const name of sums.keys()) if (!manifest.assets.some((a) => a.name === name)) problems.push(`${name}: in ${SUMS_NAME} but not in the manifest`);
   return problems;

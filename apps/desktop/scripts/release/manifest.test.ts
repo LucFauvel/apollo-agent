@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  assetNameProblems,
   compareAssets,
+  expectedAssetName,
   formatSums,
   type Manifest,
   type ManifestAsset,
@@ -175,6 +177,57 @@ describe("compareAssets", () => {
     const f = files();
     f.delete("Apollo-0.4.0-arm64.dmg");
     f.set("Apollo-0.3.9-arm64.dmg", { size: 20, sha256: h("2") });
-    expect(compareAssets(stale, parseSums(formatSums(stale.assets)), f).join("\n")).toMatch(/Apollo-0.3.9-arm64.dmg: name does not carry version 0.4.0/);
+    expect(compareAssets(stale, parseSums(formatSums(stale.assets)), f).join("\n")).toMatch(/Apollo-0.3.9-arm64.dmg: name disagrees with its entry.*expected Apollo-0.4.0-arm64.dmg/);
+  });
+});
+
+/**
+ * The reviewer's P2-1 probes: file names that disagree with their manifest entry, with hashes
+ * kept self-consistent so only the name rule can catch them. Each must be refused by the pure
+ * merge, by compareAssets (merge CLI + verify-release) and by checkRelease.
+ */
+describe("asset names must be exactly what their entry says", () => {
+  const rename = (m: Manifest, from: string, to: string): Manifest => ({ ...m, assets: m.assets.map((a) => (a.name === from ? { ...a, name: to } : a)) });
+  const probes: Array<[string, (parts: Array<Manifest>) => Array<Manifest>, RegExp]> = [
+    [
+      "unsigned installers without the -unsigned marking",
+      (p) => p.map((m) => ({ ...m, assets: m.assets.map((a) => ({ ...a, name: a.name.replace("-unsigned", "") })) })),
+      /Apollo-0.4.0-win-x64-setup.exe: name disagrees.*unsigned.*expected Apollo-0.4.0-win-x64-unsigned-setup.exe/,
+    ],
+    [
+      "an x64 file name on the arm64 entry",
+      (p) => [p[0]!, p[1]!, rename(p[2]!, "Apollo-0.4.0-win-arm64-unsigned-setup.exe", "Apollo-0.4.0-win-x64-second-unsigned-setup.exe")],
+      /win-x64-second-unsigned-setup.exe: name disagrees.*win32-arm64.*expected Apollo-0.4.0-win-arm64-unsigned-setup.exe/,
+    ],
+    [
+      "nightly-looking file names under release metadata (the release version is a substring)",
+      (p) => p.map((m) => ({ ...m, assets: m.assets.map((a) => ({ ...a, name: a.name.replace("Apollo-0.4.0-", "Apollo-0.4.0-nightly.20261109.1-") })) })),
+      /Apollo-0.4.0-nightly.20261109.1-arm64.zip: name disagrees/,
+    ],
+    ["a .exe name on a macOS zip entry", (p) => [rename(p[0]!, "Apollo-0.4.0-arm64.zip", "Apollo-0.4.0-arm64.exe"), p[1]!, p[2]!], /Apollo-0.4.0-arm64.exe: name disagrees.*expected Apollo-0.4.0-arm64.zip/],
+    [
+      "a signed-looking name on an unsigned entry is caught, and so is the reverse",
+      (p) => [p[0]!, { ...p[1]!, assets: p[1]!.assets.map((a) => ({ ...a, codeSigning: { kind: "authenticode", publisher: "X" } as const })) }, p[2]!],
+      /Apollo-0.4.0-win-x64-unsigned-setup.exe: name disagrees.*authenticode.*expected Apollo-0.4.0-win-x64-setup.exe/,
+    ],
+    ["an ad-hoc macOS file without -adhoc", (p) => [{ ...p[0]!, assets: p[0]!.assets.map((a) => ({ ...a, codeSigning: { kind: "adhoc" } as const })) }, p[1]!, p[2]!], /Apollo-0.4.0-arm64.dmg: name disagrees.*adhoc.*expected Apollo-0.4.0-arm64-adhoc.dmg/],
+  ];
+  it.each(probes)("refuses %s", (_, mutate, pattern) => {
+    const parts = mutate([macPart, winX64, winArm]);
+    expect(() => mergeManifests(parts, RELEASE_TARGETS)).toThrow(pattern);
+    // Past the merge (e.g. a hand-made release): the hash comparison still refuses it.
+    const merged: Manifest = { ...manifest, assets: parts.flatMap((m) => m.assets) };
+    const recomputed = new Map(merged.assets.map((a) => [a.name, { size: a.size, sha256: a.sha256 }]));
+    expect(compareAssets(merged, parseSums(formatSums(merged.assets)), recomputed).join("\n")).toMatch(pattern);
+    expect(assetNameProblems(merged).join("\n")).toMatch(pattern);
+  });
+  it("accepts the names the builders produce", () => {
+    expect(assetNameProblems(manifest)).toEqual([]);
+    expect(expectedAssetName("0.4.1-nightly.20261109.3", { platform: "darwin", arch: "arm64", kind: "zip", codeSigning: { kind: "adhoc" } })).toBe(
+      "Apollo-0.4.1-nightly.20261109.3-arm64-adhoc.zip",
+    );
+    expect(expectedAssetName("0.4.0", { platform: "win32", arch: "arm64", kind: "nsis", codeSigning: { kind: "authenticode", publisher: "L" } })).toBe(
+      "Apollo-0.4.0-win-arm64-setup.exe",
+    );
   });
 });

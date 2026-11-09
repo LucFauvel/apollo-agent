@@ -37,7 +37,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { BuildInfo } from "../install-app-lib.ts";
-import { type CodeSigning, describeAsset, formatSums, type Manifest, MANIFEST_FORMAT, partialManifestName, SUMS_NAME } from "./manifest.ts";
+import { type CodeSigning, describeAsset, expectedAssetName, formatSums, type Manifest, MANIFEST_FORMAT, partialManifestName, SUMS_NAME } from "./manifest.ts";
 
 const desktopDir = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const ARCH = "arm64";
@@ -142,11 +142,9 @@ if (!existsSync(appPath)) fail(`no ${appPath}`);
 const dmg = readdirSync(builderOut).find((f) => f.endsWith(".dmg")) ?? fail(`no .dmg in ${builderOut}`);
 
 // 3. Zip with ditto (keeps framework symlinks and signatures; what the updater will unpack).
-const suffix = signingMode === "adhoc" ? "-adhoc" : "";
-const base = `Apollo-${version}-${ARCH}${suffix}`;
 const staging = mkdtempSync(join(tmpdir(), "apollo-release-"));
-const zipPath = join(staging, `${base}.zip`);
-const dmgPath = join(staging, `${base}.dmg`);
+const zipPath = join(staging, expectedAssetName(version, { platform: "darwin", arch: ARCH, kind: "zip", codeSigning }));
+const dmgPath = join(staging, expectedAssetName(version, { platform: "darwin", arch: ARCH, kind: "dmg", codeSigning }));
 run("ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", appPath, zipPath]);
 copyFileSync(join(builderOut, dmg), dmgPath);
 if (notaryArgs) {

@@ -47,6 +47,11 @@ describe("checkRelease: sign", () => {
     ["ad-hoc macOS build", { manifest: withAsset(0, { codeSigning: { kind: "adhoc" } }) }, /Apollo-0.4.0-arm64.zip is adhoc: a darwin release needs developer-id/],
     ["a missing Windows arch", { manifest: { ...manifest, assets: manifest.assets.slice(0, 2) } }, /no win32-arm64 build/],
     ["an extra target", { manifest: withAsset(2, { arch: "ia32" }) }, /unexpected win32-ia32 build/],
+    // The reviewer's P2-1 probes reach checkRelease with assetProblems empty: the policy itself must refuse.
+    ["an unsigned installer without -unsigned in its name", { manifest: withAsset(1, { name: "Apollo-0.4.0-win-x64-setup.exe" }) }, /win-x64-setup.exe: name disagrees/],
+    ["an x64 name on the arm64 entry", { manifest: withAsset(2, { name: "Apollo-0.4.0-win-x64-wrongarch-setup.exe" }) }, /wrongarch-setup.exe: name disagrees.*win32-arm64/],
+    ["a nightly-looking name under release metadata", { manifest: withAsset(0, { name: "Apollo-0.4.0-nightly.20261109.1-arm64.zip" }) }, /nightly.20261109.1-arm64.zip: name disagrees/],
+    ["a .exe name on a macOS zip entry", { manifest: withAsset(0, { name: "Apollo-0.4.0-arm64.exe" }) }, /arm64.exe: name disagrees/],
     ["nightly manifest", { manifest: { ...manifest, channel: "nightly" } }, /channel is nightly/],
     ["hash mismatch", { assetProblems: ["x.zip: sha256 a != manifest b"] }, /x.zip: sha256/],
     ["already published", { release: { isDraft: false, isPrerelease: true } }, /already published/],

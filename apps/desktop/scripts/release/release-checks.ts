@@ -3,7 +3,7 @@
  * the stable channel (stage `promote`). Pure: verify-release.ts gathers the facts (git, gh,
  * hashes, minisign) and this decides. Every problem is reported, not just the first.
  */
-import { type CodeSigning, type Manifest, type Platform, RELEASE_TARGETS, targetsOf } from "./manifest.ts";
+import { assetNameProblems, type CodeSigning, type Manifest, type Platform, RELEASE_TARGETS, targetsOf } from "./manifest.ts";
 import { formatSemVer, parseReleaseTag } from "./version.ts";
 
 /**
@@ -52,7 +52,8 @@ export const checkRelease = (facts: ReleaseFacts, stage: Stage): Array<string> =
     const allowed = RELEASE_SIGNING[a.platform];
     if (!allowed.includes(a.codeSigning.kind)) problems.push(`${a.name} is ${a.codeSigning.kind}: a ${a.platform} release needs ${allowed.join(" or ")}`);
   }
-  problems.push(...facts.assetProblems);
+  // File names must match their entries (also part of assetProblems; reported once).
+  for (const p of [...assetNameProblems(m), ...facts.assetProblems]) if (!problems.includes(p)) problems.push(p);
 
   if (stage === "sign") {
     if (!facts.release.isDraft) problems.push("the release is already published: only drafts are signed");
