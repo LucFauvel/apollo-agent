@@ -50,6 +50,7 @@ import {
   ProviderError,
   type ProviderSession,
 } from "@apollo/providers";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import { LocalModels } from "./local/LocalModels.ts";
 import { ProviderSettings } from "./ProviderSettings.ts";
@@ -216,6 +217,49 @@ const make = Effect.gen(function* () {
     );
 
   const publish = (change: AppChange) => PubSub.publish(changes, change).pipe(Effect.asVoid);
+
+  /**
+   * Cleanups of services built on the manager (background jobs, browser tabs), run when a
+   * bot is deleted: they depend on the manager, so they register here instead.
+   */
+  const botCleanups: Array<{ readonly name: string; readonly run: (botId: BotId) => Effect.Effect<void> }> = [];
+
+  /** Bots being deleted: no session may be created for them meanwhile. */
+  const deletingBots = new Set<BotId>();
+  /** Session creations under way, per bot: a deletion waits for them to finish first. */
+  const creatingSessions = new Map<BotId, number>();
+  /** Runs a session creation for `botId`, unless the bot is being deleted (then: not_found). */
+  const creatingFor = <A, E, R>(botId: BotId, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E | ApolloError, R> =>
+    Effect.suspend((): Effect.Effect<A, E | ApolloError, R> => {
+      if (deletingBots.has(botId)) {
+        return Effect.fail(new ApolloError({ code: "not_found", message: `bot ${botId} not found (it is being deleted)` }));
+      }
+      creatingSessions.set(botId, (creatingSessions.get(botId) ?? 0) + 1);
+      return effect.pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            const left = (creatingSessions.get(botId) ?? 1) - 1;
+            if (left > 0) creatingSessions.set(botId, left);
+            else creatingSessions.delete(botId);
+          }),
+        ),
+      );
+    });
+  /** How long a deletion waits for session creations under way (a git worktree, say). */
+  const CREATION_DRAIN_MS = 30_000;
+
+  /** Any failure, defects included, as an ApolloError saying what failed (interruptions stay). */
+  const asApolloError =
+    (what: string) =>
+    <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, ApolloError, R> =>
+      effect.pipe(
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt;
+          const error = Cause.squash(cause);
+          if (error instanceof ApolloError) return Effect.fail(error);
+          return Effect.fail(new ApolloError({ code: "internal", message: `${what}: ${error instanceof Error ? error.message : String(error)}` }));
+        }),
+      );
 
   const updateSession = (id: SessionId, patch: Parameters<typeof store.updateSession>[1]) =>
     store.updateSession(id, patch).pipe(
@@ -889,7 +933,7 @@ const make = Effect.gen(function* () {
     readonly id?: SessionId;
     readonly isolation?: "shared" | "worktree" | undefined;
   }) =>
-    Effect.gen(function* () {
+    creatingFor(input.botId, Effect.gen(function* () {
       const bot = yield* store.getBot(input.botId);
       const now = Date.now();
       const id = input.id ?? newId<SessionId>("ses");
@@ -926,7 +970,7 @@ const make = Effect.gen(function* () {
       });
       yield* publish({ _tag: "SessionUpserted", session });
       return session;
-    });
+    }));
 
   // --- settings -------------------------------------------------------------
 
@@ -1000,21 +1044,108 @@ const make = Effect.gen(function* () {
   ).pipe(Effect.delay(Duration.seconds(3)), Effect.forkIn(managerScope));
 
   /** Closes a session's process and deletes it with its log (a worktree's branch is kept). */
-  const removeSession = (id: SessionId) =>
+  /**
+   * With `strict` (a bot's deletion), a worktree that cannot be retired fails the removal
+   * before anything of the session is touched, keeping it to try again; otherwise the
+   * session goes and the checkout is left behind with a warning.
+   */
+  const removeSession = (id: SessionId, options: { readonly strict?: boolean } = {}) =>
     Effect.gen(function* () {
       yield* closeSession(id);
       const session = yield* store.getSession(id);
+      if (session.worktree) {
+        const retired = Effect.tryPromise({
+          try: () => retireWorktree(session.worktree!),
+          catch: (error) =>
+            new ApolloError({
+              code: "internal",
+              message: `could not remove the worktree ${session.worktree!.path}: ${error instanceof Error ? error.message : String(error)}`,
+            }),
+        });
+        yield* options.strict ? retired : retired.pipe(Effect.catch((error) => Effect.logWarning(`could not remove the worktree of ${id}`, error)));
+      }
       removeAttachments(config.dataDir, id);
       yield* userTitled(id);
-      if (session.worktree) {
-        yield* Effect.tryPromise(() => retireWorktree(session.worktree!)).pipe(
-          Effect.catch((error) => Effect.logWarning(`could not remove the worktree of ${id}`, error)),
-        );
-      }
       yield* store.deleteSession(id);
       yield* publish({ _tag: "SessionDeleted", sessionId: id });
       // However a running reflection goes (answered, stuck, deleted), the next may start.
       if (reflecting === id) yield* nextReflection;
+    });
+
+  /**
+   * Deletes a bot (no new session can start meanwhile, see `creatingFor`). Until its row is
+   * deleted, any failure stops the deletion with the bot kept, so trying again finishes it;
+   * after that, every remaining step runs whatever fails, and BotDeleted is always published.
+   */
+  const deleteBotNow = (bot: Bot) =>
+    Effect.gen(function* () {
+      const botId = bot.id;
+      // Creations under way finish first: their sessions (and worktrees) are then deleted too.
+      const until = Date.now() + CREATION_DRAIN_MS;
+      while (creatingSessions.has(botId)) {
+        if (Date.now() > until) {
+          return yield* new ApolloError({ code: "internal", message: `a session of ${bot.name} is still being created; try again` });
+        }
+        yield* Effect.sleep("10 millis");
+      }
+      // Its sessions' reflections waiting in line would start on deleted sessions.
+      const sessions = yield* store.listSessions(botId);
+      const owned = new Set(sessions.map((s) => s.id));
+      for (let i = reflectionQueue.length - 1; i >= 0; i--) if (owned.has(reflectionQueue[i]!)) reflectionQueue.splice(i, 1);
+      // Close every process first, so no turn starts work meanwhile. A provider that fails to
+      // close (its cleanup throwing, say) stops the deletion before anything is deleted.
+      const unclosed: Array<ApolloError> = [];
+      for (const id of owned) {
+        const closed = yield* closeSession(id).pipe(asApolloError(`could not stop session ${id}`), Effect.exit);
+        if (Exit.isFailure(closed)) {
+          const error = Cause.squash(closed.cause);
+          if (!(error instanceof ApolloError)) return yield* Effect.failCause(closed.cause as Cause.Cause<never>);
+          yield* Effect.logWarning(`could not stop session ${id} of bot ${botId}`, error);
+          unclosed.push(error);
+        }
+      }
+      if (unclosed.length > 0) {
+        return yield* new ApolloError({
+          code: "internal",
+          message: `could not stop ${unclosed.length} of ${bot.name}'s sessions (${unclosed[0]!.message}); nothing was deleted: try again`,
+        });
+      }
+      // Workers go before the orchestrator.
+      const failures: Array<ApolloError> = [];
+      const ordered = [...sessions.filter((s) => s.role !== "main"), ...sessions.filter((s) => s.role === "main")];
+      for (const session of ordered) {
+        const removed = yield* removeSession(session.id, { strict: true }).pipe(asApolloError(`could not delete session ${session.id}`), Effect.exit);
+        if (Exit.isFailure(removed)) {
+          const error = Cause.squash(removed.cause);
+          if (!(error instanceof ApolloError)) return yield* Effect.failCause(removed.cause as Cause.Cause<never>);
+          yield* Effect.logWarning(`could not delete session ${session.id} of bot ${botId}`, error);
+          failures.push(error);
+        }
+      }
+      if (failures.length > 0) {
+        return yield* new ApolloError({
+          code: "internal",
+          message: `could not delete ${failures.length} of ${bot.name}'s sessions (${failures[0]!.message}); the bot is kept: try again`,
+        });
+      }
+      if ((yield* store.listSessions(botId)).length > 0) {
+        return yield* new ApolloError({ code: "internal", message: `${bot.name} still has sessions; try again` });
+      }
+      yield* store.deleteCoreMemoryScope(botId).pipe(asApolloError(`could not delete ${bot.name}'s notes`));
+      yield* Effect.try({
+        try: () => rmSync(pluginDir(config.dataDir, botId), { recursive: true, force: true }),
+        catch: (error) => new ApolloError({ code: "internal", message: `could not delete ${bot.name}'s skills folder: ${(error as Error).message}` }),
+      });
+      yield* store.deleteBot(botId).pipe(asApolloError(`could not delete ${bot.name}`));
+
+      // The bot is gone: from here on nothing may stop the rest, nor the event.
+      autonomousTurns.delete(botId);
+      for (const cleanup of botCleanups) {
+        yield* Effect.suspend(() => cleanup.run(botId)).pipe(
+          Effect.catchCause((cause) => Effect.logWarning(`could not clean up ${cleanup.name} of deleted bot ${botId}`, cause)),
+        );
+      }
+      yield* publish({ _tag: "BotDeleted", botId });
     });
 
   const closeSession = (id: SessionId) =>
@@ -1237,16 +1368,23 @@ const make = Effect.gen(function* () {
         return bot;
       }),
 
+    /** Registers work to do when a bot is deleted (see `botCleanups`). */
+    onBotDeleted: (name: string, run: (botId: BotId) => Effect.Effect<void>) =>
+      Effect.sync(() => void botCleanups.push({ name, run })),
+
+    /**
+     * Deletes a bot and everything that belongs to it: its sessions (with their worktrees,
+     * attachments and logs), memories, notes, skills, schedules, running jobs and browser
+     * tabs. Its workspace folder, the shared user profile and global memories are kept.
+     */
+    /** Every failure is a typed ApolloError: not_found, invalid, or internal (the bot is kept; try again). */
     deleteBot: (botId: BotId) =>
       Effect.gen(function* () {
-        const sessions = yield* store.listSessions(botId);
-        yield* Effect.forEach(sessions, (s) => closeSession(s.id), { discard: true });
-        yield* store.deleteBot(botId);
-        yield* Effect.sync(() =>
-          rmSync(pluginDir(config.dataDir, botId), { recursive: true, force: true }),
-        ).pipe(Effect.ignore);
-        yield* publish({ _tag: "BotDeleted", botId });
-      }),
+        const bot = yield* store.getBot(botId); // not_found for an unknown bot, like the other bot calls
+        if (deletingBots.has(botId)) return yield* invalid(`${bot.name} is already being deleted`);
+        deletingBots.add(botId);
+        yield* deleteBotNow(bot).pipe(Effect.ensuring(Effect.sync(() => deletingBots.delete(botId))));
+      }).pipe(asApolloError(`could not delete bot ${botId}; try again`)),
 
     /** Slash commands for a session: Apollo's own, then its harness's (which needs the session open; no tokens). */
     listCommands: (id: SessionId) =>
@@ -1458,7 +1596,8 @@ const make = Effect.gen(function* () {
       readonly notifyParent?: boolean;
       readonly author?: MessageAuthor;
     }) =>
-      Effect.gen(function* () {
+      // Gated as a whole, so a bot's deletion also waits for its untitled entry and first message.
+      creatingFor(input.botId, Effect.gen(function* () {
         // No title: named after the first message (see nameSession).
         const named = input.title.trim().length > 0;
         const session = yield* createSession({
@@ -1479,7 +1618,7 @@ const make = Effect.gen(function* () {
           yield* send(session.id, input.prompt, input.author ?? "user");
         }
         return session;
-      }),
+      })),
 
     send,
 

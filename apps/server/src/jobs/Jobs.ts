@@ -25,6 +25,8 @@ interface Job {
   readonly logPath: string;
   readonly startedAt: number;
   readonly notify: boolean;
+  /** Stopped because its bot was deleted: nobody is left to report to. */
+  orphaned: boolean;
   readonly process: ChildProcess;
   readonly log: WriteStream;
   readonly exited: Deferred.Deferred<void>;
@@ -143,6 +145,7 @@ const make = Effect.gen(function* () {
         logPath,
         startedAt: Date.now(),
         notify: input.notify ?? true,
+        orphaned: false,
         process: child,
         log: createWriteStream(logPath),
         exited: yield* Deferred.make<void>(),
@@ -166,7 +169,7 @@ const make = Effect.gen(function* () {
         // (Checked before releasing the waiters, which stop counting as they wake.)
         const waited = job.waiters > 0;
         runFork(Deferred.succeed(job.exited, undefined));
-        if (job.notify && !waited) runFork(report(job));
+        if (job.notify && !waited && !job.orphaned) runFork(report(job));
       };
       child.on("exit", (code, signal) => finish(code, signal));
       child.on("error", (error) => {
@@ -200,6 +203,78 @@ const make = Effect.gen(function* () {
       return status(job);
     });
 
+  /**
+   * Whether anything of the job's process group still runs: the leader may be gone while
+   * what it started lives on. (Windows has no process groups: the leader alone.)
+   */
+  const groupAlive = (job: Job) => {
+    const pid = job.process.pid;
+    if (pid === undefined) return false;
+    if (process.platform === "win32") return job.endedAt === null;
+    try {
+      process.kill(-pid, 0);
+      return true;
+    } catch (error) {
+      // EPERM: still there, e.g. a killed member not yet reaped by launchd (macOS).
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
+  };
+  const signalGroup = (job: Job, signal: NodeJS.Signals) => {
+    const pid = job.process.pid;
+    if (pid === undefined) return;
+    try {
+      if (process.platform === "win32") job.process.kill(signal);
+      else process.kill(-pid, signal);
+    } catch {
+      // Already gone.
+    }
+  };
+  /** Polls until the job's whole process group is gone, or the time is up. */
+  const groupGone = (job: Job, ms: number) =>
+    Effect.gen(function* () {
+      for (const end = Date.now() + ms; groupAlive(job) && Date.now() < end; ) yield* Effect.sleep("25 millis");
+      return !groupAlive(job);
+    });
+
+  /**
+   * Stops every running job of a deleted bot, with everything each one started: SIGTERM to
+   * the process group, then SIGKILL to whatever of it is left after a grace period (even when
+   * the leader itself exited meanwhile). None reports back to its (deleted) session; all are
+   * forgotten.
+   *
+   * Only a job whose leader is still running is signalled: until node reaps the leader its
+   * pid, hence its group id, cannot be reused, and the group keeps its id while any member
+   * lives, which is watched without a break (every 25 ms) until it is gone. A job that
+   * already finished has no claim on that number any more: the OS may have given it to an
+   * unrelated group. (Left: the inherent gap between a check and the signal that follows.)
+   */
+  const stopForBot = (botId: BotId) =>
+    Effect.gen(function* () {
+      const owned = [...jobs.values()].filter((j) => j.botId === botId);
+      const running = owned.filter((j) => j.endedAt === null);
+      for (const job of owned) job.orphaned = true;
+      for (const job of running) signalGroup(job, "SIGTERM");
+      yield* Effect.forEach(
+        running,
+        (job) =>
+          Effect.gen(function* () {
+            if (yield* groupGone(job, 3000)) return;
+            signalGroup(job, "SIGKILL");
+            yield* groupGone(job, 2000);
+          }),
+        { concurrency: "unbounded", discard: true },
+      );
+      for (const job of owned) {
+        jobs.delete(job.id);
+        try {
+          rmSync(job.logPath, { force: true });
+        } catch {
+          // Still held open (Windows): the folder is cleared on the next start.
+        }
+      }
+    });
+  yield* manager.onBotDeleted("background jobs", stopForBot);
+
   yield* Effect.addFinalizer(() =>
     Effect.sync(() => {
       for (const job of jobs.values()) kill(job, "SIGTERM");
@@ -209,6 +284,7 @@ const make = Effect.gen(function* () {
   return {
     start,
     stop,
+    stopForBot,
     status: (caller: JobCaller, jobId: string, lines?: number) => Effect.map(own(caller, jobId), (job) => status(job, lines)),
     /** Waits until the job ends or the timeout passes, then returns its status. */
     wait: (caller: JobCaller, jobId: string, timeoutSeconds: number, lines?: number) =>

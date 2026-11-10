@@ -537,6 +537,7 @@ export function BotSettingsDialog({ bot, onClose }: { bot: Bot; onClose: () => v
   const [costBudget, setCostBudget] = useState(bot.limits.dailyCostBudgetUsd?.toString() ?? "");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
 
   const limits: BotLimits = {
     maxConcurrentWorkers: parseLimit(maxWorkers, { integer: true, optional: false })!,
@@ -570,6 +571,11 @@ export function BotSettingsDialog({ bot, onClose }: { bot: Bot; onClose: () => v
       .catch((e) => setError(errorMessage(e)))
       .finally(() => setSaving(false));
   };
+
+  // Shown instead of the settings (not over them), so Escape backs out of one dialog only.
+  if (confirmingDelete) {
+    return <DeleteBotDialog bot={bot} home={settings?.homeDir ?? ""} onCancel={() => setConfirmingDelete(false)} onDeleted={onClose} />;
+  }
 
   return (
     <Modal
@@ -659,6 +665,92 @@ export function BotSettingsDialog({ bot, onClose }: { bot: Bot; onClose: () => v
           />
         </div>
       </FormSection>
+      <FormSection title="Danger zone">
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-red-900/50 bg-red-950/20 px-3 py-2.5">
+          <div className="min-w-0 text-xs text-zinc-400">
+            <div className="font-medium text-zinc-200">Delete this bot</div>
+            Removes its sessions, memories, skills and schedules. This cannot be undone.
+          </div>
+          <Button variant="danger" size="sm" disabled={saving} onClick={() => setConfirmingDelete(true)}>
+            Delete this bot
+          </Button>
+        </div>
+      </FormSection>
+      <ErrorText>{error}</ErrorText>
+    </Modal>
+  );
+}
+
+/** Confirms deleting a bot: says what goes and what stays, and asks for its name. */
+function DeleteBotDialog({ bot, home, onCancel, onDeleted }: { bot: Bot; home: string; onCancel: () => void; onDeleted: () => void }) {
+  const [typed, setTyped] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const matches = typed === bot.name;
+  const cancel = useCallback(() => {
+    if (!deleting) onCancel();
+  }, [deleting, onCancel]);
+
+  const remove = () => {
+    if (!matches || deleting) return;
+    setDeleting(true);
+    setError(null);
+    rpc((c) => c["bots.delete"]({ botId: bot.id }))
+      .then(onDeleted)
+      .catch((e) => {
+        // Already gone (deleted elsewhere): nothing left to do.
+        if (typeof e === "object" && e !== null && (e as { code?: unknown }).code === "not_found") return onDeleted();
+        setError(errorMessage(e));
+        setDeleting(false);
+      });
+  };
+
+  return (
+    <Modal
+      title={`Delete ${bot.name}?`}
+      description="This cannot be undone."
+      onClose={cancel}
+      footer={
+        <>
+          <Button variant="ghost" disabled={deleting} onClick={cancel}>
+            Cancel
+          </Button>
+          <Button variant="danger" disabled={!matches || deleting} onClick={remove}>
+            {deleting ? "Deleting…" : "Delete bot"}
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-3 text-xs text-zinc-400">
+        <div>
+          <div className="mb-1 font-medium text-red-300">Deleted</div>
+          <ul className="list-disc space-y-0.5 pl-4">
+            <li>Its orchestrator and every worker session, with their conversations, attachments and worktrees</li>
+            <li>Its memories, notes and skills</li>
+            <li>Its schedules, running background jobs and browser tabs</li>
+          </ul>
+        </div>
+        <div>
+          <div className="mb-1 font-medium text-zinc-200">Kept</div>
+          <ul className="list-disc space-y-0.5 pl-4">
+            <li>
+              The workspace folder <span className="font-mono text-zinc-300">{home ? tildify(bot.cwd, home) : bot.cwd}</span> and its files
+            </li>
+            <li>The shared user profile, shared memories, and your other bots</li>
+          </ul>
+        </div>
+      </div>
+      <Field label={`Type ${bot.name} to confirm`}>
+        <input
+          className={inputClass}
+          value={typed}
+          autoFocus
+          disabled={deleting}
+          placeholder={bot.name}
+          onChange={(e) => setTyped(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && remove()}
+        />
+      </Field>
       <ErrorText>{error}</ErrorText>
     </Modal>
   );

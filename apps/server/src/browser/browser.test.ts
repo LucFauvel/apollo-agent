@@ -180,4 +180,19 @@ describe.skipIf(!executable)("built-in browser (real Chromium)", { timeout: 60_0
     expect(core.list(bot)).toHaveLength(0);
     expect(changes.some((c) => c._tag === "BrowserTabClosed")).toBe(true);
   });
+
+  it("closes every tab of a deleted bot, and only that bot's", async () => {
+    const other = "bot-2" as BotId;
+    const a = await core.open(bot, session, base, true);
+    const b = await core.open(bot, session, `${base}/second`, true);
+    const kept = await core.open(other, "session-2" as SessionId, base, true);
+    changes.length = 0;
+    await core.closeForBot(bot);
+    expect(core.list(bot)).toHaveLength(0);
+    expect(core.list(other).map((t) => t.id)).toEqual([kept.tabId]);
+    const closed = changes.flatMap((c) => (c._tag === "BrowserTabClosed" ? [c.tabId] : []));
+    expect(closed.sort()).toEqual([a.tabId, b.tabId].sort());
+    await core.closeForBot(bot); // nothing left: a no-op
+    await core.close(other, null, kept.tabId);
+  });
 });

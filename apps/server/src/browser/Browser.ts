@@ -871,6 +871,11 @@ export class BrowserCore {
     await this.close(tab.botId, null, tab.id);
   }
 
+  /** Closes every tab of a deleted bot, as if the user closed each one. */
+  async closeForBot(botId: BotId) {
+    for (const tab of this.list(botId)) await this.closeForUser(tab.id).catch(() => undefined);
+  }
+
   // -------------------------------------------------------------------------
   // Events
 
@@ -987,7 +992,7 @@ const make = Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.promise(() => core.shutdown()));
 
   // --- handoffs: the agent gives the user the browser and waits --------------------
-  const handoffs = new Map<string, { sessionId: SessionId; deferred: Deferred.Deferred<{ outcome: "done" | "cancelled"; note: string | null }> }>();
+  const handoffs = new Map<string, { botId: BotId; sessionId: SessionId; deferred: Deferred.Deferred<{ outcome: "done" | "cancelled"; note: string | null }> }>();
   const handoffResolved = (sessionId: SessionId, requestId: string, outcome: "done" | "cancelled" | "expired") =>
     manager.appendEvent(sessionId, { _tag: "BrowserHandoffResolved", requestId, outcome });
 
@@ -999,7 +1004,7 @@ const make = Effect.gen(function* () {
       if (!text) return yield* new ApolloError({ code: "invalid", message: "`reason` is required: tell the user what to do, e.g. \"Solve the CAPTCHA, then click Done\"" });
       const requestId = `handoff_${randomBytes(12).toString("base64url")}`;
       const deferred = yield* Deferred.make<{ outcome: "done" | "cancelled"; note: string | null }>();
-      handoffs.set(requestId, { sessionId, deferred });
+      handoffs.set(requestId, { botId, sessionId, deferred });
       yield* manager.appendEvent(sessionId, { _tag: "BrowserHandoff", requestId, tabId: tab.id, url: tab.url, reason: text });
       const bot = yield* store.getBot(botId).pipe(Effect.option);
       yield* manager.publish({
@@ -1039,9 +1044,20 @@ const make = Effect.gen(function* () {
       yield* Deferred.succeed(pending.deferred, { outcome, note: note?.trim() || null });
     });
 
+  /** A deleted bot's tabs close, and its agents stop waiting on the user in them. */
+  const closeForBot = (botId: BotId) =>
+    Effect.gen(function* () {
+      for (const pending of handoffs.values()) {
+        if (pending.botId === botId) yield* Deferred.succeed(pending.deferred, { outcome: "cancelled", note: "the bot was deleted" });
+      }
+      yield* attempt(() => core.closeForBot(botId)).pipe(Effect.ignore);
+    });
+  yield* manager.onBotDeleted("browser tabs", closeForBot);
+
   return {
     handoff,
     respondHandoff,
+    closeForBot,
     status: Effect.sync(() => core.status()),
     list: (botId?: BotId) => Effect.sync(() => core.list(botId)),
     open: (botId: BotId, sessionId: SessionId, url: string | undefined, newTab: boolean) =>
