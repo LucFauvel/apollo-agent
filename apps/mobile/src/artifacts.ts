@@ -1,3 +1,4 @@
+import { makeInflight, runPool } from "@apollo/client";
 import type { ArtifactRef, AttachmentRef, SessionId } from "@apollo/contracts";
 import { Directory, File, Paths } from "expo-file-system";
 import { Platform, Share } from "react-native";
@@ -13,16 +14,15 @@ export const formatSize = (bytes: number) =>
 
 const safeName = (name: string) => name.replace(/[/\\:\0]/g, "_") || "artifact";
 
-const pending = new Map<string, Promise<File>>();
+const downloads = makeInflight<File>();
 
 /**
- * A server file on this phone, downloaded once into the cache (what it points to never
- * changes), under its own name so sharing it keeps the name.
+ * A server file on this phone, downloaded into the cache (what it points to never changes),
+ * under its own name so sharing it keeps the name. Every call checks the cache again: the
+ * system may purge it while the app is suspended.
  */
-const cachedDownload = (pairing: Pairing, path: string, folder: ReadonlyArray<string>, name: string, size: number | null): Promise<File> => {
-  const existing = pending.get(path);
-  if (existing) return existing;
-  const download = (async () => {
+const cachedDownload = (pairing: Pairing, path: string, folder: ReadonlyArray<string>, name: string, size: number | null): Promise<File> =>
+  downloads(path, async () => {
     const dir = new Directory(Paths.cache, ...folder.map(safeName));
     const file = new File(dir, safeName(name));
     if (file.exists && (size === null || file.size === size)) return file;
@@ -33,11 +33,7 @@ const cachedDownload = (pairing: Pairing, path: string, folder: ReadonlyArray<st
     if (file.exists) file.delete();
     file.write(bytes);
     return file;
-  })();
-  pending.set(path, download);
-  download.catch(() => pending.delete(path));
-  return download;
-};
+  });
 
 export const artifactFile = (pairing: Pairing, a: ArtifactRef): Promise<File> =>
   cachedDownload(pairing, artifactPath(a), ["artifacts", a.botId, a.artifactId, String(a.version)], a.name, a.size);
@@ -64,26 +60,30 @@ export const shareArtifact = async (pairing: Pairing, a: ArtifactRef) => {
 
 const framePath = (recordingId: string, n: number) => `/api/recordings/${recordingId}/${String(n).padStart(4, "0")}.jpg`;
 
-/** Downloads a browser recording's frames into the cache (once), reporting progress; resolves to their URIs. */
-export const recordingFrames = async (pairing: Pairing, recordingId: string, frames: number, onProgress: (done: number) => void) => {
-  const dir = new Directory(Paths.cache, "recordings", safeName(recordingId));
-  dir.create({ intermediates: true, idempotent: true });
-  const uris: Array<string> = [];
-  let done = 0;
-  let next = 0;
-  const worker = async () => {
-    while (next < frames) {
-      const n = next++;
-      const file = new File(dir, `${String(n).padStart(4, "0")}.jpg`);
-      if (!file.exists) {
-        const response = await apiFetch(pairing, framePath(recordingId, n), { method: "GET" });
-        if (!response.ok) throw new Error(response.status === 404 ? "This recording is no longer on disk." : `Could not load it (${response.status}).`);
-        file.write(new Uint8Array(await response.arrayBuffer()));
-      }
-      uris[n] = file.uri;
-      onProgress(++done);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(4, frames) }, worker));
-  return uris;
+const frameFile = (recordingId: string, n: number) =>
+  new File(new Directory(Paths.cache, "recordings", safeName(recordingId)), `${String(n).padStart(4, "0")}.jpg`);
+
+const downloadFrame = async (pairing: Pairing, recordingId: string, n: number, signal?: AbortSignal) => {
+  const file = frameFile(recordingId, n);
+  if (file.exists) return file.uri;
+  const response = await apiFetch(pairing, framePath(recordingId, n), { method: "GET", ...(signal ? { signal } : {}) });
+  if (!response.ok) throw new Error(response.status === 404 ? "This recording is no longer on disk." : `Could not load it (${response.status}).`);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (signal?.aborted) throw signal.reason ?? new Error("Aborted");
+  new Directory(Paths.cache, "recordings", safeName(recordingId)).create({ intermediates: true, idempotent: true });
+  file.write(bytes);
+  return file.uri;
 };
+
+/** A frame already on this phone (from an earlier playback), or null. */
+export const cachedFrame = (recordingId: string, n: number) => {
+  const file = frameFile(recordingId, n);
+  return file.exists ? file.uri : null;
+};
+
+/**
+ * Downloads a recording's frames into the cache (frames already there are kept), reporting
+ * progress, until `signal` aborts; resolves to their URIs.
+ */
+export const recordingFrames = (pairing: Pairing, recordingId: string, frames: number, signal: AbortSignal, onProgress: (done: number) => void) =>
+  runPool(frames, 4, (n, s) => downloadFrame(pairing, recordingId, n, s), signal, onProgress);

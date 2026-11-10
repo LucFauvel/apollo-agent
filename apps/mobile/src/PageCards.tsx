@@ -1,11 +1,11 @@
-import type { TranscriptItem } from "@apollo/client";
+import { pageNavigation, type TranscriptItem } from "@apollo/client";
 import type { ArtifactKind, ArtifactRef, AttachmentRef, SessionId } from "@apollo/contracts";
-import { type ReactNode, useEffect, useMemo, useState } from "react";
-import { ActivityIndicator, Image, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { ActivityIndicator, Image, Linking, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { useApollo } from "./AppState.tsx";
-import { artifactFile, artifactText, attachmentFile, FALLBACK_IS_PAGE, formatSize, recordingFrames, shareArtifact, shareFile } from "./artifacts.ts";
+import { artifactFile, artifactText, attachmentFile, FALLBACK_IS_PAGE, cachedFrame, formatSize, recordingFrames, shareArtifact, shareFile } from "./artifacts.ts";
 import { errorMessage } from "./connection.ts";
 import { ChevronDownIcon, FileCodeIcon, FileIcon, FileTextIcon, type Icon, ImageIcon, LayoutTemplateIcon, Maximize2Icon, RotateCwIcon, ShareIcon, XIcon } from "./icons.tsx";
 import { CodeBlock, Markdown } from "./Markdown.tsx";
@@ -45,28 +45,38 @@ const prepare = (html: string) => {
   return withBase + sizer;
 };
 
-/** An agent-written page. Links it opens go to the phone's browser, never inside the card. */
+/**
+ * An agent-written page. A web or mail link the user taps opens outside the app; script
+ * redirects and other apps' URL schemes go nowhere (see pageNavigation).
+ */
 function Page({ html, height, onHeight, scroll }: { html: string; height: number | "fill"; onHeight?: (h: number) => void; scroll: boolean }) {
   const source = useMemo(() => ({ html: prepare(html) }), [html]);
+  // The user's own touches, seen natively: the page's scripts cannot fake them.
+  const touchedAt = useRef<number | null>(null);
   return (
-    <WebView
-      source={source}
-      originWhitelist={["*"]}
-      style={[{ backgroundColor: "transparent" }, height === "fill" ? { flex: 1 } : { height }]}
-      scrollEnabled={scroll}
-      nestedScrollEnabled
-      setSupportMultipleWindows={false}
-      allowsInlineMediaPlayback
-      onMessage={(e: WebViewMessageEvent): void => {
-        const next = Number(e.nativeEvent.data);
-        if (Number.isFinite(next) && next > 0) onHeight?.(Math.max(next, 60));
-      }}
-      onShouldStartLoadWithRequest={(request): boolean => {
-        if (/^(about|data|blob):/.test(request.url) || !request.isTopFrame) return true;
-        void Linking.openURL(request.url).catch(() => {});
-        return false;
-      }}
-    />
+    <View style={height === "fill" ? { flex: 1 } : { height }} onTouchStart={() => void (touchedAt.current = Date.now())}>
+      <WebView
+        source={source}
+        originWhitelist={["*"]}
+        style={{ flex: 1, backgroundColor: "transparent" }}
+        scrollEnabled={scroll}
+        nestedScrollEnabled
+        setSupportMultipleWindows={false}
+        allowsInlineMediaPlayback
+        onMessage={(e: WebViewMessageEvent): void => {
+          const next = Number(e.nativeEvent.data);
+          if (Number.isFinite(next) && next > 0) onHeight?.(Math.max(next, 60));
+        }}
+        onShouldStartLoadWithRequest={(request): boolean => {
+          const decision = pageNavigation(request, touchedAt.current, Date.now(), Platform.OS);
+          if (decision === "external") {
+            touchedAt.current = null;
+            void Linking.openURL(request.url).catch(() => {});
+          }
+          return decision === "load";
+        }}
+      />
+    </View>
   );
 }
 
@@ -410,27 +420,46 @@ const clock = (ms: number) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 };
 
-/** A browser recording an agent made: its frames played back at their real pace. Tap to play or pause. */
+/**
+ * A browser recording an agent made: its frames played back at their real pace. Nothing is
+ * downloaded until the user taps play, and leaving the conversation cancels the download.
+ */
 export function RecordingCard({ item }: { item: RecordingItem }) {
   const { pairing } = useApollo();
   const [uris, setUris] = useState<ReadonlyArray<string> | null>(null);
+  const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [frame, setFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const poster = useMemo(() => cachedFrame(item.recordingId, 0), [item.recordingId]);
   const step = item.frames > 1 ? item.durationMs / item.frames : 250;
   const last = Math.max(item.frames - 1, 0);
+  const download = useRef<AbortController | null>(null);
+  useEffect(() => () => download.current?.abort(new Error("Left the conversation")), []);
 
-  useEffect(() => {
-    let cancelled = false;
-    recordingFrames(pairing, item.recordingId, item.frames, (done) => !cancelled && setProgress(done)).then(
-      (next) => !cancelled && setUris(next),
-      (e: unknown) => !cancelled && setError(errorMessage(e)),
+  const load = () => {
+    if (download.current) return;
+    const controller = new AbortController();
+    download.current = controller;
+    setLoading(true);
+    setError(null);
+    recordingFrames(pairing, item.recordingId, item.frames, controller.signal, setProgress).then(
+      (next) => {
+        if (controller.signal.aborted) return;
+        setUris(next);
+        setLoading(false);
+        setFrame(0);
+        setPlaying(true);
+      },
+      (e: unknown) => {
+        if (controller.signal.aborted) return;
+        download.current = null;
+        setLoading(false);
+        setError(errorMessage(e));
+      },
     );
-    return () => {
-      cancelled = true;
-    };
-  }, [pairing, item.recordingId, item.frames]);
+  };
 
   useEffect(() => {
     if (!playing) return;
@@ -447,34 +476,36 @@ export function RecordingCard({ item }: { item: RecordingItem }) {
   }, [playing, step, last]);
 
   const toggle = () => {
-    if (!uris) return;
+    if (!uris) return load();
     if (frame >= last) setFrame(0);
     setPlaying(!playing);
   };
   const aspect = item.width && item.height ? item.width / item.height : 16 / 10;
-  const uri = uris?.[frame];
+  const uri = uris?.[frame] ?? poster;
   return (
-    <Frame icon={LayoutTemplateIcon} title={item.title} meta={clock(item.durationMs)}>
-      {error ? (
-        <Text style={styles.note}>{error}</Text>
-      ) : (
-        <Pressable onPress={toggle} accessibilityLabel={playing ? "Pause" : "Play"} style={{ backgroundColor: "#000", aspectRatio: aspect, maxHeight: 420 }}>
-          {uri ? <Image source={{ uri }} style={StyleSheet.absoluteFill} resizeMode="contain" /> : null}
-          {!playing ? (
-            <View style={styles.playOverlay}>
-              {uris ? (
-                <View style={styles.playButton}>
-                  {frame >= last && frame > 0 ? <RotateCwIcon size={20} color="#fff" /> : <Text style={styles.playGlyph}>▶</Text>}
-                </View>
-              ) : (
-                <Text style={styles.note}>
-                  Loading {progress}/{item.frames}…
-                </Text>
-              )}
-            </View>
-          ) : null}
-        </Pressable>
-      )}
+    <Frame icon={LayoutTemplateIcon} title={item.title} meta={`${clock(item.durationMs)} · ${item.frames} frames`}>
+      <Pressable
+        onPress={toggle}
+        disabled={loading}
+        accessibilityLabel={uris ? (playing ? "Pause" : "Play") : `Load and play the recording (${item.frames} frames)`}
+        style={{ backgroundColor: "#000", aspectRatio: aspect, maxHeight: 420 }}
+      >
+        {uri ? <Image source={{ uri }} style={StyleSheet.absoluteFill} resizeMode="contain" /> : null}
+        {!playing ? (
+          <View style={styles.playOverlay}>
+            {loading ? (
+              <Text style={styles.note}>
+                Loading {progress}/{item.frames}…
+              </Text>
+            ) : (
+              <View style={styles.playButton}>
+                {uris && frame >= last && frame > 0 ? <RotateCwIcon size={20} color="#fff" /> : <Text style={styles.playGlyph}>▶</Text>}
+              </View>
+            )}
+          </View>
+        ) : null}
+      </Pressable>
+      {error ? <Text style={[styles.note, { color: colors.red }]}>{error}</Text> : null}
       {uris ? (
         <Text style={[styles.note, { paddingVertical: 6, textAlign: "right" }]}>
           {clock(frame * step)} / {clock(item.durationMs)}

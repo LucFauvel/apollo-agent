@@ -102,7 +102,11 @@ const pairOnce = async (code: PairingCode): Promise<Pairing> => {
 };
 
 /** An authenticated, signed HTTP request to Apollo (`path` starts with `/api/`). */
-export const apiFetch = async (pairing: Pairing, path: string, init: { method: string; headers?: Record<string, string>; body?: string }) => {
+export const apiFetch = async (
+  pairing: Pairing,
+  path: string,
+  init: { method: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal },
+) => {
   const base = await routeTo(pairing.server, pairing.pin);
   const proof = await proofFor(init.method, path);
   return fetch(`${base}${path}`, {
