@@ -5,9 +5,10 @@ import { homedir } from "node:os";
 import { createServer } from "node:net";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, Menu, nativeImage, Notification, shell, Tray, type WebContents } from "electron";
+import { app, BrowserWindow, dialog, Menu, nativeImage, Notification, shell, Tray, type WebContents } from "electron";
 import { navigationDecision, windowOpenDecision } from "./navigation.js";
 import { type PanelRow, TrayPanel } from "./trayPanel.js";
+import { Updater } from "./update/controller.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
@@ -99,6 +100,100 @@ let trayPanel: TrayPanel | null = null;
 let trayMenuStale = false;
 /** Set once the user really quits; until then, closing the window hides it to the tray. */
 let quitting = false;
+/** The in-app updater (src/update/), created once the app is ready. */
+let updater: Updater | null = null;
+/** Why the updater could not be created, shown when the user asks for updates. */
+let updaterError: string | null = null;
+
+/**
+ * Creates the updater. It is built not to throw (it falls back to inert); if it does anyway, the
+ * app still starts, and the menu entry says why and tries again (updateMenuItem).
+ */
+const createUpdater = () => {
+  try {
+    updater = new Updater({
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      appPath: app.getAppPath(),
+      userData: app.getPath("userData"),
+      dataDir: resolve(process.env.APOLLO_DATA_DIR ?? join(homedir(), ".apollo")),
+      onChange: () => {
+        setAppMenu();
+        refreshTrayMenu();
+        trayPanel?.setRows(panelRows(trayStatus));
+      },
+      quit: () => {
+        quitting = true;
+        app.quit();
+      },
+      busyBots: () => trayStatus?.bots.reduce((n, b) => n + (b.working > 0 ? 1 : 0), 0) ?? 0,
+    });
+    updaterError = null;
+  } catch (error) {
+    console.error("updater unavailable:", error);
+    updater = null;
+    updaterError = error instanceof Error ? error.message : String(error);
+  }
+};
+
+/**
+ * The "Check for Updates…" entry, whose label follows the updater's state. Without an updater
+ * (it failed to start) it stays clickable: it tries again, and says why if it still can't.
+ */
+const updateMenuItem = (): Electron.MenuItemConstructorOptions =>
+  updater
+    ? { label: updater.menuLabel(), enabled: updater.menuEnabled(), click: () => updateClicked() }
+    : { label: "Check for Updates…", enabled: true, click: () => updateClicked() };
+
+/** The menu entry or tray row was clicked. */
+const updateClicked = () => {
+  if (!updater) {
+    createUpdater();
+    // (createUpdater assigns it; TypeScript cannot see that through the call.)
+    const created = updater as Updater | null;
+    if (!created) {
+      void dialog.showMessageBox({
+        type: "warning",
+        message: "Updates are unavailable",
+        detail: `Apollo's updater could not start: ${updaterError ?? "unknown error"}. You can download releases from https://github.com/LucFauvel/apollo-agent/releases.`,
+        buttons: ["OK"],
+      });
+      return;
+    }
+    created.start();
+    created.menuClicked();
+    return;
+  }
+  updater.menuClicked();
+};
+
+/** macOS: the app menu, with Check for Updates…; the other menus are Electron's defaults. */
+const setAppMenu = () => {
+  if (process.platform !== "darwin") return;
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate([
+      {
+        label: app.name,
+        submenu: [
+          { role: "about" },
+          updateMenuItem(),
+          { type: "separator" },
+          { role: "services" },
+          { type: "separator" },
+          { role: "hide" },
+          { role: "hideOthers" },
+          { role: "unhide" },
+          { type: "separator" },
+          { role: "quit" },
+        ],
+      },
+      { role: "fileMenu" },
+      { role: "editMenu" },
+      { role: "viewMenu" },
+      { role: "windowMenu" },
+    ]),
+  );
+};
 
 /**
  * Per-launch secret shared only with our own server process. The window opens
@@ -382,7 +477,7 @@ const trayMenu = (status: DesktopStatus | null) => {
     }
     items.push({ type: "separator" });
   }
-  items.push({ label: "Open Apollo", click: showWindow }, { type: "separator" }, { label: "Quit Apollo", role: "quit" });
+  items.push({ label: "Open Apollo", click: showWindow }, updateMenuItem(), { type: "separator" }, { label: "Quit Apollo", role: "quit" });
   return Menu.buildFromTemplate(items);
 };
 
@@ -418,7 +513,11 @@ const panelRows = (status: DesktopStatus | null): Array<PanelRow> => {
     }
     rows.push({ kind: "separator" });
   }
-  rows.push({ kind: "item", text: "Open Apollo", action: "open" }, { kind: "item", text: "Quit Apollo", action: "quit" });
+  rows.push(
+    { kind: "item", text: "Open Apollo", action: "open" },
+    updater?.menuEnabled() === false ? { kind: "item", text: updater.menuLabel() } : { kind: "item", text: updater?.menuLabel() ?? "Check for Updates…", action: "update" },
+    { kind: "item", text: "Quit Apollo", action: "quit" },
+  );
   return rows;
 };
 
@@ -444,7 +543,7 @@ const createTray = () => {
   if (mac) {
     // A native menu does not open on another Space (desktop or full-screen app) while
     // Apollo's window is elsewhere; a panel shown on every Space does (see TrayPanel).
-    trayPanel = new TrayPanel(tray, (action) => (action === "quit" ? app.quit() : showWindow()));
+    trayPanel = new TrayPanel(tray, (action) => (action === "quit" ? app.quit() : action === "update" ? updateClicked() : showWindow()));
     trayPanel.setRows(panelRows(trayStatus));
     tray.on("click", () => trayPanel?.toggle());
     tray.on("right-click", () => trayPanel?.toggle());
@@ -532,11 +631,16 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(async () => {
     try {
       if (layout.appIcon && process.platform === "darwin") app.dock?.setIcon(layout.appIcon);
+      if (!screenshotPath) {
+        createUpdater();
+        setAppMenu();
+      }
       if (!screenshotPath) createTray();
       const serverUrl = await startServer();
       if (tray) followStatus(serverUrl);
       const uiUrl = (devUrl ?? serverUrl).replace(/\/+$/, "");
       await createWindow(`${uiUrl}/pair#token=${bootstrapToken}&label=Apollo%20Desktop`, [new URL(uiUrl).origin, new URL(serverUrl).origin]);
+      updater?.start();
     } catch (error) {
       console.error(error);
       stopServer();

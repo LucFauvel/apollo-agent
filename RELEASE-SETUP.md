@@ -216,6 +216,12 @@ minisign -G -p apollo.pub -s apollo.key        # set a password (or -W for none)
 - Format: standard minisign Ed25519. The signing job verifies its own signature with the public
   key before uploading it, and the trusted comment binds `version`, `build` and `commit`
   (`apollo-update version=… build=… commit=…`).
+- **Updater (P2, done for macOS):** the **primary** public key (`RWRIjaaHrGmFOQ5a…`, key id
+  `398569AC87A68D48`, the same line as `RELEASE_MINISIGN_PUBLIC_KEY`) is embedded in
+  `apps/desktop/src/update/keys.ts`. The **backup slot awaits the offline backup public key**:
+  paste its `RW…` line as `BACKUP_PUBLIC_KEY` (never the secret key); while empty it is ignored and
+  can never match a signature. Only builds made after a key is embedded trust it. Without a valid
+  primary key the updater is inert (no network; the menu says updates are not configured).
 
 ### 3.6 Windows code signing: Azure Trusted Signing (recommended future path, not set up)
 No Authenticode certificate exists, and none is needed to ship: the Windows installers are
@@ -248,6 +254,7 @@ build can no longer be released.
 | Sign + publish (candidate) | stays a draft with "Signing not configured" | minisign key + `release` env with you as reviewer |
 | Promote to stable | refuses without the public-key variable / a signed candidate | the above |
 | iOS TestFlight | fails at once with the list of missing secrets | Apple Distribution .p12 + ASC key (+ profiles optional) |
+| In-app updater (`apps/desktop/src/update/`) | primary key embedded; checks `releases/latest` every ~6 h (jittered, backs off, quiet) and on "Check for Updates…" (macOS app menu + menu bar panel, Windows tray). macOS: verifies minisign signature → trusted comment → policy (release channel only, build strictly newer, schema floor, Developer ID team `XA3R5NAN2C`, exact asset name) → streams the zip (size + SHA-256) → re-checks the unpacked bundle in a private userData directory (codesign requirement, Info.plist, build-info) → a detached helper runs the install:app engine: only it, holding the shared install lock, copies that bundle to the shared staged path and re-checks the copy, then snapshot, swap, relaunch, health, rollback (same marker as install:app). A build is never offered again once it was put in place and failed, or its staged copy failed its checks; an install interrupted before that is offered again. Windows: same check, then opens the release page (manual install for now). Finds nothing until a stable release is published | a published stable release; the backup public key in `keys.ts`; a first real update on a Mac (only simulated + unit-tested so far) |
 
 Verified locally on this branch: root `pnpm typecheck && pnpm test`; a full ad-hoc
 `build-release.ts` (verification of the re-extracted zip passed); the smoke test (pass + broken-build
@@ -331,3 +338,6 @@ it is his work machine and installing Apollo there (HKCU, Start menu) needs his 
   profile with a passkey.
 - Attestations (`actions/attest-build-provenance`) are **audit only**; the app trusts the minisign
   signature, never the attestation.
+- **Updater, later:** the offline revoker's minimum-version / key-rotation files are not consulted
+  yet; the Windows silent NSIS hand-off is a separate apply step (`applyStrategy` in
+  `src/update/controller.ts`), not written.
