@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Project } from "@apollo/contracts";
-import { contextConflict, edited, fieldsOf, projectUpdate, rebase, startEdit } from "./projectForm.ts";
+import { contextConflict, edited, fieldsOf, projectUpdate, rebase, startEdit } from "../src/projectForm.ts";
 
 const project = (fields: Partial<Project> = {}) =>
   ({ id: "prj_1", botId: "bot_1", name: "Send", summary: "File sharing", context: "Goals: ship", cwd: null, status: "active", createdAt: 0, updatedAt: 0, ...fields }) as Project;

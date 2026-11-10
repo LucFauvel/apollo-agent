@@ -1,4 +1,4 @@
-import type { SessionId } from "@apollo/contracts";
+import type { BotId, ProjectId, SessionId } from "@apollo/contracts";
 import * as Linking from "expo-linking";
 import * as Notifications from "expo-notifications";
 import { StatusBar } from "expo-status-bar";
@@ -18,6 +18,8 @@ import {
 } from "./src/connection.ts";
 import { ChatScreen } from "./src/screens/ChatScreen.tsx";
 import { HomeScreen } from "./src/screens/HomeScreen.tsx";
+import { NewSessionScreen } from "./src/screens/NewSessionScreen.tsx";
+import { ProjectsScreen } from "./src/screens/ProjectsScreen.tsx";
 import { PairScreen } from "./src/screens/PairScreen.tsx";
 import { SettingsScreen } from "./src/screens/SettingsScreen.tsx";
 import { resetTailnetRoute } from "./src/tailnet.ts";
@@ -29,6 +31,9 @@ export default function App() {
   const [pairing, setPairing] = useState<Pairing | null | undefined>(undefined);
   const [open, setOpen] = useState<SessionId | null>(null);
   const [settings, setSettings] = useState(false);
+  const [projects, setProjects] = useState<{ readonly botId: BotId; readonly focus: ProjectId | null } | null>(null);
+  const [newSession, setNewSession] = useState<{ readonly botId: BotId; readonly projectId: ProjectId | null } | null>(null);
+  const startSession = (botId: BotId, projectId?: ProjectId | null) => setNewSession({ botId, projectId: projectId ?? null });
   // Scanning the QR code with the phone's own camera app opens apollo://pair?… here.
   const link = Linking.useURL();
   // A link handled once (paired, or failed) must not reopen the pairing screen.
@@ -98,6 +103,8 @@ export default function App() {
   const unpair = () => {
     void (pairing ? unregisterPush(pairing) : Promise.resolve()).then(forgetPairing).then(() => {
       setOpen(null);
+      setProjects(null);
+      setNewSession(null);
       setPairing(null);
     });
   };
@@ -119,7 +126,7 @@ export default function App() {
             }}
           />
         ) : (
-          <AppStateProvider connection={connection}>
+          <AppStateProvider connection={connection} pairing={pairing}>
             <AvatarSync pairing={pairing} />
             <NotificationsSync open={open} />
             {/* Home stays under the screens pushed over it, so going back slides to it. The
@@ -127,18 +134,23 @@ export default function App() {
             <View style={styles.fill}>
               <View
                 style={styles.fill}
-                importantForAccessibility={open || settings ? "no-hide-descendants" : "auto"}
-                accessibilityElementsHidden={Boolean(open || settings)}
+                importantForAccessibility={open || settings || projects || newSession ? "no-hide-descendants" : "auto"}
+                accessibilityElementsHidden={Boolean(open || settings || projects || newSession)}
               >
                 <SlideIn key="home" from="left">
-                  <HomeScreen onOpen={setOpen} onSettings={() => setSettings(true)} />
+                  <HomeScreen
+                    onOpen={setOpen}
+                    onSettings={() => setSettings(true)}
+                    onOpenProjects={(botId, focus) => setProjects({ botId, focus: focus ?? null })}
+                    onNewSession={startSession}
+                  />
                 </SlideIn>
               </View>
               {settings ? (
                 <View
                   style={StyleSheet.absoluteFill}
-                  importantForAccessibility={open ? "no-hide-descendants" : "auto"}
-                  accessibilityElementsHidden={Boolean(open)}
+                  importantForAccessibility={open || projects || newSession ? "no-hide-descendants" : "auto"}
+                  accessibilityElementsHidden={Boolean(open || projects || newSession)}
                 >
                   <SwipeBack key="settings" onBack={() => setSettings(false)}>
                     {(back) => (
@@ -154,11 +166,51 @@ export default function App() {
                   </SwipeBack>
                 </View>
               ) : null}
+              {projects ? (
+                <View
+                  style={StyleSheet.absoluteFill}
+                  importantForAccessibility={open || newSession ? "no-hide-descendants" : "auto"}
+                  accessibilityElementsHidden={Boolean(open || newSession)}
+                >
+                  <SwipeBack key={`projects ${projects.botId} ${projects.focus ?? ""}`} onBack={() => setProjects(null)}>
+                    {(back) => (
+                      <ProjectsScreen
+                        botId={projects.botId}
+                        focus={projects.focus}
+                        onBack={back}
+                        onOpenSession={setOpen}
+                        onNewSession={startSession}
+                      />
+                    )}
+                  </SwipeBack>
+                </View>
+              ) : null}
               {open ? (
-                <View style={StyleSheet.absoluteFill}>
+                <View
+                  style={StyleSheet.absoluteFill}
+                  importantForAccessibility={newSession ? "no-hide-descendants" : "auto"}
+                  accessibilityElementsHidden={Boolean(newSession)}
+                >
                   {/* Closes this conversation only if it is still the one open. */}
                   <SwipeBack key={open} onBack={() => setOpen((current) => (current === open ? null : current))}>
-                    {(back) => <ChatScreen sessionId={open} onBack={back} onOpenSession={setOpen} />}
+                    {(back) => <ChatScreen sessionId={open} onBack={back} onOpenSession={setOpen} onNewSession={startSession} />}
+                  </SwipeBack>
+                </View>
+              ) : null}
+              {newSession ? (
+                <View style={StyleSheet.absoluteFill}>
+                  <SwipeBack key="new-session" onBack={() => setNewSession(null)}>
+                    {(back) => (
+                      <NewSessionScreen
+                        botId={newSession.botId}
+                        projectId={newSession.projectId}
+                        onBack={back}
+                        onCreated={(session) => {
+                          setNewSession(null);
+                          setOpen(session.id);
+                        }}
+                      />
+                    )}
                   </SwipeBack>
                 </View>
               ) : null}

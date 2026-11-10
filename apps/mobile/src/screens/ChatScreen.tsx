@@ -17,7 +17,7 @@ import {
   type TranscriptItem,
   type TranscriptState,
 } from "@apollo/client";
-import { type Bot, type InputField, type InputValue, type RepoChanges, type SessionId, sortBots } from "@apollo/contracts";
+import { type Bot, type BotId, type InputField, type InputValue, limitsAccount, type ProjectId, type RepoChanges, type SessionId, sortBots } from "@apollo/contracts";
 import {
   type ReactNode,
   useContext,
@@ -44,9 +44,12 @@ import { useApollo } from "../AppState.tsx";
 import { BlobAvatar } from "../BlobAvatar.tsx";
 import { Markdown } from "../Markdown.tsx";
 import { MonitorStrip } from "../MonitorStrip.tsx";
+import { ArtifactCard, MessageAttachments, RecordingCard, VisualCard } from "../PageCards.tsx";
 import { ActivityGroup } from "../Activity.tsx";
 import { BrowserScreen, type Handoff } from "./BrowserScreen.tsx";
 import { ChangesScreen, FullDiff } from "./ChangesScreen.tsx";
+import { ProjectsScreen } from "./ProjectsScreen.tsx";
+import { UsageMeter } from "../UsageMeter.tsx";
 import { animateLayout, FadeIn, Pulse, ScrollHold, Spin, SwipeBack, Turn, useKeyboardInset, useToggle } from "../motion.tsx";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { errorMessage } from "../connection.ts";
@@ -62,6 +65,7 @@ import {
   ClipboardListIcon,
   InfoIcon,
   AppWindowIcon,
+  FolderKanbanIcon,
   HandIcon,
   KeyRoundIcon,
   LoaderIcon,
@@ -98,11 +102,14 @@ export function ChatScreen({
   sessionId,
   onBack,
   onOpenSession,
+  onNewSession,
 }: {
   sessionId: SessionId;
   onBack: () => void;
   /** Opens another session (a worker, from the Changes screen). */
   onOpenSession: (id: SessionId) => void;
+  /** Starts a new session for a bot, in one of its projects or none. */
+  onNewSession: (botId: BotId, projectId?: ProjectId | null) => void;
 }) {
   const { state, connection } = useApollo();
   const session = state.sessions.get(sessionId);
@@ -359,6 +366,10 @@ export function ChatScreen({
       summaries: summariesByTurn(own.server),
     };
   }, [turnItems, cardsState, sessionId]);
+  const project = session?.projectId ? state.projects.get(session.projectId) : undefined;
+  const limits = session && bot ? state.accountLimits.get(limitsAccount(session.provider, bot)) : undefined;
+  // The bot's projects, from the header or the session's own project.
+  const [projectsOpen, setProjectsOpen] = useState<{ focus: ProjectId | null } | null>(null);
   // Apollo's browser, live: opened from the header, or from a tab an agent handed over.
   const [browser, setBrowser] = useState<{ tabId?: string; handoff?: Handoff } | null>(null);
   const browserTabs = useMemo(() => {
@@ -381,15 +392,31 @@ export function ChatScreen({
               ? (bot?.name ?? "Bot")
               : (session?.title ?? "Session")}
           </Text>
-          <Text style={styles.headerMeta}>
-            {session?.status === "waiting-approval"
-              ? "Needs you"
-              : working
-                ? compacting
-                  ? "Compacting…"
-                  : "Working…"
-                : (session?.provider ?? "")}
-          </Text>
+          <View style={styles.headerMetaRow}>
+            {project ? (
+              <Pressable
+                onPress={() => setProjectsOpen({ focus: project.id })}
+                hitSlop={6}
+                accessibilityLabel={`Project ${project.name}`}
+                style={({ pressed }) => [styles.projectLink, pressed && { opacity: 0.6 }]}
+              >
+                <FolderKanbanIcon size={11} color={colors.muted} />
+                <Text style={styles.projectLinkText} numberOfLines={1}>
+                  {project.name}
+                </Text>
+              </Pressable>
+            ) : null}
+            <Text style={styles.headerMeta} numberOfLines={1}>
+              {session?.status === "waiting-approval"
+                ? "Needs you"
+                : working
+                  ? compacting
+                    ? "Compacting…"
+                    : "Working…"
+                  : (session?.provider ?? "")}
+            </Text>
+            {limits && limits.meters.length > 0 && session ? <UsageMeter limits={limits} provider={session.provider} /> : null}
+          </View>
         </View>
         {browserTabs > 0 ? (
           <Pressable
@@ -401,6 +428,14 @@ export function ChatScreen({
             <AppWindowIcon size={19} color={colors.muted} />
           </Pressable>
         ) : null}
+        <Pressable
+          onPress={() => setProjectsOpen({ focus: null })}
+          hitSlop={8}
+          accessibilityLabel="Projects"
+          style={({ pressed }) => [styles.headerButton, pressed && { opacity: 0.6 }]}
+        >
+          <FolderKanbanIcon size={19} color={colors.muted} />
+        </Pressable>
         <Pressable
           onPress={() => setChangesOpen(true)}
           hitSlop={8}
@@ -642,6 +677,21 @@ export function ChatScreen({
           </SwipeBack>
         </View>
       ) : null}
+      {projectsOpen && session ? (
+        <View style={StyleSheet.absoluteFill}>
+          <SwipeBack onBack={() => setProjectsOpen(null)}>
+            {(back) => (
+              <ProjectsScreen
+                botId={session.botId}
+                focus={projectsOpen.focus}
+                onBack={back}
+                onOpenSession={(id) => (id === sessionId ? back() : onOpenSession(id))}
+                onNewSession={onNewSession}
+              />
+            )}
+          </SwipeBack>
+        </View>
+      ) : null}
       {changesOpen && session ? (
         <View style={StyleSheet.absoluteFill}>
           <SwipeBack onBack={() => setChangesOpen(false)}>
@@ -707,8 +757,13 @@ function Item({
       return <ActivityGroup block={item} live={live} />;
     case "user":
       return item.author === "user" ? (
-        <View style={styles.userBubble}>
-          <Text style={styles.userText}>{item.text}</Text>
+        <View style={{ gap: 6 }}>
+          {item.attachments && item.attachments.length > 0 ? <MessageAttachments sessionId={sessionId} attachments={item.attachments} /> : null}
+          {item.text ? (
+            <View style={styles.userBubble}>
+              <Text style={styles.userText}>{item.text}</Text>
+            </View>
+          ) : null}
         </View>
       ) : item.author === "peer" ? (
         <PeerMessage botId={item.fromBotId} text={item.text} />
@@ -751,13 +806,9 @@ function Item({
     case "handoff":
       return <HandoffCard item={item} onOpen={() => onOpenBrowser(item.tabId, item.outcome === null ? { requestId: item.requestId, reason: item.reason } : undefined)} />;
     case "visual":
+      return item.artifact ? <ArtifactCard item={item} artifact={item.artifact} /> : <VisualCard item={item} />;
     case "recording":
-      return (
-        <View style={styles.notice}>
-          <InfoIcon size={14} color={colors.faint} />
-          <Text style={styles.noticeText}>{item.title}: open Apollo on your computer to view it.</Text>
-        </View>
-      );
+      return <RecordingCard item={item} />;
     default:
       return null;
   }
@@ -1347,7 +1398,10 @@ const styles = StyleSheet.create({
   turnChangesCounts: { fontFamily: MONO, fontSize: 11 },
   turnChangesReview: { color: colors.faint, fontSize: 12 },
   headerTitle: { color: colors.text, fontSize: 17, fontWeight: "600" },
-  headerMeta: { color: colors.faint, fontSize: 12 },
+  headerMeta: { color: colors.faint, fontSize: 12, flexShrink: 1 },
+  headerMetaRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+  projectLink: { flexDirection: "row", alignItems: "center", gap: 3, flexShrink: 1, maxWidth: "55%" },
+  projectLinkText: { color: colors.muted, fontSize: 12 },
   transcript: { padding: 16, gap: 12 },
   sending: { opacity: 0.6 },
   listen: { flexDirection: "row", alignItems: "center", gap: 5, alignSelf: "flex-start", marginTop: 4, paddingVertical: 3 },

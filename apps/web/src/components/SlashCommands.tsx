@@ -2,7 +2,7 @@ import { headlineMeter, type Session, type SlashCommand, type UsageLimits, type 
 import { Loader2, Slash, TerminalSquare } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { rpc } from "../rpc.ts";
-import { relativeTime } from "../format.ts";
+import { meterTone, percentLeft, relativeTime } from "@apollo/client";
 import { cx, Tooltip } from "./ui.tsx";
 
 /** `/name args` → its parts; `null` when the text is not a command. */
@@ -155,21 +155,8 @@ export function ContextMeter({ context }: { context: NonNullable<Session["contex
   );
 }
 
-const percentLeft = (m: UsageMeter) => Math.max(0, Math.min(100, Math.round(100 - m.usedPercent)));
-
-/** A meter's colour: the provider's own grading when it gives one, else how full it is. */
-const meterColor = (m: UsageMeter) =>
-  m.severity !== null
-    ? m.severity === "critical"
-      ? "text-red-400"
-      : m.severity === "warning"
-        ? "text-amber-300"
-        : "text-zinc-500"
-    : m.usedPercent >= 90
-      ? "text-red-400"
-      : m.usedPercent >= 75
-        ? "text-amber-300"
-        : "text-zinc-500";
+const METER_COLOR = { critical: "text-red-400", warning: "text-amber-300", normal: "text-zinc-500" } as const;
+const meterColor = (m: UsageMeter) => METER_COLOR[meterTone(m)];
 
 /**
  * How much of the provider account's plan is left: the headline meter as a small bar and a
