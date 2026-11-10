@@ -1,8 +1,9 @@
-import { codePlainColor, highlightCode } from "@apollo/client";
+import { codePlainColor, fileLinkFromCode, fileLinkFromHref, highlightCode, splitFileLinks } from "@apollo/client";
 import { Check, Copy } from "lucide-react";
 import { isValidElement, type ReactNode, useMemo, useState } from "react";
-import Markdown, { type Components } from "react-markdown";
+import Markdown, { type Components, defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { FileLink } from "./FileLink.tsx";
 
 /** A fenced code block, highlighted, with its language and a copy button. */
 /** The text a highlighted code block shows: its lines' spans, a newline between lines. */
@@ -63,8 +64,11 @@ const components: Components = {
   // Links (written or autolinked bare URLs) open in the user's browser, never in place of the
   // app: a new tab on the web, the system browser on desktop (its window-open handler).
   // Only in-page anchors (footnotes) stay in place.
-  a: ({ node: _node, href, children, ...props }) =>
-    href?.startsWith("#") ? (
+  // Local files (linked, or paths in text and code spans) open through FileLink.
+  a: ({ node: _node, href, children, ...props }) => {
+    const file = href ? fileLinkFromHref(href) : null;
+    if (file) return <FileLink file={file}>{children}</FileLink>;
+    return href?.startsWith("#") ? (
       <a {...props} href={href}>
         {children}
       </a>
@@ -72,15 +76,49 @@ const components: Components = {
       <a {...props} href={href} target="_blank" rel="noopener noreferrer">
         {children}
       </a>
-    ),
+    );
+  },
 };
 
-const remarkPlugins = [remarkGfm];
+interface MdNode {
+  type: string;
+  value?: string;
+  url?: string;
+  children?: Array<MdNode>;
+}
+
+const NO_LINKS = new Set(["link", "linkReference", "definition", "code", "html", "image", "imageReference"]);
+
+/** Turns paths in text and inline code into links, for the `a` component to open as files. */
+const linkPaths = (node: MdNode) => {
+  if (!node.children) return;
+  const out: Array<MdNode> = [];
+  for (const child of node.children) {
+    if (NO_LINKS.has(child.type)) out.push(child);
+    else if (child.type === "inlineCode" && child.value && fileLinkFromCode(child.value)) out.push({ type: "link", url: child.value.trim(), children: [child] });
+    else if (child.type === "text" && child.value) {
+      for (const part of splitFileLinks(child.value)) {
+        out.push(typeof part === "string" ? { type: "text", value: part } : { type: "link", url: part.text, children: [{ type: "text", value: part.text }] });
+      }
+    } else {
+      linkPaths(child);
+      out.push(child);
+    }
+  }
+  node.children = out;
+};
+
+const remarkFileLinks = () => (tree: MdNode) => linkPaths(tree);
+
+/** Keeps file links (`file:` URLs and Windows paths look like unsafe schemes to the default). */
+const urlTransform = (url: string) => (fileLinkFromHref(url) ? url : defaultUrlTransform(url));
+
+const remarkPlugins = [remarkGfm, remarkFileLinks];
 
 /** Markdown as Apollo shows it in conversations: GitHub-flavored, with highlighted code. */
 export function MarkdownText({ children }: { children: string }) {
   return (
-    <Markdown remarkPlugins={remarkPlugins} components={components}>
+    <Markdown remarkPlugins={remarkPlugins} components={components} urlTransform={urlTransform}>
       {children}
     </Markdown>
   );
@@ -113,6 +151,6 @@ export const markdownShownText = (markdown: string): string => {
     else if (plainComponents.has(node.type)) walk((node.type as (props: unknown) => ReactNode)(props));
     else walk(props.children);
   };
-  walk(Markdown({ children: markdown, remarkPlugins, components }));
+  walk(Markdown({ children: markdown, remarkPlugins, components, urlTransform }));
   return out.join("");
 };

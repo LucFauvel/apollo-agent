@@ -5,7 +5,8 @@ import { homedir } from "node:os";
 import { createServer } from "node:net";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, dialog, Menu, nativeImage, Notification, shell, Tray, type WebContents } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, Notification, shell, Tray, type WebContents } from "electron";
+import { fileOpenAction } from "./fileOpen.ts";
 import { navigationDecision, windowOpenDecision } from "./navigation.js";
 import { type PanelRow, TrayPanel } from "./trayPanel.js";
 import { Updater } from "./update/controller.ts";
@@ -96,6 +97,11 @@ const devUrl = process.env.APOLLO_DEV_URL;
 const screenshotPath = process.env.APOLLO_SCREENSHOT;
 
 let server: ChildProcess | null = null;
+/** Where the server listens, once started. */
+let serverBaseUrl: string | null = null;
+/** The app's main window and the origins its page may come from (see createWindow). */
+let mainWindow: BrowserWindow | null = null;
+let mainOrigins: ReadonlyArray<string> = [];
 let tray: Tray | null = null;
 /** Latest status from the server, and whether the tray menu is open right now. */
 let trayStatus: DesktopStatus | null = null;
@@ -300,6 +306,7 @@ const startServer = async (): Promise<string> => {
     setTimeout(() => void startServer().catch((error) => console.error("restarting the server failed", error)), 1000);
   });
   await waitForHealth(baseUrl);
+  serverBaseUrl = baseUrl;
   return baseUrl;
 };
 
@@ -369,9 +376,12 @@ const createWindow = async (url: string, appOrigins: ReadonlyArray<string>) => {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      preload: join(here, "preload.cjs"),
       ...(screenshotPath ? { offscreen: true } : {}),
     },
   });
+  mainWindow = window;
+  mainOrigins = appOrigins;
 
   // Bots keep working (schedules, workers) with the window closed: hide it to
   // the tray instead, until the user quits from the tray or the app menu.
@@ -401,6 +411,50 @@ const createWindow = async (url: string, appOrigins: ReadonlyArray<string>) => {
     app.quit();
   }
 };
+
+/**
+ * A file link the user clicked in the main window (see preload.cts): the server checks that the
+ * file is one the session may open, then it opens in its default app, or shows in Finder or
+ * Explorer when asked or when opening it would run something.
+ */
+ipcMain.handle("apollo:open-file", async (event, request: unknown) => {
+  const frame = event.senderFrame;
+  if (!mainWindow || event.sender !== mainWindow.webContents || !frame || frame !== event.sender.mainFrame) return { error: "Not allowed." };
+  let origin: string;
+  try {
+    origin = new URL(frame.url).origin;
+  } catch {
+    return { error: "Not allowed." };
+  }
+  if (!mainOrigins.includes(origin)) return { error: "Not allowed." };
+  const { sessionId, path, reveal } = (request ?? {}) as { sessionId?: unknown; path?: unknown; reveal?: unknown };
+  if (typeof sessionId !== "string" || typeof path !== "string" || !sessionId || !path) return { error: "Not a file." };
+  if (!serverBaseUrl) return { error: "Apollo is still starting." };
+  try {
+    const response = await fetch(`${serverBaseUrl}/api/desktop/file?${new URLSearchParams({ sessionId, path })}`, {
+      headers: { authorization: `Bearer ${bootstrapToken}` },
+      signal: AbortSignal.timeout(5000),
+    });
+    const body = (await response.json().catch(() => null)) as { path?: unknown; directory?: unknown; error?: unknown } | null;
+    if (!response.ok || typeof body?.path !== "string") {
+      return { error: typeof body?.error === "string" ? body.error : `Could not open it (${response.status}).` };
+    }
+    let executable = false;
+    try {
+      accessSync(body.path, constants.X_OK);
+      executable = true;
+    } catch {}
+    const target = { path: body.path, directory: body.directory === true, executable };
+    if (fileOpenAction(target, reveal === true, process.platform) === "reveal") {
+      shell.showItemInFolder(target.path);
+      return { ok: true, revealed: true };
+    }
+    const error = await shell.openPath(target.path);
+    return error ? { error } : { ok: true, revealed: false };
+  } catch {
+    return { error: "Could not reach Apollo's server." };
+  }
+});
 
 const showWindow = () => {
   const [window] = BrowserWindow.getAllWindows();

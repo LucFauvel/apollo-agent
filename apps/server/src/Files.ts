@@ -1,7 +1,11 @@
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import * as Effect from "effect/Effect";
 import type { SessionId } from "@apollo/contracts";
+import { AppSettings } from "./AppSettings.ts";
+import { fromDesktopShell } from "./DesktopStatus.ts";
+import { fileErrorMessage, type FileRoots, resolveLocalFile } from "./localFiles.ts";
 import * as Layer from "effect/Layer";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { findArtifact } from "./artifacts.ts";
@@ -120,4 +124,105 @@ const layerArtifacts = HttpRouter.add(
   }),
 );
 
-export const layer = Layer.mergeAll(layerRecordings, layerUpload, layerDownload, layerArtifacts);
+/** Local files larger than this are not served (they are read into memory); the desktop app still opens them. */
+export const MAX_LOCAL_FILE_BYTES = 100 * 1024 * 1024;
+
+const sessionRoots = (sessionId: string) =>
+  Effect.gen(function* () {
+    const store = yield* Store;
+    const appSettings = yield* AppSettings;
+    const session = yield* store.getSession(sessionId as SessionId).pipe(Effect.option);
+    if (session._tag === "None") return null;
+    const bot = yield* store.getBot(session.value.botId).pipe(Effect.option);
+    const { projectFolders } = yield* appSettings.read;
+    return {
+      sessionCwd: session.value.cwd,
+      roots: [
+        ...(bot._tag === "Some" ? [bot.value.cwd] : []),
+        ...(session.value.worktree ? [session.value.worktree.path] : []),
+        ...projectFolders,
+      ],
+      home: homedir(),
+    } satisfies FileRoots;
+  });
+
+/** A file a message links to, checked against the session's roots. */
+const localFile = (sessionId: string | undefined, path: unknown) =>
+  Effect.gen(function* () {
+    const roots = sessionId ? yield* sessionRoots(sessionId) : null;
+    if (!roots || typeof path !== "string") return { ok: false as const, status: 404, error: "Not found" };
+    const resolved = resolveLocalFile(path, roots);
+    if (!resolved.ok) return { ok: false as const, status: resolved.reason === "outside" ? 403 : 404, error: fileErrorMessage(resolved.reason) };
+    return { ok: true as const, info: resolved.info };
+  });
+
+/**
+ * `GET /api/files/<sessionId>/info?path=<path>`: what a path a message mentions points to
+ * (`LocalFileInfo`), if it is inside the session's folder, its bot's workspace or a project
+ * folder. Relative paths are relative to the session's folder.
+ */
+const layerLocalInfo = HttpRouter.add(
+  "GET",
+  "/api/files/:sessionId/info",
+  Effect.gen(function* () {
+    const { sessionId } = yield* HttpRouter.params;
+    const query = yield* HttpServerRequest.ParsedSearchParams;
+    const found = yield* localFile(sessionId, query.path);
+    if (!found.ok) return HttpServerResponse.jsonUnsafe({ error: found.error }, { status: found.status });
+    return HttpServerResponse.jsonUnsafe(found.info).pipe(HttpServerResponse.setHeader("cache-control", "no-store"));
+  }),
+);
+
+/** `GET /api/files/<sessionId>/content?path=<path>`: that file's bytes. `?download=1` serves it as a download. */
+const layerLocalContent = HttpRouter.add(
+  "GET",
+  "/api/files/:sessionId/content",
+  Effect.gen(function* () {
+    const { sessionId } = yield* HttpRouter.params;
+    const query = yield* HttpServerRequest.ParsedSearchParams;
+    const found = yield* localFile(sessionId, query.path);
+    if (!found.ok) return HttpServerResponse.text(found.error, { status: found.status });
+    if (found.info.directory) return HttpServerResponse.text("This is a folder: open it in Apollo on your computer.", { status: 400 });
+    if (found.info.size > MAX_LOCAL_FILE_BYTES) return HttpServerResponse.text("This file is larger than 100 MB: open it in Apollo on your computer.", { status: 413 });
+    try {
+      return HttpServerResponse.uint8Array(readFileSync(found.info.path), { contentType: found.info.mime }).pipe(
+        HttpServerResponse.setHeader("cache-control", "no-store"),
+        HttpServerResponse.setHeader(
+          "content-disposition",
+          `${query.download === "1" ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(found.info.name)}`,
+        ),
+        // A local HTML or SVG file must never run as a page on Apollo's origin.
+        HttpServerResponse.setHeader("content-security-policy", "sandbox"),
+        HttpServerResponse.setHeader("x-content-type-options", "nosniff"),
+      );
+    } catch {
+      return notFound;
+    }
+  }),
+);
+
+/**
+ * `GET /api/desktop/file?sessionId=<id>&path=<path>` for the desktop shell (bootstrap token):
+ * the same check as `/api/files/<sessionId>/info`, before it opens the file on this computer.
+ */
+const layerDesktopFile = HttpRouter.add(
+  "GET",
+  "/api/desktop/file",
+  Effect.gen(function* () {
+    if (!(yield* fromDesktopShell)) return HttpServerResponse.jsonUnsafe({ error: "Only the desktop app may ask this." }, { status: 401 });
+    const query = yield* HttpServerRequest.ParsedSearchParams;
+    const found = yield* localFile(typeof query.sessionId === "string" ? query.sessionId : undefined, query.path);
+    if (!found.ok) return HttpServerResponse.jsonUnsafe({ error: found.error }, { status: found.status });
+    return HttpServerResponse.jsonUnsafe(found.info);
+  }),
+);
+
+export const layer = Layer.mergeAll(
+  layerRecordings,
+  layerUpload,
+  layerDownload,
+  layerArtifacts,
+  layerLocalInfo,
+  layerLocalContent,
+  layerDesktopFile,
+);

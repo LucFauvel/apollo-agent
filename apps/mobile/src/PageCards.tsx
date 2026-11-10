@@ -1,11 +1,25 @@
-import { externalTarget, pageNavigation, type TranscriptItem } from "@apollo/client";
+import { externalTarget, type FileReference, fileLinkName, pageNavigation, type TranscriptItem } from "@apollo/client";
 import type { ArtifactKind, ArtifactRef, AttachmentRef, SessionId } from "@apollo/contracts";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Image, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { useApollo } from "./AppState.tsx";
-import { artifactFile, artifactText, attachmentFile, FALLBACK_IS_PAGE, cachedFrame, formatSize, recordingFrames, shareArtifact, shareFile } from "./artifacts.ts";
+import {
+  artifactFile,
+  artifactText,
+  attachmentFile,
+  FALLBACK_IS_PAGE,
+  cachedFrame,
+  formatSize,
+  localFile,
+  localFileInfo,
+  type LocalFileInfo,
+  MAX_LOCAL_FILE_BYTES,
+  recordingFrames,
+  shareArtifact,
+  shareFile,
+} from "./artifacts.ts";
 import { errorMessage } from "./connection.ts";
 import { ChevronDownIcon, FileCodeIcon, FileIcon, FileTextIcon, type Icon, ImageIcon, LayoutTemplateIcon, Maximize2Icon, RotateCwIcon, ShareIcon, XIcon } from "./icons.tsx";
 import { CodeBlock, Markdown } from "./Markdown.tsx";
@@ -151,7 +165,7 @@ function Frame({
   );
 }
 
-function Viewer({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+function Viewer({ title, onClose, onShare, children }: { title: string; onClose: () => void; onShare?: (() => void) | undefined; children: ReactNode }) {
   const insets = useSafeAreaInsets();
   return (
     <Modal visible animationType="slide" presentationStyle="fullScreen" onRequestClose={onClose}>
@@ -160,6 +174,11 @@ function Viewer({ title, onClose, children }: { title: string; onClose: () => vo
           <Text style={styles.viewerTitle} numberOfLines={1}>
             {title}
           </Text>
+          {onShare ? (
+            <Pressable onPress={onShare} hitSlop={10} accessibilityLabel="Share or save">
+              <ShareIcon size={18} color={colors.muted} />
+            </Pressable>
+          ) : null}
           <Pressable onPress={onClose} hitSlop={10} accessibilityLabel="Close">
             <XIcon size={20} color={colors.muted} />
           </Pressable>
@@ -367,6 +386,111 @@ export function ArtifactCard({ item, artifact: a }: { item: VisualItem; artifact
         </Viewer>
       ) : null}
     </>
+  );
+}
+
+type LocalFileState =
+  | { readonly step: "loading" }
+  | { readonly step: "error"; readonly message: string }
+  | { readonly step: "info"; readonly info: LocalFileInfo }
+  | { readonly step: "ready"; readonly info: LocalFileInfo; readonly uri: string; readonly text: string | null };
+
+const TEXT_KINDS = new Set<ArtifactKind>(["markdown", "code", "text", "html"]);
+
+/**
+ * A local file a message links to, full screen: the server checks it is one the session may
+ * open, then it is downloaded and previewed by kind (as artifacts are), or offered to share.
+ */
+export function LocalFileViewer({ sessionId, file, onClose }: { sessionId: SessionId; file: FileReference; onClose: () => void }) {
+  const { pairing } = useApollo();
+  const [state, setState] = useState<LocalFileState>({ step: "loading" });
+  const [shareError, setShareError] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const info = await localFileInfo(pairing, sessionId, file.path);
+      if (cancelled) return;
+      const previewable = !info.directory && info.size <= MAX_LOCAL_FILE_BYTES && (TEXT_KINDS.has(info.kind) || info.kind === "image" || info.mime === "application/pdf");
+      if (!previewable) return setState({ step: "info", info });
+      const downloaded = await localFile(pairing, sessionId, info);
+      const text = TEXT_KINDS.has(info.kind) ? await downloaded.text() : null;
+      if (!cancelled) setState({ step: "ready", info, uri: downloaded.uri, text });
+    })().catch((e: unknown) => !cancelled && setState({ step: "error", message: errorMessage(e) }));
+    return () => {
+      cancelled = true;
+    };
+  }, [pairing, sessionId, file.path]);
+
+  const info = state.step === "info" || state.step === "ready" ? state.info : null;
+  const title = info?.name ?? fileLinkName(file.path);
+  const canShare = info !== null && !info.directory && info.size <= MAX_LOCAL_FILE_BYTES;
+  const share = () => {
+    if (!info) return;
+    setShareError(null);
+    localFile(pairing, sessionId, info)
+      .then((f) => shareFile(f, info.name))
+      .catch((e: unknown) => setShareError(errorMessage(e)));
+  };
+
+  let body: ReactNode;
+  if (state.step === "loading") body = <Loading />;
+  else if (state.step === "error") body = <Text style={styles.note}>{state.message}</Text>;
+  else if (state.step === "info") {
+    const { info } = state;
+    body = info.directory ? (
+      <Text style={styles.note}>This is a folder. Open it in Apollo on your computer.</Text>
+    ) : info.size > MAX_LOCAL_FILE_BYTES ? (
+      <Text style={styles.note}>This file is {formatSize(info.size)}, too large to send to the phone. Open it in Apollo on your computer.</Text>
+    ) : (
+      <Pressable onPress={share} style={({ pressed }) => [styles.download, pressed && { opacity: 0.5 }]}>
+        <ShareIcon size={14} color={colors.muted} />
+        <Text style={styles.downloadText}>
+          Save or share {info.name} ({formatSize(info.size)})
+        </Text>
+      </Pressable>
+    );
+  } else {
+    const { info, uri, text } = state;
+    if (info.kind === "image") {
+      body = (
+        <ScrollView maximumZoomScale={5} minimumZoomScale={1} centerContent contentContainerStyle={{ flexGrow: 1 }}>
+          <Image source={{ uri }} style={{ flex: 1 }} resizeMode="contain" />
+        </ScrollView>
+      );
+    } else if (info.mime === "application/pdf") {
+      body = (
+        <WebView
+          source={{ uri }}
+          originWhitelist={["file://*"]}
+          allowingReadAccessToURL={uri}
+          onShouldStartLoadWithRequest={(request) => request.url === uri}
+          style={{ flex: 1, backgroundColor: colors.bg }}
+        />
+      );
+    } else if (info.kind === "html" && text !== null) {
+      body = <Page html={text} height="fill" scroll />;
+    } else {
+      const shown = (text ?? "").slice(0, MAX_TEXT);
+      body = (
+        <ScrollView contentContainerStyle={{ paddingBottom: 24 }}>
+          {info.kind === "markdown" ? (
+            <View style={{ paddingHorizontal: 14, paddingVertical: 10 }}>
+              <Markdown text={shown} />
+            </View>
+          ) : (
+            <CodeBlock code={shown} lang={info.kind === "code" ? (info.language ?? null) : null} />
+          )}
+          {text !== null && shown.length < text.length ? <Text style={styles.note}>Only the first {formatSize(MAX_TEXT)} are shown; share it for the rest.</Text> : null}
+        </ScrollView>
+      );
+    }
+  }
+
+  return (
+    <Viewer title={title} onClose={onClose} onShare={canShare ? share : undefined}>
+      {shareError ? <Text style={[styles.note, { color: colors.red }]}>{shareError}</Text> : null}
+      {body}
+    </Viewer>
   );
 }
 

@@ -18,6 +18,7 @@ import {
   type TranscriptBlock,
   type TranscriptItem,
   type TranscriptState,
+  type FileReference,
 } from "@apollo/client";
 import { type Bot, type BotId, type InputField, type InputValue, limitsAccount, type ProjectId, type ReplyRef, type RepoChanges, type SessionId, sortBots } from "@apollo/contracts";
 import {
@@ -45,10 +46,10 @@ import {
 } from "react-native";
 import { useApollo } from "../AppState.tsx";
 import { BlobAvatar } from "../BlobAvatar.tsx";
-import { Markdown } from "../Markdown.tsx";
+import { FileLinkContext, Markdown } from "../Markdown.tsx";
 import { ModelMenu } from "../ModelPicker.tsx";
 import { MonitorStrip } from "../MonitorStrip.tsx";
-import { ArtifactCard, MessageAttachments, RecordingCard, VisualCard } from "../PageCards.tsx";
+import { ArtifactCard, LocalFileViewer, MessageAttachments, RecordingCard, VisualCard } from "../PageCards.tsx";
 import { ActivityGroup } from "../Activity.tsx";
 import { BrowserScreen, type Handoff } from "./BrowserScreen.tsx";
 import { ChangesScreen, FullDiff } from "./ChangesScreen.tsx";
@@ -128,6 +129,7 @@ export function ChatScreen({
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [replyTo, setReplyTo] = useState<ReplyRef | null>(null);
+  const [openFile, setOpenFile] = useState<FileReference | null>(null);
   const input = useRef<TextInputInstance>(null);
   const scroll = useRef<ScrollViewInstance>(null);
   // Follow new output only while the user is at the bottom, and never because a row opened.
@@ -418,6 +420,7 @@ export function ChatScreen({
   }, [state.browserTabs, session?.botId]);
 
   return (
+    <FileLinkContext.Provider value={setOpenFile}>
     <View style={{ flex: 1 }}>
     <Animated.View style={[styles.screen, { paddingBottom: keyboard }]}>
       <View style={styles.header}>
@@ -789,7 +792,9 @@ export function ChatScreen({
           </SwipeBack>
         </View>
       ) : null}
+      {openFile ? <LocalFileViewer key={openFile.path} sessionId={sessionId} file={openFile} onClose={() => setOpenFile(null)} /> : null}
     </View>
+    </FileLinkContext.Provider>
   );
 }
 

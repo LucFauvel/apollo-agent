@@ -1,6 +1,6 @@
-import { type ReactNode, useMemo } from "react";
+import { createContext, type ReactNode, useContext, useMemo } from "react";
 import { Linking, Platform, ScrollView, StyleSheet, Text, type TextStyle, View } from "react-native";
-import { codePlainColor, highlightCode } from "@apollo/client";
+import { codePlainColor, type FileReference, fileLinkFromCode, fileLinkFromHref, highlightCode, markdownLinkPattern, parseMarkdownLink, splitFileLinks } from "@apollo/client";
 import { colors } from "./theme.ts";
 
 const mono = Platform.OS === "ios" ? "Menlo" : "monospace";
@@ -102,29 +102,63 @@ const parseBlocks = (source: string): Array<Block> => {
   return blocks;
 };
 
-const inlinePattern = /(`[^`]+`)|(\*\*[^*]+\*\*|__[^_]+__)|(\*[^*\s][^*]*\*|_[^_\s][^_]*_)|(~~[^~]+~~)|(\[[^\]]+\]\([^)\s]+\))|(https?:\/\/[^\s)]+)/g;
+const inlinePattern = new RegExp(
+  String.raw`(\`[^\`]+\`)|(\*\*[^*]+\*\*|__[^_]+__)|(\*[^*\s][^*]*\*|_[^_\s][^_]*_)|(~~[^~]+~~)|(${markdownLinkPattern})|(https?:\/\/[^\s)]+)`,
+  "g",
+);
+
+/**
+ * Opens a local file a message links to (see LocalFileViewer); without one, as in artifacts
+ * and skills, paths stay plain text.
+ */
+export const FileLinkContext = createContext<((file: FileReference) => void) | null>(null);
+
+type OnFile = ((file: FileReference) => void) | null;
+
+/** Plain text, with the paths in it as file links. */
+const withFileLinks = (text: string, onFile: OnFile, key: string): Array<ReactNode> => {
+  if (!onFile) return [text];
+  return splitFileLinks(text).map((part, i) =>
+    typeof part === "string" ? (
+      part
+    ) : (
+      <Text key={`${key}f${i}`} style={styles.link} onPress={() => onFile(part.ref)}>
+        {part.text}
+      </Text>
+    ),
+  );
+};
 
 /** Inline spans: code, bold, italic, strikethrough and links. */
-const renderInline = (text: string, base: TextStyle, keyPrefix = ""): Array<ReactNode> => {
+const renderInline = (text: string, base: TextStyle, onFile: OnFile, keyPrefix = ""): Array<ReactNode> => {
   const out: Array<ReactNode> = [];
   let last = 0;
   let n = 0;
   for (const match of text.matchAll(inlinePattern)) {
     const start = match.index;
-    if (start > last) out.push(text.slice(last, start));
+    if (start > last) out.push(...withFileLinks(text.slice(last, start), onFile, `${keyPrefix}${n}`));
     const [token, code, bold, italic, strike, link, url] = match;
     const key = `${keyPrefix}${n++}`;
-    if (code) out.push(<Text key={key} style={styles.inlineCode}>{code.slice(1, -1)}</Text>);
-    else if (bold) out.push(<Text key={key} style={styles.bold}>{renderInline(bold.slice(2, -2), base, `${key}.`)}</Text>);
-    else if (italic) out.push(<Text key={key} style={styles.italic}>{renderInline(italic.slice(1, -1), base, `${key}.`)}</Text>);
-    else if (strike) out.push(<Text key={key} style={styles.strike}>{strike.slice(2, -2)}</Text>);
-    else if (link) {
-      const m = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(link)!;
+    if (code) {
+      const file = onFile ? fileLinkFromCode(code.slice(1, -1)) : null;
       out.push(
-        <Text key={key} style={styles.link} onPress={() => void Linking.openURL(m[2]!).catch(() => {})}>
-          {m[1]}
+        <Text key={key} style={file ? [styles.inlineCode, styles.link] : styles.inlineCode} onPress={file ? () => onFile!(file) : undefined}>
+          {code.slice(1, -1)}
         </Text>,
       );
+    } else if (bold) out.push(<Text key={key} style={styles.bold}>{renderInline(bold.slice(2, -2), base, onFile, `${key}.`)}</Text>);
+    else if (italic) out.push(<Text key={key} style={styles.italic}>{renderInline(italic.slice(1, -1), base, onFile, `${key}.`)}</Text>);
+    else if (strike) out.push(<Text key={key} style={styles.strike}>{strike.slice(2, -2)}</Text>);
+    else if (link) {
+      const { text: label, href } = parseMarkdownLink(link)!;
+      const file = fileLinkFromHref(href);
+      if (file && !onFile) out.push(label);
+      else
+        out.push(
+          <Text key={key} style={styles.link} onPress={() => (file ? onFile!(file) : void Linking.openURL(href).catch(() => {}))}>
+            {label}
+          </Text>,
+        );
     } else if (url) {
       out.push(
         <Text key={key} style={styles.link} onPress={() => void Linking.openURL(url).catch(() => {})}>
@@ -134,7 +168,7 @@ const renderInline = (text: string, base: TextStyle, keyPrefix = ""): Array<Reac
     } else out.push(token);
     last = start + token.length;
   }
-  if (last < text.length) out.push(text.slice(last));
+  if (last < text.length) out.push(...withFileLinks(text.slice(last), onFile, `${keyPrefix}${n}`));
   return out;
 };
 
@@ -182,6 +216,7 @@ export function CodeBlock({ code, lang }: { code: string; lang: string | null })
 /** Renders an agent's markdown reply with native text. */
 export function Markdown({ text, color = colors.textSoft, size = 15 }: { text: string; color?: string; size?: number }) {
   const blocks = useMemo(() => parseBlocks(text), [text]);
+  const onFile = useContext(FileLinkContext);
   const base: TextStyle = { color, fontSize: size, lineHeight: Math.round(size * 1.45) };
   return (
     <View style={styles.root}>
@@ -190,13 +225,13 @@ export function Markdown({ text, color = colors.textSoft, size = 15 }: { text: s
           case "heading":
             return (
               <Text key={i} style={[base, styles.heading, { fontSize: size + Math.max(0, 5 - block.level) * 1.5, color: colors.text }]}>
-                {renderInline(block.text, base)}
+                {renderInline(block.text, base, onFile)}
               </Text>
             );
           case "paragraph":
             return (
               <Text key={i} style={base} selectable>
-                {renderInline(block.text, base)}
+                {renderInline(block.text, base, onFile)}
               </Text>
             );
           case "code":
@@ -214,7 +249,7 @@ export function Markdown({ text, color = colors.textSoft, size = 15 }: { text: s
                   <View key={j} style={[styles.listItem, { paddingLeft: item.indent * 16 }]}>
                     <Text style={[base, styles.marker]}>{block.ordered ? item.marker : item.indent ? "◦" : "•"}</Text>
                     <Text style={[base, { flex: 1 }]} selectable>
-                      {renderInline(item.text.replace(/^\[( |x)\]\s*/i, (_, c: string) => (c === " " ? "☐ " : "☑ ")), base)}
+                      {renderInline(item.text.replace(/^\[( |x)\]\s*/i, (_, c: string) => (c === " " ? "☐ " : "☑ ")), base, onFile)}
                     </Text>
                   </View>
                 ))}
@@ -228,7 +263,7 @@ export function Markdown({ text, color = colors.textSoft, size = 15 }: { text: s
                     <View key={r} style={[styles.tableRow, r === 0 && styles.tableHead]}>
                       {row.map((cell, c) => (
                         <Text key={c} style={[base, styles.tableCell, r === 0 && styles.bold, { fontSize: size - 2 }]}>
-                          {renderInline(cell, base)}
+                          {renderInline(cell, base, onFile)}
                         </Text>
                       ))}
                     </View>
