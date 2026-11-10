@@ -5,7 +5,7 @@
  */
 import { execFile } from "node:child_process";
 import { join } from "node:path";
-import type { BuildInfo, FileOps } from "../install/lib.ts";
+import type { FileOps } from "../install/lib.ts";
 import { stagedProblems, type UpdateJob } from "./helperCore.ts";
 
 export type Exec = (command: string, args: ReadonlyArray<string>) => Promise<{ readonly status: number | null; readonly stdout: string; readonly stderr: string }>;
@@ -66,9 +66,9 @@ export const verifyFromZip = async (o: {
   if ((await plistValue(exec, app, "CFBundleIdentifier")) !== BUNDLE_ID) throw new Error(`the update is not ${BUNDLE_ID}`);
   const bundleVersion = await plistValue(exec, app, "CFBundleVersion");
   if (bundleVersion !== String(job.build)) throw new Error(`the update's CFBundleVersion is ${bundleVersion}, the manifest says ${job.build}`);
-  let info: Partial<BuildInfo> | null = null;
+  let info: unknown = null;
   try {
-    info = JSON.parse(files.readText(join(app, "Contents", "Resources", "build-info.json"))) as Partial<BuildInfo>;
+    info = JSON.parse(files.readText(join(app, "Contents", "Resources", "build-info.json"))) as unknown;
   } catch {
     info = null;
   }

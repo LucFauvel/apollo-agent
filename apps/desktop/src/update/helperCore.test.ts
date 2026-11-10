@@ -207,6 +207,43 @@ describe("applying an update with the install engine", () => {
     expect(installed().version).toBe("1.3.0");
   });
 
+  it("does not put the new build in place when its swap cannot be recorded first", async () => {
+    const { job, fx, installed, outcome } = world({ next: { ...NEW, health: "bad" } });
+    let renamed = false;
+    const files = {
+      ...fx.files,
+      writeText: (path: string, text: string) => {
+        if (path === job.progressPath && text.includes('"swapStarted":true')) throw new Error("EPERM (injected)");
+        fx.files.writeText(path, text);
+      },
+      rename: (from: string, to: string) => {
+        if (from === job.bundles.staged && to === job.bundles.target) renamed = true;
+        fx.files.rename(from, to);
+      },
+    };
+    const result = await runInstall(helperDeps(job, { ...fx, files }));
+    expect(renamed).toBe(false);
+    expect(result.status).toBe("rolled-back");
+    expect(installed().version).toBe("1.2.0");
+    // The new build never ran: not held against it.
+    expect(outcome(result, 400)).toMatchObject({ kind: "failed", skip: false });
+  });
+
+  it("records a failed staged check in the result even when the progress file cannot be written", async () => {
+    const { job, fx, outcome } = world({ stagedInfo: { commit: { toString: null } } });
+    const files = {
+      ...fx.files,
+      writeText: (path: string, text: string) => {
+        if (path === job.progressPath && text.includes('"checksFailed":true')) throw new Error("EPERM (injected)");
+        fx.files.writeText(path, text);
+      },
+    };
+    const result = await runInstall(helperDeps(job, { ...fx, files }));
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("staged check failed: ");
+    expect(outcome(result, 400)).toMatchObject({ kind: "failed", skip: true });
+  });
+
   it("refuses to install a build that cannot read the database (schema gate)", async () => {
     const { job, fx, installed, data, outcome } = world();
     makeDb(join(data, "apollo.db"), 25);
@@ -249,7 +286,7 @@ describe("classifyOutcome", () => {
       launches: [],
       ...over,
     })!;
-  const none = { jobId: "j", swapped: false, checksFailed: false };
+  const none = { jobId: "j", swapStarted: false, swapped: false, checksFailed: false };
   const swapped = { ...none, swapped: true };
 
   it("waits while the helper runs", () => {
@@ -281,6 +318,17 @@ describe("classifyOutcome", () => {
     expect(classifyOutcome(job, result({ status: "running", stage: "relaunch" }), swapped, 400, false)).toMatchObject({ kind: "failed", skip: true });
   });
 
+  it("skips the build once its swap was recorded as started, even if the rename's own record is missing", () => {
+    expect(classifyOutcome(job, result({ status: "rolled-back", stage: "rollback-relaunch" }), { ...none, swapStarted: true }, 400, false)).toMatchObject({ kind: "failed", skip: true });
+    expect(classifyOutcome(job, null, { ...none, swapStarted: true }, 400, false)).toMatchObject({ kind: "failed", skip: true });
+  });
+
+  it("finds a failed staged check in the result file when the progress file has none", () => {
+    const failedCheck = result({ status: "failed", stage: "build", build: null, error: "Build failed: staged check failed: the staged bundle is not release 1.3.0: commit object != …" });
+    expect(classifyOutcome(job, failedCheck, none, 400, false)).toMatchObject({ kind: "failed", skip: true });
+    expect(classifyOutcome(job, result({ status: "failed", stage: "build", build: null, error: "Build failed: could not copy: ENOSPC" }), none, 400, false)).toMatchObject({ skip: false });
+  });
+
   it("skips the build when its staged copy failed the checks", () => {
     expect(classifyOutcome(job, result({ status: "failed", stage: "build" }), { ...none, checksFailed: true }, 400, false)).toMatchObject({ kind: "failed", skip: true });
     // A copy that failed (disk full) is not the build's fault.
@@ -301,7 +349,7 @@ describe("classifyOutcome", () => {
       expect(summarizeResult(text)).toBeNull();
     }
     expect(summarizeResult('{"status":"failed","stage":"build","startedAt":"2026","build":{"commit":{"toString":null}}}')).toMatchObject({ commit: null });
-    expect(parseProgress('{"jobId":"j","swapped":"yes"}', "j")).toEqual({ jobId: "j", swapped: false, checksFailed: false });
+    expect(parseProgress('{"jobId":"j","swapped":"yes","swapStarted":1}', "j")).toEqual({ jobId: "j", swapStarted: false, swapped: false, checksFailed: false });
     expect(parseProgress('{"jobId":"other","swapped":true}', "j")).toBeNull();
     expect(parseProgress('{"__proto__":{"jobId":"j"},"swapped":true}', "j")).toBeNull();
     expect(classifyOutcome(job, { status: "running", stage: "swap", startedAt: "garbage", error: null, commit: COMMIT }, none, 400, false)).toMatchObject({ skip: false });

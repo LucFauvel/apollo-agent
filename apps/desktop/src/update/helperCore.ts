@@ -79,16 +79,34 @@ export const parseJob = (text: string): UpdateJob => {
   return j as UpdateJob;
 };
 
+/** An own data property; never runs getters or reads inherited (`__proto__`) values. */
+const ownProperty = (o: unknown, key: string): unknown => {
+  if (typeof o !== "object" || o === null) return undefined;
+  const d = Object.getOwnPropertyDescriptor(o, key);
+  return d && "value" in d ? d.value : undefined;
+};
+
 /** Every way the staged bundle's build-info.json disagrees with the job (the signed manifest). */
-export const stagedProblems = (info: Partial<BuildInfo> | null, job: Pick<UpdateJob, "version" | "build" | "commit" | "schemaVersion">): Array<string> => {
-  if (!info) return ["the staged bundle has no readable build-info.json"];
-  const problems: Array<string> = [];
-  if (info.commit !== job.commit) problems.push(`commit ${String(info.commit)} != ${job.commit}`);
-  if (info.version !== job.version) problems.push(`version ${String(info.version)} != ${job.version}`);
-  if (info.bundleVersion !== String(job.build)) problems.push(`build ${String(info.bundleVersion)} != ${job.build}`);
-  if (info.schemaVersion !== job.schemaVersion) problems.push(`schema ${String(info.schemaVersion)} != ${job.schemaVersion}`);
-  if (info.channel !== "release") problems.push(`channel ${String(info.channel)} != release`);
-  return problems;
+export const stagedProblems = (info: unknown, job: Pick<UpdateJob, "version" | "build" | "commit" | "schemaVersion">): Array<string> => {
+  // The bundle's metadata is untrusted input: own data properties of exact types only, never
+  // coerced (an object with `toString: null` must not throw), and never a throw out of here.
+  try {
+    if (typeof info !== "object" || info === null || Array.isArray(info)) return ["the staged bundle has no readable build-info.json"];
+    const show = (v: unknown) => (typeof v === "string" || typeof v === "number" ? JSON.stringify(v) : typeof v);
+    const expected: Array<[string, unknown]> = [
+      ["commit", job.commit],
+      ["version", job.version],
+      ["bundleVersion", String(job.build)],
+      ["schemaVersion", job.schemaVersion],
+      ["channel", "release"],
+    ];
+    return expected.flatMap(([key, want]) => {
+      const got = ownProperty(info, key);
+      return got === want ? [] : [`${key} ${show(got)} != ${JSON.stringify(want)}`];
+    });
+  } catch {
+    return ["the staged bundle's build-info.json cannot be read"];
+  }
 };
 
 /** The real-world effects the engine needs, injected (helper.ts gives the real ones). */
@@ -115,27 +133,44 @@ export interface HelperEffects {
 
 /**
  * How far the helper got, as evidence for classifyOutcome (written by the helper as it goes):
- *  - swapped: the new build was renamed into the app's place (the installed app changed);
+ *  - swapStarted: the previous bundle was moved aside and the new build is being renamed into
+ *    the app's place. Recorded durably before that rename, which is refused if it cannot be;
  *  - checksFailed: the staged copy is not this release, or its code signature is invalid.
  * Only these make a build "skipped for good"; a stage name alone never does (the engine records
- * the `swap` stage before its first rename).
+ * the `swap` stage before its first move).
  */
 export interface Progress {
   readonly jobId: string;
+  /**
+   * The old bundle was moved aside and the new one is being renamed into its place. Written
+   * BEFORE that rename, and the rename does not happen unless it was written: so a swap can
+   * never have happened without this durable record, whatever fails or dies afterwards.
+   */
+  readonly swapStarted: boolean;
+  /** The rename completed (best effort, for the log; swapStarted is the evidence). */
   readonly swapped: boolean;
   readonly checksFailed: boolean;
 }
 
+/**
+ * Starts the error of a failed staged check. The engine copies it into the result file, so the
+ * failure is on record even if the progress file could not be written.
+ */
+export const STAGED_CHECK_FAILED = "staged check failed: ";
+
 /** The engine's dependencies for one update job. */
 export const helperDeps = (job: UpdateJob, fx: HelperEffects): Deps => {
   const dbPath = join(job.dataDir, "apollo.db");
-  let progress: Progress = { jobId: job.id, swapped: false, checksFailed: false };
-  const record = (change: Partial<Progress>) => {
+  let progress: Progress = { jobId: job.id, swapStarted: false, swapped: false, checksFailed: false };
+  /** Writes the progress file; with `required`, a failed write throws (the step does not happen). */
+  const record = (change: Partial<Progress>, required = false) => {
+    const before = progress;
     progress = { ...progress, ...change };
     try {
       fx.files.writeText(job.progressPath, `${JSON.stringify(progress)}\n`);
     } catch (e) {
-      // Without the evidence the build is not held against: it may be offered again.
+      if (required) progress = before;
+      if (required) throw new Error(`cannot record the update's progress, so the new build is not put in place: ${e instanceof Error ? e.message : String(e)}`);
       fx.log(`  (could not record progress: ${e instanceof Error ? e.message : String(e)})`);
     }
   };
@@ -144,26 +179,30 @@ export const helperDeps = (job: UpdateJob, fx: HelperEffects): Deps => {
   const files: FileOps = {
     ...fx.files,
     rename: (from, to) => {
+      const swap = from === staged && to === target;
+      // Evidence first: a swap that is not durably recorded does not happen (the engine then
+      // rolls back to the previous bundle it has just moved aside).
+      if (swap) record({ swapStarted: true }, true);
       fx.files.rename(from, to);
-      if (from === staged && to === target) record({ swapped: true });
+      if (swap) record({ swapped: true });
     },
   };
   const check = async (): Promise<BuildInfo> => {
-    let info: Partial<BuildInfo> | null = null;
+    let info: unknown = null;
     try {
-      info = JSON.parse(fx.files.readText(join(staged, "Contents", "Resources", "build-info.json"))) as Partial<BuildInfo>;
+      info = JSON.parse(fx.files.readText(join(staged, "Contents", "Resources", "build-info.json"))) as unknown;
     } catch {
       info = null;
     }
     const problems = stagedProblems(info, job);
     if (problems.length > 0) {
       record({ checksFailed: true });
-      throw new Error(`the staged bundle is not release ${job.version}: ${problems.join("; ")}`);
+      throw new Error(`${STAGED_CHECK_FAILED}the staged bundle is not release ${job.version}: ${problems.join("; ")}`);
     }
     const signature = await fx.checkSignature(staged, job.teamId);
     if (signature) {
       record({ checksFailed: true });
-      throw new Error(`the staged bundle's code signature is not valid: ${signature}`);
+      throw new Error(`${STAGED_CHECK_FAILED}the staged bundle's code signature is not valid: ${signature}`);
     }
     return info as BuildInfo;
   };
@@ -247,7 +286,7 @@ export const parseProgress = (text: string | null, jobId: string): Progress | nu
     if (typeof text !== "string") return null;
     const p: unknown = JSON.parse(text);
     if (own(p, "jobId") !== jobId) return null;
-    return { jobId, swapped: own(p, "swapped") === true, checksFailed: own(p, "checksFailed") === true };
+    return { jobId, swapStarted: own(p, "swapStarted") === true, swapped: own(p, "swapped") === true, checksFailed: own(p, "checksFailed") === true };
   } catch {
     return null;
   }
@@ -280,7 +319,12 @@ export const classifyOutcome = (
   const startedAt = result ? Date.parse(result.startedAt) : Number.NaN;
   const mine = result !== null && Number.isFinite(startedAt) && startedAt >= job.createdAt - 1000;
   const ours = mine && result.commit === job.commit;
-  const evidence = progress !== null && (progress.swapped || progress.checksFailed);
+  // Evidence the build itself is bad: it was being put in place (recorded before the rename),
+  // or its staged copy failed the checks (recorded in the progress file, or, should that write
+  // have failed, in the error the engine wrote to the result).
+  const evidence =
+    (progress !== null && (progress.swapStarted || progress.swapped || progress.checksFailed)) ||
+    (result !== null && mine && result.status === "failed" && result.stage === "build" && (result.error ?? "").includes(STAGED_CHECK_FAILED));
   if (!mine) return { kind: "failed", skip: evidence, reason: "the update helper did not finish" };
   if (result.status === "aborted") return { kind: "postponed", reason: result.error ?? "the update did not start" };
   if (result.status === "ok") {
