@@ -1,9 +1,9 @@
 import { gapAt, moveToGap } from "@apollo/client";
-import { type Bot, type BotId, type Session, type SessionId, sortBots } from "@apollo/contracts";
+import { type Bot, type BotId, type ProjectId, type Session, type SessionId, sortBots } from "@apollo/contracts";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Animated, type HostInstance, type LayoutRectangle, PanResponder, Pressable, ScrollView, type ScrollViewInstance, StyleSheet, Text, View } from "react-native";
 import { errorMessage } from "../connection.ts";
-import { ArchiveIcon, GearIcon } from "../icons.tsx";
+import { ArchiveIcon, FolderKanbanIcon, GearIcon, SquarePenIcon } from "../icons.tsx";
 import { animateLayout } from "../motion.tsx";
 import { useApollo } from "../AppState.tsx";
 import { BlobAvatar } from "../BlobAvatar.tsx";
@@ -61,6 +61,17 @@ function FinishedSection({ sessions, botName, onOpen }: { sessions: Array<Sessio
         </View>
       ) : null}
     </View>
+  );
+}
+
+function WorkerRow({ session: w, nested, onOpen }: { session: Session; nested?: boolean; onOpen: (id: SessionId) => void }) {
+  return (
+    <Pressable style={({ pressed }) => [styles.workerRow, nested && styles.nested, pressed && styles.pressed]} onPress={() => onOpen(w.id)}>
+      <Text style={styles.workerTitle} numberOfLines={1}>
+        {w.title}
+      </Text>
+      {statusText(w) ? <Text style={[styles.status, { color: statusColor(w) }]}>{statusText(w)}</Text> : null}
+    </Pressable>
   );
 }
 
@@ -239,12 +250,20 @@ function useBotDrag(ordered: ReadonlyArray<Bot>, reorder: (order: ReadonlyArray<
 export function HomeScreen({
   onOpen,
   onSettings,
+  onOpenProjects,
+  onNewSession,
 }: {
   onOpen: (id: SessionId) => void;
   onSettings: () => void;
+  onOpenProjects: (botId: BotId, focus?: ProjectId) => void;
+  onNewSession: (botId: BotId) => void;
 }) {
   const { state, reorderBots } = useApollo();
   const sessions = [...state.sessions.values()];
+  const activeProjects = useMemo(
+    () => [...state.projects.values()].filter((p) => p.status === "active").sort((a, b) => a.name.localeCompare(b.name)),
+    [state.projects],
+  );
   const ordered = useMemo(() => sortBots(state.bots.values()), [state.bots]);
   const drag = useBotDrag(ordered, reorderBots);
   return (
@@ -263,6 +282,9 @@ export function HomeScreen({
           {ordered.map((bot) => {
             const main = state.sessions.get(bot.mainSessionId);
             const workers = sessions.filter((s) => s.botId === bot.id && s.role === "worker" && (busy(s) || s.completedTurns === 0));
+            const projects = activeProjects.filter((p) => p.botId === bot.id);
+            const shown = new Set(projects.map((p) => p.id));
+            const loose = workers.filter((w) => !w.projectId || !shown.has(w.projectId));
             const mainStatus = main ? statusText(main) : null;
             const lifted = drag.dragId === bot.id;
             return (
@@ -293,14 +315,39 @@ export function HomeScreen({
                     </Text>
                   </View>
                   {mainStatus && main ? <Text style={[styles.status, { color: statusColor(main) }]}>{mainStatus}</Text> : null}
-                </Pressable>
-                {workers.map((w) => (
-                  <Pressable key={w.id} style={({ pressed }) => [styles.workerRow, pressed && styles.pressed]} onPress={() => onOpen(w.id)}>
-                    <Text style={styles.workerTitle} numberOfLines={1}>
-                      {w.title}
-                    </Text>
-                    {statusText(w) ? <Text style={[styles.status, { color: statusColor(w) }]}>{statusText(w)}</Text> : null}
+                  <Pressable
+                    hitSlop={10}
+                    onPress={() => onNewSession(bot.id)}
+                    accessibilityLabel={`New session for ${bot.name}`}
+                    style={({ pressed }) => [styles.newSession, pressed && styles.pressed]}
+                  >
+                    <SquarePenIcon size={17} color={colors.faint} />
                   </Pressable>
+                </Pressable>
+                {projects.map((p) => {
+                  const inside = workers.filter((w) => w.projectId === p.id);
+                  const working = sessions.filter((x) => x.projectId === p.id && busy(x)).length;
+                  return (
+                    <View key={p.id}>
+                      <Pressable
+                        style={({ pressed }) => [styles.workerRow, pressed && styles.pressed]}
+                        onPress={() => onOpenProjects(bot.id, p.id)}
+                        accessibilityLabel={`Project ${p.name}`}
+                      >
+                        <FolderKanbanIcon size={15} color={colors.faint} />
+                        <Text style={styles.workerTitle} numberOfLines={1}>
+                          {p.name}
+                        </Text>
+                        {working > 0 ? <Text style={[styles.status, { color: colors.green }]}>{working}</Text> : null}
+                      </Pressable>
+                      {inside.map((w) => (
+                        <WorkerRow key={w.id} session={w} nested onOpen={onOpen} />
+                      ))}
+                    </View>
+                  );
+                })}
+                {loose.map((w) => (
+                  <WorkerRow key={w.id} session={w} onOpen={onOpen} />
                 ))}
               </Animated.View>
             );
@@ -342,6 +389,8 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: colors.border,
   },
+  nested: { paddingLeft: 37 },
+  newSession: { padding: 4, marginLeft: 2 },
   workerTitle: { color: colors.textSoft, fontSize: 14, flex: 1 },
   empty: { color: colors.muted, textAlign: "center", marginTop: 40 },
   lifted: { zIndex: 10, elevation: 8, borderColor: colors.accent, shadowColor: "#000", shadowOpacity: 0.45, shadowRadius: 14, shadowOffset: { width: 0, height: 6 } },
