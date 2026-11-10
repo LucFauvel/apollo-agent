@@ -3,13 +3,15 @@ import * as AppSettings from "../AppSettings.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AgentEvent, type AppChange, DEFAULT_BOT_LIMITS, type ProviderKind, type ScheduleId } from "@apollo/contracts";
-import type { Provider } from "@apollo/providers";
+import { type Provider, ProviderError } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import { ServerConfig } from "../Config.ts";
 import * as Database from "../Database.ts";
+import * as Jobs from "../jobs/Jobs.ts";
+import * as Push from "../push/Push.ts";
 import * as SessionManager from "../SessionManager.ts";
 import * as Store from "../Store.ts";
 import * as Scheduler from "./Scheduler.ts";
@@ -18,11 +20,15 @@ import * as Scheduler from "./Scheduler.ts";
  * Answers `echo: <text>`. A message containing "quiet" is answered `[SILENT]`,
  * "boom" fails the turn, and "slow" takes a while.
  */
+/** When set, providers fail to start with this message (a CLI that is logged out, say). */
+let failToStart: string | null = null;
+
 const fakeProvider = (kind: ProviderKind): Provider => ({
   kind,
   listModels: Effect.succeed([]),
   open: (_options, emit) =>
     Effect.gen(function* () {
+      if (failToStart) return yield* Effect.fail(new ProviderError({ provider: kind, message: failToStart }));
       const agent = (event: AgentEvent) => emit({ _tag: "Event", event });
       const scope = yield* Effect.scope;
       let n = 0;
@@ -88,6 +94,14 @@ const layer = Scheduler.layerWith({ tickEvery: null, taskTimeout: "5 seconds", h
       storage: { budgetBytes: 1e9, archiveLimit: 2000, detailRetentionMs: 30 * 86_400_000 },
     }),
   ),
+);
+
+/** With Apollo's notification watcher, as in the app (fast hold timings, no phone). */
+const watchedLayer = Push.makeLayerWatcher({ settleMs: 50, graceMs: 200, sweepMs: 10, jobCapMs: 60_000 }).pipe(
+  Layer.provideMerge(Push.Notices.layer),
+  Layer.provideMerge(Layer.succeed(Push.PushSender, async (messages) => messages.map(() => ({ status: "ok" as const })))),
+  Layer.provideMerge(Jobs.layer),
+  Layer.provideMerge(layer),
 );
 
 const setup = Effect.gen(function* () {
@@ -226,6 +240,30 @@ describe("Scheduler", () => {
       expect((yield* mainMessages)[0]!.text).toMatch(/^\[Apollo heartbeat "Check-in"\] slow: anything new\?/);
       expect(notifications()).toMatchObject([{ title: "Atlas: Check-in", sessionId: bot.mainSessionId }]);
     }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
+
+  it.live("announces a heartbeat whose provider fails to start once, as the schedule's failure", () =>
+    Effect.gen(function* () {
+      const { scheduler, bot, notifications, settled } = yield* setup;
+      const notices = yield* Push.Notices;
+      const schedule = yield* scheduler.create(
+        { botId: bot.id, kind: "heartbeat", name: "Check in", prompt: "anything new?", spec: "every 30m" },
+        "bot",
+      );
+      failToStart = "claude: not logged in";
+      yield* scheduler.tick(schedule.nextRunAt! + 1000);
+      const [run] = yield* settled(schedule.id);
+      failToStart = null;
+      expect(run).toMatchObject({ status: "failed" });
+      // Past the watcher's hold: the startup error did not go out on its own.
+      yield* Effect.sleep("300 millis");
+      expect(notifications().map((n) => n.title)).toEqual(['Atlas: "Check in" failed']);
+      expect(notices.since(0).map((n) => n.title)).toEqual(['Atlas: "Check in" failed']);
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => void (failToStart = null))),
+      Effect.scoped,
+      Effect.provide(watchedLayer),
+    ),
   );
 
   it.live("waits for a busy orchestrator, then skips a heartbeat that missed its window", () =>

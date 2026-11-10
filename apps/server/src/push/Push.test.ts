@@ -246,6 +246,31 @@ describe("finished turns while work is pending", () => {
 });
 
 describe("providers that fail to start", () => {
+  const timing = { settleMs: 1_000, graceMs: 10_000, sweepMs: 100, jobCapMs: 600_000 };
+  const id = "s1" as SessionId;
+  const botId = "b1" as BotId;
+  const failure = notificationFor(session({ status: "error" } as Partial<Session>), bot, { _tag: "TurnCompleted", outcome: "failed", error: "logged out" }, null)!;
+  const waiting = (w: Partial<Waiting> = {}) =>
+    new Map([[id, { busy: false, workers: 0, jobs: 0, botReplies: 0, answeredBot: false, ...w } as Waiting]]);
+
+  it("holds the error just long enough for a scheduled run to say so itself", () => {
+    const turns = makeTurnNotices(timing);
+    expect(turns.offer(id, botId, failure, 0, true)).toBeNull();
+    expect(turns.sweep(500, waiting())).toEqual([]);
+    // The scheduler's "… failed" arrives: it is the one the user hears.
+    turns.notifiedAfterTurn(id, 600);
+    expect(turns.sweep(2_000, waiting())).toEqual([]);
+    expect(turns.held()).toEqual([]);
+  });
+
+  it("sends the error after the settle time otherwise, whatever the session waits on", () => {
+    const turns = makeTurnNotices(timing);
+    turns.offer(id, botId, failure, 0, true);
+    expect(turns.sweep(999, waiting({ workers: 1 }))).toEqual([]);
+    expect(turns.sweep(1_000, waiting({ workers: 1, answeredBot: true }))).toEqual([{ sessionId: id, botId, note: failure }]);
+    expect(turns.held()).toEqual([]);
+  });
+
   const errored = session({ status: "error" } as Partial<Session>);
   it("counts a turn under way that ends in error", () => {
     expect(failedToStart("running", errored)).toBe(true);
