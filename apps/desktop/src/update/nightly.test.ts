@@ -9,7 +9,7 @@ import { stagedProblems } from "./helperCore.ts";
 import { nightlyTrustedKeys, trustedKeys } from "./keys.ts";
 import { type Manifest, releaseTagFor } from "./manifestFormat.ts";
 import { decide, type DecideOptions, type RunningBuild } from "./policy.ts";
-import { EMPTY_STATE, followedChannel, parseState } from "./state.ts";
+import { afterCheck, EMPTY_STATE, followedChannel, parseState, withInitialChannel } from "./state.ts";
 import { comment, makeKey, manifest, minisign, TEAM, type TestKey } from "./testing/fixtures.ts";
 
 const REPO = "LucFauvel/apollo-agent";
@@ -206,6 +206,37 @@ describe("followed channel", () => {
     expect(parseState(JSON.stringify({ channel: "nightly" })).channel).toBe("nightly");
     for (const channel of ["beta", 1, null, { toString: "nightly" }]) expect(parseState(JSON.stringify({ channel })).channel).toBeNull();
     expect(parseState(null).channel).toBeNull();
+  });
+});
+
+describe("initial channel (survives updates across channels)", () => {
+  it("a fresh nightly install keeps following nightlies after it updates to a stable release", () => {
+    // First start of a nightly build: the channel is saved before anything can update the app.
+    let s = withInitialChannel(EMPTY_STATE, "nightly");
+    expect(s.channel).toBe("nightly");
+    s = afterCheck(s, { kind: "up-to-date", latest: null }, 1);
+    // It accepted a newer stable release; the next launch runs a release build and reads state.json back.
+    const relaunched = withInitialChannel(parseState(JSON.stringify(s)), "release");
+    expect(relaunched.channel).toBe("nightly");
+    expect(followedChannel(relaunched, "release", true)).toBe("nightly");
+  });
+
+  it("a fresh stable install keeps following stable releases if it ever runs a nightly build", () => {
+    const s = withInitialChannel(EMPTY_STATE, "release");
+    expect(followedChannel(withInitialChannel(parseState(JSON.stringify(s)), "nightly"), "nightly", true)).toBe("release");
+  });
+
+  it("never overrides a saved choice, and never pins for a local build or unknown build", () => {
+    const chosen = { ...EMPTY_STATE, channel: "release" as const };
+    expect(withInitialChannel(chosen, "nightly")).toBe(chosen);
+    expect(withInitialChannel(EMPTY_STATE, "local")).toBe(EMPTY_STATE);
+    expect(withInitialChannel(EMPTY_STATE, null)).toBe(EMPTY_STATE);
+  });
+
+  it("pins nightly even when this build cannot verify nightlies yet, so a later build that can follows them", () => {
+    const s = withInitialChannel(EMPTY_STATE, "nightly");
+    expect(followedChannel(s, "nightly", false)).toBe("release");
+    expect(followedChannel(s, "release", true)).toBe("nightly");
   });
 });
 

@@ -104,6 +104,16 @@ export const nextCheckAt = (s: UpdaterState, now: number, random: number, startu
   return Math.max(due, earliest);
 };
 
+/**
+ * Saves the channel a fresh install starts on, so it is the user's from then on: an update to a
+ * build of the other channel (a nightly follower taking a newer stable release) must not change
+ * what is followed. Only release and nightly builds pin it (a local build is never updated);
+ * a choice already saved is kept. It pins what the build's channel asks for, even when this build
+ * cannot verify nightlies yet, so a later build that can still follows them.
+ */
+export const withInitialChannel = (s: UpdaterState, runningChannel: Channel | null): UpdaterState =>
+  s.channel !== null || (runningChannel !== "release" && runningChannel !== "nightly") ? s : { ...s, channel: runningChannel };
+
 /** The state after a check with `result` at `now`. */
 export const afterCheck = (s: UpdaterState, result: CheckResult, now: number): UpdaterState => {
   switch (result.kind) {

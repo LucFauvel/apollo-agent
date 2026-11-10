@@ -30,7 +30,7 @@ import { nightlyTrustedKeys, RELEASES_REPO, TEAM_ID, trustedKeys, type TrustedKe
 import type { UpdateChannel } from "./manifestFormat.ts";
 import { realExec, verifyFromZip } from "./macos.ts";
 import type { RunningBuild } from "./policy.ts";
-import { afterCheck, followedChannel, nextCheckAt, parseState, type UpdaterState, withSkipped } from "./state.ts";
+import { afterCheck, followedChannel, nextCheckAt, parseState, type UpdaterState, withInitialChannel, withSkipped } from "./state.ts";
 
 export type UpdatePhase =
   | { readonly kind: "idle" }
@@ -224,6 +224,9 @@ export class Updater {
       else for (const note of this.#keys.notes) log(note);
       if (!this.#nightlyKeys.configured) log(`nightly channel unavailable: ${this.#nightlyKeys.reason}`);
       log(`following ${this.channel} builds`);
+      // Before anything can update the app: the channel then survives updates across channels.
+      const pinned = withInitialChannel(this.#state, this.#running?.channel ?? null);
+      if (pinned !== this.#state) this.#saveState(pinned);
       this.#reconcile();
       if (this.#automatic) this.#schedule(true);
     } catch (error) {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Manifest } from "./manifest.ts";
-import { checkRelease, type ReleaseFacts, trustedComment } from "./release-checks.ts";
+import { checkRelease, type ReleaseFacts, trustedComment, newestReleaseCandidate } from "./release-checks.ts";
 
 const commit = "c".repeat(40);
 const manifest: Manifest = {
@@ -81,5 +81,29 @@ describe("checkRelease: promote", () => {
 describe("trustedComment", () => {
   it("binds version, build and commit", () => {
     expect(trustedComment(manifest)).toBe(`apollo-update version=0.4.0 build=412 commit=${commit}`);
+  });
+});
+
+describe("newestReleaseCandidate (promote-to-stable without a tag)", () => {
+  const r = (tagName: string, publishedAt: string | null, o: { isPrerelease?: boolean; isDraft?: boolean } = {}) => ({ tagName, publishedAt, isPrerelease: o.isPrerelease ?? true, isDraft: o.isDraft ?? false });
+  it("picks the newest vX.Y.Z prerelease, never a nightly published after it", () => {
+    const list = [
+      r("nightly-1.2.4-nightly.20261111.43", "2026-11-11T03:00:00Z"),
+      r("v1.2.3", "2026-11-10T12:00:00Z"),
+      r("nightly-1.2.4-nightly.20261110.42", "2026-11-10T03:00:00Z"),
+      r("v1.2.2", "2026-11-01T12:00:00Z"),
+    ];
+    expect(newestReleaseCandidate(list)).toBe("v1.2.3");
+  });
+  it("ignores drafts, stable releases, malformed tags and unpublished entries; null when none is left", () => {
+    expect(
+      newestReleaseCandidate([
+        r("v1.3.0", "2026-11-12T00:00:00Z", { isDraft: true }),
+        r("v1.2.9", "2026-11-12T00:00:00Z", { isPrerelease: false }),
+        r("v1.2.8-rc.1", "2026-11-12T00:00:00Z"),
+        r("v1.2.7", null),
+        r("nightly-1.2.4-nightly.20261111.43", "2026-11-11T03:00:00Z"),
+      ]),
+    ).toBeNull();
   });
 });

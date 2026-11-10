@@ -81,3 +81,21 @@ export const checkRelease = (facts: ReleaseFacts, stage: Stage): Array<string> =
 /** The minisign trusted comment: signed together with the manifest, so it cannot be swapped. */
 export const trustedComment = (m: Pick<Manifest, "version" | "commit" | "build">): string =>
   `apollo-update version=${m.version} build=${m.build} commit=${m.commit}`;
+
+export interface ListedCandidate {
+  readonly tagName: string;
+  readonly isPrerelease: boolean;
+  readonly isDraft: boolean;
+  readonly publishedAt: string | null;
+}
+
+/**
+ * The release candidate promote-to-stable picks when no tag is given: the most recently
+ * published, non-draft prerelease whose tag is a release tag (vX.Y.Z). Nightly prereleases
+ * (`nightly-*`) and anything else are never candidates. null when there is none.
+ */
+export const newestReleaseCandidate = (releases: ReadonlyArray<ListedCandidate>): string | null => {
+  const candidates = releases.filter((r) => r.isPrerelease && !r.isDraft && parseReleaseTag(r.tagName) !== null && r.publishedAt !== null && !Number.isNaN(Date.parse(r.publishedAt)));
+  candidates.sort((a, b) => Date.parse(b.publishedAt!) - Date.parse(a.publishedAt!));
+  return candidates[0]?.tagName ?? null;
+};

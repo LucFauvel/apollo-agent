@@ -4,14 +4,14 @@
 # also have a successful nightly (Desktop workflow on a push to main).
 #
 # Dispatch it from main (Actions → Promote to stable → Run workflow), optionally with a tag;
-# empty = the newest prerelease.
+# empty = the newest release-candidate prerelease (vX.Y.Z; nightly-* prereleases are ignored).
 name: Promote to stable
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release candidate tag (vX.Y.Z). Empty = the newest prerelease."
+        description: "Release candidate tag (vX.Y.Z). Empty = the newest vX.Y.Z prerelease (nightlies are ignored)."
         required: false
         default: ""
 
@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   promote:
-    name: Promote ${{ inputs.tag || 'newest prerelease' }}
+    name: Promote ${{ inputs.tag || 'newest release candidate' }}
     # The workflow file that runs is main's, never a branch's.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -50,9 +50,8 @@ jobs:
         run: |
           tag="$INPUT_TAG"
           if [[ -z "$tag" ]]; then
-            tag="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 50 --json tagName,isPrerelease,isDraft,publishedAt \
-              --jq '[.[] | select(.isPrerelease and (.isDraft | not))] | sort_by(.publishedAt) | last | .tagName // ""')"
-            [[ -n "$tag" ]] || { echo "::error::No published prerelease to promote."; exit 1; }
+            # The newest vX.Y.Z prerelease; nightly-* prereleases are never candidates.
+            tag="$(node apps/desktop/scripts/release/pick-candidate.ts)" || { echo "::error::No published release candidate (vX.Y.Z prerelease) to promote."; exit 1; }
           fi
           [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "::error::'$tag' is not a release tag"; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"

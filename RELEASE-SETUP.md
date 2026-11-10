@@ -36,6 +36,7 @@ push tag vX.Y.Z ──── desktop.yml
                                                          provenance; publish as PRERELEASE (candidate)
 manual ───────────── promote-to-stable.yml               re-verify (signature, hashes, tag on main) +
                                                          same-commit rule (green nightly of that commit);
+                                                         no tag given → newest vX.Y.Z prerelease (nightly-* never);
                                                          prerelease → stable "latest". NO rebuild.
 
 manual / tag v* ──── ios-testflight.yml  env release-build   apps/mobile/scripts/testflight.sh → TestFlight
@@ -269,8 +270,9 @@ The nightly channel has its own minisign keypair. It sits in CI with no human ga
 `main` publishes), so it must never be the release key, and the app treats it accordingly:
 - the app verifies nightlies with `NIGHTLY_PUBLIC_KEY` (`apps/desktop/src/update/keys.ts`) **only**
   for `nightly`-channel manifests from `nightly-<version>` prereleases, and **only** when the user
-  follows nightlies ("Follow Nightly Builds" in the macOS app menu / Windows tray; a nightly build
-  follows nightlies by default). Stable releases are verified with the release keys only, so the
+  follows nightlies ("Follow Nightly Builds" in the macOS app menu / Windows tray; a fresh install
+  starts on its build's channel, saved at first start, so a nightly follower that takes a newer
+  stable release keeps following nightlies until the user turns them off). Stable releases are verified with the release keys only, so the
   nightly key can never reach someone on the stable channel;
 - an embedded nightly key equal to a release key disables the channel; CI's preflight
   (`scripts/release/nightly.ts`) refuses to sign with a nightly key that is
