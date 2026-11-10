@@ -101,7 +101,7 @@ describe("who gets push notifications", () => {
 });
 
 describe("finished turns while work is pending", () => {
-  const timing = { settleMs: 1_000, graceMs: 10_000, sweepMs: 100 };
+  const timing = { settleMs: 1_000, graceMs: 10_000, sweepMs: 100, jobCapMs: 600_000 };
   const id = "s1" as SessionId;
   const botId = "b1" as BotId;
   const idle: Waiting = { busy: false, workers: 0, jobs: 0, botReplies: 0, answeredBot: false };
@@ -130,6 +130,36 @@ describe("finished turns while work is pending", () => {
     turns.offer(id, botId, finished);
     expect(run(turns, () => at(pending), 0, 60_000)).toEqual([]);
     expect(turns.held()).toEqual([id]);
+  });
+
+  it("lets a notice wait on background jobs alone only up to the cap", () => {
+    const turns = makeTurnNotices(timing);
+    turns.offer(id, botId, finished, 0);
+    expect(run(turns, () => at({ jobs: 1 }), 0, 599_900)).toEqual([]);
+    expect(run(turns, () => at({ jobs: 1 }), 600_000, 0)).toEqual([{ t: 600_000, body: finished.body }]);
+    expect(turns.held()).toEqual([]);
+  });
+
+  it("does not cap a notice that also waits on a worker or another bot", () => {
+    for (const pending of [{ workers: 1 }, { botReplies: 1 }]) {
+      const turns = makeTurnNotices(timing);
+      turns.offer(id, botId, finished, 0);
+      expect(run(turns, () => at({ jobs: 1, ...pending }), 0, 1_200_000)).toEqual([]);
+      expect(turns.held()).toEqual([id]);
+    }
+  });
+
+  it("sends a capped notice once: the job ending later does not repeat it", () => {
+    const turns = makeTurnNotices(timing);
+    turns.offer(id, botId, finished, 0);
+    expect(run(turns, () => at({ jobs: 1 }), 0, 600_000)).toHaveLength(1);
+    // The job ends at 15 min without waking the session (no grace-period repeat either)…
+    expect(run(turns, (t) => at({ jobs: t < 900_000 ? 1 : 0 }), 600_100, 600_000)).toEqual([]);
+    // …or it reports, and the turn that starts decides for itself.
+    turns.turnStarted(id);
+    const report = { ...finished, body: "The build passed." };
+    turns.offer(id, botId, report, 1_300_000);
+    expect(run(turns, () => at(), 1_300_000, 5_000)).toEqual([{ t: 1_301_000, body: report.body }]);
   });
 
   it("notifies the follow-up turn once the work is done, not the one that waited", () => {

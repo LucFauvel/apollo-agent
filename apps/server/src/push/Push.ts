@@ -159,9 +159,18 @@ export interface HoldTiming {
   readonly graceMs: number;
   /** How often held notices are checked. */
   readonly sweepMs: number;
+  /**
+   * How long a notice may wait on background jobs alone (no busy worker, no pending bot
+   * answer) before it goes out anyway: a job can run for hours (a server started with
+   * notify on). Workers and bot answers have no such cap.
+   */
+  readonly jobCapMs: number;
 }
 
-export const DEFAULT_HOLD: HoldTiming = { settleMs: 1_500, graceMs: 15_000, sweepMs: 500 };
+/** A held notice waiting only on background jobs goes out after this long. */
+export const JOB_HOLD_CAP_MS = 10 * 60_000;
+
+export const DEFAULT_HOLD: HoldTiming = { settleMs: 1_500, graceMs: 15_000, sweepMs: 500, jobCapMs: JOB_HOLD_CAP_MS };
 
 type Note = { readonly kind: string; readonly title: string; readonly body: string };
 
@@ -176,14 +185,17 @@ type Note = { readonly kind: string; readonly title: string; readonly body: stri
  * errors need the user now.
  */
 export const makeTurnNotices = (timing: HoldTiming) => {
-  const held = new Map<SessionId, { readonly note: Note; readonly botId: BotId; clearSince: number | null; waited: boolean }>();
+  const held = new Map<
+    SessionId,
+    { readonly note: Note; readonly botId: BotId; readonly heldAt: number; clearSince: number | null; waited: boolean }
+  >();
   return {
     /** A turn started: whatever an earlier turn held back is replaced by this one's outcome. */
     turnStarted: (id: SessionId) => void held.delete(id),
     /** A notice for a session event: returned to send now, or held (finished turns). */
-    offer: (id: SessionId, botId: BotId, note: Note): Note | null => {
+    offer: (id: SessionId, botId: BotId, note: Note, now = Date.now()): Note | null => {
       if (note.kind !== "done") return note;
-      held.set(id, { note, botId, clearSince: null, waited: false });
+      held.set(id, { note, botId, heldAt: now, clearSince: null, waited: false });
       return null;
     },
     /** Sessions with a held notice. */
@@ -199,6 +211,14 @@ export const makeTurnNotices = (timing: HoldTiming) => {
         const w = waiting.get(id) ?? null;
         if (w === null || w.answeredBot) {
           held.delete(id);
+          continue;
+        }
+        // Only jobs left, for too long: say so now. (Released once: the turn a job's report
+        // starts later decides for itself.)
+        const jobsOnly = !w.busy && w.jobs > 0 && w.workers === 0 && w.botReplies === 0;
+        if (jobsOnly && now - hold.heldAt >= timing.jobCapMs) {
+          held.delete(id);
+          due.push({ sessionId: id, botId: hold.botId, note: hold.note });
           continue;
         }
         if (w.busy || isWaiting(w)) {

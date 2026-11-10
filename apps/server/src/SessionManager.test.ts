@@ -187,7 +187,7 @@ const layerWith = (
 const layer = layerWith(1e9);
 
 /** Push notification timings short enough for tests. */
-const FAST_HOLD: Push.HoldTiming = { settleMs: 20, graceMs: 100, sweepMs: 10 };
+const FAST_HOLD: Push.HoldTiming = { settleMs: 20, graceMs: 100, sweepMs: 10, jobCapMs: 60_000 };
 
 const createBot = (manager: SessionManager.SessionManager["Service"], autoLearn = false) =>
   manager.createBot({
