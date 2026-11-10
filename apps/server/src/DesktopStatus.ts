@@ -49,6 +49,15 @@ export const desktopStatus = Effect.gen(function* () {
   return { bots, localModels } satisfies DesktopStatus;
 });
 
+/** Whether the request carries the per-launch bootstrap token the desktop shell started the server with. */
+export const fromDesktopShell = Effect.gen(function* () {
+  const config = yield* ServerConfig;
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const header = request.headers.authorization ?? "";
+  const token = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
+  return Boolean(config.desktopBootstrapToken) && safeEqual(token, config.desktopBootstrapToken ?? "");
+});
+
 /**
  * `GET /api/desktop/status` for the desktop shell, which authenticates with the
  * per-launch bootstrap token it started the server with. Anything else gets 401.
@@ -57,11 +66,8 @@ export const layer = HttpRouter.add(
   "GET",
   DESKTOP_STATUS_PATH,
   Effect.gen(function* () {
-    const config = yield* ServerConfig;
     const request = yield* HttpServerRequest.HttpServerRequest;
-    const header = request.headers.authorization ?? "";
-    const token = header.toLowerCase().startsWith("bearer ") ? header.slice(7).trim() : "";
-    if (!config.desktopBootstrapToken || !safeEqual(token, config.desktopBootstrapToken)) {
+    if (!(yield* fromDesktopShell)) {
       return HttpServerResponse.jsonUnsafe({ error: "Only the desktop app may read this." }, { status: 401 });
     }
     const after = Number(new URL(request.url, "http://apollo.invalid").searchParams.get("after") ?? "NaN");

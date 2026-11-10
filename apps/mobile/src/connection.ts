@@ -108,7 +108,8 @@ export const apiFetch = async (
   init: { method: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal },
 ) => {
   const base = await routeTo(pairing.server, pairing.pin);
-  const proof = await proofFor(init.method, path);
+  // The server checks the proof against the path without its query.
+  const proof = await proofFor(init.method, path.split("?")[0]!);
   return fetch(`${base}${path}`, {
     ...init,
     headers: {

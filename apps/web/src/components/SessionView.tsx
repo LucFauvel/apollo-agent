@@ -50,6 +50,7 @@ import {
   withoutFullDiffs,
 } from "@apollo/client";
 import { MarkdownText } from "./Code.tsx";
+import { FileLinkSession } from "./FileLink.tsx";
 import { useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import { ChatScroll, scrollKey } from "../chatScroll.ts";
 import { formatUsage, usageTitle } from "../format.ts";
@@ -1379,6 +1380,7 @@ export function SessionView({
         onPointerDown={(e) => e.pointerType !== "touch" && follower.press(e.currentTarget, true)}
         onTouchStart={(e) => follower.press(e.currentTarget, true)}
       >
+        <FileLinkSession.Provider value={session.id}>
         <div
           className={cx("mx-auto max-w-3xl space-y-2 px-4 py-6", loaded ? "animate-fade-in" : "pointer-events-none invisible")}
           aria-hidden={!loaded}
@@ -1435,6 +1437,7 @@ export function SessionView({
             loadingModel ? <LoadProgress model={loadingModel} /> : <WorkingRow />
           ) : null}
         </div>
+        </FileLinkSession.Provider>
       </div>
       {!loaded ? (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center gap-2.5 text-xs">

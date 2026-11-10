@@ -79,6 +79,7 @@ const isPublic = (path: string) =>
   path === "/mcp" ||
   // Authenticated by its handler with the desktop bootstrap token.
   path === "/api/desktop/status" ||
+  path === "/api/desktop/file" ||
   !(path === "/rpc" || path.startsWith("/api/"));
 
 const cookieOptions = (request: HttpServerRequest.HttpServerRequest, peer: TailnetPeer | null) => ({

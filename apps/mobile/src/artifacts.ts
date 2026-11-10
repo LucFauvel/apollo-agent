@@ -1,5 +1,5 @@
 import { makeInflight, runPool } from "@apollo/client";
-import type { ArtifactRef, AttachmentRef, SessionId } from "@apollo/contracts";
+import type { ArtifactKind, ArtifactRef, AttachmentRef, SessionId } from "@apollo/contracts";
 import { Directory, File, Paths } from "expo-file-system";
 import { Platform, Share } from "react-native";
 import { apiFetch, type Pairing } from "./connection.ts";
@@ -46,6 +46,51 @@ export const shareFile = async (file: File, title: string) => {
   if (Platform.OS === "ios") await Share.share({ url: file.uri, title });
   else throw new Error("Sharing files from Android is not supported yet: open it in Apollo on your computer.");
 };
+
+/** What `/api/files/<sessionId>/info` says about a path a message links to (LocalFileInfo on the server). */
+export interface LocalFileInfo {
+  readonly path: string;
+  readonly name: string;
+  readonly directory: boolean;
+  readonly size: number;
+  readonly modifiedAt: number;
+  readonly kind: ArtifactKind;
+  readonly mime: string;
+  readonly language?: string;
+}
+
+/** Local files larger than this are not served (MAX_LOCAL_FILE_BYTES on the server). */
+export const MAX_LOCAL_FILE_BYTES = 100 * 1024 * 1024;
+
+const query = (params: Record<string, string>) =>
+  Object.entries(params)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join("&");
+
+export const localFileInfo = async (pairing: Pairing, sessionId: SessionId, path: string): Promise<LocalFileInfo> => {
+  const response = await apiFetch(pairing, `/api/files/${sessionId}/info?${query({ path })}`, { method: "GET" });
+  const body = (await response.json().catch(() => null)) as (LocalFileInfo & { error?: string }) | null;
+  if (!response.ok || !body || typeof body.path !== "string") {
+    throw new Error(body?.error ?? (response.status === 404 ? "This file is not on disk." : `Could not open it (${response.status}).`));
+  }
+  return body;
+};
+
+const hash = (text: string) => {
+  let h = 5381;
+  for (let i = 0; i < text.length; i++) h = (Math.imul(h, 33) ^ text.charCodeAt(i)) >>> 0;
+  return h.toString(16);
+};
+
+/** A local file downloaded through the server; a changed file (time or size) is downloaded again. */
+export const localFile = (pairing: Pairing, sessionId: SessionId, info: LocalFileInfo): Promise<File> =>
+  cachedDownload(
+    pairing,
+    `/api/files/${sessionId}/content?${query({ path: info.path })}`,
+    ["files", sessionId, hash(`${info.path}\n${info.modifiedAt}\n${info.size}`)],
+    info.name,
+    info.size,
+  );
 
 export const artifactText = async (pairing: Pairing, a: ArtifactRef) => (await artifactFile(pairing, a)).text();
 
