@@ -27,6 +27,8 @@ import {
   BotLimits,
   Timestamp,
   Usage,
+  UsageLimits,
+  AccountLimits,
   ClientId,
   CoreMemory,
   CoreMemoryTarget,
@@ -66,6 +68,8 @@ export const AppChange = Schema.Union([
   Schema.TaggedStruct("MemoryChanged", { botId: Schema.NullOr(BotId) }),
   Schema.TaggedStruct("SkillChanged", { botId: Schema.NullOr(BotId) }),
   Schema.TaggedStruct("BotUsageToday", { botId: BotId, usage: Usage }),
+  /** A provider account's plan meters changed (`null`: it has none now). */
+  Schema.TaggedStruct("AccountLimitsUpdated", { account: Schema.String, limits: Schema.NullOr(UsageLimits) }),
   Schema.TaggedStruct("LocalModelsChanged", { state: LocalModelsState }),
   Schema.TaggedStruct("ScheduleUpserted", { schedule: Schedule }),
   Schema.TaggedStruct("ScheduleDeleted", { scheduleId: ScheduleId, botId: BotId }),
@@ -112,6 +116,8 @@ export const AppSnapshot = Schema.Struct({
   sessions: Schema.Array(Session),
   /** Each bot's usage today (server local time). */
   usageToday: Schema.Array(Schema.Struct({ botId: BotId, usage: Usage })),
+  /** Each provider account's latest plan meters (see `limitsAccount`). */
+  accountLimits: Schema.optional(Schema.Array(AccountLimits)),
   schedules: Schema.Array(Schedule),
   browserTabs: Schema.Array(BrowserTab),
   pullRequests: Schema.Array(PullRequest),

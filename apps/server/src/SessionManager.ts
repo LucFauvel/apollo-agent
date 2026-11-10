@@ -14,6 +14,7 @@ import {
   type BotId,
   billableTokens,
   formatUsd,
+  limitsAccount,
   type CreateBotInput,
   DEFAULT_BOT_LIMITS,
   EMPTY_USAGE,
@@ -302,7 +303,12 @@ const make = Effect.gen(function* () {
             return;
           }
           case "UsageLimits": {
-            yield* updateSession(id, { limits: emission.meters.length > 0 ? { meters: emission.meters, at: Date.now() } : null });
+            // Limits belong to the provider account: every session on it shows this reading.
+            const session = yield* store.getSession(id);
+            const bot = yield* store.getBot(session.botId);
+            const account = limitsAccount(session.provider, bot);
+            const limits = emission.meters.length > 0 ? { meters: emission.meters, at: Date.now() } : null;
+            if (yield* store.setAccountLimits(account, limits)) yield* publish({ _tag: "AccountLimitsUpdated", account, limits });
             return;
           }
           case "Exited": {
@@ -1276,7 +1282,12 @@ const make = Effect.gen(function* () {
     /** Every session's events as they happen (live only, no history). */
     liveEvents: Stream.fromPubSub(events),
 
-    snapshot: Effect.all({ bots: store.listBots, sessions: store.listSessions(), usageToday: store.usageOn() }),
+    snapshot: Effect.all({
+      bots: store.listBots,
+      sessions: store.listSessions(),
+      usageToday: store.usageOn(),
+      accountLimits: store.listAccountLimits,
+    }),
 
     /** Replays persisted events after `afterSeq`, then follows live ones without gaps. */
     events: (id: SessionId, afterSeq: number): Stream.Stream<SessionEvent, ApolloError> =>

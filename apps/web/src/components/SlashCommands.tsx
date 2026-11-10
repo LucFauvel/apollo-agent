@@ -1,4 +1,4 @@
-import { headlineMeter, type Session, type SlashCommand, type UsageMeter } from "@apollo/contracts";
+import { headlineMeter, type Session, type SlashCommand, type UsageLimits, type UsageMeter } from "@apollo/contracts";
 import { Loader2, Slash, TerminalSquare } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { rpc } from "../rpc.ts";
@@ -172,10 +172,11 @@ const meterColor = (m: UsageMeter) =>
         : "text-zinc-500";
 
 /**
- * How much of the provider plan's usage is left: the headline meter as a small bar and a
- * percentage, every meter in the tooltip. Only meters the provider reported.
+ * How much of the provider account's plan is left: the headline meter as a small bar and a
+ * percentage, every meter in the tooltip. Only meters the provider reported. Shared by every
+ * session on the account, whichever of them read it last.
  */
-export function UsageLimitsMeter({ limits, provider }: { limits: NonNullable<Session["limits"]>; provider: string }) {
+export function UsageLimitsMeter({ limits, provider }: { limits: UsageLimits; provider: string }) {
   const headline = headlineMeter(limits.meters);
   if (!headline) return null;
   const left = percentLeft(headline);
@@ -194,12 +195,13 @@ export function UsageLimitsMeter({ limits, provider }: { limits: NonNullable<Ses
               </span>
             </span>
           ))}
-          <span className="mt-1 block text-zinc-500">As reported by {provider}, {relativeTime(limits.at, now)}.</span>
+          <span className="mt-1 block text-zinc-500">For the whole {provider} account, as it reported {relativeTime(limits.at, now)}.</span>
         </>
       }
     >
       <span
-        className={cx("flex items-center gap-1 px-1 text-[11px] tabular-nums", meterColor(headline))}
+        data-no-drag
+        className={cx("flex shrink-0 items-center gap-1 px-1 text-[11px] tabular-nums", meterColor(headline))}
         aria-label={`${provider} usage: ${left}% left (${headline.label})`}
       >
         <svg width="14" height="10" viewBox="0 0 14 10">

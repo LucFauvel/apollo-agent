@@ -12,6 +12,7 @@ import type {
   Session,
   SessionId,
   Usage,
+  UsageLimits,
 } from "@apollo/contracts";
 import { invalidateChanges, withSeenMark } from "@apollo/client";
 import * as Stream from "effect/Stream";
@@ -26,6 +27,8 @@ export interface AppState {
   readonly sessions: ReadonlyMap<SessionId, Session>;
   /** Each bot's usage today. */
   readonly usageToday: ReadonlyMap<BotId, Usage>;
+  /** Each provider account's latest plan meters, keyed by `limitsAccount`. */
+  readonly accountLimits: ReadonlyMap<string, UsageLimits>;
   /** Bumped when memories/skills of a bot (or global, key "global") change. */
   readonly knowledgeVersion: ReadonlyMap<BotId | "global", number>;
   /** llama.cpp engine, server and model library; loaded when first needed. */
@@ -57,6 +60,7 @@ let state: AppState = {
   bots: new Map(),
   sessions: new Map(),
   usageToday: new Map(),
+  accountLimits: new Map(),
   knowledgeVersion: new Map(),
   localModels: null,
   schedules: new Map(),
@@ -138,6 +142,12 @@ const apply = (change: AppChange) => {
     }
     case "BotUsageToday":
       return setState({ ...state, usageToday: new Map(state.usageToday).set(change.botId, change.usage) });
+    case "AccountLimitsUpdated": {
+      const accountLimits = new Map(state.accountLimits);
+      if (change.limits) accountLimits.set(change.account, change.limits);
+      else accountLimits.delete(change.account);
+      return setState({ ...state, accountLimits });
+    }
     case "MemoryChanged":
     case "SkillChanged":
       return setState({ ...state, knowledgeVersion: bump(change.botId ?? "global") });
@@ -206,6 +216,7 @@ export const startSync = () =>
           bots: new Map(item.bots.map((b) => [b.id, b])),
           sessions: new Map(item.sessions.map((s) => [s.id, s])),
           usageToday: new Map(item.usageToday.map((u) => [u.botId, u.usage])),
+          accountLimits: new Map((item.accountLimits ?? []).map((a) => [a.account, a.limits])),
           schedules: new Map(item.schedules.map((s) => [s.id, s])),
           browserTabs: new Map(item.browserTabs.map((t) => [t.id, t])),
           pullRequests: new Map(item.pullRequests.map((p) => [`${p.sessionId} ${p.url}`, p])),

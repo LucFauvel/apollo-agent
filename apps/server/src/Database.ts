@@ -307,6 +307,27 @@ export const MIGRATIONS: ReadonlyArray<string> = [
   `
   alter table sessions add column limits text;      -- JSON UsageLimits
   `,
+  // 22: plan limits belong to the provider account, not the session: the latest reading
+  // of each account (keyed like limitsAccount: "<provider>:<account id or local>"), seeded
+  // with the newest reading any of its sessions kept.
+  `
+  create table account_limits (
+    account text primary key,
+    limits text not null,               -- JSON UsageLimits
+    at integer not null
+  );
+  insert into account_limits (account, limits, at)
+  select account, limits, max(at) from (
+    select s.provider || ':' || coalesce(
+             case s.provider when 'claude' then b.claude_account_id when 'codex' then b.codex_account_id end,
+             'local') as account,
+           s.limits as limits,
+           json_extract(s.limits, '$.at') as at
+    from sessions s join bots b on b.id = s.bot_id
+    where s.limits is not null and json_valid(s.limits)
+  ) group by account;
+  update sessions set limits = null;
+  `,
 ];
 
 /**
