@@ -12,7 +12,7 @@ import { useEffect, useMemo, useState } from "react";
 import { relativeTime } from "../format.ts";
 import { errorMessage, rpc } from "../rpc.ts";
 import { useApp } from "../store.ts";
-import { contextConflict, edited, fieldsOf, type ProjectEdit, projectUpdate, rebase, startEdit } from "../projectForm.ts";
+import { contextConflict, edited, fieldsOf, type ProjectEdit, projectUpdate, rebase, startEdit } from "@apollo/client";
 import { ProviderLogo } from "./icons.tsx";
 import { Badge, Button, cx, EmptyState, ErrorText, Field, IconButton, inputClass, Panel, StatusDot } from "./ui.tsx";
 
