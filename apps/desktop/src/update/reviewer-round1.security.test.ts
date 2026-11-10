@@ -85,11 +85,13 @@ describe('real HTTP download failures',()=>{
     });
     server.listen(0,'127.0.0.1');await once(server,'listening');
     const url='http://127.0.0.1:'+(server.address() as any).port;
-    const run=(path:string,size=3,sha256='0'.repeat(64))=>downloadVerified({fetchFn:fetch,url:url+path,path:join(temp(),'asset'),expected:{size,sha256},stallMs:60});
+    // Only /stall needs a short budget: on loaded CI runners the stall timer can otherwise
+    // fire before the first chunk is delivered, masking the real failure under "stalled".
+    const run=(path:string,size=3,sha256='0'.repeat(64),stallMs=2_000)=>downloadVerified({fetchFn:fetch,url:url+path,path:join(temp(),'asset'),expected:{size,sha256},stallMs});
     try {
       await expect(run('/overflow',2)).rejects.toThrow(/larger/);
       await expect(run('/hash')).rejects.toThrow(/SHA-256/);
-      await expect(run('/stall')).rejects.toThrow();
+      await expect(run('/stall',3,'0'.repeat(64),60)).rejects.toThrow();
       await expect(run('/reset')).rejects.toThrow();
       await expect(run('/status')).rejects.toThrow(/503/);
     } finally {server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));}
