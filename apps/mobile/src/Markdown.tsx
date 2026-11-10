@@ -1,6 +1,6 @@
 import { createContext, type ReactNode, useContext, useMemo } from "react";
 import { Linking, Platform, ScrollView, StyleSheet, Text, type TextStyle, View } from "react-native";
-import { codePlainColor, type FileReference, fileLinkFromCode, fileLinkFromHref, highlightCode, splitFileLinks } from "@apollo/client";
+import { codePlainColor, type FileReference, fileLinkFromCode, fileLinkFromHref, highlightCode, markdownLinkPattern, parseMarkdownLink, splitFileLinks } from "@apollo/client";
 import { colors } from "./theme.ts";
 
 const mono = Platform.OS === "ios" ? "Menlo" : "monospace";
@@ -102,7 +102,10 @@ const parseBlocks = (source: string): Array<Block> => {
   return blocks;
 };
 
-const inlinePattern = /(`[^`]+`)|(\*\*[^*]+\*\*|__[^_]+__)|(\*[^*\s][^*]*\*|_[^_\s][^_]*_)|(~~[^~]+~~)|(\[[^\]]+\]\([^)\s]+\))|(https?:\/\/[^\s)]+)/g;
+const inlinePattern = new RegExp(
+  String.raw`(\`[^\`]+\`)|(\*\*[^*]+\*\*|__[^_]+__)|(\*[^*\s][^*]*\*|_[^_\s][^_]*_)|(~~[^~]+~~)|(${markdownLinkPattern})|(https?:\/\/[^\s)]+)`,
+  "g",
+);
 
 /**
  * Opens a local file a message links to (see LocalFileViewer); without one, as in artifacts
@@ -147,13 +150,13 @@ const renderInline = (text: string, base: TextStyle, onFile: OnFile, keyPrefix =
     else if (italic) out.push(<Text key={key} style={styles.italic}>{renderInline(italic.slice(1, -1), base, onFile, `${key}.`)}</Text>);
     else if (strike) out.push(<Text key={key} style={styles.strike}>{strike.slice(2, -2)}</Text>);
     else if (link) {
-      const m = /^\[([^\]]+)\]\(([^)\s]+)\)$/.exec(link)!;
-      const file = fileLinkFromHref(m[2]!);
-      if (file && !onFile) out.push(m[1]);
+      const { text: label, href } = parseMarkdownLink(link)!;
+      const file = fileLinkFromHref(href);
+      if (file && !onFile) out.push(label);
       else
         out.push(
-          <Text key={key} style={styles.link} onPress={() => (file ? onFile!(file) : void Linking.openURL(m[2]!).catch(() => {}))}>
-            {m[1]}
+          <Text key={key} style={styles.link} onPress={() => (file ? onFile!(file) : void Linking.openURL(href).catch(() => {}))}>
+            {label}
           </Text>,
         );
     } else if (url) {

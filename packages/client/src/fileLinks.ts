@@ -79,12 +79,31 @@ export const fileLinkFromHref = (href: string): FileReference | null => {
     return { path: ref.path, line: line ? Number(line) : ref.line };
   }
   if (SCHEME.test(h) && !WINDOWS_ABSOLUTE.test(h)) return null;
-  let decoded = h;
+  const ref = splitLine(h);
+  let path = ref.path;
   try {
-    decoded = decodeURI(h);
+    path = decodeURIComponent(path);
   } catch {}
-  const ref = splitLine(decoded);
-  return ref.path && ref.path.length <= 1024 ? ref : null;
+  return path && path.length <= 1024 ? { path, line: ref.line } : null;
+};
+
+const DESTINATION = String.raw`<[^<>\n]*>|(?:[^()\s<]|\((?:[^()\s]|\([^()\s]*\))*\))+`;
+
+/**
+ * An inline Markdown link, `[text](destination)` or `[text](destination "title")`, without
+ * capture groups so renderers can embed it in their own patterns. The destination is either
+ * `<…>` (may hold spaces) or bare with balanced parentheses, as CommonMark reads them.
+ */
+export const markdownLinkPattern = String.raw`\[[^\]]+\]\((?:${DESTINATION})(?:\s+"[^"]*")?\)`;
+
+const MARKDOWN_LINK = new RegExp(String.raw`^\[([^\]]+)\]\((${DESTINATION})(?:\s+"[^"]*")?\)$`);
+
+/** A Markdown link's text and destination (angle brackets removed), or null. */
+export const parseMarkdownLink = (token: string): { readonly text: string; readonly href: string } | null => {
+  const m = MARKDOWN_LINK.exec(token);
+  if (!m) return null;
+  const destination = m[2]!;
+  return { text: m[1]!, href: destination.startsWith("<") ? destination.slice(1, -1) : destination };
 };
 
 /** The file an inline code span names (`src/app.ts:12`, `~/notes/plan.md`), or null for other code. */

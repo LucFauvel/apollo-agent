@@ -11,7 +11,7 @@ const render = (text: string) =>
       <MarkdownText>{text}</MarkdownText>
     </FileLinkSession.Provider>,
   );
-const hrefs = (html: string) => [...html.matchAll(/href="([^"]+)"/g)].map((m) => decodeURIComponent(m[1]!.replace(/&amp;/g, "&")));
+const hrefs = (html: string) => [...html.matchAll(/href="([^"]+)"/g)].map((m) => decodeURIComponent(m[1]!.replace(/&amp;/g, "&").replace(/\+/g, " ")));
 
 describe("file links in messages", () => {
   it("link paths in text, code spans and links to the session's files", () => {
@@ -23,6 +23,13 @@ describe("file links in messages", () => {
       "https://example.com/a.md",
     ]);
     expect(html).toContain("<code>src/app.ts:12</code>");
+  });
+
+  it("pass escaped file names on decoded", () => {
+    expect(hrefs(render("[report](/Users/me/report%23final.md) and [mine](</Users/me/My Report.md>)"))).toEqual([
+      `/api/files/${session}/content?path=/Users/me/report#final.md`,
+      `/api/files/${session}/content?path=/Users/me/My Report.md`,
+    ]);
   });
 
   it("leave code blocks and other code alone", () => {
