@@ -26,6 +26,8 @@ const useDesktopNotifications = (open: (id: SessionId) => void) =>
       onNotify((notice) => {
         // The desktop app shows these itself (see apolloOpenSession below).
         if (/Electron\//.test(navigator.userAgent)) return;
+        // Session events (finished turns, approvals): watchTurns shows them, unless the user is looking.
+        if (notice.pushed) return;
         if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
         const notification = new Notification(notice.title, { body: notice.body });
         notification.onclick = () => {
