@@ -307,6 +307,7 @@ const make = Effect.gen(function* () {
       const entry = live.get(id);
       if (!entry) return Effect.void;
       live.delete(id);
+      staleLive.delete(id);
       tokens.delete(entry.token);
       return Scope.close(entry.scope, Exit.void);
     });
@@ -462,13 +463,30 @@ const make = Effect.gen(function* () {
       lockFor(id),
       Effect.gen(function* () {
         const existing = live.get(id);
-        if (existing) return existing;
+        if (existing) {
+          if (!staleLive.has(id)) return existing;
+          // A turn still running on it keeps it until it ends (see reopenWithNewSettings).
+          if (isBusy((yield* store.getSession(id)).status)) {
+            pendingReopen.add(id);
+            return existing;
+          }
+          staleLive.delete(id);
+          generations.delete(id);
+          yield* closeLive(id);
+        }
         for (let attempt = 0; ; attempt++) {
           opening.add(id);
           staleWhileOpening.delete(id);
           const entry = yield* openProcess(id, forTurn).pipe(Effect.ensuring(Effect.sync(() => opening.delete(id))));
           // Its instructions were read before a change that should reach it: open it again with fresh ones.
-          if (!staleWhileOpening.delete(id) || attempt >= 2) return entry;
+          if (!staleWhileOpening.delete(id)) return entry;
+          if (attempt >= 2) {
+            // Changes keep coming: serve with this one, and replace it once the turn it opened
+            // for ends, or else the next time it is needed.
+            if (forTurn) pendingReopen.add(id);
+            else staleLive.add(id);
+            return entry;
+          }
           generations.delete(id);
           yield* closeLive(id);
         }
@@ -479,6 +497,8 @@ const make = Effect.gen(function* () {
   const opening = new Set<SessionId>();
   /** Sessions whose instructions went stale while their process was opening. */
   const staleWhileOpening = new Set<SessionId>();
+  /** Live processes with stale instructions, replaced the next time they are needed. */
+  const staleLive = new Set<SessionId>();
 
   const openProcess = (id: SessionId, forTurn: boolean): Effect.Effect<LiveSession, ApolloError> =>
       Effect.gen(function* () {

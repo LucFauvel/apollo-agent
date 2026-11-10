@@ -366,6 +366,59 @@ describe("a project change while the orchestrator starts", () => {
   });
 });
 
+describe("project changes during every retried start", () => {
+  it.live.each([
+    ["a message", true],
+    ["the slash command list", false],
+  ] as const)("still reach the orchestrator, from its next turn (opened for %s)", (_, forTurn) => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, projects, store, bot } = yield* setup(f.cwd);
+      const idle = () =>
+        Effect.promise(async () => {
+          for (let i = 0; i < 300; i++) {
+            if ((await Effect.runPromise(store.getSession(bot.mainSessionId))).status === "idle") return;
+            await new Promise((r) => setTimeout(r, 10));
+          }
+          throw new Error("still busy");
+        });
+      const hold = () => {
+        let release!: () => void;
+        f.gate.wait = new Promise((resolve) => (release = resolve));
+        return release;
+      };
+      let release = hold();
+      const opening = forTurn ? manager.send(bot.mainSessionId, "hello", "user") : manager.listCommands(bot.mainSessionId);
+      const sending = yield* Effect.asVoid(opening).pipe(Effect.forkChild({ startImmediately: true }));
+      yield* until(() => f.gate.started === 1);
+      const project = yield* projects.create({ botId: bot.id, name: "Send v1", summary: "" });
+      for (const [start, name] of [[2, "Send v2"], [3, "Send v3"]] as const) {
+        const previous = release;
+        release = hold();
+        previous();
+        yield* until(() => f.gate.started === start);
+        yield* projects.update({ projectId: project.id, name });
+      }
+      f.gate.wait = Promise.resolve();
+      release();
+      yield* Fiber.join(sending);
+      yield* idle();
+      // The third start gives up retrying and serves what it was opened for.
+      expect(f.opened).toHaveLength(3);
+      expect(f.opened[2]!.instructions).toContain("Send v2");
+
+      yield* manager.send(bot.mainSessionId, "again", "user");
+      yield* idle();
+      expect(f.opened).toHaveLength(4);
+      expect(f.opened[3]!.instructions).toContain("Send v3");
+
+      yield* manager.send(bot.mainSessionId, "once more", "user");
+      yield* idle();
+      expect(f.opened).toHaveLength(4);
+    }).pipe(Effect.provide(f.layer));
+  });
+});
+
 describe.skipIf(process.platform === "win32")("deleting a project while a session is created in it", () => {
   it.live("waits for the session, then moves it out of the project", () => {
     const f = fixture();
