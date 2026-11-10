@@ -402,6 +402,8 @@ interface DesktopStatus {
     readonly downloads: ReadonlyArray<{ readonly model: string; readonly percent: number }>;
   } | null;
   readonly notifications?: ReadonlyArray<Notice>;
+  /** When the user last saw each bot's chats (on any device). */
+  readonly notificationsSeen?: ReadonlyArray<{ readonly botId: string; readonly at: number }>;
 }
 
 interface Notice {
@@ -410,10 +412,27 @@ interface Notice {
   readonly title: string;
   readonly body: string;
   readonly sessionId: string;
+  readonly botId?: string;
+  /** When the server sent it (ms). */
+  readonly at?: number;
 }
 
-/** Shown notifications, kept so they are not garbage-collected before they are clicked. */
-const shownNotices = new Set<Notification>();
+/**
+ * Shown notifications, kept so they are not garbage-collected before they are clicked, and
+ * so they can be closed once the user sees their bot's chats (here or on the phone).
+ */
+const shownNotices = new Map<Notification, { readonly botId: string; readonly at: number }>();
+
+/** Closes the notifications of bots whose chats were seen after they were sent. */
+const closeSeenNotices = (seen: ReadonlyArray<{ readonly botId: string; readonly at: number }>) => {
+  const marks = new Map(seen.map((m) => [m.botId, m.at]));
+  for (const [notification, { botId, at }] of shownNotices) {
+    const seenAt = botId ? marks.get(botId) : undefined;
+    if (seenAt === undefined || at > seenAt) continue;
+    shownNotices.delete(notification);
+    notification.close();
+  }
+};
 
 /**
  * A turn finished, or a bot needs an approval, an answer or a secret: a system
@@ -425,7 +444,7 @@ const showNotice = (notice: Notice) => {
   if (notice.kind !== "test" && window && window.isVisible() && window.isFocused()) return;
   if (!Notification.isSupported()) return;
   const notification = new Notification({ title: notice.title, body: notice.body });
-  shownNotices.add(notification);
+  shownNotices.set(notification, { botId: notice.botId ?? "", at: notice.at ?? Date.now() });
   const forget = () => shownNotices.delete(notification);
   notification.on("click", () => {
     forget();
@@ -593,12 +612,13 @@ const followStatus = (serverUrl: string) => {
         signal: AbortSignal.timeout(3000),
       });
       if (!response.ok) return;
-      const { notifications = [], ...status } = (await response.json()) as DesktopStatus;
+      const { notifications = [], notificationsSeen = [], ...status } = (await response.json()) as DesktopStatus;
       for (const notice of notifications) {
         if (notice.id <= noticeCursor) continue;
         noticeCursor = notice.id;
         showNotice(notice);
       }
+      closeSeenNotices(notificationsSeen);
       const key = JSON.stringify(status);
       if (key === last || !tray) return;
       last = key;

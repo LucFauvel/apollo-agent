@@ -1,4 +1,4 @@
-import { invalidateChanges } from "@apollo/client";
+import { invalidateChanges, withSeenMark } from "@apollo/client";
 import type { AppChange, AppSnapshot, Bot, BotId, BrowserTab, PullRequest, Session, SessionId } from "@apollo/contracts";
 import * as Stream from "effect/Stream";
 import { createContext, type ReactNode, useContext, useEffect, useState } from "react";
@@ -14,9 +14,19 @@ export interface AppState {
   readonly changesVersion: ReadonlyMap<BotId, number>;
   /** Open tabs of Apollo's browser, by id. */
   readonly browserTabs: ReadonlyMap<string, BrowserTab>;
+  /** When the user last saw each bot's chats, on any device: its notifications up to then are dismissed. */
+  readonly notificationsSeen: ReadonlyMap<string, number>;
 }
 
-const empty: AppState = { connected: false, bots: new Map(), sessions: new Map(), pullRequests: new Map(), changesVersion: new Map(), browserTabs: new Map() };
+const empty: AppState = {
+  connected: false,
+  bots: new Map(),
+  sessions: new Map(),
+  pullRequests: new Map(),
+  changesVersion: new Map(),
+  browserTabs: new Map(),
+  notificationsSeen: new Map(),
+};
 
 type Incoming = ({ readonly _tag: "Snapshot" } & AppSnapshot) | AppChange;
 
@@ -32,6 +42,7 @@ const apply = (state: AppState, item: Incoming): AppState => {
         // (Bots this phone never heard a ChangesUpdated for included: they start from none.)
         changesVersion: invalidateChanges(state.changesVersion, item.bots.map((b) => b.id)),
         browserTabs: new Map(item.browserTabs.map((t) => [t.id, t])),
+        notificationsSeen: (item.notificationsSeen ?? []).reduce((marks, m) => withSeenMark(marks, m.botId, m.at), state.notificationsSeen),
       };
     case "BrowserTabUpserted":
       return { ...state, browserTabs: new Map(state.browserTabs).set(item.tab.id, item.tab) };
@@ -49,6 +60,8 @@ const apply = (state: AppState, item: Incoming): AppState => {
       pullRequests.delete(`${item.sessionId} ${item.url}`);
       return { ...state, pullRequests };
     }
+    case "NotificationsSeen":
+      return { ...state, notificationsSeen: withSeenMark(state.notificationsSeen, item.botId, item.at) };
     case "ChangesUpdated":
       return { ...state, changesVersion: new Map(state.changesVersion).set(item.botId, (state.changesVersion.get(item.botId) ?? 0) + 1) };
     case "BotUpserted":

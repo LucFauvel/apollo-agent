@@ -1,3 +1,4 @@
+import { seenNotifications } from "@apollo/client";
 import type { SessionId } from "@apollo/contracts";
 import Constants from "expo-constants";
 import * as Notifications from "expo-notifications";
@@ -100,6 +101,30 @@ export const unregisterPush = async (pairing: Pairing): Promise<void> => {
 export const sendTestNotification = async (pairing: Pairing) => {
   const response = await apiFetch(pairing, "/api/notifications/test", { method: "POST" });
   if (!response.ok) throw new Error(`Apollo refused the test (${response.status})`);
+};
+
+/**
+ * Removes delivered notifications of bots whose chats the user has seen since (on this phone
+ * or another device): from the lock screen and Notification Center / the shade. Others stay.
+ * Never throws.
+ */
+export const dismissSeenNotifications = async (marks: ReadonlyMap<string, number>): Promise<void> => {
+  if (marks.size === 0) return;
+  try {
+    const presented = (await Notifications.getPresentedNotificationsAsync()).map((n) => {
+      const data = (n.request.content.data ?? {}) as { botId?: unknown; at?: unknown };
+      return {
+        identifier: n.request.identifier,
+        botId: typeof data.botId === "string" ? data.botId : null,
+        at: typeof data.at === "number" ? data.at : null,
+        // (Seconds on some platforms, milliseconds on others.)
+        receivedAt: n.date < 1e12 ? n.date * 1000 : n.date,
+      };
+    });
+    await Promise.all(seenNotifications(presented, marks).map((n) => Notifications.dismissNotificationAsync(n.identifier).catch(() => undefined)));
+  } catch {
+    // Dismissing is a courtesy: notifications left behind are harmless.
+  }
 };
 
 /** The session a tapped notification points to. */

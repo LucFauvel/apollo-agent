@@ -297,6 +297,9 @@ const make = Effect.gen(function* () {
         );
         return { ...status(job, lines), timedOut: job.endedAt === null };
       }),
+    /** Running jobs of a session that will report back to it when they end (notify on). */
+    reportingTo: (sessionId: SessionId) =>
+      [...jobs.values()].filter((j) => j.sessionId === sessionId && j.endedAt === null && j.notify && !j.orphaned).length,
     list: (caller: JobCaller) =>
       Effect.sync(() =>
         [...jobs.values()]

@@ -1,4 +1,6 @@
-import type { Session, SessionId } from "@apollo/contracts";
+import { seenNotifications } from "@apollo/client";
+import type { BotId, SessionId } from "@apollo/contracts";
+import { rpc } from "./rpc.ts";
 import { getAppState, onNotify, subscribeApp } from "./store.ts";
 
 /** Brings Apollo forward; in the desktop app the window may be hidden, which only the shell can undo. */
@@ -7,76 +9,86 @@ export const showApp = () => {
   window.focus();
 };
 
-const busy = (s: Session) => s.status === "running" || s.status === "starting";
+/** Notifications this tab showed and has not closed, with their bot: closed once its chats are seen. */
+const shown = new Set<{ readonly notification: Notification; readonly botId: string; readonly receivedAt: number }>();
 
-/** Plain text for a notification body: no markdown, one short line. */
-const summary = (text: string | null) =>
-  (text ?? "")
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/[*_`#>[\]]|\(https?:[^)]*\)/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 160);
+/** Shows a notification for a bot (kept, to be closed when the user sees that bot's chats). */
+export const showNotification = (botId: string, title: string, options: NotificationOptions, onClick: () => void) => {
+  const notification = new Notification(title, options);
+  const entry = { notification, botId, receivedAt: Date.now() };
+  shown.add(entry);
+  notification.onclick = () => {
+    shown.delete(entry);
+    onClick();
+  };
+  notification.onclose = () => void shown.delete(entry);
+};
+
+/** Closes the notifications of bots whose chats were seen since (here or on another device). */
+const dismissSeen = (marks: ReadonlyMap<string, number>) => {
+  for (const entry of seenNotifications(shown, marks)) {
+    shown.delete(entry);
+    entry.notification.close();
+  }
+};
 
 /**
- * Desktop notifications when a conversation the user started finishes a turn, needs an
- * approval, or fails, while they are not looking at it (another app in front, or another
- * session open). Workers a bot spawned are left out: their orchestrator reports on them.
- * Clicking a notification opens the session.
+ * Desktop notifications in a browser tab when a conversation finishes a turn with something
+ * for the user, needs an approval or an answer, or fails, while they are not looking at it
+ * (another app in front, or another session open). The server decides which turns are worth
+ * it (the same ones it pushes to phones: not a turn that only waits on a worker, a job or
+ * another bot) and sends them as `pushed` notifications. Clicking one opens the session.
+ * Notifications of a bot close once its chats are seen, on this device or another.
  */
 export const watchTurns = (selected: () => SessionId | null, open: (id: SessionId) => void) => {
   if (typeof Notification === "undefined") return () => undefined;
   if (Notification.permission === "default") void Notification.requestPermission();
-
-  let previous = new Map<SessionId, Session["status"]>();
-  for (const s of getAppState().sessions.values()) previous.set(s.id, s.status);
-  // The server already notified about this session (e.g. a scheduled result): do not repeat it.
-  const recentlyNotified = new Map<string, number>();
-  const stopNotices = onNotify((n) => {
-    if (n.sessionId) recentlyNotified.set(n.sessionId, Date.now());
+  let marks = getAppState().notificationsSeen;
+  const stopSeen = subscribeApp(() => {
+    const next = getAppState().notificationsSeen;
+    if (next === marks) return;
+    marks = next;
+    dismissSeen(marks);
   });
-
-  const stop = subscribeApp(() => {
-    const { sessions, bots } = getAppState();
-    const next = new Map<SessionId, Session["status"]>();
-    for (const session of sessions.values()) {
-      next.set(session.id, session.status);
-      const before = previous.get(session.id);
-      if (before === undefined || before === session.status) continue;
-      if (session.role === "reflection" || (session.role === "worker" && session.parentSessionId !== null)) continue;
-      const watching = document.hasFocus() && selected() === session.id;
-      if (watching || Notification.permission !== "granted") continue;
-
-      const bot = bots.get(session.botId);
-      const who = session.role === "main" ? (bot?.name ?? "Your bot") : `${session.title} (${bot?.name ?? "worker"})`;
-      let title: string | null = null;
-      let body = "";
-      if (session.status === "waiting-approval") {
-        title = `${who} needs your approval`;
-        body = "Open Apollo to allow or decline.";
-      } else if (before === "running" || before === "waiting-approval") {
-        // (starting → idle is a process opening, e.g. to list commands, not a finished turn)
-        if (session.status === "error") {
-          title = `${who} stopped with an error`;
-        } else if (session.status === "idle" && !busy(session)) {
-          if ((session.lastMessage ?? "").trim() === "[SILENT]") continue;
-          if (Date.now() - (recentlyNotified.get(session.id) ?? 0) < 10_000) continue;
-          title = `${who} finished`;
-          body = summary(session.lastMessage) || "The turn is done.";
-        }
-      }
-      if (!title) continue;
-      const notification = new Notification(title, { body, tag: `turn-${session.id}` });
-      notification.onclick = () => {
-        showApp();
-        open(session.id);
-      };
-    }
-    previous = next;
+  const stopNotify = onNotify((notice) => {
+    if (!notice.pushed || !notice.sessionId || Notification.permission !== "granted") return;
+    const sessionId = notice.sessionId;
+    if (document.hasFocus() && selected() === sessionId) return;
+    showNotification(notice.botId, notice.title, { body: notice.body, tag: `turn-${sessionId}` }, () => {
+      showApp();
+      open(sessionId);
+    });
   });
-
   return () => {
-    stop();
-    stopNotices();
+    stopSeen();
+    stopNotify();
+  };
+};
+
+/**
+ * Tells the server the user sees this bot's chats: when one of its sessions opens, and when
+ * the window comes back to the front with one open. (Not when a notification arrives while
+ * it is open: only being shown the chat counts.) Its notifications are then dismissed on
+ * every device.
+ */
+export const watchSeen = (selectedBot: () => BotId | null) => {
+  let last: { botId: BotId; at: number } | null = null;
+  const check = () => {
+    const botId = selectedBot();
+    if (!botId || document.visibilityState !== "visible" || !document.hasFocus()) return;
+    // (Focus can bounce; one mark a few seconds is plenty.)
+    if (last && last.botId === botId && Date.now() - last.at < 3_000) return;
+    last = { botId, at: Date.now() };
+    void rpc((c) => c["notifications.seen"]({ botId })).catch(() => undefined);
+  };
+  window.addEventListener("focus", check);
+  document.addEventListener("visibilitychange", check);
+  return {
+    /** The open session changed. */
+    check,
+    stop: () => {
+      window.removeEventListener("focus", check);
+      document.removeEventListener("visibilitychange", check);
+    },
   };
 };

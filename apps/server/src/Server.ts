@@ -57,6 +57,7 @@ const layerHttpServer = Layer.unwrap(
 
 const layerCore = Compaction.layer.pipe(
   Layer.provideMerge(Push.layerWatcher),
+  Layer.provideMerge(Push.NotificationsSeen.layer),
   Layer.provideMerge(Push.PushSender.expo),
   Layer.provideMerge(Push.Notices.layer),
   Layer.provideMerge(ProviderVersions.layer),

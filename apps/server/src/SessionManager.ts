@@ -331,6 +331,7 @@ const make = Effect.gen(function* () {
             const stored = yield* appendEvent(id, event);
             switch (event._tag) {
               case "TurnStarted": {
+                answeredBot.delete(id);
                 yield* updateSession(id, { status: "running" });
                 // Snapshot the session's repositories, to see what this turn changes.
                 const session = yield* store.getSession(id);
@@ -796,6 +797,8 @@ const make = Effect.gen(function* () {
 
   /** Conversations waiting for another bot's answer (apollo_ask_bot), by that bot's main session. */
   const mentionReplies = new Map<SessionId, Array<{ fromSessionId: SessionId; kind: "ask" }>>();
+  /** Conversations whose last turn answered another bot: that bot reports, not this turn. */
+  const answeredBot = new Set<SessionId>();
   /** Messages a conversation sent to other bots since the user last wrote in it. */
   const botTalk = new Map<SessionId, number>();
   /** How many messages bots may exchange before the user takes part again. */
@@ -901,6 +904,7 @@ const make = Effect.gen(function* () {
       const waiting = mentionReplies.get(session.id);
       if (!waiting?.length) return;
       mentionReplies.delete(session.id);
+      answeredBot.add(session.id);
       const bot = yield* store.getBot(session.botId);
       const answer = session.lastMessage?.trim();
       for (const { fromSessionId } of waiting) {
@@ -1443,6 +1447,31 @@ const make = Effect.gen(function* () {
     /** A worker's worktree: its commits, uncommitted changes and diff summary. */
     // --- other bots ------------------------------------------------------------
     askBot,
+
+    /**
+     * What a session's finished turn still waits on before its result is ready for the user
+     * (push notifications hold back meanwhile): workers it spawned that are busy and will
+     * report back, and other bots' answers to its apollo_ask_bot. `busy`: a turn is under way
+     * or about to start (a report just arrived). `answeredBot`: its last turn answered another
+     * bot, which reports to the user itself. (Background jobs are counted by Jobs.)
+     */
+    waitingOn: (id: SessionId) =>
+      Effect.gen(function* () {
+        const session = yield* store.getSession(id);
+        let workers = 0;
+        for (const s of yield* store.listSessions(session.botId)) {
+          if (s.parentSessionId === id && isBusy(s.status) && (yield* store.notifiesParent(s.id))) workers++;
+        }
+        // Only while the other bot is still at it: one whose agent died will not answer.
+        let botReplies = 0;
+        for (const [channelId, waiting] of mentionReplies) {
+          const asks = waiting.filter((w) => w.fromSessionId === id).length;
+          if (asks === 0) continue;
+          const channel = yield* store.getSession(channelId).pipe(Effect.option);
+          if (Option.isSome(channel) && isBusy(channel.value.status)) botReplies += asks;
+        }
+        return { busy: isBusy(session.status), workers, botReplies, answeredBot: answeredBot.has(id) };
+      }),
 
     // --- changes -----------------------------------------------------------
 

@@ -13,6 +13,7 @@ import { Compaction } from "./Compaction.ts";
 import { LocalModels } from "./local/LocalModels.ts";
 import { RECOMMENDED_REVIEWER } from "./local/Reviewer.ts";
 import { ProviderSettings } from "./ProviderSettings.ts";
+import { NotificationsSeen } from "./push/Push.ts";
 import { Scheduler } from "./schedule/Scheduler.ts";
 import { SessionManager } from "./SessionManager.ts";
 import { Store } from "./Store.ts";
@@ -34,20 +35,33 @@ export const layer = ApolloRpcs.toLayer(
     const pullRequests = yield* PullRequests;
     const providerVersions = yield* ProviderVersions;
     const tailscale = yield* Tailscale;
+    const seen = yield* NotificationsSeen;
     // Errors from the local-model service reach the UI as plain messages.
     const local = <A, R>(effect: Effect.Effect<A, Error, R>) =>
       effect.pipe(Effect.mapError((error) => new ApolloError({ code: "internal", message: error.message })));
 
     return {
       "app.snapshot": () =>
-        Effect.all([manager.snapshot, scheduler.list(), browser.list(), pullRequests.list]).pipe(
-          Effect.map(([snapshot, schedules, browserTabs, prs]) => ({ ...snapshot, schedules, browserTabs, pullRequests: prs })),
+        Effect.all([manager.snapshot, scheduler.list(), browser.list(), pullRequests.list, seen.all]).pipe(
+          Effect.map(([snapshot, schedules, browserTabs, prs, notificationsSeen]) => ({
+            ...snapshot,
+            schedules,
+            browserTabs,
+            pullRequests: prs,
+            notificationsSeen,
+          })),
         ),
       "app.changes": () =>
         Stream.merge(
           manager.changes,
           localModels.changes.pipe(Stream.map((state): AppChange => ({ _tag: "LocalModelsChanged", state }))),
         ),
+
+      "notifications.seen": ({ botId }) =>
+        Effect.gen(function* () {
+          yield* store.getBot(botId);
+          yield* seen.mark(botId);
+        }),
 
       "localModels.state": () => localModels.state,
       "localModels.installEngine": ({ backend }) => local(localModels.installEngine(backend)),
