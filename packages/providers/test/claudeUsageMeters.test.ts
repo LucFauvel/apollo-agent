@@ -1,6 +1,6 @@
 import { headlineMeter } from "@apollo/contracts";
 import { describe, expect, it } from "@effect/vitest";
-import { claudeUsageMeters } from "../src/ClaudeProvider.ts";
+import { claudeLimitsFromUsage, claudeUsageMeters } from "../src/ClaudeProvider.ts";
 
 describe("claudeUsageMeters", () => {
   it("takes the server's rows as sent, with their grading and headline pick", () => {
@@ -43,5 +43,13 @@ describe("claudeUsageMeters", () => {
   it("has no meters when Claude Code reports none", () => {
     expect(claudeUsageMeters(null)).toEqual([]);
     expect(claudeUsageMeters({ limits: [] })).toEqual([]);
+  });
+
+  it("reports an empty set when plan limits do not apply, so saved meters are cleared", () => {
+    // After a switch from a subscription to an API key, Claude Code says limits are unavailable.
+    expect(claudeLimitsFromUsage({ rate_limits_available: false, rate_limits: null })).toEqual([]);
+    expect(
+      claudeLimitsFromUsage({ rate_limits_available: true, rate_limits: { limits: [{ group: "session", percent: 5, severity: "normal", is_active: true }] } }),
+    ).toEqual([{ label: "Session", usedPercent: 5, resetsAt: null, severity: "normal", headline: true }]);
   });
 });

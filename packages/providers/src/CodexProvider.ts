@@ -5,6 +5,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import { fieldsFromSchema, makeInputRequests } from "./InputRequests.ts";
 import { JsonRpcFailure, spawnJsonRpcProcess } from "./JsonRpcProcess.ts";
+import { makeLimitsRefresher } from "./UsageLimits.ts";
 import {
   type Emit,
   type Provider,
@@ -670,31 +671,13 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
     yield* setSkillRoots;
 
     // The plan's usage meters, now and whenever Codex says they moved. Never waits a turn.
-    const limitsScope = yield* Effect.scope;
-    let limitsReading = false;
-    let limitsAgain = false;
-    const readOnce: Effect.Effect<void> = call("account/rateLimits/read", undefined).pipe(
-      Effect.flatMap((response) => emit({ _tag: "UsageLimits", meters: codexUsageMeters(response) })),
-      Effect.ignore,
-    );
-    const readAll: Effect.Effect<void> = Effect.suspend(() => {
-      limitsAgain = false;
-      return Effect.andThen(readOnce, () => (limitsAgain ? readAll : Effect.void));
+    const refreshLimits = makeLimitsRefresher({
+      read: call("account/rateLimits/read", undefined).pipe(Effect.map(codexUsageMeters)),
+      emit,
+      scope: yield* Effect.scope,
+      minIntervalMs: 0,
     });
-    readLimits = options.readOnly
-      ? Effect.void
-      : Effect.suspend(() => {
-          if (limitsReading) {
-            limitsAgain = true;
-            return Effect.void;
-          }
-          limitsReading = true;
-          return readAll.pipe(
-            Effect.ensuring(Effect.sync(() => (limitsReading = false))),
-            Effect.forkIn(limitsScope),
-            Effect.asVoid,
-          );
-        });
+    if (!options.readOnly) readLimits = refreshLimits(true);
     yield* readLimits;
 
     const threadParams = {

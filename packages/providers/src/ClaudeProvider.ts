@@ -16,6 +16,7 @@ import * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { makeAsyncInbox } from "./AsyncInbox.ts";
+import { makeLimitsRefresher } from "./UsageLimits.ts";
 import { fieldsFromSchema, makeInputRequests } from "./InputRequests.ts";
 import {
   type Emit,
@@ -107,6 +108,13 @@ export const claudeUsageMeters = (rateLimits: unknown): Array<UsageMeter> => {
   }
   return meters;
 };
+
+/**
+ * The meters in a get_usage reply. None when plan limits do not apply (an API key, Bedrock,
+ * Vertex): `[]` then clears meters saved from an earlier login.
+ */
+export const claudeLimitsFromUsage = (usage: { readonly rate_limits_available: boolean; readonly rate_limits: unknown }): Array<UsageMeter> =>
+  usage.rate_limits_available ? claudeUsageMeters(usage.rate_limits) : [];
 
 /** What a read-only session (a reflection) may not use: questions to the user, edits, commands. */
 const READ_ONLY_DISALLOWED = [
@@ -636,24 +644,16 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
      * them: an API key or another backend has none, and Claude Code says so. At most once a
      * minute unless Claude Code reported that its rate limits changed; never waits a turn.
      */
-    const limitsScope = yield* Effect.scope;
-    let limitsReading = false;
-    let limitsReadAt = 0;
+    const refreshLimits = makeLimitsRefresher({
+      read: Effect.tryPromise(() => session.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true })).pipe(
+        Effect.map(claudeLimitsFromUsage),
+      ),
+      emit,
+      scope: yield* Effect.scope,
+      minIntervalMs: 60_000,
+    });
     const reportLimits = (force: boolean): Effect.Effect<void> =>
-      Effect.suspend(() => {
-        if (config.backend || options.readOnly || limitsReading || (!force && Date.now() - limitsReadAt < 60_000)) return Effect.void;
-        limitsReading = true;
-        return Effect.tryPromise(() => session.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true })).pipe(
-          Effect.flatMap((usage) => {
-            limitsReadAt = Date.now();
-            return usage.rate_limits_available ? emit({ _tag: "UsageLimits", meters: claudeUsageMeters(usage.rate_limits) }) : Effect.void;
-          }),
-          Effect.ignore,
-          Effect.ensuring(Effect.sync(() => (limitsReading = false))),
-          Effect.forkIn(limitsScope),
-          Effect.asVoid,
-        );
-      });
+      config.backend || options.readOnly ? Effect.void : refreshLimits(force);
 
     /**
      * Claude Code starts a turn on its own when a background subagent finishes (to read its
