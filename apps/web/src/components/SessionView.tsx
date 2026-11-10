@@ -1,4 +1,4 @@
-import { limitsAccount, type ApprovalDecision, type AttachmentRef, type Bot, type InputResponse, type LocalModel, type ProjectId, type RepoChanges, type Session } from "@apollo/contracts";
+import { limitsAccount, type ApprovalDecision, type AttachmentRef, type Bot, type InputResponse, type LocalModel, type ProjectId, type ReplyRef, type RepoChanges, type Session } from "@apollo/contracts";
 import {
   ArrowUp,
   Ban,
@@ -6,6 +6,7 @@ import {
   Clock,
   CornerDownLeft,
   Pencil,
+  Reply,
   X,
   Brain,
   AppWindow,
@@ -34,6 +35,8 @@ import {
   emptyResults,
   foldQuery,
   matchAt,
+  quoteLine,
+  replyTargetIndex,
   type SearchMatch,
   stepMatch,
   hasCards,
@@ -53,6 +56,7 @@ import { formatUsage, usageTitle } from "../format.ts";
 import { useModelLabel } from "../models.ts";
 import { errorMessage, rpc } from "../rpc.ts";
 import { dequeue, enqueue, type QueuedMessage, useQueue } from "../queue.ts";
+import { setReplyTarget, useReplyTarget } from "../reply.ts";
 import { useApp } from "../store.ts";
 import { type TranscriptItem, useTranscript } from "../transcript.ts";
 import { useConversationSearch } from "../searchClient.ts";
@@ -80,7 +84,7 @@ import { MonitorStrip } from "./MonitorStrip.tsx";
 import { ConversationBar, ConversationButton, DictateButton, ReadAloudButton, useConversation } from "./Voice.tsx";
 import { BotAvatar } from "./Sidebar.tsx";
 import { MentionMenu, PeerMessage, useMentions, WithMentions } from "./Mentions.tsx";
-import { DayDivider, groupByDay, MessageTime } from "./DayGroups.tsx";
+import { DayDivider, dayIndexOf, groupByDay, MessageTime } from "./DayGroups.tsx";
 import { MessageRail, type RailTurn } from "./MessageRail.tsx";
 import { clearSearchHighlights, ConversationSearchBar, type CurrentMatch, JumpTracker, opensSearch, paintAndJump, showSearchMatches } from "./ConversationSearch.tsx";
 import { Badge, Button, Collapse, cx, IconButton, Menu, ModelChip, providerName, StatusDot, statusLabel, Tooltip } from "./ui.tsx";
@@ -198,6 +202,39 @@ function MemoryToggle({
   );
 }
 
+/** Makes the composer reply to this message. Shown on hover, like MemoryToggle. */
+function ReplyButton({ sessionId, target }: { sessionId: Session["id"]; target: ReplyRef }) {
+  return (
+    <Tooltip content="Reply to this message">
+      <button
+        type="button"
+        onClick={() => setReplyTarget(sessionId, target)}
+        aria-label="Reply"
+        className="flex shrink-0 items-center rounded-md px-1.5 py-0.5 text-zinc-500 opacity-0 transition-all group-hover:opacity-100 hover:bg-zinc-800 hover:text-zinc-300 focus-visible:opacity-100"
+      >
+        <Reply className="size-3.5" />
+      </button>
+    </Tooltip>
+  );
+}
+
+/** The message a reply answers, above it; clicking it scrolls back to that message. */
+function ReplyQuote({ replyTo, onJump }: { replyTo: ReplyRef; onJump: (replyTo: ReplyRef) => void }) {
+  return (
+    <div className="flex justify-end">
+      <button
+        type="button"
+        onClick={() => onJump(replyTo)}
+        className="flex max-w-[85%] min-w-0 items-center gap-1.5 rounded-lg border-l-2 border-zinc-600 bg-zinc-900/60 px-2.5 py-1 text-left text-xs text-zinc-400 transition-colors hover:bg-zinc-800/80 hover:text-zinc-300"
+      >
+        <Reply className="size-3 shrink-0 text-zinc-500" />
+        <span className="shrink-0 font-medium text-zinc-500">{replyTo.from === "assistant" ? "Agent" : "You"}</span>
+        <span className="min-w-0 truncate">{quoteLine(replyTo.text)}</span>
+      </button>
+    </div>
+  );
+}
+
 /** A brain with a slash through it (lucide has no brain-off). */
 function BrainOff() {
   return (
@@ -249,6 +286,7 @@ function Item({
   live,
   sessionId,
   onOpenChanges,
+  onJumpToReply,
   cards,
   searchCurrent,
 }: {
@@ -257,6 +295,7 @@ function Item({
   live: boolean;
   sessionId: Session["id"];
   onOpenChanges: () => void;
+  onJumpToReply: (replyTo: ReplyRef) => void;
   cards: ChangesCards;
   /** Search's current match is in this block: show it whole. */
   searchCurrent: boolean;
@@ -291,11 +330,13 @@ function Item({
       if (item.author === "peer") return <PeerMessage botId={item.fromBotId} text={item.text} searchKey={item.key} forceOpen={searchCurrent} />;
       if (item.author !== "user") return <SystemMessage author={item.author} text={item.text} searchKey={item.key} forceOpen={searchCurrent} />;
       return (
-        <div className="group animate-fade-up scroll-mt-12 space-y-1.5 pt-2" data-turn={item.key}>
+        <div className="group animate-fade-up scroll-mt-12 space-y-1.5 rounded-xl pt-2" data-turn={item.key} data-reply-seq={item.seq}>
+          {item.replyTo ? <ReplyQuote replyTo={item.replyTo} onJump={onJumpToReply} /> : null}
           {item.attachments?.length ? <MessageAttachments sessionId={sessionId} attachments={item.attachments} /> : null}
           {item.text ? (
             <div className="flex items-center justify-end gap-1.5">
               <MessageTime at={item.at} />
+              <ReplyButton sessionId={sessionId} target={{ seq: item.seq, from: "user", text: item.text }} />
               <MemoryToggle sessionId={sessionId} seq={item.seq} excluded={item.excluded ?? false} align="end" />
               <div
                 className={cx(
@@ -316,7 +357,7 @@ function Item({
         return <div className="text-[11px] text-zinc-600 italic">Nothing to report.</div>;
       }
       return (
-        <div className="group animate-fade-up">
+        <div className="group animate-fade-up rounded-xl" data-reply-seq={item.seq || undefined}>
           <div
             className={cx("markdown py-1 text-sm leading-relaxed text-zinc-200 transition-opacity", item.excluded && "opacity-45")}
             data-search-text={item.key}
@@ -327,6 +368,7 @@ function Item({
           {!item.streaming && item.seq ? (
             <div className="-mt-0.5 flex h-6 items-center gap-0.5">
               <MemoryToggle sessionId={sessionId} seq={item.seq} excluded={item.excluded ?? false} align="start" />
+              <ReplyButton sessionId={sessionId} target={{ seq: item.seq, from: "assistant", text: item.text }} />
               <ReadAloudButton text={item.text} />
               <MessageTime at={item.at} className="ml-1" />
             </div>
@@ -399,6 +441,11 @@ function QueuedMessages({
         >
           <div className="min-w-0 flex-1 py-0.5">
             <p className="line-clamp-3 text-sm whitespace-pre-wrap text-zinc-300">{m.text}</p>
+            {m.replyTo ? (
+              <span className="mt-0.5 flex min-w-0 items-center gap-1 text-[11px] text-zinc-500">
+                <Reply className="size-3 shrink-0" /> <span className="truncate">{quoteLine(m.replyTo.text)}</span>
+              </span>
+            ) : null}
             {m.attachments.length ? (
               <span className="mt-0.5 flex items-center gap-1 text-[11px] text-zinc-500">
                 <Paperclip className="size-3" /> {m.attachments.length} attachment{m.attachments.length > 1 ? "s" : ""}
@@ -442,6 +489,7 @@ function Composer({
   const ref = useRef<HTMLTextAreaElement>(null);
   const picker = useRef<HTMLInputElement>(null);
   const files = useAttachments(session.id);
+  const replyTo = useReplyTarget(session.id);
   const slash = useSlashCommands(session, text);
   // `@Name` asks another bot; the picker follows the caret.
   const [caret, setCaret] = useState(0);
@@ -456,15 +504,15 @@ function Composer({
     });
   };
 
-  // Focus the box when switching sessions.
-  useEffect(() => ref.current?.focus(), [session.id]);
+  // Focus the box when switching sessions, and when a message's Reply button is clicked.
+  useEffect(() => ref.current?.focus(), [session.id, replyTo]);
 
   const canSend = (text.trim().length > 0 || files.refs.length > 0) && !files.uploading && waitingFor === null;
   const send = () => {
     const value = text.trim();
     if (!canSend) return;
     // `/compact`, `/clear`… run as commands (unknown ones go to the agent's harness).
-    const command = files.refs.length === 0 ? parseCommand(value) : null;
+    const command = files.refs.length === 0 && !replyTo ? parseCommand(value) : null;
     if (command) {
       setText("");
       setError(null);
@@ -478,21 +526,28 @@ function Composer({
     setText("");
     setError(null);
     files.clear();
+    setReplyTarget(session.id, null);
     // While the agent works, the message waits for the turn to end (or "Send now" steers).
     if (busy || queue.length > 0) {
-      enqueue(session.id, value, attachments);
+      enqueue(session.id, value, attachments, replyTo);
       return;
     }
-    deliver(value, attachments);
+    deliver(value, attachments, replyTo);
   };
 
-  const deliver = (value: string, attachments: ReadonlyArray<AttachmentRef>) =>
-    rpc((c) => c["sessions.send"]({ sessionId: session.id, text: value, ...(attachments.length > 0 ? { attachments } : {}) })).catch(
-      (e) => {
-        setError(errorMessage(e));
-        setText(value);
-      },
-    );
+  const deliver = (value: string, attachments: ReadonlyArray<AttachmentRef>, replyTo: ReplyRef | null = null) =>
+    rpc((c) =>
+      c["sessions.send"]({
+        sessionId: session.id,
+        text: value,
+        ...(attachments.length > 0 ? { attachments } : {}),
+        ...(replyTo ? { replyToSeq: replyTo.seq } : {}),
+      }),
+    ).catch((e) => {
+      setError(errorMessage(e));
+      setText(value);
+      if (replyTo) setReplyTarget(session.id, replyTo);
+    });
 
   // Queued messages go out one per turn, once the session is idle.
   const queue = useQueue(session.id);
@@ -513,7 +568,7 @@ function Composer({
     const next = dequeue(session.id, queue[0]!.id);
     if (!next) return;
     dispatched.current = { at: Date.now(), sawBusy: false };
-    void deliver(next.text, next.attachments);
+    void deliver(next.text, next.attachments, next.replyTo);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [busy, session.status, queue, session.id, tick]);
 
@@ -558,18 +613,29 @@ function Composer({
             queue={queue}
             onSendNow={(id) => {
               const message = dequeue(session.id, id);
-              if (message) void deliver(message.text, message.attachments);
+              if (message) void deliver(message.text, message.attachments, message.replyTo);
             }}
             onEdit={(id) => {
               const message = dequeue(session.id, id);
               if (!message) return;
               setText((current) => (current.trim() ? `${message.text}\n${current}` : message.text));
+              if (message.replyTo) setReplyTarget(session.id, message.replyTo);
               ref.current?.focus();
             }}
             onRemove={(id) => dequeue(session.id, id)}
             busy={busy}
             status={session.status}
           />
+          {replyTo ? (
+            <div className="mx-3 mt-3 flex items-center gap-2 rounded-lg border-l-2 border-sky-500/70 bg-zinc-800/50 py-1 pr-1 pl-2.5 text-xs">
+              <Reply className="size-3.5 shrink-0 text-sky-400" />
+              <span className="shrink-0 font-medium text-zinc-300">
+                Replying to {replyTo.from === "assistant" ? botName : "yourself"}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-zinc-500">{quoteLine(replyTo.text)}</span>
+              <IconButton icon={X} label="Cancel reply (Esc)" size="sm" onClick={() => setReplyTarget(session.id, null)} />
+            </div>
+          ) : null}
           <PendingAttachments items={files.items} onRemove={files.remove} />
           <textarea
             onPaste={(e) => {
@@ -603,6 +669,11 @@ function Composer({
                   mention.dismiss();
                   return;
                 }
+              }
+              if (e.key === "Escape" && replyTo && !slash.open) {
+                e.preventDefault();
+                setReplyTarget(session.id, null);
+                return;
               }
               if (slash.open && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
                 e.preventDefault();
@@ -914,15 +985,19 @@ export function SessionView({
     }
     return turns;
   }, [blocks]);
-  /** Scrolls to a message, opening its day first if it is folded. */
-  const jumpToTurn = (key: string) => {
-    const dayIndex = days.findIndex((day) => day.blocks.some(({ block }) => block.key === key));
+  /**
+   * Scrolls to a block (found in the page with `selector`), opening its day first if it is
+   * folded. `settled` runs once it is in place.
+   */
+  const jumpToBlock = (key: string, selector: string, block: ScrollLogicalPosition, settled?: (el: HTMLElement) => void) => {
+    const dayIndex = dayIndexOf(days, key);
     follower.leave();
-    const scroll = (behavior: ScrollBehavior) => {
-      const el = scrollRef.current?.querySelector<HTMLElement>(`[data-turn="${CSS.escape(key)}"]`);
+    const scroll = (behavior: ScrollBehavior, done?: (el: HTMLElement) => void) => {
+      const el = scrollRef.current?.querySelector<HTMLElement>(selector);
       if (!el) return false;
       follower.leave();
-      el.scrollIntoView({ block: "start", behavior });
+      el.scrollIntoView({ block, behavior });
+      done?.(el);
       return true;
     };
     if (dayIndex >= 0 && days.length > 1 && !isDayOpen(days[dayIndex]!.key, dayIndex)) {
@@ -931,8 +1006,18 @@ export function SessionView({
       let tries = 0;
       const retry = () => !scroll("auto") && tries++ < 20 && requestAnimationFrame(retry);
       requestAnimationFrame(retry);
-      setTimeout(() => scroll("smooth"), 320);
-    } else scroll("smooth");
+      setTimeout(() => scroll("smooth", settled), 320);
+    } else scroll("smooth", settled);
+  };
+  /** Scrolls to a message, opening its day first if it is folded. */
+  const jumpToTurn = (key: string) => jumpToBlock(key, `[data-turn="${CSS.escape(key)}"]`, "start");
+  /** Scrolls back to the message a reply quotes, and flashes it. */
+  const jumpToReply = (replyTo: ReplyRef) => {
+    const target = blocks[replyTargetIndex(blocks, replyTo)];
+    if (!target) return;
+    jumpToBlock(target.key, `[data-reply-seq="${replyTo.seq}"]`, "center", (el) =>
+      el.animate([{ backgroundColor: "rgb(56 189 248 / 0.12)" }, { backgroundColor: "transparent" }], { duration: 1200 }),
+    );
   };
   const toggleDay = (key: string, _index: number) =>
     setToggledDays((current) => {
@@ -1329,6 +1414,7 @@ export function SessionView({
                   live={busy && i === blocks.length - 1}
                   sessionId={session.id}
                   onOpenChanges={() => panel !== "changes" && onTogglePanel("changes")}
+                  onJumpToReply={jumpToReply}
                   cards={cards}
                   searchCurrent={currentMatch?.key === block.key}
                 />

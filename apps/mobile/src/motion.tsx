@@ -5,6 +5,7 @@ import {
   Easing,
   type GestureResponderEvent,
   Keyboard,
+  type LayoutChangeEvent,
   LayoutAnimation,
   PanResponder,
   type PanResponderGestureState,
@@ -67,9 +68,11 @@ export function SlideIn({
 export function FadeIn({
   children,
   animate = true,
+  onLayout,
 }: {
   children: ReactNode;
   animate?: boolean;
+  onLayout?: (e: LayoutChangeEvent) => void;
 }) {
   const progress = useRef(new Animated.Value(animate ? 0 : 1)).current;
   useEffect(() => {
@@ -84,6 +87,7 @@ export function FadeIn({
   }, [progress]);
   return (
     <Animated.View
+      onLayout={onLayout}
       style={{
         opacity: progress,
         transform: [

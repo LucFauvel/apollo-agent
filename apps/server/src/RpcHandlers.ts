@@ -173,7 +173,8 @@ export const layer = ApolloRpcs.toLayer(
       "sessions.create": ({ botId, title, provider, cwd, isolation, prompt, projectId }) =>
         manager.createSession({ botId, title, provider, cwd, isolation, prompt, projectId }),
       "sessions.update": (input) => manager.updateSessionSettings(input),
-      "sessions.send": ({ sessionId, text, attachments }) => manager.send(sessionId, text, "user", attachments ?? []),
+      "sessions.send": ({ sessionId, text, attachments, replyToSeq }) =>
+        manager.send(sessionId, text, "user", attachments ?? [], replyToSeq === undefined ? {} : { replyToSeq }),
       "sessions.interrupt": ({ sessionId }) => manager.interrupt(sessionId),
       "sessions.commands": ({ sessionId }) => manager.listCommands(sessionId),
       "sessions.runCommand": ({ sessionId, name, args }) => manager.runCommand(sessionId, name, args),

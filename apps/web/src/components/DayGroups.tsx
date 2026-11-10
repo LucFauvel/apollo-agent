@@ -46,6 +46,9 @@ export const groupByDay = (blocks: ReadonlyArray<TranscriptBlock>): Array<DayGro
   return groups;
 };
 
+/** Which day holds the block with `key` (-1: none). */
+export const dayIndexOf = (days: ReadonlyArray<DayGroup>, key: string) => days.findIndex((day) => day.blocks.some(({ block }) => block.key === key));
+
 /** Messages and steps, for a folded day's count. */
 const countOf = (group: DayGroup) =>
   group.blocks.filter(({ block }) => block.kind === "user" || block.kind === "assistant").length;

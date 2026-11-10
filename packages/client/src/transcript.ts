@@ -10,6 +10,7 @@ import type {
   InputAction,
   InputField,
   MessageAuthor,
+  ReplyRef,
   RepoChanges,
   SessionEvent,
   SessionId,
@@ -27,6 +28,7 @@ type TranscriptItemKind =
       readonly attachments?: ReadonlyArray<AttachmentRef>;
       /** For `peer` messages: the bot that wrote it. */
       readonly fromBotId?: string;
+      readonly replyTo?: ReplyRef;
       /** Position in the session log; `excluded` when kept out of the bot's memory. */
       readonly seq: number;
       readonly excluded?: boolean;
@@ -170,6 +172,7 @@ export const reduceTranscript = (state: TranscriptState, e: SessionEvent): Trans
         seq: e.seq,
         ...(event.attachments ? { attachments: event.attachments } : {}),
         ...(event.fromBotId ? { fromBotId: event.fromBotId } : {}),
+        ...(event.replyTo ? { replyTo: event.replyTo } : {}),
       });
     case "MemoryExclusion": {
       const updated = updateWhere(

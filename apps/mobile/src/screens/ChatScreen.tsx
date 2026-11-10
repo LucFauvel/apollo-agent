@@ -10,6 +10,8 @@ import {
   summariesByTurn,
   withoutFullDiffs,
   isCompacting,
+  quoteLine,
+  replyTargetIndex,
   showWorking,
   systemMessageParts,
   toBlocks,
@@ -17,7 +19,7 @@ import {
   type TranscriptItem,
   type TranscriptState,
 } from "@apollo/client";
-import { type Bot, type BotId, type InputField, type InputValue, limitsAccount, type ProjectId, type RepoChanges, type SessionId, sortBots } from "@apollo/contracts";
+import { type Bot, type BotId, type InputField, type InputValue, limitsAccount, type ProjectId, type ReplyRef, type RepoChanges, type SessionId, sortBots } from "@apollo/contracts";
 import {
   type ReactNode,
   useContext,
@@ -38,6 +40,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  type TextInputInstance,
   View,
 } from "react-native";
 import { useApollo } from "../AppState.tsx";
@@ -71,11 +74,13 @@ import {
   LoaderIcon,
   LockIcon,
   NetworkIcon,
+  ReplyIcon,
   ShieldAlertIcon,
   ShieldCheckIcon,
   SparklesIcon,
   SpeakerIcon,
   SquareIcon,
+  XIcon,
 } from "../icons.tsx";
 import { speak, stopSpeaking } from "../voice.ts";
 import { speakable } from "@apollo/client";
@@ -121,6 +126,8 @@ export function ChatScreen({
   });
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [replyTo, setReplyTo] = useState<ReplyRef | null>(null);
+  const input = useRef<TextInputInstance>(null);
   const scroll = useRef<ScrollViewInstance>(null);
   // Follow new output only while the user is at the bottom, and never because a row opened.
   const atBottom = useRef(true);
@@ -199,6 +206,7 @@ export function ChatScreen({
     setFirstKey(null);
     reveal.setValue(0);
     setFarFromBottom(false);
+    setReplyTo(null);
   }, [sessionId, reveal]);
 
   // A conversation with nothing in it yet answers with no event at all: do not wait long.
@@ -247,17 +255,20 @@ export function ChatScreen({
   const send = () => {
     const value = text.trim();
     if (!value) return;
+    const reply = replyTo;
     setText("");
     setError(null);
+    setReplyTo(null);
     const id = ++outboxId.current;
     setOutbox((o) => [...o, { id, text: value }]);
     setTimeout(() => toLatest(true), 50);
     connection
-      .rpc((c) => c["sessions.send"]({ sessionId, text: value }))
+      .rpc((c) => c["sessions.send"]({ sessionId, text: value, ...(reply ? { replyToSeq: reply.seq } : {}) }))
       .catch((e) => {
         setOutbox((o) => o.filter((m) => m.id !== id));
         setError(errorMessage(e));
         setText(value);
+        setReplyTo(reply);
       });
   };
 
@@ -268,6 +279,33 @@ export function ChatScreen({
   const start = pinnedAt >= 0 ? pinnedAt : latestStart;
   const shown = useMemo(() => (start === 0 ? blocks : blocks.slice(start)), [blocks, start]);
   const showEarlier = () => setFirstKey(blocks[Math.max(0, start - WINDOW)]?.key ?? null);
+  /** Where each shown block sits in the transcript, to scroll back to a message a reply quotes. */
+  const blockY = useRef(new Map<string, number>());
+  const pendingJump = useRef<string | null>(null);
+  const [flashKey, setFlashKey] = useState<string | null>(null);
+  const scrollToBlock = (key: string) => {
+    const y = blockY.current.get(key);
+    if (y === undefined) return false;
+    pendingJump.current = null;
+    atBottom.current = false;
+    ownScrollUntil.current = 0;
+    scroll.current?.scrollTo({ y: Math.max(0, y - 80), animated: true });
+    setFlashKey(key);
+    setTimeout(() => setFlashKey((k) => (k === key ? null : k)), 1200);
+    return true;
+  };
+  /** Scrolls back to the message a reply quotes, showing earlier blocks first if it is above the window. */
+  const jumpToReply = (replyTo: ReplyRef) => {
+    const index = replyTargetIndex(blocks, replyTo);
+    if (index < 0) return;
+    const key = blocks[index]!.key;
+    if (index < start) {
+      pendingJump.current = key;
+      setFirstKey(key);
+      return;
+    }
+    if (!scrollToBlock(key)) pendingJump.current = key;
+  };
   // Once loaded, the window stays where it starts (new blocks add to it), from its first
   // block on: also after a `/clear`, and for history arriving only after an empty wait.
   const pinKey = pinnedAt < 0 ? (blocks[latestStart]?.key ?? null) : null;
@@ -517,12 +555,25 @@ export function ChatScreen({
         </View>
         <ScrollHold.Provider value={hold}>
           {shown.map((item, i) => (
-            <FadeIn key={item.key} animate={loadedRef.current}>
+            <FadeIn
+              key={item.key}
+              animate={loadedRef.current}
+              onLayout={(e) => {
+                blockY.current.set(item.key, e.nativeEvent.layout.y);
+                if (pendingJump.current === item.key) scrollToBlock(item.key);
+              }}
+            >
+              <View style={flashKey === item.key ? styles.flash : undefined}>
               <Item
                 item={item}
                 sessionId={sessionId}
                 live={busy && start + i === blocks.length - 1}
                 onOpenChanges={() => setChangesOpen(true)}
+                onJumpToReply={jumpToReply}
+                onReply={(target) => {
+                  setReplyTo(target);
+                  input.current?.focus();
+                }}
                 cards={cards}
                 onOpenBrowser={(tabId, handoff) => setBrowser({ tabId, ...(handoff ? { handoff: { ...handoff, sessionId } } : {}) })}
                 onApprove={(requestId, decision) =>
@@ -556,6 +607,7 @@ export function ChatScreen({
                   )
                 }
               />
+              </View>
             </FadeIn>
           ))}
         </ScrollHold.Provider>
@@ -639,6 +691,24 @@ export function ChatScreen({
           </View>
         </FadeIn>
       ) : null}
+      {replyTo ? (
+        <FadeIn>
+          <View style={styles.replyBar}>
+            <ReplyIcon size={14} color={colors.accent} />
+            <View style={{ flex: 1, minWidth: 0 }}>
+              <Text style={styles.replyBarTitle} numberOfLines={1}>
+                Replying to {replyTo.from === "assistant" ? (bot?.name ?? "the agent") : "yourself"}
+              </Text>
+              <Text style={styles.replyBarText} numberOfLines={1}>
+                {quoteLine(replyTo.text)}
+              </Text>
+            </View>
+            <Pressable onPress={() => setReplyTo(null)} hitSlop={10} accessibilityLabel="Cancel reply">
+              <XIcon size={16} color={colors.muted} />
+            </Pressable>
+          </View>
+        </FadeIn>
+      ) : null}
       <View style={styles.composer}>
         <MicButton
           disabled={talking}
@@ -646,6 +716,7 @@ export function ChatScreen({
           onText={(spoken) => setText((current) => (current.trim() ? `${current.trimEnd()} ${spoken}` : spoken))}
         />
         <TextInput
+          ref={input}
           style={styles.input}
           value={text}
           onChangeText={setText}
@@ -729,6 +800,8 @@ function Item({
   onInput,
   onSecret,
   onOpenChanges,
+  onReply,
+  onJumpToReply,
   cards,
   onOpenBrowser,
 }: {
@@ -736,6 +809,8 @@ function Item({
   sessionId: SessionId;
   live: boolean;
   onOpenChanges: () => void;
+  onReply: (target: ReplyRef) => void;
+  onJumpToReply: (replyTo: ReplyRef) => void;
   cards: ChangesCards;
   onOpenBrowser: (tabId: string, handoff?: { requestId: string; reason: string }) => void;
 } & Respond) {
@@ -758,11 +833,16 @@ function Item({
     case "user":
       return item.author === "user" ? (
         <View style={{ gap: 6 }}>
+          {item.replyTo ? <ReplyQuote replyTo={item.replyTo} onPress={onJumpToReply} /> : null}
           {item.attachments && item.attachments.length > 0 ? <MessageAttachments sessionId={sessionId} attachments={item.attachments} /> : null}
           {item.text ? (
-            <View style={styles.userBubble}>
+            <Pressable
+              onLongPress={() => onReply({ seq: item.seq, from: "user", text: item.text })}
+              accessibilityHint="Long press to reply"
+              style={({ pressed }) => [styles.userBubble, pressed && { opacity: 0.8 }]}
+            >
               <Text style={styles.userText}>{item.text}</Text>
-            </View>
+            </Pressable>
           ) : null}
         </View>
       ) : item.author === "peer" ? (
@@ -776,7 +856,24 @@ function Item({
       return (
         <View>
           <Markdown text={item.text} />
-          {item.streaming ? <Pulse style={styles.cursor}>{null}</Pulse> : <ListenButton text={item.text} />}
+          {item.streaming ? (
+            <Pulse style={styles.cursor}>{null}</Pulse>
+          ) : (
+            <View style={styles.messageActions}>
+              <ListenButton text={item.text} />
+              {item.seq ? (
+                <Pressable
+                  hitSlop={8}
+                  style={styles.listen}
+                  accessibilityLabel="Reply to this message"
+                  onPress={() => onReply({ seq: item.seq!, from: "assistant", text: item.text })}
+                >
+                  <ReplyIcon size={14} color={colors.faint} />
+                  <Text style={styles.listenText}>Reply</Text>
+                </Pressable>
+              ) : null}
+            </View>
+          )}
         </View>
       );
     case "notice":
@@ -1003,6 +1100,25 @@ function SystemMessage({ author, text }: { author: string; text: string }) {
         </View>
       ) : null}
     </View>
+  );
+}
+
+/** The message a reply answers, shown above it; tapping it scrolls back to that message. */
+function ReplyQuote({ replyTo, onPress }: { replyTo: ReplyRef; onPress: (replyTo: ReplyRef) => void }) {
+  return (
+    <Pressable
+      onPress={() => onPress(replyTo)}
+      hitSlop={6}
+      accessibilityRole="button"
+      accessibilityLabel="Show the message this replies to"
+      style={({ pressed }) => [styles.replyQuote, pressed && { opacity: 0.6 }]}
+    >
+      <ReplyIcon size={12} color={colors.faint} />
+      <Text style={styles.replyQuoteFrom}>{replyTo.from === "assistant" ? "Agent" : "You"}</Text>
+      <Text style={styles.replyQuoteText} numberOfLines={1}>
+        {quoteLine(replyTo.text)}
+      </Text>
+    </Pressable>
   );
 }
 
@@ -1406,6 +1522,39 @@ const styles = StyleSheet.create({
   sending: { opacity: 0.6 },
   listen: { flexDirection: "row", alignItems: "center", gap: 5, alignSelf: "flex-start", marginTop: 4, paddingVertical: 3 },
   listenText: { color: colors.faint, fontSize: 11.5 },
+  flash: { borderRadius: 12, backgroundColor: "rgba(129,140,248,0.12)" },
+  messageActions: { flexDirection: "row", alignItems: "center", gap: 16 },
+  replyQuote: {
+    alignSelf: "flex-end",
+    maxWidth: "85%",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderLeftWidth: 2,
+    borderLeftColor: "#52525b",
+    borderRadius: 8,
+    backgroundColor: "rgba(24,24,27,0.6)",
+  },
+  replyQuoteFrom: { color: colors.faint, fontSize: 12, fontWeight: "600" },
+  replyQuoteText: { flexShrink: 1, color: colors.muted, fontSize: 12 },
+  replyBar: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginHorizontal: 10,
+    marginBottom: 6,
+    paddingVertical: 7,
+    paddingLeft: 10,
+    paddingRight: 12,
+    borderLeftWidth: 2,
+    borderLeftColor: colors.accent,
+    borderRadius: 10,
+    backgroundColor: colors.panel,
+  },
+  replyBarTitle: { color: colors.textSoft, fontSize: 12.5, fontWeight: "600" },
+  replyBarText: { color: colors.faint, fontSize: 12.5, marginTop: 1 },
   cursor: { width: 6, height: 14, borderRadius: 2, backgroundColor: colors.muted, marginTop: 2 },
   silent: { color: "#52525b", fontSize: 11.5, fontStyle: "italic" },
   userBubble: {

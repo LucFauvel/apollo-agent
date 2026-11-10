@@ -668,6 +668,32 @@ describe("SessionManager", () => {
     }).pipe(Effect.provide(layer)),
   );
 
+  it.live("replies quote the earlier message to the agent and record it on the message", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      yield* manager.send(bot.mainSessionId, "first line\nsecond line", "user");
+      yield* waitIdle(manager, bot.mainSessionId);
+      const events = yield* store.listEvents(bot.mainSessionId, 0);
+      const answer = events.find((e) => e.event._tag === "AssistantMessage")!;
+      const question = events.find((e) => e.event._tag === "UserMessage")!;
+
+      yield* manager.send(bot.mainSessionId, "why?", "user", [], { replyToSeq: answer.seq });
+      yield* waitIdle(manager, bot.mainSessionId);
+      expect(sent.at(-1)).toBe("[The user is replying to this earlier message of yours:]\n> echo: first line\n> second line\n\nwhy?");
+      const reply = (yield* store.listEvents(bot.mainSessionId, answer.seq)).find((e) => e.event._tag === "UserMessage")!.event;
+      expect(reply).toMatchObject({ text: "why?", replyTo: { seq: answer.seq, from: "assistant", text: "echo: first line\nsecond line" } });
+
+      yield* manager.send(bot.mainSessionId, "and this", "user", [], { replyToSeq: question.seq });
+      yield* waitIdle(manager, bot.mainSessionId);
+      expect(sent.at(-1)).toContain("[The user is following up on this earlier message of theirs:]\n> first line");
+
+      const bad = yield* manager.send(bot.mainSessionId, "nope", "user", [], { replyToSeq: 9999 }).pipe(Effect.flip);
+      expect(bad.message).toContain("can only reply");
+    }).pipe(Effect.provide(layer)),
+  );
+
   it.live("names sessions started without a title from their first message", () =>
     Effect.gen(function* () {
       const manager = yield* SessionManager.SessionManager;

@@ -825,6 +825,34 @@ const make = Effect.gen(function* () {
       if (Option.isSome(exists)) yield* updateSession(session.id, { title });
     }).pipe(Effect.catchCause((cause) => Effect.logInfo(`session ${session.id} keeps its provisional title`, cause)));
 
+  // --- replies ------------------------------------------------------------
+
+  /** How much of the replied-to message the chat shows, and how much the agent reads. */
+  const REPLY_EXCERPT = 280;
+  const REPLY_QUOTE = 2000;
+
+  const excerpt = (text: string, max: number) => {
+    const trimmed = text.trim();
+    return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max).trimEnd()}…`;
+  };
+
+  /** The message a reply quotes: one of the user's own messages, or one of the agent's. */
+  const repliedMessage = (id: SessionId, seq: number) =>
+    Effect.gen(function* () {
+      const event = yield* store.eventAt(id, seq);
+      if (event?._tag === "AssistantMessage") return { seq, from: "assistant" as const, text: event.text };
+      if (event?._tag === "UserMessage" && event.author === "user") return { seq, from: "user" as const, text: event.text };
+      return yield* invalid("can only reply to a message from you or the agent in this conversation");
+    });
+
+  const replyNote = (quoted: { readonly from: "user" | "assistant"; readonly text: string }) =>
+    [
+      quoted.from === "assistant"
+        ? "[The user is replying to this earlier message of yours:]"
+        : "[The user is following up on this earlier message of theirs:]",
+      ...excerpt(quoted.text, REPLY_QUOTE).split("\n").map((line) => `> ${line}`),
+    ].join("\n");
+
   // --- public API ---------------------------------------------------------
 
   const send = (
@@ -833,10 +861,11 @@ const make = Effect.gen(function* () {
     author: MessageAuthor = "user",
     attachments: ReadonlyArray<AttachmentRef> = [],
     /** A `peer` message's bot, and what the agent reads when it differs from what the chat shows. */
-    extra: { readonly fromBotId?: BotId; readonly agentText?: string } = {},
+    extra: { readonly fromBotId?: BotId; readonly agentText?: string; readonly replyToSeq?: number } = {},
   ) =>
     Effect.gen(function* () {
       if (text.trim().length === 0 && attachments.length === 0) return yield* invalid("message is empty");
+      const quoted = extra.replyToSeq === undefined ? null : yield* repliedMessage(id, extra.replyToSeq);
       const files = attachments.map((ref) => findAttachment(config.dataDir, id, ref.id));
       if (files.some((f) => f === null)) return yield* invalid("an attachment is missing; upload it again");
       const target = yield* store.getSession(id);
@@ -872,6 +901,7 @@ const make = Effect.gen(function* () {
         author,
         ...(attachments.length > 0 ? { attachments: files.map((f) => ({ id: f!.id, name: f!.name, mime: f!.mime, size: f!.size })) } : {}),
         ...(extra.fromBotId ? { fromBotId: extra.fromBotId } : {}),
+        ...(quoted ? { replyTo: { seq: quoted.seq, from: quoted.from, text: excerpt(quoted.text, REPLY_EXCERPT) } } : {}),
       });
       // Mark busy before the provider acknowledges the turn, so a caller that
       // immediately waits on this session (e.g. apollo_wait_session) cannot see
@@ -879,7 +909,8 @@ const make = Effect.gen(function* () {
       const before = yield* store.getSession(id);
       if (!isBusy(before.status)) yield* updateSession(id, { status: "running" });
       // `@OtherBot` in the user's message points the agent at that bot: it reads who that is.
-      const agentText = extra.agentText ?? (author === "user" ? yield* withMentionNote(target, text) : text);
+      const said = extra.agentText ?? (author === "user" ? yield* withMentionNote(target, text) : text);
+      const agentText = quoted ? `${replyNote(quoted)}\n\n${said}` : said;
       // A failure to open posts its own notice and marks the session as errored.
       const entry = yield* ensureOpen(id, true);
       yield* entry.provider.send(agentText, files.map((f) => ({ path: f!.path, name: f!.name, mime: f!.mime, size: f!.size }))).pipe(
