@@ -52,6 +52,10 @@
 
 ::selection { background: rgb(113 113 122 / 0.45); }
 
+/* Conversation search (CSS Custom Highlight API): every match, and the current one. */
+::highlight(conversation-search) { background-color: rgb(250 204 21 / 0.28); color: inherit; }
+::highlight(conversation-search-current) { background-color: rgb(251 146 60 / 0.85); color: var(--color-zinc-950); }
+
 /* Thin, unobtrusive scrollbars. */
 * { scrollbar-width: thin; scrollbar-color: var(--color-zinc-800) transparent; }
 *::-webkit-scrollbar { width: 10px; height: 10px; }

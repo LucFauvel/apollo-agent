@@ -218,6 +218,7 @@ export function Modal({
     >
       <div
         role="dialog"
+        aria-modal="true"
         aria-label={title}
         className={cx(
           "animate-pop-in flex max-h-[88vh] w-full flex-col rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl shadow-black/50",

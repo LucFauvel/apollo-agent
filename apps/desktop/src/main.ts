@@ -5,7 +5,8 @@ import { homedir } from "node:os";
 import { createServer } from "node:net";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { app, BrowserWindow, Menu, nativeImage, Notification, shell, Tray } from "electron";
+import { app, BrowserWindow, Menu, nativeImage, Notification, shell, Tray, type WebContents } from "electron";
+import { navigationDecision, windowOpenDecision } from "./navigation.js";
 import { type PanelRow, TrayPanel } from "./trayPanel.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -189,7 +190,47 @@ const stopServer = () => {
   server = null;
 };
 
-const createWindow = async (url: string) => {
+/**
+ * Links never take an app window away from the app, and app URLs never leave it: the app's
+ * own pages load in place or in an app window (e.g. an attachment opened in a new tab), web
+ * and mail links go to the user's browser or mail app, anything else is dropped. Windows
+ * opened this way get the same rules.
+ */
+const guardLinks = (contents: WebContents, appOrigins: ReadonlyArray<string>) => {
+  contents.setWindowOpenHandler(({ url: target }) => {
+    switch (windowOpenDecision(target, appOrigins)) {
+      case "show":
+        showWindow();
+        return { action: "deny" };
+      case "in-app":
+        return {
+          action: "allow",
+          overrideBrowserWindowOptions: {
+            backgroundColor: "#09090b",
+            autoHideMenuBar: true,
+            webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
+          },
+        };
+      case "external":
+        void shell.openExternal(target);
+        return { action: "deny" };
+      case "block":
+        return { action: "deny" };
+    }
+  });
+  contents.on("did-create-window", (child) => guardLinks(child.webContents, appOrigins));
+  // The window itself never leaves the app: a link or script that would navigate it to
+  // another site opens in the user's browser instead (target-less links, location changes).
+  contents.on("will-navigate", (event, target) => {
+    const decision = navigationDecision(target, appOrigins);
+    if (decision === "allow") return;
+    event.preventDefault();
+    if (decision === "external") void shell.openExternal(target);
+  });
+};
+
+/** `appOrigins`: where the UI and server are served from; only these load inside the window. */
+const createWindow = async (url: string, appOrigins: ReadonlyArray<string>) => {
   const window = new BrowserWindow({
     width: 1360,
     height: 860,
@@ -221,16 +262,7 @@ const createWindow = async (url: string) => {
     });
   }
 
-  // Links open in the user's browser, never inside the app.
-  window.webContents.setWindowOpenHandler(({ url: target }) => {
-    // The page asks to be shown (e.g. a notification was clicked while the window was hidden).
-    if (target === "apollo-desktop://show") {
-      showWindow();
-      return { action: "deny" };
-    }
-    void shell.openExternal(target);
-    return { action: "deny" };
-  });
+  guardLinks(window.webContents, appOrigins);
 
   await window.loadURL(url);
 
@@ -504,7 +536,7 @@ if (!app.requestSingleInstanceLock()) {
       const serverUrl = await startServer();
       if (tray) followStatus(serverUrl);
       const uiUrl = (devUrl ?? serverUrl).replace(/\/+$/, "");
-      await createWindow(`${uiUrl}/pair#token=${bootstrapToken}&label=Apollo%20Desktop`);
+      await createWindow(`${uiUrl}/pair#token=${bootstrapToken}&label=Apollo%20Desktop`, [new URL(uiUrl).origin, new URL(serverUrl).origin]);
     } catch (error) {
       console.error(error);
       stopServer();
