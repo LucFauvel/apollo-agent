@@ -9,6 +9,7 @@ import {
   type QuantOption,
   type SuggestedModel,
 } from "@apollo/contracts";
+import { downloadPercent, splitModelId } from "@apollo/client";
 import { useEffect, useState } from "react";
 import { forgetModels } from "../models.ts";
 import { errorMessage, rpc } from "../rpc.ts";
@@ -30,9 +31,7 @@ const resumeDownload = (id: string) => {
   return rpc((c) => c["localModels.download"]({ repo: repo!, quant: quant ?? "" }));
 };
 
-/** Download progress of a local model, 0-100. */
-export const downloadPercent = (model: LocalModel) =>
-  model.download && model.download.total > 0 ? Math.floor((model.download.done / model.download.total) * 100) : 0;
+export { downloadPercent, splitModelId };
 
 /**
  * The download a llama.cpp session must wait for: its model, or (with no model
@@ -111,12 +110,6 @@ export function LoadProgress({ model }: { model: LocalModel }) {
     </div>
   );
 }
-
-/** `unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M` → name and quant. */
-export const splitModelId = (id: string) => {
-  const [repo, quant] = id.split(/:(?=[^/]+$)/);
-  return { name: repo!.split("/").pop()!.replace(/[-_.]?GGUF$/i, ""), author: repo!.split("/")[0]!, quant: quant ?? null };
-};
 
 const BACKENDS: ReadonlyArray<{ value: LlamaBackend; label: string }> = [
   { value: "cuda", label: "CUDA (NVIDIA)" },

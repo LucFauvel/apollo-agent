@@ -1,13 +1,14 @@
-import { isDownloaded, type ProviderKind } from "@apollo/contracts";
+import { isDownloaded, type ProviderKind, type Session } from "@apollo/contracts";
+import { Check, ChevronDown, Settings2 } from "lucide-react";
+import { makeChoiceSync, type ModelChoice, withEffort, withModel } from "@apollo/client";
+import { type ReactNode, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { effectiveModel, useModels } from "../models.ts";
+import { errorMessage, rpc } from "../rpc.ts";
 import { useApp } from "../store.ts";
 import { downloadPercent, splitModelId } from "./LocalModelsDialog.tsx";
-import { cx, inputClass } from "./ui.tsx";
+import { cx, inputClass, ModelChip, providerName } from "./ui.tsx";
 
-export interface ModelChoice {
-  readonly model: string | null;
-  readonly effort: string | null;
-}
+export type { ModelChoice };
 
 const CUSTOM = "__custom__";
 
@@ -121,6 +122,191 @@ export function ModelPicker({
               </option>
             ))}
           </select>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The model indicator in the message box, which is also the session's model
+ * and effort menu. A pick applies from the next message.
+ */
+export function ModelMenu({
+  session,
+  label,
+  onMoreSettings,
+}: {
+  session: Session;
+  label: string | null;
+  onMoreSettings: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+  const state = useModels(session.provider);
+  const localModels = useApp((s) => (session.provider === "llamacpp" ? s.localModels : null));
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => !ref.current?.contains(e.target as Node) && setOpen(false);
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const [, rerender] = useReducer((n: number) => n + 1, 0);
+  const sync = useMemo(
+    () =>
+      makeChoiceSync({
+        send: (choice) =>
+          rpc((c) => c["sessions.update"]({ sessionId: session.id, model: choice.model, effort: choice.effort })).then((saved) => ({
+            model: saved.model,
+            effort: saved.effort,
+          })),
+        onChange: rerender,
+        onError: (e) => setError(errorMessage(e)),
+      }),
+    [session.id],
+  );
+  useEffect(() => sync.sessionChanged({ model: session.model, effort: session.effort }), [sync, session.model, session.effort]);
+  const shown = sync.shown({ model: session.model, effort: session.effort });
+
+  const models = state.status === "ready" ? state.models : [];
+  const pending = (localModels?.models ?? []).filter((d) => !isDownloaded(d) && !models.some((m) => m.id === d.id));
+  const current = effectiveModel(models, shown.model);
+  const efforts = [...new Set([...(current?.efforts ?? []), ...(shown.effort ? [shown.effort] : [])])];
+  const fallback = models.find((m) => m.isDefault);
+  const shownLabel = shown.model === session.model ? label : (current?.label ?? shown.model);
+
+  const update = (choice: ModelChoice) => {
+    setError(null);
+    sync.pick(choice);
+  };
+  const pickModel = (model: string | null) => update(withModel(models, shown, model));
+
+  const row = (key: string, selected: boolean, onSelect: () => void, children: ReactNode, title?: string) => (
+    <button
+      key={key}
+      type="button"
+      role="menuitemradio"
+      aria-checked={selected}
+      title={title}
+      onClick={onSelect}
+      className={cx(
+        "flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[13px]",
+        selected ? "bg-zinc-800/70 text-zinc-100" : "text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100",
+      )}
+    >
+      <span className="min-w-0 flex-1 truncate">{children}</span>
+      {selected ? <Check className="size-3.5 shrink-0 text-zinc-400" /> : null}
+    </button>
+  );
+
+  return (
+    <div ref={ref} className="relative min-w-0">
+      <button
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+        className={cx(
+          "group flex min-w-0 items-center rounded-md transition-[background-color,box-shadow,color] duration-200",
+          "hover:bg-white/[0.04] hover:shadow-[0_0_12px_rgba(255,255,255,0.08)] focus-visible:ring-1 focus-visible:ring-zinc-600 focus-visible:outline-none",
+          open && "bg-white/[0.04] shadow-[0_0_12px_rgba(255,255,255,0.08)]",
+        )}
+      >
+        <ModelChip
+          provider={session.provider}
+          model={shownLabel ?? providerName(session.provider)}
+          effort={shown.effort}
+          className="px-1.5 text-zinc-500"
+        />
+        <ChevronDown
+          className={cx(
+            "h-3 shrink-0 text-zinc-500 transition-all duration-200",
+            open ? "mr-1 w-3 rotate-180 opacity-100" : "w-0 opacity-0 group-hover:mr-1 group-hover:w-3 group-hover:opacity-100 group-focus-visible:mr-1 group-focus-visible:w-3 group-focus-visible:opacity-100",
+          )}
+        />
+      </button>
+      {open ? (
+        <div
+          role="menu"
+          className="animate-pop-in absolute bottom-full left-0 z-40 mb-2 w-72 rounded-xl border border-zinc-800 bg-zinc-900 p-1 shadow-xl shadow-black/40"
+        >
+          <div className="px-2.5 pt-1.5 pb-1 text-[11px] font-medium text-zinc-500">{providerName(session.provider)} model</div>
+          <div className="max-h-72 overflow-y-auto">
+            {state.status === "loading" ? (
+              <div className="px-2.5 py-1.5 text-[13px] text-zinc-500">Loading models…</div>
+            ) : state.status === "error" && pending.length === 0 ? (
+              <div className="px-2.5 py-1.5 text-[12px] text-zinc-500">Could not list models ({state.error}).</div>
+            ) : (
+              <>
+                {row("default", shown.model === null, () => pickModel(null), `Default${fallback ? ` (${fallback.label})` : ""}`)}
+                {models.map((m) => row(m.id, shown.model === m.id, () => pickModel(m.id), m.label, m.description || undefined))}
+                {pending.map((m) => {
+                  const { name, quant } = splitModelId(m.id);
+                  return row(
+                    m.id,
+                    shown.model === m.id,
+                    () => pickModel(m.id),
+                    <>
+                      {name} {quant ?? ""} <span className="text-zinc-500">· downloading {downloadPercent(m)}%</span>
+                    </>,
+                  );
+                })}
+                {shown.model !== null && !models.some((m) => m.id === shown.model) && !pending.some((m) => m.id === shown.model)
+                  ? row(shown.model, true, () => setOpen(false), <span className="font-mono text-xs">{shown.model}</span>)
+                  : null}
+              </>
+            )}
+          </div>
+          {efforts.length > 0 ? (
+            <>
+              <div className="mx-1 my-1 border-t border-zinc-800" />
+              <div className="px-2.5 pt-1 pb-1 text-[11px] font-medium text-zinc-500">Effort</div>
+              <div className="flex flex-wrap gap-1 px-1.5 pb-1.5">
+                {[null, ...efforts].map((e) => {
+                  const selected = shown.effort === e;
+                  return (
+                    <button
+                      key={e ?? "default"}
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={selected}
+                      onClick={() => update(withEffort(shown, e))}
+                      className={cx(
+                        "rounded-md border px-2 py-0.5 text-[12px]",
+                        selected
+                          ? "border-zinc-600 bg-zinc-800 text-zinc-100"
+                          : "border-zinc-800 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200",
+                      )}
+                    >
+                      {e === null ? `Default${current?.defaultEffort ? ` (${effortLabel(current.defaultEffort)})` : ""}` : effortLabel(e)}
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          ) : null}
+          {error ? <div className="px-2.5 py-1 text-[11px] text-red-400">{error}</div> : null}
+          <div className="mx-1 my-1 border-t border-zinc-800" />
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              onMoreSettings();
+            }}
+            className="flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[13px] text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+          >
+            <Settings2 className="size-3.5 shrink-0 opacity-80" />
+            Other model, permissions…
+          </button>
         </div>
       ) : null}
     </div>

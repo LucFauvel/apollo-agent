@@ -1,3 +1,4 @@
+import { effectiveModel } from "@apollo/client";
 import type { ModelOption, ProviderKind } from "@apollo/contracts";
 import { useEffect, useState } from "react";
 import { errorMessage, rpc } from "./rpc.ts";
@@ -55,9 +56,7 @@ export const useModels = (provider: ProviderKind): ModelsState => {
   return state;
 };
 
-/** The model a session actually runs: the chosen one, or the provider's default. */
-export const effectiveModel = (models: ReadonlyArray<ModelOption>, model: string | null) =>
-  models.find((m) => m.id === model) ?? (model === null ? models.find((m) => m.isDefault) : undefined);
+export { effectiveModel };
 
 /**
  * Short display name for the model a session runs: the chosen id's label, or
