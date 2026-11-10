@@ -1,7 +1,7 @@
-import { invalidateChanges, withSeenMark } from "@apollo/client";
+import { invalidateChanges, rollBack, withOrder, withSeenMark } from "@apollo/client";
 import type { AppChange, AppSnapshot, Bot, BotId, BrowserTab, PullRequest, Session, SessionId } from "@apollo/contracts";
 import * as Stream from "effect/Stream";
-import { createContext, type ReactNode, useContext, useEffect, useState } from "react";
+import { createContext, type ReactNode, useCallback, useContext, useEffect, useRef, useState } from "react";
 import type { Connection } from "./connection.ts";
 
 export interface AppState {
@@ -88,7 +88,17 @@ const apply = (state: AppState, item: Incoming): AppState => {
   }
 };
 
-const StateContext = createContext<{ state: AppState; connection: Connection } | null>(null);
+interface Apollo {
+  readonly state: AppState;
+  readonly connection: Connection;
+  /**
+   * Puts the bot list in `order` (every bot id, first to last): shown at once, saved with
+   * `bots.reorder`, undone if the server refuses (the promise then rejects).
+   */
+  readonly reorderBots: (order: ReadonlyArray<BotId>) => Promise<void>;
+}
+
+const StateContext = createContext<Apollo | null>(null);
 
 /** Bots and sessions, kept in sync with the server (a snapshot, then changes; resumed after drops). */
 export function AppStateProvider({ connection, children }: { connection: Connection; children: ReactNode }) {
@@ -107,7 +117,24 @@ export function AppStateProvider({ connection, children }: { connection: Connect
       ),
     [connection],
   );
-  return <StateContext.Provider value={{ state, connection }}>{children}</StateContext.Provider>;
+  const latest = useRef(state);
+  latest.current = state;
+  const reorderBots = useCallback(
+    async (order: ReadonlyArray<BotId>) => {
+      const before = latest.current.bots;
+      const optimistic = withOrder(before, order);
+      latest.current = { ...latest.current, bots: optimistic };
+      setState((s) => ({ ...s, bots: withOrder(s.bots, order) }));
+      try {
+        await connection.rpc((c) => c["bots.reorder"]({ botIds: order }));
+      } catch (error) {
+        setState((s) => ({ ...s, bots: rollBack(s.bots, optimistic, before) }));
+        throw error;
+      }
+    },
+    [connection],
+  );
+  return <StateContext.Provider value={{ state, connection, reorderBots }}>{children}</StateContext.Provider>;
 }
 
 export const useApollo = () => {

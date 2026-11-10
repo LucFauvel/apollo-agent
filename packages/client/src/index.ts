@@ -6,3 +6,4 @@ export * from "./changes.ts";
 export * from "./replay.ts";
 export * from "./search.ts";
 export * from "./notifications.ts";
+export * from "./botOrder.ts";

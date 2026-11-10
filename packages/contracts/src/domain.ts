@@ -170,10 +170,19 @@ export const Bot = Schema.Struct({
   /** The same for Codex sessions: an added Codex account, or `null` for this machine's login. */
   codexAccountId: Schema.NullOr(Schema.String),
   mainSessionId: SessionId,
+  /**
+   * Where the bot sits in the user's bot list: clients show bots sorted by it (then by
+   * `createdAt`). Set by `bots.reorder`; new bots go last. Gaps are allowed.
+   */
+  position: Schema.Number,
   createdAt: Timestamp,
   updatedAt: Timestamp,
 });
 export type Bot = typeof Bot.Type;
+
+/** Bots in the user's order: by `position`, then by creation. */
+export const sortBots = <B extends { readonly position: number; readonly createdAt: number; readonly id: string }>(bots: Iterable<B>): Array<B> =>
+  [...bots].sort((a, b) => a.position - b.position || a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
 // ---------------------------------------------------------------------------
 // Sessions

@@ -16,7 +16,7 @@ import { Sidebar } from "./components/Sidebar.tsx";
 import { ClaudeLogo, CodexLogo, LlamaLogo } from "./components/icons.tsx";
 import { Button } from "./components/ui.tsx";
 import { Plus } from "lucide-react";
-import { onNotify, startSync, useApp } from "./store.ts";
+import { firstBot as firstBotOf, onNotify, startSync, useApp } from "./store.ts";
 import { useAvatarImages } from "./avatarImages.ts";
 
 /** Shows server notifications (scheduled results, failures) on the desktop; clicking opens the session. */
@@ -84,7 +84,7 @@ export function App() {
   }, []);
   useEffect(() => seenRef.current?.check(), [selectedId, seenBotId]);
   const bot = useApp((s) => (session ? s.bots.get(session.botId) : undefined));
-  const firstBot = useApp((s) => s.bots.values().next().value);
+  const firstBot = useApp(firstBotOf);
 
   // Select the first bot's orchestrator once state arrives, and recover from deletions.
   useEffect(() => {

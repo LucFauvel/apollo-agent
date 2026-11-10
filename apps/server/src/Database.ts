@@ -293,6 +293,16 @@ export const MIGRATIONS: ReadonlyArray<string> = [
     primary key (session_id, seq)
   );
   `,
+  // 20: the user's order of the bot list. Existing bots keep the order they were shown in
+  // (creation order); new bots go last.
+  `
+  alter table bots add column position integer not null default 0;
+  update bots set position = (
+    select count(*) from bots as earlier
+    where earlier.created_at < bots.created_at
+       or (earlier.created_at = bots.created_at and earlier.id < bots.id)
+  );
+  `,
 ];
 
 /**

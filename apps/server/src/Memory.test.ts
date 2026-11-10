@@ -30,6 +30,7 @@ const bot = (id: string): Bot => ({
   claudeAccountId: null,
   codexAccountId: null,
   mainSessionId: `${id}-main` as SessionId,
+  position: 0,
   createdAt: 0,
   updatedAt: 0,
 });

@@ -17,7 +17,7 @@ import {
   type TranscriptItem,
   type TranscriptState,
 } from "@apollo/client";
-import type { Bot, InputField, InputValue, RepoChanges, SessionId } from "@apollo/contracts";
+import { type Bot, type InputField, type InputValue, type RepoChanges, type SessionId, sortBots } from "@apollo/contracts";
 import {
   type ReactNode,
   useContext,
@@ -320,7 +320,7 @@ export function ChatScreen({
   const mentionMatches =
     mentionQuery === undefined || !session
       ? []
-      : [...state.bots.values()].filter((b) => b.id !== session.botId && b.name.toLowerCase().startsWith(mentionQuery.toLowerCase())).slice(0, 6);
+      : sortBots(state.bots.values()).filter((b) => b.id !== session.botId && b.name.toLowerCase().startsWith(mentionQuery.toLowerCase())).slice(0, 6);
   // The Changes screen, over the conversation (swipe from the edge to come back).
   const [changesOpen, setChangesOpen] = useState(false);
   const openPullRequests = useMemo(() => {

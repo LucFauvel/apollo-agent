@@ -240,6 +240,13 @@ export class ApolloRpcs extends RpcGroup.make(
   Rpc.make("bots.create", { payload: CreateBotInput, success: Bot, error }),
   Rpc.make("bots.update", { payload: UpdateBotInput, success: Bot, error }),
   Rpc.make("bots.delete", { payload: { botId: BotId }, error }),
+  /**
+   * Sets the order of the bot list to `botIds` (the whole list, first to last). Ids of bots
+   * that no longer exist are skipped, and bots missing from the list keep their relative
+   * order after the listed ones, so a reorder racing a create or delete still applies.
+   * Fails (invalid) when an id appears twice. Every moved bot is pushed as `BotUpserted`.
+   */
+  Rpc.make("bots.reorder", { payload: { botIds: Schema.Array(BotId) }, success: Schema.Array(Bot), error }),
   /** Interrupts everything the bot is doing and pauses its automated work. */
   Rpc.make("bots.stop", { payload: { botId: BotId }, success: Bot, error }),
   /** Lifts a pause. Fails while the bot is over today's budget. */

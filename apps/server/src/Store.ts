@@ -80,6 +80,7 @@ const toBot = (r: Row): Bot => ({
   claudeAccountId: (r.claude_account_id as string | null) ?? null,
   codexAccountId: (r.codex_account_id as string | null) ?? null,
   mainSessionId: r.main_session_id as SessionId,
+  position: Number(r.position),
   createdAt: Number(r.created_at),
   updatedAt: Number(r.updated_at),
 });
@@ -254,15 +255,17 @@ const makeStore = (db: DatabaseSync) => {
       }),
 
     // --- bots ------------------------------------------------------------
-    listBots: Effect.sync(() => all("select * from bots order by created_at").map(toBot)),
+    listBots: Effect.sync(() => all("select * from bots order by position, created_at, id").map(toBot)),
     getBot,
-    insertBot: (bot: Bot) =>
-      Effect.sync(() => {
+    /** Inserts the bot at the end of the bot list; returns it with that position. */
+    insertBot: (bot: Omit<Bot, "position">) =>
+      Effect.sync((): Bot => {
         run(
           `insert into bots (id, name, instructions, cwd, main_provider, main_model, main_effort, worker_provider,
              worker_model, worker_effort, runtime_mode, auto_learn, limits, paused_reason, main_session_id,
-             created_at, updated_at, avatar, claude_account_id, codex_account_id)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             created_at, updated_at, avatar, claude_account_id, codex_account_id, position)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+             (select coalesce(max(position), -1) + 1 from bots))`,
           bot.id,
           bot.name,
           bot.instructions,
@@ -284,8 +287,9 @@ const makeStore = (db: DatabaseSync) => {
           bot.claudeAccountId,
           bot.codexAccountId,
         );
-        return bot;
+        return toBot(get("select * from bots where id = ?", bot.id)!);
       }),
+    /** Saves the bot's settings (not its position); returns it as stored. */
     updateBot: (bot: Bot) =>
       Effect.sync(() => {
         run(
@@ -310,7 +314,37 @@ const makeStore = (db: DatabaseSync) => {
           bot.codexAccountId,
           bot.id,
         );
-        return bot;
+        // Its position may have moved since `bot` was read: report the stored one.
+        const row = get("select position from bots where id = ?", bot.id);
+        return row ? { ...bot, position: Number(row.position) } : bot;
+      }),
+    /**
+     * Puts the bots in `botIds` order (see `bots.reorder`): unknown ids are skipped, bots not
+     * listed follow in their current order, and positions become 0..n-1. Returns the bots
+     * whose position changed.
+     */
+    reorderBots: (botIds: ReadonlyArray<BotId>) =>
+      Effect.sync(() => {
+        db.exec("begin");
+        try {
+          const current = all("select * from bots order by position, created_at, id").map(toBot);
+          const byId = new Map(current.map((b) => [b.id, b]));
+          const listed = botIds.filter((id) => byId.has(id));
+          const listedSet = new Set(listed);
+          const order = [...listed, ...current.map((b) => b.id).filter((id) => !listedSet.has(id))];
+          const moved: Array<Bot> = [];
+          order.forEach((id, position) => {
+            const bot = byId.get(id)!;
+            if (bot.position === position) return;
+            run("update bots set position = ? where id = ?", position, id);
+            moved.push({ ...bot, position });
+          });
+          db.exec("commit");
+          return moved;
+        } catch (error) {
+          db.exec("rollback");
+          throw error;
+        }
       }),
     deleteBot: (id: BotId) => Effect.sync(() => void run("delete from bots where id = ?", id)),
 
