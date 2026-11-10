@@ -1,4 +1,4 @@
-import type { ArtifactRef } from "@apollo/contracts";
+import type { ArtifactRef, AttachmentRef, SessionId } from "@apollo/contracts";
 import { Directory, File, Paths } from "expo-file-system";
 import { Platform, Share } from "react-native";
 import { apiFetch, type Pairing } from "./connection.ts";
@@ -16,28 +16,39 @@ const safeName = (name: string) => name.replace(/[/\\:\0]/g, "_") || "artifact";
 const pending = new Map<string, Promise<File>>();
 
 /**
- * The artifact's file on this phone, downloaded once per version (versions never change)
- * into the cache, under its own name so sharing it keeps the name.
+ * A server file on this phone, downloaded once into the cache (what it points to never
+ * changes), under its own name so sharing it keeps the name.
  */
-export const artifactFile = (pairing: Pairing, a: ArtifactRef): Promise<File> => {
-  const key = `${a.botId}/${a.artifactId}/${a.version}`;
-  const existing = pending.get(key);
+const cachedDownload = (pairing: Pairing, path: string, folder: ReadonlyArray<string>, name: string, size: number | null): Promise<File> => {
+  const existing = pending.get(path);
   if (existing) return existing;
   const download = (async () => {
-    const dir = new Directory(Paths.cache, "artifacts", a.botId, a.artifactId, String(a.version));
-    const file = new File(dir, safeName(a.name));
-    if (file.exists && file.size === a.size) return file;
-    const response = await apiFetch(pairing, artifactPath(a), { method: "GET" });
-    if (!response.ok) throw new Error(response.status === 404 ? "This artifact is no longer on disk." : `Could not load it (${response.status}).`);
+    const dir = new Directory(Paths.cache, ...folder.map(safeName));
+    const file = new File(dir, safeName(name));
+    if (file.exists && (size === null || file.size === size)) return file;
+    const response = await apiFetch(pairing, path, { method: "GET" });
+    if (!response.ok) throw new Error(response.status === 404 ? "This file is no longer on disk." : `Could not load it (${response.status}).`);
     const bytes = new Uint8Array(await response.arrayBuffer());
     dir.create({ intermediates: true, idempotent: true });
     if (file.exists) file.delete();
     file.write(bytes);
     return file;
   })();
-  pending.set(key, download);
-  download.catch(() => pending.delete(key));
+  pending.set(path, download);
+  download.catch(() => pending.delete(path));
   return download;
+};
+
+export const artifactFile = (pairing: Pairing, a: ArtifactRef): Promise<File> =>
+  cachedDownload(pairing, artifactPath(a), ["artifacts", a.botId, a.artifactId, String(a.version)], a.name, a.size);
+
+export const attachmentFile = (pairing: Pairing, sessionId: SessionId, a: AttachmentRef): Promise<File> =>
+  cachedDownload(pairing, `/api/attachments/${sessionId}/${a.id}`, ["attachments", sessionId, a.id], a.name, a.size);
+
+/** The share sheet with the file itself on iOS (Save to Files, AirDrop, open in another app). */
+export const shareFile = async (file: File, title: string) => {
+  if (Platform.OS === "ios") await Share.share({ url: file.uri, title });
+  else throw new Error("Sharing files from Android is not supported yet: open it in Apollo on your computer.");
 };
 
 export const artifactText = async (pairing: Pairing, a: ArtifactRef) => (await artifactFile(pairing, a)).text();

@@ -1,11 +1,11 @@
 import type { TranscriptItem } from "@apollo/client";
-import type { ArtifactKind, ArtifactRef } from "@apollo/contracts";
+import type { ArtifactKind, ArtifactRef, AttachmentRef, SessionId } from "@apollo/contracts";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, Image, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { useApollo } from "./AppState.tsx";
-import { artifactFile, artifactText, FALLBACK_IS_PAGE, formatSize, recordingFrames, shareArtifact } from "./artifacts.ts";
+import { artifactFile, artifactText, attachmentFile, FALLBACK_IS_PAGE, formatSize, recordingFrames, shareArtifact, shareFile } from "./artifacts.ts";
 import { errorMessage } from "./connection.ts";
 import { ChevronDownIcon, FileCodeIcon, FileIcon, FileTextIcon, type Icon, ImageIcon, LayoutTemplateIcon, Maximize2Icon, RotateCwIcon, ShareIcon, XIcon } from "./icons.tsx";
 import { CodeBlock, Markdown } from "./Markdown.tsx";
@@ -340,6 +340,71 @@ export function ArtifactCard({ item, artifact: a }: { item: VisualItem; artifact
   );
 }
 
+function Attachment({ sessionId, attachment: a }: { sessionId: SessionId; attachment: AttachmentRef }) {
+  const { pairing } = useApollo();
+  const image = a.mime.startsWith("image/");
+  const [uri, setUri] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!image) return;
+    let cancelled = false;
+    attachmentFile(pairing, sessionId, a).then(
+      (f) => !cancelled && setUri(f.uri),
+      (e: unknown) => !cancelled && setError(errorMessage(e)),
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [pairing, sessionId, a.id, image]);
+  const share = () => {
+    setError(null);
+    attachmentFile(pairing, sessionId, a)
+      .then((f) => shareFile(f, a.name))
+      .catch((e: unknown) => setError(errorMessage(e)));
+  };
+  if (image && !error) {
+    return (
+      <>
+        <Pressable onPress={() => uri && setOpen(true)} accessibilityLabel={a.name} style={styles.thumb}>
+          {uri ? <Image source={{ uri }} style={StyleSheet.absoluteFill} resizeMode="cover" /> : <ActivityIndicator color={colors.faint} />}
+        </Pressable>
+        {open && uri ? (
+          <Viewer title={a.name} onClose={() => setOpen(false)}>
+            <ScrollView maximumZoomScale={5} minimumZoomScale={1} centerContent contentContainerStyle={{ flexGrow: 1 }}>
+              <Image source={{ uri }} style={{ flex: 1 }} resizeMode="contain" />
+            </ScrollView>
+          </Viewer>
+        ) : null}
+      </>
+    );
+  }
+  return (
+    <Pressable onPress={share} style={({ pressed }) => [styles.chip, pressed && { opacity: 0.5 }]} accessibilityLabel={`${a.name}, share or save`}>
+      <FileTextIcon size={16} color={colors.muted} />
+      <View style={{ flexShrink: 1 }}>
+        <Text style={styles.chipName} numberOfLines={1}>
+          {a.name}
+        </Text>
+        <Text style={[styles.chipSize, error ? { color: colors.red } : null]} numberOfLines={2}>
+          {error ?? formatSize(a.size)}
+        </Text>
+      </View>
+    </Pressable>
+  );
+}
+
+/** Files sent with a message: images as thumbnails (tap for full screen), others to share or save. */
+export function MessageAttachments({ sessionId, attachments }: { sessionId: SessionId; attachments: ReadonlyArray<AttachmentRef> }) {
+  return (
+    <View style={styles.attachments}>
+      {attachments.map((a) => (
+        <Attachment key={a.id} sessionId={sessionId} attachment={a} />
+      ))}
+    </View>
+  );
+}
+
 const clock = (ms: number) => {
   const s = Math.max(0, Math.round(ms / 1000));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
@@ -420,6 +485,11 @@ export function RecordingCard({ item }: { item: RecordingItem }) {
 }
 
 const styles = StyleSheet.create({
+  attachments: { flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: 6 },
+  thumb: { width: 120, height: 96, borderRadius: 12, borderWidth: 1, borderColor: colors.border, overflow: "hidden", alignItems: "center", justifyContent: "center", backgroundColor: colors.panelSoft },
+  chip: { flexDirection: "row", alignItems: "center", gap: 8, maxWidth: 240, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 12, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panelSoft },
+  chipName: { color: colors.textSoft, fontSize: 13 },
+  chipSize: { color: colors.faint, fontSize: 11 },
   playOverlay: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0, alignItems: "center", justifyContent: "center", backgroundColor: "rgba(0,0,0,0.2)" },
   playButton: { width: 48, height: 48, borderRadius: 24, backgroundColor: "rgba(0,0,0,0.6)", alignItems: "center", justifyContent: "center" },
   playGlyph: { color: "#fff", fontSize: 18, marginLeft: 3 },

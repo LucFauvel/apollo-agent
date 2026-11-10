@@ -44,7 +44,7 @@ import { useApollo } from "../AppState.tsx";
 import { BlobAvatar } from "../BlobAvatar.tsx";
 import { Markdown } from "../Markdown.tsx";
 import { MonitorStrip } from "../MonitorStrip.tsx";
-import { ArtifactCard, RecordingCard, VisualCard } from "../PageCards.tsx";
+import { ArtifactCard, MessageAttachments, RecordingCard, VisualCard } from "../PageCards.tsx";
 import { ActivityGroup } from "../Activity.tsx";
 import { BrowserScreen, type Handoff } from "./BrowserScreen.tsx";
 import { ChangesScreen, FullDiff } from "./ChangesScreen.tsx";
@@ -757,8 +757,13 @@ function Item({
       return <ActivityGroup block={item} live={live} />;
     case "user":
       return item.author === "user" ? (
-        <View style={styles.userBubble}>
-          <Text style={styles.userText}>{item.text}</Text>
+        <View style={{ gap: 6 }}>
+          {item.attachments && item.attachments.length > 0 ? <MessageAttachments sessionId={sessionId} attachments={item.attachments} /> : null}
+          {item.text ? (
+            <View style={styles.userBubble}>
+              <Text style={styles.userText}>{item.text}</Text>
+            </View>
+          ) : null}
         </View>
       ) : item.author === "peer" ? (
         <PeerMessage botId={item.fromBotId} text={item.text} />
