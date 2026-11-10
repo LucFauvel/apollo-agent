@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   ApolloError,
@@ -67,7 +68,10 @@ const make = Effect.gen(function* () {
   const manager = yield* SessionManager;
   const store = yield* Store;
   const appSettings = yield* AppSettings;
-  const pending = new Map<string, { readonly sessionId: SessionId; readonly deferred: Deferred.Deferred<InputResponse> }>();
+  const pending = new Map<
+    string,
+    { readonly sessionId: SessionId; readonly deferred: Deferred.Deferred<InputResponse>; readonly options: ReadonlySet<string> }
+  >();
 
   /** Models the user can pick from: the proposed provider's first, then the creator's, Claude's and Codex's. */
   const modelOptions = (providers: ReadonlyArray<ProviderKind>) =>
@@ -89,7 +93,8 @@ const make = Effect.gen(function* () {
       const taken = new Set(bots.map((b) => b.cwd));
       const base = join(workspaceRoot, slugify(name));
       let cwd = base;
-      for (let n = 2; taken.has(cwd); n++) cwd = `${base}-${n}`;
+      // A deleted bot's workspace stays on disk: never hand its files to a new bot.
+      for (let n = 2; taken.has(cwd) || existsSync(cwd); n++) cwd = `${base}-${n}`;
       return cwd;
     });
 
@@ -158,21 +163,27 @@ const make = Effect.gen(function* () {
 
       const requestId = `${PROPOSAL_PREFIX}${randomBytes(12).toString("base64url")}`;
       const deferred = yield* Deferred.make<InputResponse>();
-      pending.set(requestId, { sessionId: caller.sessionId, deferred });
-      yield* manager.appendEvent(caller.sessionId, {
-        _tag: "InputRequested",
-        requestId,
-        source: creator.name,
-        message: `Create a new bot, “${name}”? Pick its model and check its instructions.`,
-        url: null,
-        fields,
-      });
-
-      const answer = yield* Deferred.await(deferred).pipe(
-        Effect.timeoutOption(Duration.millis(input.timeoutMs)),
-        Effect.onInterrupt(() => resolved(caller.sessionId, requestId, "cancel").pipe(Effect.ignore)),
-        Effect.ensuring(Effect.sync(() => pending.delete(requestId))),
-      );
+      pending.set(requestId, { sessionId: caller.sessionId, deferred, options: new Set(options.map((o) => o.value)) });
+      yield* manager.setWaitingOnUser(caller.sessionId, true).pipe(Effect.ignore);
+      const answer = yield* manager
+        .appendEvent(caller.sessionId, {
+          _tag: "InputRequested",
+          requestId,
+          source: creator.name,
+          message: `Create a new bot, “${name}”? Pick its model and check its instructions.`,
+          url: null,
+          fields,
+        })
+        .pipe(
+          Effect.andThen(Deferred.await(deferred)),
+          Effect.timeoutOption(Duration.millis(input.timeoutMs)),
+          Effect.onInterrupt(() => resolved(caller.sessionId, requestId, "cancel").pipe(Effect.ignore)),
+          Effect.ensuring(
+            Effect.sync(() => pending.delete(requestId)).pipe(
+              Effect.andThen(manager.setWaitingOnUser(caller.sessionId, false).pipe(Effect.ignore)),
+            ),
+          ),
+        );
       if (Option.isNone(answer)) {
         yield* resolved(caller.sessionId, requestId, "cancel");
         return yield* invalid(`the user did not answer within ${Math.round(input.timeoutMs / 1000)} s; no bot was created`);
@@ -183,10 +194,9 @@ const make = Effect.gen(function* () {
       }
 
       const values = answer.value.values;
-      const finalName = text(values.name).slice(0, 60) || name;
-      const finalInstructions = text(values.instructions) || instructions;
-      const picked = text(values.model);
-      const choice = parseModel(options.some((o) => o.value === picked) ? picked : fallback)!;
+      const finalName = text(values.name).slice(0, 60);
+      const finalInstructions = text(values.instructions);
+      const choice = parseModel(text(values.model))!;
       const bots = yield* store.listBots;
       const bot = yield* manager
         .createBot({
@@ -221,6 +231,20 @@ const make = Effect.gen(function* () {
         // Apollo restarted, or it expired: close the card so it stops asking.
         yield* resolved(sessionId, requestId, "cancel").pipe(Effect.ignore);
         return yield* invalid("this proposal is no longer waiting (it expired, or Apollo restarted)");
+      }
+      if (response.action === "accept") {
+        // Clients built before field defaults were prefilled send nothing for untouched fields:
+        // the user never saw the proposal, so it must not be approved on their behalf.
+        const missing = [
+          !text(response.values.name) && "name",
+          !parseModel(text(response.values.model)) || !request.options.has(text(response.values.model)) ? "model" : false,
+          !text(response.values.instructions) && "instructions",
+        ].filter(Boolean);
+        if (missing.length > 0) {
+          return yield* invalid(
+            `Fill in the ${missing.join(", ")} before creating the bot. If they show empty here, update the app or answer from the desktop app to see the proposal.`,
+          );
+        }
       }
       yield* Deferred.succeed(request.deferred, response);
     });
