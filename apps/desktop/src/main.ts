@@ -354,8 +354,12 @@ const createWindow = async (url: string, appOrigins: ReadonlyArray<string>) => {
     show: !screenshotPath,
     ...(layout.appIcon && process.platform !== "darwin" ? { icon: layout.appIcon } : {}),
     autoHideMenuBar: true,
-    // macOS: no title bar; the UI draws its own and leaves room for the traffic lights.
+    // No title bar: the UI draws its own and leaves room for the traffic lights (macOS) or the
+    // caption buttons (Windows). 55 px keeps the headers' bottom border (h-14) visible under them.
     ...(process.platform === "darwin" ? { titleBarStyle: "hidden" as const, trafficLightPosition: { x: 16, y: 17 } } : {}),
+    ...(process.platform === "win32"
+      ? { titleBarStyle: "hidden" as const, titleBarOverlay: { color: "#09090b", symbolColor: "#a1a1aa", height: 55 } }
+      : {}),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,

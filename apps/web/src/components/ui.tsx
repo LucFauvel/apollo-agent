@@ -349,7 +349,7 @@ export function Panel({
         />
       </div>
       {/* Same height as the session header beside it, so their borders line up. */}
-      <div className="app-drag flex h-14 shrink-0 items-center gap-2 border-b border-zinc-800/80 pr-2 pl-4">
+      <div className="app-drag caption-buttons-inset flex h-14 shrink-0 items-center gap-2 border-b border-zinc-800/80 pr-2 pl-4">
         <div className="flex min-w-0 flex-1 items-center gap-1">{title}</div>
         {actions}
         <IconButton icon={X} label="Close panel" size="sm" onClick={onClose} />

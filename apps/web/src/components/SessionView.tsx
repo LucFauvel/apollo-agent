@@ -1053,7 +1053,7 @@ export function SessionView({
 
   return (
     <section className="flex min-w-0 flex-1 flex-col bg-zinc-950">
-      <header className="app-drag flex h-14 shrink-0 items-center gap-3 border-b border-zinc-800/80 px-4">
+      <header className={cx("app-drag flex h-14 shrink-0 items-center gap-3 border-b border-zinc-800/80 px-4", !panel && "caption-buttons-inset")}>
         {main ? (
           <BotAvatar avatar={bot.avatar} size="lg" />
         ) : (
