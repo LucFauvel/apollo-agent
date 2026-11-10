@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import {
   type AgentEvent,
   ApolloError,
+  type AccountLimitsChange,
   type AppChange,
   type ApprovalDecision,
   type Bot,
@@ -195,6 +196,8 @@ const make = Effect.gen(function* () {
 
   const changes = yield* PubSub.unbounded<AppChange>();
   const events = yield* PubSub.unbounded<SessionEvent>();
+  /** Provider accounts' plan meters, on their own stream (see AccountLimitsChange). */
+  const limitsChanges = yield* PubSub.unbounded<AccountLimitsChange>();
 
   const live = new Map<SessionId, LiveSession>();
   const tokens = new Map<string, SessionId>();
@@ -285,8 +288,13 @@ const make = Effect.gen(function* () {
       return Scope.close(entry.scope, Exit.void);
     });
 
+  /**
+   * `account`: the provider account the process was opened on (see limitsAccount). The bot
+   * may switch accounts while a turn runs; until the session reopens, its readings are
+   * still the old account's.
+   */
   const handleEmission =
-    (id: SessionId, generation: object) =>
+    (id: SessionId, generation: object, account: string) =>
     (emission: ProviderEmission): Effect.Effect<void> =>
       Effect.gen(function* () {
         switch (emission._tag) {
@@ -304,11 +312,10 @@ const make = Effect.gen(function* () {
           }
           case "UsageLimits": {
             // Limits belong to the provider account: every session on it shows this reading.
-            const session = yield* store.getSession(id);
-            const bot = yield* store.getBot(session.botId);
-            const account = limitsAccount(session.provider, bot);
             const limits = emission.meters.length > 0 ? { meters: emission.meters, at: Date.now() } : null;
-            if (yield* store.setAccountLimits(account, limits)) yield* publish({ _tag: "AccountLimitsUpdated", account, limits });
+            if (yield* store.setAccountLimits(account, limits)) {
+              yield* PubSub.publish(limitsChanges, { _tag: "AccountLimitsUpdated", account, limits });
+            }
             return;
           }
           case "Exited": {
@@ -480,7 +487,7 @@ const make = Effect.gen(function* () {
               mcp: { name: MCP_SERVER_NAME, url: `${config.baseUrl}/mcp`, bearerToken: token },
               skillsPluginDir,
             },
-            handleEmission(id, generation),
+            handleEmission(id, generation, limitsAccount(session.provider, bot)),
           )
           .pipe(Scope.provide(scope), Effect.exit);
 
@@ -1282,12 +1289,17 @@ const make = Effect.gen(function* () {
     /** Every session's events as they happen (live only, no history). */
     liveEvents: Stream.fromPubSub(events),
 
-    snapshot: Effect.all({
-      bots: store.listBots,
-      sessions: store.listSessions(),
-      usageToday: store.usageOn(),
-      accountLimits: store.listAccountLimits,
-    }),
+    snapshot: Effect.all({ bots: store.listBots, sessions: store.listSessions(), usageToday: store.usageOn() }),
+
+    /** `limits.watch`: every account's latest plan meters, then each change, without gaps. */
+    watchLimits: Stream.unwrap(
+      Effect.gen(function* () {
+        const subscription = yield* PubSub.subscribe(limitsChanges);
+        const accounts = yield* store.listAccountLimits;
+        const first: AccountLimitsChange = { _tag: "AccountLimitsSnapshot", accounts };
+        return Stream.concat(Stream.succeed(first), Stream.fromSubscription(subscription));
+      }),
+    ) as Stream.Stream<AccountLimitsChange>,
 
     /** Replays persisted events after `afterSeq`, then follows live ones without gaps. */
     events: (id: SessionId, afterSeq: number): Stream.Stream<SessionEvent, ApolloError> =>

@@ -1,4 +1,5 @@
 import type {
+  AccountLimitsChange,
   AppChange,
   AppSnapshot,
   Bot,
@@ -142,12 +143,6 @@ const apply = (change: AppChange) => {
     }
     case "BotUsageToday":
       return setState({ ...state, usageToday: new Map(state.usageToday).set(change.botId, change.usage) });
-    case "AccountLimitsUpdated": {
-      const accountLimits = new Map(state.accountLimits);
-      if (change.limits) accountLimits.set(change.account, change.limits);
-      else accountLimits.delete(change.account);
-      return setState({ ...state, accountLimits });
-    }
     case "MemoryChanged":
     case "SkillChanged":
       return setState({ ...state, knowledgeVersion: bump(change.botId ?? "global") });
@@ -198,9 +193,22 @@ export const setLocalModels = (localModels: LocalModelsState) => setState({ ...s
 
 type Incoming = ({ readonly _tag: "Snapshot" } & AppSnapshot) | AppChange;
 
+/** Applies one item of `limits.watch`: each (re)connection starts with every account's reading. */
+const applyLimits = (change: AccountLimitsChange) => {
+  if (change._tag === "AccountLimitsSnapshot") {
+    return setState({ ...state, accountLimits: new Map(change.accounts.map((a) => [a.account, a.limits])) });
+  }
+  const accountLimits = new Map(state.accountLimits);
+  if (change.limits) accountLimits.set(change.account, change.limits);
+  else accountLimits.delete(change.account);
+  setState({ ...state, accountLimits });
+};
+
 /** Starts syncing app state; each (re)connection begins with a fresh snapshot. */
-export const startSync = () =>
-  follow(
+export const startSync = () => {
+  // Provider accounts' plan limits come on their own stream (see AccountLimitsChange).
+  const stopLimits = follow((client) => client["limits.watch"](), applyLimits);
+  const stopApp = follow(
     (client) =>
       Stream.concat(
         Stream.fromEffect(client["app.snapshot"]()).pipe(
@@ -216,7 +224,6 @@ export const startSync = () =>
           bots: new Map(item.bots.map((b) => [b.id, b])),
           sessions: new Map(item.sessions.map((s) => [s.id, s])),
           usageToday: new Map(item.usageToday.map((u) => [u.botId, u.usage])),
-          accountLimits: new Map((item.accountLimits ?? []).map((a) => [a.account, a.limits])),
           schedules: new Map(item.schedules.map((s) => [s.id, s])),
           browserTabs: new Map(item.browserTabs.map((t) => [t.id, t])),
           pullRequests: new Map(item.pullRequests.map((p) => [`${p.sessionId} ${p.url}`, p])),
@@ -233,3 +240,8 @@ export const startSync = () =>
       if (state.connected) setState({ ...state, connected: false });
     },
   );
+  return () => {
+    stopApp();
+    stopLimits();
+  };
+};
