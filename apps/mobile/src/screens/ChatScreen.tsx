@@ -43,6 +43,7 @@ import {
 import { useApollo } from "../AppState.tsx";
 import { BlobAvatar } from "../BlobAvatar.tsx";
 import { Markdown } from "../Markdown.tsx";
+import { MonitorStrip } from "../MonitorStrip.tsx";
 import { ActivityGroup } from "../Activity.tsx";
 import { BrowserScreen, type Handoff } from "./BrowserScreen.tsx";
 import { ChangesScreen, FullDiff } from "./ChangesScreen.tsx";
@@ -573,6 +574,7 @@ export function ChatScreen({
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {talking ? <ConversationBar session={session} onEnd={() => setTalking(false)} /> : null}
+      <MonitorStrip sessionId={sessionId} />
       {mentionMatches.length > 0 ? (
         // Like Discord: a list above the composer, the best match first.
         <FadeIn>

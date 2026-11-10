@@ -1,5 +1,5 @@
 import { invalidateChanges, rollBack, withOrder, withSeenMark } from "@apollo/client";
-import type { AppChange, AppSnapshot, Bot, BotId, BrowserTab, PullRequest, Session, SessionId } from "@apollo/contracts";
+import type { AppChange, AppSnapshot, Bot, BotId, BrowserTab, Monitor, PullRequest, Session, SessionId } from "@apollo/contracts";
 import * as Stream from "effect/Stream";
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useRef, useState } from "react";
 import type { Connection } from "./connection.ts";
@@ -14,6 +14,8 @@ export interface AppState {
   readonly changesVersion: ReadonlyMap<BotId, number>;
   /** Open tabs of Apollo's browser, by id. */
   readonly browserTabs: ReadonlyMap<string, BrowserTab>;
+  /** Monitors agents set up (apollo_monitor_start), running and recently ended, by id. */
+  readonly monitors: ReadonlyMap<string, Monitor>;
   /** When the user last saw each bot's chats, on any device: its notifications up to then are dismissed. */
   readonly notificationsSeen: ReadonlyMap<string, number>;
 }
@@ -25,6 +27,7 @@ const empty: AppState = {
   pullRequests: new Map(),
   changesVersion: new Map(),
   browserTabs: new Map(),
+  monitors: new Map(),
   notificationsSeen: new Map(),
 };
 
@@ -42,6 +45,8 @@ const apply = (state: AppState, item: Incoming): AppState => {
         // (Bots this phone never heard a ChangesUpdated for included: they start from none.)
         changesVersion: invalidateChanges(state.changesVersion, item.bots.map((b) => b.id)),
         browserTabs: new Map(item.browserTabs.map((t) => [t.id, t])),
+        // Older servers send no monitors.
+        monitors: new Map((item.monitors ?? []).map((m) => [m.id, m])),
         notificationsSeen: (item.notificationsSeen ?? []).reduce((marks, m) => withSeenMark(marks, m.botId, m.at), state.notificationsSeen),
       };
     case "BrowserTabUpserted":
@@ -60,6 +65,13 @@ const apply = (state: AppState, item: Incoming): AppState => {
       pullRequests.delete(`${item.sessionId} ${item.url}`);
       return { ...state, pullRequests };
     }
+    case "MonitorUpserted":
+      return { ...state, monitors: new Map(state.monitors).set(item.monitor.id, item.monitor) };
+    case "MonitorRemoved": {
+      const monitors = new Map(state.monitors);
+      monitors.delete(item.monitorId);
+      return { ...state, monitors };
+    }
     case "NotificationsSeen":
       return { ...state, notificationsSeen: withSeenMark(state.notificationsSeen, item.botId, item.at) };
     case "ChangesUpdated":
@@ -74,6 +86,7 @@ const apply = (state: AppState, item: Incoming): AppState => {
         bots,
         sessions: new Map([...state.sessions].filter(([, s]) => s.botId !== item.botId)),
         browserTabs: new Map([...state.browserTabs].filter(([, t]) => t.botId !== item.botId)),
+        monitors: new Map([...state.monitors].filter(([, m]) => m.botId !== item.botId)),
       };
     }
     case "SessionUpserted":
@@ -81,7 +94,7 @@ const apply = (state: AppState, item: Incoming): AppState => {
     case "SessionDeleted": {
       const sessions = new Map(state.sessions);
       sessions.delete(item.sessionId);
-      return { ...state, sessions };
+      return { ...state, sessions, monitors: new Map([...state.monitors].filter(([, m]) => m.sessionId !== item.sessionId)) };
     }
     default:
       return state;
