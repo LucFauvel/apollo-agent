@@ -1829,6 +1829,16 @@ const make = Effect.gen(function* () {
     resetAutonomy: (botId: BotId) => Effect.sync(() => void autonomousTurns.delete(botId)),
     /** Appends an Apollo-originated event (visuals, secret requests) to a session's log. */
     appendEvent: (id: SessionId, event: AgentEvent) => appendEvent(id, event).pipe(Effect.asVoid),
+    /**
+     * A tool waits on the user (or no longer does) in the middle of a turn: shows the session
+     * as needing them, as provider approvals do.
+     */
+    setWaitingOnUser: (id: SessionId, waiting: boolean) =>
+      Effect.gen(function* () {
+        const { status } = yield* store.getSession(id);
+        if (waiting && status === "running") yield* updateSession(id, { status: "waiting-approval" });
+        if (!waiting && status === "waiting-approval") yield* updateSession(id, { status: "running" });
+      }),
     appendNotice: (id: SessionId, level: "info" | "warning" | "error", message: string) =>
       appendEvent(id, { _tag: "Notice", level, message }).pipe(Effect.asVoid),
     isBusy: (id: SessionId) => Effect.map(store.getSession(id), (s) => isBusy(s.status)),

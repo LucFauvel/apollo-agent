@@ -9,6 +9,7 @@ import { Tailscale } from "./remote/Tailscale.ts";
 import { Auth, PAIRING_TOKEN_TTL_MS, PHONE_PAIRING_TTL_MS } from "./auth/Auth.ts";
 import { Browser } from "./browser/Browser.ts";
 import { Accounts } from "./Accounts.ts";
+import { BotProposals, PROPOSAL_PREFIX } from "./bots/BotProposals.ts";
 import { Secrets } from "./secrets/Secrets.ts";
 import { Compaction } from "./Compaction.ts";
 import { LocalModels } from "./local/LocalModels.ts";
@@ -33,6 +34,7 @@ export const layer = ApolloRpcs.toLayer(
     const browser = yield* Browser;
     const accounts = yield* Accounts;
     const secrets = yield* Secrets;
+    const botProposals = yield* BotProposals;
     const appSettings = yield* AppSettings;
     const pullRequests = yield* PullRequests;
     const monitors = yield* Monitors;
@@ -177,7 +179,9 @@ export const layer = ApolloRpcs.toLayer(
       "sessions.respondApproval": ({ sessionId, requestId, decision }) =>
         manager.respondApproval(sessionId, requestId, decision),
       "sessions.respondInput": ({ sessionId, requestId, response }) =>
-        manager.respondInput(sessionId, requestId, response),
+        requestId.startsWith(PROPOSAL_PREFIX)
+          ? botProposals.respond(sessionId, requestId, response)
+          : manager.respondInput(sessionId, requestId, response),
       "sessions.reflect": ({ sessionId }) => manager.reflect(sessionId),
       "sessions.events": ({ sessionId, afterSeq }) => manager.events(sessionId, afterSeq),
 

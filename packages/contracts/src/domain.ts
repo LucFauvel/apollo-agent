@@ -336,6 +336,8 @@ export const InputField = Schema.Struct({
   default: Schema.NullOr(InputValue),
   /** Mask the value while typing (passwords, tokens). */
   secret: Schema.Boolean,
+  /** A `string` field for long text (shown as a text area). */
+  multiline: Schema.optional(Schema.Boolean),
 });
 export type InputField = typeof InputField.Type;
 

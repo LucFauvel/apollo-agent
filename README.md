@@ -173,6 +173,9 @@ Agents get browser tools on Apollo's MCP server, modelled on T3 Code's preview t
   0600 file under `<data dir>/secrets` to read in a shell command. References and files
   expire after 15 minutes and are cleared at shutdown and startup. The value is never
   written to the event log, the database or the transcript.
+- `apollo_create_bot` lets an orchestrator propose a new bot. You get a card where you pick
+  its model and approve or edit its name and instructions; the bot is created only when you
+  accept, with its own workspace and the proposing bot's workers, permissions and accounts.
 - 1Password goes through its CLI (`op`, or `APOLLO_OP_BIN`), with the desktop app's CLI
   integration or `op signin`. Apollo lists items and field labels; it reads only the
   field you pick, on the server, so field values never reach the UI or the agent.

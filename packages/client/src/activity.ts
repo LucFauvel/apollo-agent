@@ -185,6 +185,7 @@ export const toolSummary = (name: string, summary: string): string => {
   // Visuals and secret requests: show what they are about, not their payload.
   if (/apollo_(show|preview)_html$/.test(name)) return str(input.title ?? (input.width ? `${str(input.width)}px` : ""));
   if (/apollo_request_secret$/.test(name)) return str(input.label ?? "");
+  if (/apollo_create_bot$/.test(name)) return str(input.name ?? "");
   if (/apollo_artifact_save$/.test(name)) return str(input.title ?? input.name ?? input.path ?? input.artifactId ?? "");
   return Object.values(input)
     .filter((v) => v !== null && v !== undefined && v !== "")
