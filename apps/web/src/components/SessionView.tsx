@@ -35,6 +35,8 @@ import {
   emptyResults,
   foldQuery,
   matchAt,
+  quoteLine,
+  replyTargetIndex,
   type SearchMatch,
   stepMatch,
   hasCards,
@@ -54,7 +56,7 @@ import { formatUsage, usageTitle } from "../format.ts";
 import { useModelLabel } from "../models.ts";
 import { errorMessage, rpc } from "../rpc.ts";
 import { dequeue, enqueue, type QueuedMessage, useQueue } from "../queue.ts";
-import { quoteLine, setReplyTarget, useReplyTarget } from "../reply.ts";
+import { setReplyTarget, useReplyTarget } from "../reply.ts";
 import { useApp } from "../store.ts";
 import { type TranscriptItem, useTranscript } from "../transcript.ts";
 import { useConversationSearch } from "../searchClient.ts";
@@ -82,7 +84,7 @@ import { MonitorStrip } from "./MonitorStrip.tsx";
 import { ConversationBar, ConversationButton, DictateButton, ReadAloudButton, useConversation } from "./Voice.tsx";
 import { BotAvatar } from "./Sidebar.tsx";
 import { MentionMenu, PeerMessage, useMentions, WithMentions } from "./Mentions.tsx";
-import { DayDivider, groupByDay, MessageTime } from "./DayGroups.tsx";
+import { DayDivider, dayIndexOf, groupByDay, MessageTime } from "./DayGroups.tsx";
 import { MessageRail, type RailTurn } from "./MessageRail.tsx";
 import { clearSearchHighlights, ConversationSearchBar, type CurrentMatch, JumpTracker, opensSearch, paintAndJump, showSearchMatches } from "./ConversationSearch.tsx";
 import { Badge, Button, Collapse, cx, IconButton, Menu, ModelChip, providerName, StatusDot, statusLabel, Tooltip } from "./ui.tsx";
@@ -217,18 +219,12 @@ function ReplyButton({ sessionId, target }: { sessionId: Session["id"]; target: 
 }
 
 /** The message a reply answers, above it; clicking it scrolls back to that message. */
-function ReplyQuote({ replyTo }: { replyTo: ReplyRef }) {
-  const jump = () => {
-    const el = document.querySelector<HTMLElement>(`[data-reply-seq="${replyTo.seq}"]`);
-    if (!el) return;
-    el.scrollIntoView({ block: "center", behavior: "smooth" });
-    el.animate([{ backgroundColor: "rgb(56 189 248 / 0.12)" }, { backgroundColor: "transparent" }], { duration: 1200 });
-  };
+function ReplyQuote({ replyTo, onJump }: { replyTo: ReplyRef; onJump: (replyTo: ReplyRef) => void }) {
   return (
     <div className="flex justify-end">
       <button
         type="button"
-        onClick={jump}
+        onClick={() => onJump(replyTo)}
         className="flex max-w-[85%] min-w-0 items-center gap-1.5 rounded-lg border-l-2 border-zinc-600 bg-zinc-900/60 px-2.5 py-1 text-left text-xs text-zinc-400 transition-colors hover:bg-zinc-800/80 hover:text-zinc-300"
       >
         <Reply className="size-3 shrink-0 text-zinc-500" />
@@ -290,6 +286,7 @@ function Item({
   live,
   sessionId,
   onOpenChanges,
+  onJumpToReply,
   cards,
   searchCurrent,
 }: {
@@ -298,6 +295,7 @@ function Item({
   live: boolean;
   sessionId: Session["id"];
   onOpenChanges: () => void;
+  onJumpToReply: (replyTo: ReplyRef) => void;
   cards: ChangesCards;
   /** Search's current match is in this block: show it whole. */
   searchCurrent: boolean;
@@ -333,7 +331,7 @@ function Item({
       if (item.author !== "user") return <SystemMessage author={item.author} text={item.text} searchKey={item.key} forceOpen={searchCurrent} />;
       return (
         <div className="group animate-fade-up scroll-mt-12 space-y-1.5 rounded-xl pt-2" data-turn={item.key} data-reply-seq={item.seq}>
-          {item.replyTo ? <ReplyQuote replyTo={item.replyTo} /> : null}
+          {item.replyTo ? <ReplyQuote replyTo={item.replyTo} onJump={onJumpToReply} /> : null}
           {item.attachments?.length ? <MessageAttachments sessionId={sessionId} attachments={item.attachments} /> : null}
           {item.text ? (
             <div className="flex items-center justify-end gap-1.5">
@@ -987,15 +985,19 @@ export function SessionView({
     }
     return turns;
   }, [blocks]);
-  /** Scrolls to a message, opening its day first if it is folded. */
-  const jumpToTurn = (key: string) => {
-    const dayIndex = days.findIndex((day) => day.blocks.some(({ block }) => block.key === key));
+  /**
+   * Scrolls to a block (found in the page with `selector`), opening its day first if it is
+   * folded. `settled` runs once it is in place.
+   */
+  const jumpToBlock = (key: string, selector: string, block: ScrollLogicalPosition, settled?: (el: HTMLElement) => void) => {
+    const dayIndex = dayIndexOf(days, key);
     follower.leave();
-    const scroll = (behavior: ScrollBehavior) => {
-      const el = scrollRef.current?.querySelector<HTMLElement>(`[data-turn="${CSS.escape(key)}"]`);
+    const scroll = (behavior: ScrollBehavior, done?: (el: HTMLElement) => void) => {
+      const el = scrollRef.current?.querySelector<HTMLElement>(selector);
       if (!el) return false;
       follower.leave();
-      el.scrollIntoView({ block: "start", behavior });
+      el.scrollIntoView({ block, behavior });
+      done?.(el);
       return true;
     };
     if (dayIndex >= 0 && days.length > 1 && !isDayOpen(days[dayIndex]!.key, dayIndex)) {
@@ -1004,8 +1006,18 @@ export function SessionView({
       let tries = 0;
       const retry = () => !scroll("auto") && tries++ < 20 && requestAnimationFrame(retry);
       requestAnimationFrame(retry);
-      setTimeout(() => scroll("smooth"), 320);
-    } else scroll("smooth");
+      setTimeout(() => scroll("smooth", settled), 320);
+    } else scroll("smooth", settled);
+  };
+  /** Scrolls to a message, opening its day first if it is folded. */
+  const jumpToTurn = (key: string) => jumpToBlock(key, `[data-turn="${CSS.escape(key)}"]`, "start");
+  /** Scrolls back to the message a reply quotes, and flashes it. */
+  const jumpToReply = (replyTo: ReplyRef) => {
+    const target = blocks[replyTargetIndex(blocks, replyTo)];
+    if (!target) return;
+    jumpToBlock(target.key, `[data-reply-seq="${replyTo.seq}"]`, "center", (el) =>
+      el.animate([{ backgroundColor: "rgb(56 189 248 / 0.12)" }, { backgroundColor: "transparent" }], { duration: 1200 }),
+    );
   };
   const toggleDay = (key: string, _index: number) =>
     setToggledDays((current) => {
@@ -1402,6 +1414,7 @@ export function SessionView({
                   live={busy && i === blocks.length - 1}
                   sessionId={session.id}
                   onOpenChanges={() => panel !== "changes" && onTogglePanel("changes")}
+                  onJumpToReply={jumpToReply}
                   cards={cards}
                   searchCurrent={currentMatch?.key === block.key}
                 />

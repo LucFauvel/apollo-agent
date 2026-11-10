@@ -10,6 +10,8 @@ import {
   summariesByTurn,
   withoutFullDiffs,
   isCompacting,
+  quoteLine,
+  replyTargetIndex,
   showWorking,
   systemMessageParts,
   toBlocks,
@@ -277,6 +279,33 @@ export function ChatScreen({
   const start = pinnedAt >= 0 ? pinnedAt : latestStart;
   const shown = useMemo(() => (start === 0 ? blocks : blocks.slice(start)), [blocks, start]);
   const showEarlier = () => setFirstKey(blocks[Math.max(0, start - WINDOW)]?.key ?? null);
+  /** Where each shown block sits in the transcript, to scroll back to a message a reply quotes. */
+  const blockY = useRef(new Map<string, number>());
+  const pendingJump = useRef<string | null>(null);
+  const [flashKey, setFlashKey] = useState<string | null>(null);
+  const scrollToBlock = (key: string) => {
+    const y = blockY.current.get(key);
+    if (y === undefined) return false;
+    pendingJump.current = null;
+    atBottom.current = false;
+    ownScrollUntil.current = 0;
+    scroll.current?.scrollTo({ y: Math.max(0, y - 80), animated: true });
+    setFlashKey(key);
+    setTimeout(() => setFlashKey((k) => (k === key ? null : k)), 1200);
+    return true;
+  };
+  /** Scrolls back to the message a reply quotes, showing earlier blocks first if it is above the window. */
+  const jumpToReply = (replyTo: ReplyRef) => {
+    const index = replyTargetIndex(blocks, replyTo);
+    if (index < 0) return;
+    const key = blocks[index]!.key;
+    if (index < start) {
+      pendingJump.current = key;
+      setFirstKey(key);
+      return;
+    }
+    if (!scrollToBlock(key)) pendingJump.current = key;
+  };
   // Once loaded, the window stays where it starts (new blocks add to it), from its first
   // block on: also after a `/clear`, and for history arriving only after an empty wait.
   const pinKey = pinnedAt < 0 ? (blocks[latestStart]?.key ?? null) : null;
@@ -526,12 +555,21 @@ export function ChatScreen({
         </View>
         <ScrollHold.Provider value={hold}>
           {shown.map((item, i) => (
-            <FadeIn key={item.key} animate={loadedRef.current}>
+            <FadeIn
+              key={item.key}
+              animate={loadedRef.current}
+              onLayout={(e) => {
+                blockY.current.set(item.key, e.nativeEvent.layout.y);
+                if (pendingJump.current === item.key) scrollToBlock(item.key);
+              }}
+            >
+              <View style={flashKey === item.key ? styles.flash : undefined}>
               <Item
                 item={item}
                 sessionId={sessionId}
                 live={busy && start + i === blocks.length - 1}
                 onOpenChanges={() => setChangesOpen(true)}
+                onJumpToReply={jumpToReply}
                 onReply={(target) => {
                   setReplyTo(target);
                   input.current?.focus();
@@ -569,6 +607,7 @@ export function ChatScreen({
                   )
                 }
               />
+              </View>
             </FadeIn>
           ))}
         </ScrollHold.Provider>
@@ -762,6 +801,7 @@ function Item({
   onSecret,
   onOpenChanges,
   onReply,
+  onJumpToReply,
   cards,
   onOpenBrowser,
 }: {
@@ -770,6 +810,7 @@ function Item({
   live: boolean;
   onOpenChanges: () => void;
   onReply: (target: ReplyRef) => void;
+  onJumpToReply: (replyTo: ReplyRef) => void;
   cards: ChangesCards;
   onOpenBrowser: (tabId: string, handoff?: { requestId: string; reason: string }) => void;
 } & Respond) {
@@ -792,7 +833,7 @@ function Item({
     case "user":
       return item.author === "user" ? (
         <View style={{ gap: 6 }}>
-          {item.replyTo ? <ReplyQuote replyTo={item.replyTo} /> : null}
+          {item.replyTo ? <ReplyQuote replyTo={item.replyTo} onPress={onJumpToReply} /> : null}
           {item.attachments && item.attachments.length > 0 ? <MessageAttachments sessionId={sessionId} attachments={item.attachments} /> : null}
           {item.text ? (
             <Pressable
@@ -1062,18 +1103,22 @@ function SystemMessage({ author, text }: { author: string; text: string }) {
   );
 }
 
-const quoteLine = (text: string) => text.replace(/\s+/g, " ").trim();
-
-/** The message a reply answers, shown above it. */
-function ReplyQuote({ replyTo }: { replyTo: ReplyRef }) {
+/** The message a reply answers, shown above it; tapping it scrolls back to that message. */
+function ReplyQuote({ replyTo, onPress }: { replyTo: ReplyRef; onPress: (replyTo: ReplyRef) => void }) {
   return (
-    <View style={styles.replyQuote}>
+    <Pressable
+      onPress={() => onPress(replyTo)}
+      hitSlop={6}
+      accessibilityRole="button"
+      accessibilityLabel="Show the message this replies to"
+      style={({ pressed }) => [styles.replyQuote, pressed && { opacity: 0.6 }]}
+    >
       <ReplyIcon size={12} color={colors.faint} />
       <Text style={styles.replyQuoteFrom}>{replyTo.from === "assistant" ? "Agent" : "You"}</Text>
       <Text style={styles.replyQuoteText} numberOfLines={1}>
         {quoteLine(replyTo.text)}
       </Text>
-    </View>
+    </Pressable>
   );
 }
 
@@ -1477,6 +1522,7 @@ const styles = StyleSheet.create({
   sending: { opacity: 0.6 },
   listen: { flexDirection: "row", alignItems: "center", gap: 5, alignSelf: "flex-start", marginTop: 4, paddingVertical: 3 },
   listenText: { color: colors.faint, fontSize: 11.5 },
+  flash: { borderRadius: 12, backgroundColor: "rgba(129,140,248,0.12)" },
   messageActions: { flexDirection: "row", alignItems: "center", gap: 16 },
   replyQuote: {
     alignSelf: "flex-end",

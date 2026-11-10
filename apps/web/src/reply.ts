@@ -21,6 +21,3 @@ export const useReplyTarget = (sessionId: string) =>
     },
     () => targets.get(sessionId) ?? null,
   );
-
-/** One line of a quoted message, for the reply chip and the quote above a reply. */
-export const quoteLine = (text: string) => text.replace(/\s+/g, " ").trim();
