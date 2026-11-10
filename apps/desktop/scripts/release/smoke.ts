@@ -44,6 +44,7 @@ import {
   type CommandResult,
   descendantsOf,
   isNsisUninstaller,
+  isTracked,
   portAccepts,
   processesUnder,
   type ProcessList,
@@ -230,7 +231,7 @@ const alive = (pid: number) => {
   }
 };
 /** Every pid descended from the app at any point of the run (the tree is lost once it exits). */
-const tracked = new Set<number>();
+const tracked = new Map<number, string | null>();
 
 const healthy = async (url: string) => {
   try {
@@ -285,12 +286,13 @@ const runOnce = async (seedVersion: number): Promise<Array<string>> => {
       if (exit) break;
       if (list.ok) {
         samples++;
-        for (const pid of descendantsOf(list.procs, child.pid)) tracked.add(pid);
+        const ids = new Set([child.pid, ...descendantsOf(list.procs, child.pid)]);
+        for (const p of list.procs) if (ids.has(p.pid) && !tracked.has(p.pid)) tracked.set(p.pid, p.command);
       } else sampleError = list.error;
       await Promise.race([exited, sleep(250)]);
     }
   })();
-  if (child.pid !== undefined) tracked.add(child.pid);
+  if (child.pid !== undefined) tracked.set(child.pid, null);
   while (!answered && !exit && Date.now() < deadline) {
     url ??= serverUrlFromLog(readFileSync(logPath, "utf8"));
     answered = url !== null && (await healthy(url));
@@ -349,7 +351,9 @@ try {
   console.log(`▸ process list ${warm.ok ? `read (${warm.procs.length} processes)` : `UNREADABLE (${warm.error})`} in ${Math.round(performance.now() - warmStart)}ms`);
   for (const v of seedVersions) failures.push(...(await runOnce(v)));
 } finally {
-  for (const pid of tracked) if (alive(pid)) killTree(pid);
+  // Kill what is left of the app, but never a process that merely reuses one of its pids.
+  const last = await listProcesses();
+  for (const pid of last.ok ? last.procs.filter((p) => p.pid !== process.pid && isTracked(tracked, p)).map((p) => p.pid) : [...tracked.keys()].filter(alive)) killTree(pid);
   uninstall?.();
   if (uninstall) {
     // The NSIS uninstaller copies itself to %TEMP%\~nsuX.tmp\Un_X.exe and relaunches with

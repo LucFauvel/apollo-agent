@@ -300,10 +300,21 @@ export const readProcessList = (platform: NodeJS.Platform, r: CommandResult, sel
   return { ok: true, procs };
 };
 
+/** Whether a listed process is one recorded as the app's: same pid AND (when known) same command line. */
+export const isTracked = (tracked: ReadonlyMap<number, string | null>, p: Proc): boolean => {
+  if (!tracked.has(p.pid)) return false;
+  const seen = tracked.get(p.pid);
+  return seen === null || seen === undefined || seen === p.command;
+};
+
 export interface SurvivorFacts {
   readonly list: ProcessList;
-  /** Pids recorded as the app's descendants while it ran (plus the app itself). */
-  readonly tracked: ReadonlySet<number>;
+  /**
+   * Pids recorded as the app's descendants while it ran (plus the app itself), with the command
+   * line each had when seen (null: never seen in a list). Windows reuses pids quickly: a listed
+   * process only counts as the app's if its command line is still the recorded one.
+   */
+  readonly tracked: ReadonlyMap<number, string | null>;
   /** Whether a pid is alive (signal 0): works even when the process list can't be read. */
   readonly isAlive: (pid: number) => boolean;
   readonly appDirs: ReadonlyArray<string>;
@@ -326,12 +337,13 @@ export const survivorVerdict = (f: SurvivorFacts): { readonly clean: boolean; re
   const describe = (p: Proc) => `${p.pid} (${p.command.slice(0, 160)})`;
   let kill: Array<number>;
   if (f.list.ok) {
-    const leftovers = f.list.procs.filter((p) => p.pid !== f.selfPid && (f.tracked.has(p.pid) || processesUnder([p], f.appDirs, f.platform).length > 0));
+    const leftovers = f.list.procs.filter((p) => p.pid !== f.selfPid && (isTracked(f.tracked, p) || processesUnder([p], f.appDirs, f.platform).length > 0));
     if (leftovers.length) problems.push(`processes still running ${f.graceSeconds}s after the app exited: ${leftovers.map(describe).join("; ")}`);
     kill = leftovers.map((p) => p.pid);
   } else {
     problems.push(`could not list processes (${f.list.error}): cannot confirm that nothing of the app survived`);
-    kill = [...f.tracked].filter((pid) => pid !== f.selfPid && f.isAlive(pid));
+    // No list, so no way to tell a reused pid from the app's own: report and kill by pid alone.
+    kill = [...f.tracked.keys()].filter((pid) => pid !== f.selfPid && f.isAlive(pid));
     if (kill.length) problems.push(`processes of the app still alive ${f.graceSeconds}s after it exited: ${kill.join(", ")}`);
   }
   if (f.listening) problems.push(`something still accepts connections on the server's port ${f.port} ${f.graceSeconds}s after the app exited`);

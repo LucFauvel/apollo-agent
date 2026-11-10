@@ -239,7 +239,10 @@ describe("unreadable process lists are never empty ones (review round 2)", () =>
   });
 
   const facts = {
-    tracked: new Set([100, 101]),
+    tracked: new Map<number, string | null>([
+      [100, null],
+      [101, "node helper.mjs"],
+    ]),
     isAlive: (pid: number) => pid === 101,
     appDirs: ["/tmp/x/Apollo.app"],
     platform: "darwin" as const,
@@ -259,6 +262,11 @@ describe("unreadable process lists are never empty ones (review round 2)", () =>
     const v = survivorVerdict({ ...facts, list });
     expect(v.clean).toBe(false);
     expect(v.kill.sort()).toEqual([101, 77]);
+  });
+
+  it("a tracked pid reused by an unrelated process is not a survivor (Windows pid reuse)", () => {
+    const list = readProcessList("win32", ok(JSON.stringify([{ ProcessId: self, ParentProcessId: 1, CommandLine: "node smoke.ts" }, { ProcessId: 101, ParentProcessId: 4, ExecutablePath: "C:\\Windows\\servicing\\TrustedInstaller.exe" }])), self);
+    expect(survivorVerdict({ ...facts, platform: "win32", appDirs: ["C:\\Temp\\installed"], list })).toEqual({ clean: true, problems: [], kill: [] });
   });
 
   it("an unreadable list is never clean, even with a quiet port and no live tracked pid", () => {
