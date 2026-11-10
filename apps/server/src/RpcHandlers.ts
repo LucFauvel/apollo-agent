@@ -131,6 +131,7 @@ export const layer = ApolloRpcs.toLayer(
       "bots.create": (input) => manager.createBot(input),
       "bots.update": (input) => manager.updateBot(input),
       "bots.delete": ({ botId }) => manager.deleteBot(botId),
+      "bots.reorder": ({ botIds }) => manager.reorderBots(botIds),
       "bots.stop": ({ botId }) => manager.stopBot(botId),
       "bots.resume": ({ botId }) => manager.resumeBot(botId),
 

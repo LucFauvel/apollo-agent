@@ -1289,7 +1289,7 @@ const make = Effect.gen(function* () {
         if (input.name.trim().length === 0) return yield* invalid("bot name is required");
         const cwd = yield* prepareWorkspace(input.cwd);
         const now = Date.now();
-        const bot: Bot = {
+        const fresh: Omit<Bot, "position"> = {
           id: newId<BotId>("bot"),
           name: input.name.trim(),
           avatar: input.avatar ?? randomAvatar(),
@@ -1307,7 +1307,7 @@ const make = Effect.gen(function* () {
           createdAt: now,
           updatedAt: now,
         };
-        yield* store.insertBot(bot);
+        const bot = yield* store.insertBot(fresh);
         yield* publish({ _tag: "BotUpserted", bot });
         yield* createSession({
           id: bot.mainSessionId,
@@ -1324,7 +1324,7 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const current = yield* store.getBot(input.botId);
         const cwd = input.cwd !== undefined && input.cwd.trim() !== current.cwd ? yield* prepareWorkspace(input.cwd) : undefined;
-        const bot: Bot = {
+        const edited: Bot = {
           ...current,
           ...(input.name !== undefined ? { name: input.name } : {}),
           ...(input.avatar !== undefined ? { avatar: input.avatar } : {}),
@@ -1339,7 +1339,7 @@ const make = Effect.gen(function* () {
           ...(input.codexAccountId !== undefined ? { codexAccountId: input.codexAccountId } : {}),
           updatedAt: Date.now(),
         };
-        yield* store.updateBot(bot);
+        const bot = yield* store.updateBot(edited);
         yield* publish({ _tag: "BotUpserted", bot });
         // The orchestrator follows the bot's main model; sessions without their own
         // runtime mode follow the bot's.
@@ -1366,6 +1366,15 @@ const make = Effect.gen(function* () {
           }
         }
         return bot;
+      }),
+
+    /** `bots.reorder`: the whole bot list, first to last. Publishes each moved bot. */
+    reorderBots: (botIds: ReadonlyArray<BotId>) =>
+      Effect.gen(function* () {
+        if (new Set(botIds).size !== botIds.length) return yield* invalid("a bot appears twice in the new order");
+        const moved = yield* store.reorderBots(botIds);
+        for (const bot of moved) yield* publish({ _tag: "BotUpserted", bot });
+        return yield* store.listBots;
       }),
 
     /** Registers work to do when a bot is deleted (see `botCleanups`). */
