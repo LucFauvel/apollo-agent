@@ -5,7 +5,7 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { safeEqual } from "./auth/Auth.ts";
 import { ServerConfig } from "./Config.ts";
 import { LocalModels } from "./local/LocalModels.ts";
-import { Notices } from "./push/Push.ts";
+import { Notices, NotificationsSeen } from "./push/Push.ts";
 import { Store } from "./Store.ts";
 
 export const DESKTOP_STATUS_PATH = "/api/desktop/status";
@@ -67,6 +67,12 @@ export const layer = HttpRouter.add(
     const after = Number(new URL(request.url, "http://apollo.invalid").searchParams.get("after") ?? "NaN");
     const notices = yield* Effect.serviceOption(Notices);
     const notifications = Option.isSome(notices) && Number.isFinite(after) ? notices.value.since(after) : undefined;
-    return HttpServerResponse.jsonUnsafe({ ...(yield* desktopStatus), ...(notifications ? { notifications } : {}) });
+    const seen = yield* Effect.serviceOption(NotificationsSeen);
+    const notificationsSeen = Option.isSome(seen) ? yield* seen.value.all : undefined;
+    return HttpServerResponse.jsonUnsafe({
+      ...(yield* desktopStatus),
+      ...(notifications ? { notifications } : {}),
+      ...(notificationsSeen ? { notificationsSeen } : {}),
+    });
   }),
 );

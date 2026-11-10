@@ -12,7 +12,7 @@ import type {
   SessionId,
   Usage,
 } from "@apollo/contracts";
-import { invalidateChanges } from "@apollo/client";
+import { invalidateChanges, withSeenMark } from "@apollo/client";
 import * as Stream from "effect/Stream";
 import { useSyncExternalStore } from "react";
 import { follow } from "./rpc.ts";
@@ -34,6 +34,8 @@ export interface AppState {
   readonly pullRequests: ReadonlyMap<string, PullRequest>;
   /** Bumped when a bot's sessions changed files or explained changes: the Changes panel refetches. */
   readonly changesVersion: ReadonlyMap<BotId, number>;
+  /** When the user last saw each bot's chats, on any device: its notifications up to then are dismissed. */
+  readonly notificationsSeen: ReadonlyMap<string, number>;
 }
 
 export type Notice = Extract<AppChange, { _tag: "Notify" }>;
@@ -56,6 +58,7 @@ let state: AppState = {
   browserTabs: new Map(),
   pullRequests: new Map(),
   changesVersion: new Map(),
+  notificationsSeen: new Map(),
 };
 const listeners = new Set<() => void>();
 
@@ -139,6 +142,8 @@ const apply = (change: AppChange) => {
     case "Notify":
       for (const listener of noticeListeners) listener(change);
       return;
+    case "NotificationsSeen":
+      return setState({ ...state, notificationsSeen: withSeenMark(state.notificationsSeen, change.botId, change.at) });
   }
 };
 
@@ -170,6 +175,7 @@ export const startSync = () =>
           pullRequests: new Map(item.pullRequests.map((p) => [`${p.sessionId} ${p.url}`, p])),
           // A reconnect may have missed ChangesUpdated: open changes views refetch.
           changesVersion: invalidateChanges(state.changesVersion, item.bots.map((b) => b.id)),
+          notificationsSeen: (item.notificationsSeen ?? []).reduce((marks, m) => withSeenMark(marks, m.botId, m.at), state.notificationsSeen),
         });
       } else {
         apply(item);

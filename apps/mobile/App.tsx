@@ -22,7 +22,7 @@ import { PairScreen } from "./src/screens/PairScreen.tsx";
 import { SettingsScreen } from "./src/screens/SettingsScreen.tsx";
 import { resetTailnetRoute } from "./src/tailnet.ts";
 import { SlideIn, SwipeBack } from "./src/motion.tsx";
-import { registerForPush, sessionOf, setViewingSession, unregisterPush } from "./src/push.ts";
+import { dismissSeenNotifications, registerForPush, sessionOf, setViewingSession, unregisterPush } from "./src/push.ts";
 import { colors } from "./src/theme.ts";
 
 export default function App() {
@@ -121,6 +121,7 @@ export default function App() {
         ) : (
           <AppStateProvider connection={connection}>
             <AvatarSync pairing={pairing} />
+            <NotificationsSync open={open} />
             {/* Home stays under the screens pushed over it, so going back slides to it. The
                 stack has a padding-free parent so the pushed screens fill exactly what Home does. */}
             <View style={styles.fill}>
@@ -176,6 +177,32 @@ const styles = StyleSheet.create({
 });
 
 /** Keeps the bots' avatar images on this phone, for notifications. */
+/**
+ * Notifications of chats the user has seen: while one of a bot's sessions is on screen (opened,
+ * or the app comes back to the front on it) the server hears so, and every device dismisses
+ * that bot's notifications. Delivered ones are compared with the seen marks whenever they
+ * change and whenever the app comes to the front (it may have missed a change meanwhile).
+ */
+function NotificationsSync({ open }: { open: SessionId | null }) {
+  const { state, connection } = useApollo();
+  const botId = open ? (state.sessions.get(open)?.botId ?? null) : null;
+  const [active, setActive] = useState(AppState.currentState === "active");
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (next) => setActive(next === "active"));
+    return () => sub.remove();
+  }, []);
+  // Seen: a chat of this bot is on screen in the foreground (not merely a notification arriving).
+  useEffect(() => {
+    if (!botId || !active || !state.connected) return;
+    void connection.rpc((c) => c["notifications.seen"]({ botId })).catch(() => undefined);
+  }, [botId, open, active, state.connected, connection]);
+  const marks = state.notificationsSeen;
+  useEffect(() => {
+    if (active) void dismissSeenNotifications(marks);
+  }, [marks, active]);
+  return null;
+}
+
 function AvatarSync({ pairing }: { pairing: Pairing }) {
   const { state } = useApollo();
   useAvatarImages(pairing, state.bots, state.connected);

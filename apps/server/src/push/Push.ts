@@ -32,6 +32,8 @@ export interface PushMessage {
     /** The bot it is from: the phone shows its avatar as the sender (notification service extension). */
     readonly botId?: BotId;
     readonly avatar?: BotAvatar;
+    /** When it was sent (server time, ms): the phone dismisses it once the bot's chats are seen after that. */
+    readonly at: number;
   };
   readonly sound: "default";
   readonly priority: "high";
@@ -244,6 +246,7 @@ const deliver = (
   note: { kind: string; title: string; body: string },
   sessionId: SessionId | null,
   bot: Pick<Bot, "id" | "avatar"> | undefined,
+  at: number,
 ) =>
   Effect.gen(function* () {
     const to = tokens.active();
@@ -253,7 +256,7 @@ const deliver = (
         to: token,
         title: note.title,
         body: note.body,
-        data: { sessionId, kind: note.kind, ...(bot ? { botId: bot.id, avatar: bot.avatar } : {}) },
+        data: { sessionId, kind: note.kind, ...(bot ? { botId: bot.id, avatar: bot.avatar } : {}), at },
         sound: "default",
         priority: "high",
         mutableContent: true,
@@ -271,24 +274,90 @@ export interface Notice {
   readonly title: string;
   readonly body: string;
   readonly sessionId: string;
+  /** Its bot, `""` when unknown. */
+  readonly botId: string;
+  /** When it was sent (server time, ms). */
+  readonly at: number;
 }
 
 /** The latest notifications, for the desktop app, which polls for the ones it has not shown. */
 export class Notices extends Context.Service<
   Notices,
-  { readonly record: (note: Omit<Notice, "id">) => void; readonly since: (after: number) => ReadonlyArray<Notice> }
+  {
+    readonly record: (note: Omit<Notice, "id" | "at"> & { readonly at?: number }) => void;
+    readonly since: (after: number) => ReadonlyArray<Notice>;
+    /** The user saw this bot's chats: its notifications up to now are not shown again. */
+    readonly dismiss: (botId: string) => void;
+  }
 >()("apollo/push/Notices") {
   static readonly layer = Layer.sync(Notices, () => {
-    const recent: Array<Notice> = [];
+    let recent: Array<Notice> = [];
     let next = 1;
     return Notices.of({
       record: (note) => {
-        recent.push({ id: next++, ...note });
+        recent.push({ ...note, id: next++, at: note.at ?? Date.now() });
         if (recent.length > 50) recent.shift();
       },
       since: (after) => recent.filter((n) => n.id > after),
+      dismiss: (botId) => {
+        recent = recent.filter((n) => n.botId !== botId);
+      },
     });
   });
+}
+
+const SEEN_KEY = "notifications.seen";
+
+/**
+ * When the user last saw each bot's chats: opening one of its sessions, or coming back to
+ * one on screen, on any device. Recording it clears the desktop app's pending notices and
+ * tells every connected client (NotificationsSeen), which dismiss the bot's notifications
+ * delivered up to then; clients that were away compare against the marks when they return.
+ */
+export class NotificationsSeen extends Context.Service<
+  NotificationsSeen,
+  {
+    readonly mark: (botId: BotId, now?: number) => Effect.Effect<number>;
+    readonly all: Effect.Effect<ReadonlyArray<{ readonly botId: BotId; readonly at: number }>>;
+  }
+>()("apollo/push/NotificationsSeen") {
+  static readonly layer = Layer.effect(
+    NotificationsSeen,
+    Effect.gen(function* () {
+      const store = yield* Store;
+      const manager = yield* SessionManager;
+      const notices = yield* Notices;
+      const marks = new Map<BotId, number>();
+      try {
+        for (const [botId, at] of Object.entries(JSON.parse((yield* store.getSetting(SEEN_KEY)) ?? "{}") as Record<string, unknown>)) {
+          if (typeof at === "number") marks.set(botId as BotId, at);
+        }
+      } catch {
+        // A damaged record only costs dismissals of notifications already delivered.
+      }
+      const all = Effect.suspend(() =>
+        Effect.map(store.listBots, (bots) => {
+          const known = new Set(bots.map((b) => b.id));
+          return [...marks].filter(([botId]) => known.has(botId)).map(([botId, at]) => ({ botId, at }));
+        }),
+      );
+      return NotificationsSeen.of({
+        all: all.pipe(Effect.orElseSucceed(() => [])),
+        mark: (botId, now = Date.now()) =>
+          Effect.gen(function* () {
+            // (Never backwards, should two devices race.)
+            const at = Math.max(now, marks.get(botId) ?? 0);
+            marks.set(botId, at);
+            notices.dismiss(botId);
+            const known = new Set((yield* store.listBots).map((b) => b.id));
+            for (const id of marks.keys()) if (!known.has(id)) marks.delete(id);
+            yield* store.setSetting(SEEN_KEY, JSON.stringify(Object.fromEntries(marks)));
+            yield* manager.publish({ _tag: "NotificationsSeen", botId, at });
+            return at;
+          }).pipe(Effect.orElseSucceed(() => now)),
+      });
+    }),
+  );
 }
 
 /** Watches every session and pushes the events above, holding finished turns back while work is pending. */
@@ -308,9 +377,10 @@ export const makeLayerWatcher = (timing: HoldTiming = DEFAULT_HOLD) =>
       const announce = (sessionId: SessionId, botId: BotId, note: Note) =>
         Effect.gen(function* () {
           const bot = yield* store.getBot(botId).pipe(Effect.option);
-          notices.record({ ...note, sessionId });
+          const at = Date.now();
+          notices.record({ ...note, sessionId, botId, at });
           yield* manager.publish({ _tag: "Notify", botId, sessionId, title: note.title, body: note.body, pushed: true });
-          yield* Effect.forkDetach(deliver(tokens, send, note, sessionId, bot._tag === "Some" ? bot.value : undefined));
+          yield* Effect.forkDetach(deliver(tokens, send, note, sessionId, bot._tag === "Some" ? bot.value : undefined, at));
         });
 
       yield* manager.liveEvents.pipe(
@@ -362,14 +432,10 @@ export const makeLayerWatcher = (timing: HoldTiming = DEFAULT_HOLD) =>
             // (`pushed`: one of ours, above.)
             if (change._tag !== "Notify" || change.pushed) return;
             const note = { kind: "notify", title: change.title, body: plain(change.body) };
-            notices.record({ ...note, sessionId: change.sessionId ?? "" });
-            const bot = change.sessionId
-              ? yield* store.getSession(change.sessionId).pipe(
-                  Effect.flatMap((session) => store.getBot(session.botId)),
-                  Effect.option,
-                )
-              : undefined;
-            yield* Effect.forkDetach(deliver(tokens, send, note, change.sessionId ?? null, bot?._tag === "Some" ? bot.value : undefined));
+            const at = Date.now();
+            notices.record({ ...note, sessionId: change.sessionId ?? "", botId: change.botId, at });
+            const bot = yield* store.getBot(change.botId).pipe(Effect.option);
+            yield* Effect.forkDetach(deliver(tokens, send, note, change.sessionId ?? null, bot._tag === "Some" ? bot.value : undefined, at));
           }),
         ),
         Effect.forkScoped,
@@ -399,9 +465,9 @@ export const layerRoutes = Layer.mergeAll(
       const store = yield* Store;
       const bot = (yield* store.listBots)[0];
       const note = { kind: "test", title: bot?.name ?? "Apollo", body: "Notifications work. You'll hear from your bots here." };
-      notices.record({ ...note, sessionId: "" });
+      notices.record({ ...note, sessionId: "", botId: "" });
       const phones = tokens.active().length;
-      yield* deliver(tokens, send, note, null, bot);
+      yield* deliver(tokens, send, note, null, bot, Date.now());
       return HttpServerResponse.jsonUnsafe({ ok: true, phones });
     }),
   ),

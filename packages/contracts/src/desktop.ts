@@ -37,8 +37,13 @@ export const DesktopStatus = Schema.Struct({
         title: Schema.String,
         body: Schema.String,
         sessionId: Schema.String,
+        /** Its bot (`""` when unknown), and when it was sent (server time, ms). */
+        botId: Schema.optional(Schema.String),
+        at: Schema.optional(Schema.Number),
       }),
     ),
   ),
+  /** When the user last saw each bot's chats: the shell closes the notifications it showed for them up to then. */
+  notificationsSeen: Schema.optional(Schema.Array(Schema.Struct({ botId: Schema.String, at: Schema.Number }))),
 });
 export type DesktopStatus = typeof DesktopStatus.Type;

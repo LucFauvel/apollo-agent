@@ -24,6 +24,7 @@ import {
   ProviderAccount,
   BotId,
   BotLimits,
+  Timestamp,
   Usage,
   ClientId,
   CoreMemory,
@@ -87,6 +88,12 @@ export const AppChange = Schema.Union([
      */
     pushed: Schema.optional(Schema.Boolean),
   }),
+  /**
+   * The user saw this bot's chats at `at` (server time, ms): on some device they opened one
+   * of its sessions, or came back to one on screen. Clients dismiss the bot's notifications
+   * delivered up to then.
+   */
+  Schema.TaggedStruct("NotificationsSeen", { botId: BotId, at: Timestamp }),
 ]);
 export type AppChange = typeof AppChange.Type;
 
@@ -98,6 +105,8 @@ export const AppSnapshot = Schema.Struct({
   schedules: Schema.Array(Schedule),
   browserTabs: Schema.Array(BrowserTab),
   pullRequests: Schema.Array(PullRequest),
+  /** When the user last saw each bot's chats (see the NotificationsSeen change). */
+  notificationsSeen: Schema.optional(Schema.Array(Schema.Struct({ botId: BotId, at: Timestamp }))),
 });
 export type AppSnapshot = typeof AppSnapshot.Type;
 
@@ -172,6 +181,8 @@ export class ApolloRpcs extends RpcGroup.make(
   // --- app ---------------------------------------------------------------
   Rpc.make("app.snapshot", { success: AppSnapshot, error }),
   Rpc.make("app.changes", { success: AppChange, stream: true }),
+  /** The user is looking at one of this bot's chats: its notifications are dismissed everywhere. */
+  Rpc.make("notifications.seen", { payload: { botId: BotId }, success: Schema.Void, error }),
 
   // --- providers ---------------------------------------------------------
   Rpc.make("providers.models", {

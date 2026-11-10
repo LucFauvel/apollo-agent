@@ -249,9 +249,68 @@ describe("SessionManager", () => {
       expect(tokens.active()).toEqual(["ExponentPushToken[live]"]);
       // The desktop app polls the same notifications.
       const notices = (yield* Push.Notices).since(0);
-      expect(notices).toEqual([{ id: 1, kind: "done", title: "Atlas", body: "echo: ship it", sessionId: bot.mainSessionId }]);
+      expect(notices).toEqual([
+        { id: 1, kind: "done", title: "Atlas", body: "echo: ship it", sessionId: bot.mainSessionId, botId: bot.id, at: expect.any(Number) },
+      ]);
+      // The phone gets when it was sent, to dismiss it once the chat is seen after that.
+      expect(pushed[0]!.data.at).toBe(notices[0]!.at);
       expect((yield* Push.Notices).since(1)).toEqual([]);
     }).pipe(Effect.provide(pushLayer));
+  });
+
+  it.live("records when a bot's chats are seen, tells every client, and forgets that bot's pending notices", () => {
+    const seenLayer = Push.NotificationsSeen.layer.pipe(Layer.provideMerge(Push.Notices.layer), Layer.provideMerge(layer));
+    return Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const notices = yield* Push.Notices;
+      const seen = yield* Push.NotificationsSeen;
+      const atlas = yield* createBot(manager);
+      const vega = yield* manager.createBot({
+        name: "Vega",
+        instructions: "",
+        cwd: "/tmp",
+        main: { provider: "claude" },
+        defaultWorker: { provider: "codex" },
+        runtimeMode: "full-access",
+        autoLearn: false,
+      });
+      notices.record({ kind: "done", title: "Atlas", body: "a", sessionId: atlas.mainSessionId, botId: atlas.id });
+      notices.record({ kind: "done", title: "Vega", body: "v", sessionId: vega.mainSessionId, botId: vega.id });
+      const changes: Array<AppChange> = [];
+      const fiber = yield* manager.changes.pipe(
+        Stream.filter((c) => c._tag === "NotificationsSeen"),
+        Stream.runForEach((c) => Effect.sync(() => void changes.push(c))),
+        Effect.forkChild,
+      );
+      yield* Effect.sleep("20 millis");
+
+      expect(yield* seen.mark(atlas.id, 5_000)).toBe(5_000);
+      yield* Effect.sleep("20 millis");
+      expect(changes).toEqual([{ _tag: "NotificationsSeen", botId: atlas.id, at: 5_000 }]);
+      // The desktop app will not show Atlas's notice again; Vega's stays.
+      expect(notices.since(0).map((n) => n.botId)).toEqual([vega.id]);
+      expect(yield* seen.all).toEqual([{ botId: atlas.id, at: 5_000 }]);
+      // A device with a slow clock never moves it back.
+      expect(yield* seen.mark(atlas.id, 4_000)).toBe(5_000);
+      yield* Fiber.interrupt(fiber);
+    }).pipe(Effect.provide(seenLayer));
+  });
+
+  it.live("keeps seen marks across restarts", () => {
+    const dir = mkdtempSync(join(tmpdir(), "apollo-seen-"));
+    const onDisk = Push.NotificationsSeen.layer.pipe(Layer.provideMerge(Push.Notices.layer), Layer.provideMerge(layerWith(1e9, Database.layer, dir)));
+    return Effect.gen(function* () {
+      const botId = yield* Effect.gen(function* () {
+        const bot = yield* createBot(yield* SessionManager.SessionManager);
+        yield* (yield* Push.NotificationsSeen).mark(bot.id, 7_000);
+        return bot.id;
+      }).pipe(Effect.provide(onDisk));
+      // A new server on the same database.
+      const marks = yield* Effect.gen(function* () {
+        return yield* (yield* Push.NotificationsSeen).all;
+      }).pipe(Effect.provide(onDisk));
+      expect(marks).toEqual([{ botId, at: 7_000 }]);
+    });
   });
 
   describe("turn notifications while work is pending", () => {

@@ -1,7 +1,7 @@
 import { useBrowserFocus } from "./browserFocus.ts";
-import { showApp, watchTurns } from "./turnNotifications.ts";
+import { showApp, showNotification, watchSeen, watchTurns } from "./turnNotifications.ts";
 import type { Bot, SessionId } from "@apollo/contracts";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { BotSettingsDialog, NewBotDialog, NewSessionDialog } from "./components/Dialogs.tsx";
 import { BrowserPanel } from "./components/BrowserPanel.tsx";
 import { ChangesPanel } from "./components/ChangesPanel.tsx";
@@ -20,7 +20,7 @@ import { onNotify, startSync, useApp } from "./store.ts";
 import { useAvatarImages } from "./avatarImages.ts";
 
 /** Shows server notifications (scheduled results, failures) on the desktop; clicking opens the session. */
-const useDesktopNotifications = (open: (id: SessionId) => void) =>
+const useDesktopNotifications = (open: (id: SessionId) => void, selected: () => SessionId | null) =>
   useEffect(
     () =>
       onNotify((notice) => {
@@ -29,13 +29,14 @@ const useDesktopNotifications = (open: (id: SessionId) => void) =>
         // Session events (finished turns, approvals): watchTurns shows them, unless the user is looking.
         if (notice.pushed) return;
         if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
-        const notification = new Notification(notice.title, { body: notice.body });
-        notification.onclick = () => {
+        // Not for the conversation the user is looking at.
+        if (notice.sessionId && document.hasFocus() && selected() === notice.sessionId) return;
+        showNotification(notice.botId, notice.title, { body: notice.body }, () => {
           showApp();
           if (notice.sessionId) open(notice.sessionId);
-        };
+        });
       }),
-    [open],
+    [open, selected],
   );
 
 export function App() {
@@ -54,10 +55,11 @@ export function App() {
   useEffect(() => {
     if (browserFocus) setPanel("browser");
   }, [browserFocus]);
-  useDesktopNotifications(setSelectedId);
-  // Turn notifications compare against the open session; read it through a ref.
+  // Notifications compare against the open session; read it through a ref.
   const selectedRef = useRef(selectedId);
   selectedRef.current = selectedId;
+  const currentSelected = useCallback(() => selectedRef.current, []);
+  useDesktopNotifications(setSelectedId, currentSelected);
   // The desktop app shows notifications itself (from the server, even with the window
   // closed) and opens a session through this hook; a plain browser tab does its own.
   useEffect(() => {
@@ -67,6 +69,20 @@ export function App() {
   }, []);
 
   const session = useApp((s) => (selectedId ? s.sessions.get(selectedId) : undefined));
+  // Seeing one of a bot's chats dismisses its notifications, here and on the phone.
+  const seenBotId = session?.botId ?? null;
+  const seenBotRef = useRef(seenBotId);
+  seenBotRef.current = seenBotId;
+  const seenRef = useRef<ReturnType<typeof watchSeen> | null>(null);
+  useEffect(() => {
+    const watcher = watchSeen(() => seenBotRef.current);
+    seenRef.current = watcher;
+    return () => {
+      watcher.stop();
+      seenRef.current = null;
+    };
+  }, []);
+  useEffect(() => seenRef.current?.check(), [selectedId, seenBotId]);
   const bot = useApp((s) => (session ? s.bots.get(session.botId) : undefined));
   const firstBot = useApp((s) => s.bots.values().next().value);
 
