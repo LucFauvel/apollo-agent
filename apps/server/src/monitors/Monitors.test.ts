@@ -248,4 +248,107 @@ describe.skipIf(process.platform === "win32")("monitors", () => {
       expect(f.sent.filter((t) => t.includes(started.id))).toEqual([]);
     }).pipe(Effect.scoped, Effect.provide(f.layer));
   });
+
+  /** A child that ignores SIGTERM, its output redirected away from the monitor, and writes its pid to `pidFile`. */
+  const stubbornChild = (dir: string) => {
+    const pidFile = join(dir, "stubborn.pid");
+    const script = join(dir, "stubborn.cjs");
+    writeFileSync(
+      script,
+      `process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`,
+    );
+    return {
+      // The shell waits on it, and exits on SIGTERM: its pipes close while the child lives on.
+      command: `${JSON.stringify(process.execPath)} ${JSON.stringify(script)} > /dev/null 2>&1 & wait`,
+      pid: Effect.gen(function* () {
+        yield* until(() => {
+          try {
+            return readFileSync(pidFile, "utf8").length > 0;
+          } catch {
+            return false;
+          }
+        });
+        return Number(readFileSync(pidFile, "utf8"));
+      }),
+    };
+  };
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  it.live(
+    "stopping kills a child that ignores SIGTERM after the shell has exited",
+    () => {
+      const f = fixture();
+      const child = stubbornChild(f.dir);
+      return Effect.gen(function* () {
+        const { monitors, caller } = yield* setup(f.cwd);
+        const started = yield* monitors.start(caller, { command: child.command, description: "stubborn", timeoutMs: null });
+        const pid = yield* child.pid;
+        yield* monitors.stopByUser(started.id);
+        // Stopped means stopped: nothing of it is left once the stop returns.
+        expect(alive(pid)).toBe(false);
+      }).pipe(Effect.scoped, Effect.provide(f.layer));
+    },
+    20_000,
+  );
+
+  it.live(
+    "deleting the bot kills a child that ignores SIGTERM after the shell has exited",
+    () => {
+      const f = fixture();
+      const child = stubbornChild(f.dir);
+      return Effect.gen(function* () {
+        const { manager, monitors, bot, caller } = yield* setup(f.cwd);
+        yield* monitors.start(caller, { command: child.command, description: "stubborn", timeoutMs: null });
+        const pid = yield* child.pid;
+        yield* manager.deleteBot(bot.id);
+        expect(alive(pid)).toBe(false);
+        expect(yield* monitors.list).toEqual([]);
+      }).pipe(Effect.scoped, Effect.provide(f.layer));
+    },
+    20_000,
+  );
+
+  it.live("holds at most one clipped line of output that never ends with a newline", () => {
+    const f = fixture();
+    const total = 2_000_000;
+    // Progress over carriage returns on stdout, and one long unfinished line on stderr, then idles.
+    const script = [
+      `let s = ''; for (let i = 0; s.length < ${total}; i++) s += 'progress ' + i + '%\\r';`,
+      `process.stdout.write(s.slice(0, ${total}));`,
+      `process.stderr.write('e'.repeat(${total}));`,
+      "setInterval(() => {}, 1000);",
+    ].join(" ");
+    return Effect.gen(function* () {
+      const { monitors, caller } = yield* setup(f.cwd);
+      const started = yield* monitors.start(caller, { command: node(script), description: "progress", timeoutMs: null });
+      yield* until(() => (monitors.buffered(started.id)?.stdoutBytes ?? 0) >= total);
+      const held = monitors.buffered(started.id)!;
+      expect(held.stdout).toBeLessThanOrEqual(1001);
+      expect(held.stderr).toBeLessThanOrEqual(1001);
+      yield* monitors.stop(caller, started.id);
+    }).pipe(Effect.scoped, Effect.provide(f.layer));
+  });
+
+  it.live("delivers an overlong line clipped, once its newline arrives", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { monitors, caller } = yield* setup(f.cwd);
+      const started = yield* monitors.start(caller, {
+        command: node("process.stdout.write('x'.repeat(50000)); setTimeout(() => console.log('y'), 200); setInterval(() => {}, 1000)"),
+        description: "long line",
+        timeoutMs: null,
+      });
+      yield* until(() => f.sent.some((t) => t.includes(started.id)));
+      const message = f.sent.find((t) => t.includes(started.id))!;
+      expect(message).toBe(`[Apollo] Monitor ${started.id} ("long line"):\n${"x".repeat(1000)}…`);
+      yield* monitors.stop(caller, started.id);
+    }).pipe(Effect.scoped, Effect.provide(f.layer));
+  });
 });

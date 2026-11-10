@@ -19,6 +19,8 @@ const MAX_LINES_PER_MESSAGE = 50;
 const MAX_LINE_CHARS = 1000;
 /** Stderr lines kept, to explain how a monitor ended. */
 const STDERR_TAIL = 20;
+/** How long a stopped monitor's processes get to exit after SIGTERM, before SIGKILL. */
+const TERM_GRACE_MS = 3000;
 export const DEFAULT_TIMEOUT_MINUTES = 60;
 export const MAX_TIMEOUT_MINUTES = 24 * 60;
 
@@ -42,6 +44,8 @@ interface Entry {
   pending: Array<string>;
   dropped: number;
   partial: string;
+  /** Bytes read from stdout so far. */
+  stdoutBytes: number;
   stderr: Array<string>;
   stderrPartial: string;
   flushTimer: ReturnType<typeof setTimeout> | null;
@@ -129,9 +133,15 @@ const make = Effect.gen(function* () {
     entry.flushTimer ??= setTimeout(() => flush(entry), BATCH_MS);
   };
 
+  /**
+   * Complete lines in `buffered` + `chunk`, and the unfinished rest. The rest is cut as it
+   * grows, so a command printing without newlines (progress over `\r`, say) holds at most
+   * one clipped line in memory; what comes after the cut, up to the next newline, is lost.
+   */
   const split = (buffered: string, chunk: Buffer) => {
     const lines = (buffered + chunk.toString("utf8")).split(/\r?\n/);
-    return { lines, rest: lines.pop() ?? "" };
+    const rest = lines.pop() ?? "";
+    return { lines, rest: rest.length > MAX_LINE_CHARS ? rest.slice(0, MAX_LINE_CHARS + 1) : rest };
   };
 
   /** Forgets the oldest ended monitors of a session beyond those kept. */
@@ -184,9 +194,25 @@ const make = Effect.gen(function* () {
     void deliver(entry, text.join("\n"));
   };
 
-  const kill = (entry: Entry, signal: NodeJS.Signals) => {
+  /**
+   * Whether anything of the monitor's process group still runs: the shell may be gone while
+   * what it started lives on. (Windows has no process groups: the shell alone.)
+   */
+  const groupAlive = (entry: Entry) => {
     const pid = entry.process.pid;
-    if (entry.monitor.status !== "running" || pid === undefined) return;
+    if (pid === undefined) return false;
+    if (process.platform === "win32") return entry.process.exitCode === null && entry.process.signalCode === null;
+    try {
+      process.kill(-pid, 0);
+      return true;
+    } catch (error) {
+      // EPERM: still there, e.g. a killed member not yet reaped by launchd (macOS).
+      return (error as NodeJS.ErrnoException).code === "EPERM";
+    }
+  };
+  const signalGroup = (entry: Entry, signal: NodeJS.Signals) => {
+    const pid = entry.process.pid;
+    if (pid === undefined) return;
     try {
       if (process.platform === "win32") entry.process.kill(signal);
       else process.kill(-pid, signal);
@@ -194,19 +220,39 @@ const make = Effect.gen(function* () {
       // Already gone.
     }
   };
+  /** Polls until the monitor's whole process group is gone, or the time is up. */
+  const groupGone = (entry: Entry, ms: number) =>
+    Effect.gen(function* () {
+      for (const end = Date.now() + ms; groupAlive(entry) && Date.now() < end; ) yield* Effect.sleep("25 millis");
+      return !groupAlive(entry);
+    });
 
-  /** Stops the monitor's process group (TERM, then KILL) and waits until it has ended. */
+  /**
+   * Stops the monitor's whole process group and waits until it has ended: SIGTERM, then
+   * SIGKILL to whatever of it is left after a grace period, even when the shell itself
+   * exited meanwhile (a child that ignores SIGTERM, its output redirected elsewhere).
+   *
+   * The group is only signalled while it is known to exist, and is then watched without a
+   * break (every 25 ms) until it is gone: a group keeps its id while any member lives, so
+   * the id cannot pass to an unrelated group meanwhile. (Left: the inherent gap between
+   * the first check and the signal that follows.)
+   */
   const halt = (entry: Entry, by: NonNullable<Entry["stopping"]>["by"]) =>
     Effect.gen(function* () {
       if (entry.monitor.status !== "running") return;
       entry.stopping ??= { by };
-      kill(entry, "SIGTERM");
-      const done = yield* Deferred.await(entry.exited).pipe(Effect.timeoutOption("5 seconds"));
-      if (Option.isNone(done)) {
-        kill(entry, "SIGKILL");
-        const killed = yield* Deferred.await(entry.exited).pipe(Effect.timeoutOption("2 seconds"));
-        // Its pipes may stay open after it died (a grandchild holding them): count it as ended.
-        if (Option.isNone(killed)) finish(entry, null);
+      if (groupAlive(entry)) {
+        signalGroup(entry, "SIGTERM");
+        if (!(yield* groupGone(entry, TERM_GRACE_MS))) {
+          signalGroup(entry, "SIGKILL");
+          yield* groupGone(entry, 2000);
+        }
+      }
+      const closed = yield* Deferred.await(entry.exited).pipe(Effect.timeoutOption("2 seconds"));
+      // Its pipes may stay open after it died (a process outside the group holding them): count it as ended.
+      if (Option.isNone(closed)) {
+        finish(entry, null);
+        yield* Deferred.await(entry.exited);
       }
     });
 
@@ -261,6 +307,7 @@ const make = Effect.gen(function* () {
         pending: [],
         dropped: 0,
         partial: "",
+        stdoutBytes: 0,
         stderr: [],
         stderrPartial: "",
         flushTimer: null,
@@ -270,6 +317,7 @@ const make = Effect.gen(function* () {
       };
       entries.set(id, entry);
       child.stdout?.on("data", (chunk: Buffer) => {
+        entry.stdoutBytes += chunk.length;
         const { lines, rest } = split(entry.partial, chunk);
         entry.partial = rest;
         for (const line of lines) onLine(entry, line);
@@ -315,8 +363,9 @@ const make = Effect.gen(function* () {
   yield* Effect.addFinalizer(() =>
     Effect.sync(() => {
       for (const entry of entries.values()) {
+        if (entry.monitor.status !== "running") continue;
         entry.stopping ??= { by: "silent" };
-        kill(entry, "SIGTERM");
+        signalGroup(entry, "SIGTERM");
       }
     }),
   );
@@ -341,6 +390,11 @@ const make = Effect.gen(function* () {
     listFor: (caller: MonitorCaller) =>
       Effect.sync(() => [...entries.values()].map((e) => e.monitor).filter((m) => m.sessionId === caller.sessionId)),
     list: Effect.sync(() => [...entries.values()].map((e) => e.monitor)),
+    /** How much of a monitor's output is held (for tests). */
+    buffered: (monitorId: string) => {
+      const entry = entries.get(monitorId);
+      return entry ? { stdoutBytes: entry.stdoutBytes, stdout: entry.partial.length, stderr: entry.stderrPartial.length } : null;
+    },
     /** Resolves once every delivery queued so far has been sent (for tests). */
     settled: Effect.promise(() => Promise.all([...entries.values()].map((e) => e.chain))).pipe(Effect.asVoid),
   };
