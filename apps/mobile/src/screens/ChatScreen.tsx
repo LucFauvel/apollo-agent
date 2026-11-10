@@ -643,7 +643,7 @@ export function ChatScreen({
       <View style={styles.composerWrap}>
         {session ? (
           <View style={styles.composerTools}>
-            <ModelMenu session={session} />
+            <ModelMenu session={session} bot={bot} />
           </View>
         ) : null}
         <View style={styles.composer}>

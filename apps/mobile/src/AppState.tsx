@@ -6,6 +6,7 @@ import type {
   Bot,
   BotId,
   BrowserTab,
+  LocalModelsState,
   Monitor,
   Project,
   ProjectId,
@@ -39,6 +40,8 @@ export interface AppState {
   readonly accountLimits: ReadonlyMap<string, UsageLimits>;
   /** Bumped when a bot's memories changed: screens that list them refetch. */
   readonly memoryVersion: ReadonlyMap<BotId, number>;
+  /** Apollo's local models (llama.cpp), once a screen loaded them; kept current by `LocalModelsChanged`. */
+  readonly localModels: LocalModelsState | null;
 }
 
 const empty: AppState = {
@@ -53,6 +56,7 @@ const empty: AppState = {
   projects: new Map(),
   accountLimits: new Map(),
   memoryVersion: new Map(),
+  localModels: null,
 };
 
 type Incoming = ({ readonly _tag: "Snapshot" } & AppSnapshot) | AppChange;
@@ -118,6 +122,8 @@ const apply = (state: AppState, item: Incoming): AppState => {
         projects: new Map([...state.projects].filter(([, p]) => p.botId !== item.botId)),
       };
     }
+    case "LocalModelsChanged":
+      return { ...state, localModels: item.state };
     case "SessionUpserted":
       return { ...state, sessions: new Map(state.sessions).set(item.session.id, item.session) };
     case "SessionDeleted": {
@@ -156,6 +162,8 @@ interface Apollo {
    * `bots.reorder`, undone if the server refuses (the promise then rejects).
    */
   readonly reorderBots: (order: ReadonlyArray<BotId>) => Promise<void>;
+  /** Fetches the local models state; `LocalModelsChanged` keeps it current afterwards. */
+  readonly loadLocalModels: () => Promise<void>;
 }
 
 const StateContext = createContext<Apollo | null>(null);
@@ -197,7 +205,11 @@ export function AppStateProvider({ connection, pairing, children }: { connection
     },
     [connection],
   );
-  return <StateContext.Provider value={{ state, connection, pairing, reorderBots }}>{children}</StateContext.Provider>;
+  const loadLocalModels = useCallback(
+    () => connection.rpc((c) => c["localModels.state"]()).then((localModels) => setState((s) => ({ ...s, localModels }))),
+    [connection],
+  );
+  return <StateContext.Provider value={{ state, connection, pairing, reorderBots, loadLocalModels }}>{children}</StateContext.Provider>;
 }
 
 export const useApollo = () => {

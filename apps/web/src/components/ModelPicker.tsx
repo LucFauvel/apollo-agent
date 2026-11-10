@@ -1,16 +1,14 @@
 import { isDownloaded, type ProviderKind, type Session } from "@apollo/contracts";
 import { Check, ChevronDown, Settings2 } from "lucide-react";
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import { makeChoiceSync, type ModelChoice, withEffort, withModel } from "@apollo/client";
+import { type ReactNode, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { effectiveModel, useModels } from "../models.ts";
 import { errorMessage, rpc } from "../rpc.ts";
 import { useApp } from "../store.ts";
 import { downloadPercent, splitModelId } from "./LocalModelsDialog.tsx";
 import { cx, inputClass, ModelChip, providerName } from "./ui.tsx";
 
-export interface ModelChoice {
-  readonly model: string | null;
-  readonly effort: string | null;
-}
+export type { ModelChoice };
 
 const CUSTOM = "__custom__";
 
@@ -161,23 +159,35 @@ export function ModelMenu({
     };
   }, [open]);
 
+  const [, rerender] = useReducer((n: number) => n + 1, 0);
+  const sync = useMemo(
+    () =>
+      makeChoiceSync({
+        send: (choice) =>
+          rpc((c) => c["sessions.update"]({ sessionId: session.id, model: choice.model, effort: choice.effort })).then((saved) => ({
+            model: saved.model,
+            effort: saved.effort,
+          })),
+        onChange: rerender,
+        onError: (e) => setError(errorMessage(e)),
+      }),
+    [session.id],
+  );
+  useEffect(() => sync.sessionChanged({ model: session.model, effort: session.effort }), [sync, session.model, session.effort]);
+  const shown = sync.shown({ model: session.model, effort: session.effort });
+
   const models = state.status === "ready" ? state.models : [];
   const pending = (localModels?.models ?? []).filter((d) => !isDownloaded(d) && !models.some((m) => m.id === d.id));
-  const current = effectiveModel(models, session.model);
-  const efforts = [...new Set([...(current?.efforts ?? []), ...(session.effort ? [session.effort] : [])])];
+  const current = effectiveModel(models, shown.model);
+  const efforts = [...new Set([...(current?.efforts ?? []), ...(shown.effort ? [shown.effort] : [])])];
   const fallback = models.find((m) => m.isDefault);
+  const shownLabel = shown.model === session.model ? label : (current?.label ?? shown.model);
 
   const update = (choice: ModelChoice) => {
     setError(null);
-    rpc((c) => c["sessions.update"]({ sessionId: session.id, model: choice.model, effort: choice.effort })).catch((e) =>
-      setError(errorMessage(e)),
-    );
+    sync.pick(choice);
   };
-  const pickModel = (model: string | null) => {
-    const next = effectiveModel(models, model);
-    const effort = session.effort !== null && next?.efforts.includes(session.effort) ? session.effort : null;
-    update({ model, effort });
-  };
+  const pickModel = (model: string | null) => update(withModel(models, shown, model));
 
   const row = (key: string, selected: boolean, onSelect: () => void, children: ReactNode, title?: string) => (
     <button
@@ -212,8 +222,8 @@ export function ModelMenu({
       >
         <ModelChip
           provider={session.provider}
-          model={label ?? providerName(session.provider)}
-          effort={session.effort}
+          model={shownLabel ?? providerName(session.provider)}
+          effort={shown.effort}
           className="px-1.5 text-zinc-500"
         />
         <ChevronDown
@@ -236,21 +246,21 @@ export function ModelMenu({
               <div className="px-2.5 py-1.5 text-[12px] text-zinc-500">Could not list models ({state.error}).</div>
             ) : (
               <>
-                {row("default", session.model === null, () => pickModel(null), `Default${fallback ? ` (${fallback.label})` : ""}`)}
-                {models.map((m) => row(m.id, session.model === m.id, () => pickModel(m.id), m.label, m.description || undefined))}
+                {row("default", shown.model === null, () => pickModel(null), `Default${fallback ? ` (${fallback.label})` : ""}`)}
+                {models.map((m) => row(m.id, shown.model === m.id, () => pickModel(m.id), m.label, m.description || undefined))}
                 {pending.map((m) => {
                   const { name, quant } = splitModelId(m.id);
                   return row(
                     m.id,
-                    session.model === m.id,
+                    shown.model === m.id,
                     () => pickModel(m.id),
                     <>
                       {name} {quant ?? ""} <span className="text-zinc-500">· downloading {downloadPercent(m)}%</span>
                     </>,
                   );
                 })}
-                {session.model !== null && !models.some((m) => m.id === session.model) && !pending.some((m) => m.id === session.model)
-                  ? row(session.model, true, () => setOpen(false), <span className="font-mono text-xs">{session.model}</span>)
+                {shown.model !== null && !models.some((m) => m.id === shown.model) && !pending.some((m) => m.id === shown.model)
+                  ? row(shown.model, true, () => setOpen(false), <span className="font-mono text-xs">{shown.model}</span>)
                   : null}
               </>
             )}
@@ -261,14 +271,14 @@ export function ModelMenu({
               <div className="px-2.5 pt-1 pb-1 text-[11px] font-medium text-zinc-500">Effort</div>
               <div className="flex flex-wrap gap-1 px-1.5 pb-1.5">
                 {[null, ...efforts].map((e) => {
-                  const selected = session.effort === e;
+                  const selected = shown.effort === e;
                   return (
                     <button
                       key={e ?? "default"}
                       type="button"
                       role="menuitemradio"
                       aria-checked={selected}
-                      onClick={() => update({ model: session.model, effort: e })}
+                      onClick={() => update(withEffort(shown, e))}
                       className={cx(
                         "rounded-md border px-2 py-0.5 text-[12px]",
                         selected
