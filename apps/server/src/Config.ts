@@ -14,6 +14,11 @@ export interface ServerConfigShape {
   readonly baseUrl: string;
   readonly claudeExecutable: string | undefined;
   readonly codexExecutable: string | undefined;
+  /**
+   * Claude Code's binary comes with the Agent SDK (development runs). The installed app does
+   * not ship it, so it needs the `claude` CLI. Unset: bundled.
+   */
+  readonly claudeBundled?: boolean;
   /** The tailnet addon (apps/server/native/tailnet), loaded to publish Apollo on the tailnet. */
   readonly tailnetAddon: string | undefined;
   /** Defaults for the llama.cpp provider until changed in the settings. */
@@ -80,6 +85,7 @@ export const fromEnv = (env: NodeJS.ProcessEnv = process.env): ServerConfigShape
     },
     claudeExecutable: env.APOLLO_CLAUDE_BIN,
     codexExecutable: env.APOLLO_CODEX_BIN,
+    claudeBundled: env.APOLLO_CLAUDE_BUNDLED !== "0",
     tailnetAddon: env.APOLLO_TAILNET_ADDON || undefined,
     llamaCpp: {
       baseUrl: env.APOLLO_LLAMACPP_URL || "http://127.0.0.1:8080",

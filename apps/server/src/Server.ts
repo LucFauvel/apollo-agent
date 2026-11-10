@@ -9,6 +9,8 @@ import { RpcSerialization, RpcServer } from "effect/rpc";
 import * as Auth from "./auth/Auth.ts";
 import * as Browser from "./browser/Browser.ts";
 import * as Accounts from "./Accounts.ts";
+import * as AgentClis from "./AgentClis.ts";
+import * as AgentCliModels from "./agentCliModels.ts";
 import * as Secrets from "./secrets/Secrets.ts";
 import * as BotProposals from "./bots/BotProposals.ts";
 import * as Compaction from "./Compaction.ts";
@@ -63,7 +65,7 @@ const layerCore = Compaction.layer.pipe(
   Layer.provideMerge(Push.NotificationsSeen.layer),
   Layer.provideMerge(Push.PushSender.expo),
   Layer.provideMerge(Push.Notices.layer),
-  Layer.provideMerge(ProviderVersions.layer),
+  Layer.provideMerge(Layer.mergeAll(ProviderVersions.layer, AgentCliModels.layer)),
   Layer.provideMerge(PullRequests.layer),
   Layer.provideMerge(Layer.mergeAll(Jobs.layer, Monitors.layer)),
   Layer.provideMerge(Layer.mergeAll(Secrets.layer, BotProposals.layer)),
@@ -72,7 +74,7 @@ const layerCore = Compaction.layer.pipe(
   Layer.provideMerge(Layer.mergeAll(Scheduler.layer, Projects.layer)),
   Layer.provideMerge(SessionManager.layer),
   Layer.provideMerge(SessionManager.layerProviders),
-  Layer.provideMerge(LocalModels.layer),
+  Layer.provideMerge(Layer.mergeAll(LocalModels.layer, AgentClis.layer)),
   Layer.provideMerge(ProviderSettings.layer),
   Layer.provideMerge(Tailscale.layer),
   Layer.provideMerge(AppSettings.layer),

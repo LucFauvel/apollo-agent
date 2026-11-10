@@ -7,6 +7,7 @@ import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import { AgentClis } from "./AgentClis.ts";
 import { ServerConfig } from "./Config.ts";
 import { LocalModels } from "./local/LocalModels.ts";
 
@@ -56,12 +57,14 @@ interface Cli {
 const make = Effect.gen(function* () {
   const config = yield* ServerConfig;
   const localModels = yield* LocalModels;
+  const clis = yield* AgentClis;
+  const bundledClaude = config.claudeBundled ?? true;
   const cache = new Map<ProviderKind, { at: number; version: ProviderVersion }>();
   const agentsDir = join(config.dataDir, "agents");
 
   const CLIS: Partial<Record<ProviderKind, Cli>> = {
-    claude: { name: "claude", exe: () => config.claudeExecutable, npm: "@anthropic-ai/claude-code", update: ["update"] },
-    codex: { name: "codex", exe: () => config.codexExecutable ?? "codex", npm: "@openai/codex", update: ["update"] },
+    claude: { name: "claude", exe: () => clis.sessionExecutable("claude"), npm: "@anthropic-ai/claude-code", update: ["update"] },
+    codex: { name: "codex", exe: () => clis.executable("codex"), npm: "@openai/codex", update: ["update"] },
     cursor: { name: "cursor-agent", exe: () => findExecutable(["cursor-agent", "agent"]), update: ["update"] },
     grok: { name: "grok", exe: () => findExecutable(["grok"]), npm: "@xai-official/grok" },
     opencode: { name: "opencode", exe: () => findExecutable(["opencode"]), npm: "opencode-ai", update: ["upgrade"] },
@@ -100,8 +103,12 @@ const make = Effect.gen(function* () {
       const cli = CLIS[kind]!;
       const exe = cli.exe();
       // In development Claude Code comes with Apollo's SDK and updates with it.
-      if (kind === "claude" && !exe) {
+      if (kind === "claude" && !exe && bundledClaude) {
         return { provider: kind, installed: null, latest: null, updateAvailable: false, canUpdate: false, note: "Bundled with Apollo." };
+      }
+      // Claude Code and Codex: Apollo runs their official installers.
+      if (!exe && (kind === "claude" || kind === "codex")) {
+        return { provider: kind, installed: null, latest: null, updateAvailable: false, canUpdate: true, note: "Not installed" };
       }
       if (!exe) {
         // CLIs published on npm: Apollo can install them (npm install -g).
@@ -162,7 +169,14 @@ const make = Effect.gen(function* () {
         const cli = CLIS[kind]!;
         const exe = cli.exe();
         const npm = findExecutable(["npm"]);
-        if (!exe && kind === "claude") return yield* new ApolloError({ code: "invalid", message: "Claude Code is bundled with Apollo here" });
+        if (!exe && kind === "claude" && bundledClaude) return yield* new ApolloError({ code: "invalid", message: "Claude Code is bundled with Apollo here" });
+        if (!exe && (kind === "claude" || kind === "codex")) {
+          yield* clis.install(kind);
+          yield* clis.awaitInstall(kind);
+          const version = yield* check(kind);
+          cache.set(kind, { at: Date.now(), version });
+          return version;
+        }
         // Its own update command when it has one; npm for CLIs published there (install or update).
         const command: readonly [string, ReadonlyArray<string>] | null =
           exe && cli.update ? [exe, cli.update] : cli.npm && npm ? [npm, ["install", "-g", `${cli.npm}@latest`]] : null;

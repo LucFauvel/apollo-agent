@@ -52,7 +52,7 @@ const fs = require("fs"), path = require("path");
 const file = path.join(process.env.CODEX_HOME, "auth.json");
 const [cmd, sub] = process.argv.slice(2);
 if (cmd === "login" && sub === "status") {
-  if (fs.existsSync(file)) console.log("Logged in using ChatGPT"); else { console.error("Not logged in"); process.exit(1); }
+  if (fs.existsSync(file)) console.error("Logged in using ChatGPT"); else { console.error("Not logged in"); process.exit(1); }
 } else if (cmd === "logout") {
   fs.rmSync(file, { force: true });
 } else if (cmd === "login") {
