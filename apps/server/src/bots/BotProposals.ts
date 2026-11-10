@@ -179,8 +179,14 @@ const make = Effect.gen(function* () {
           Effect.timeoutOption(Duration.millis(input.timeoutMs)),
           Effect.onInterrupt(() => resolved(caller.sessionId, requestId, "cancel").pipe(Effect.ignore)),
           Effect.ensuring(
-            Effect.sync(() => pending.delete(requestId)).pipe(
-              Effect.andThen(manager.setWaitingOnUser(caller.sessionId, false).pipe(Effect.ignore)),
+            Effect.sync(() => {
+              pending.delete(requestId);
+              // Another proposal of this session still waits on the user: it keeps "Needs you".
+              return [...pending.values()].some((p) => p.sessionId === caller.sessionId);
+            }).pipe(
+              Effect.flatMap((othersWaiting) =>
+                othersWaiting ? Effect.void : manager.setWaitingOnUser(caller.sessionId, false).pipe(Effect.ignore),
+              ),
             ),
           ),
         );

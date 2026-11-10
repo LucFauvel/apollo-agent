@@ -1796,6 +1796,42 @@ describe("SessionManager", () => {
       }).pipe(Effect.provide(proposalLayer)),
     );
 
+    it.live("keeps needing the user while another proposal still waits", () =>
+      Effect.gen(function* () {
+        let afterFirst: string | null = null;
+        const { status } = yield* propose((proposals, sessionId, first) =>
+          Effect.gen(function* () {
+            const store = yield* Store.Store;
+            const { botId } = yield* store.getSession(sessionId);
+            const second = yield* proposals
+              .propose({ sessionId, botId }, { name: "Pilot", instructions: full.instructions, provider: undefined, model: undefined, timeoutMs: 5000 })
+              .pipe(Effect.result, Effect.forkChild);
+            let card: Card | undefined;
+            for (let i = 0; i < 200 && !card; i++) {
+              const found = (yield* store.listEvents(sessionId, 0))
+                .map((e) => e.event)
+                .find((e) => e._tag === "InputRequested" && e.requestId !== first.requestId);
+              if (found?._tag === "InputRequested") card = found;
+              else yield* Effect.sleep("10 millis");
+            }
+            if (!card) throw new Error("no second proposal card");
+            yield* proposals.respond(sessionId, first.requestId, { action: "decline", values: {} });
+            // The first wait has fully ended (its status update runs before its card is resolved).
+            for (let i = 0; i < 200; i++) {
+              const events = (yield* store.listEvents(sessionId, 0)).map((e) => e.event);
+              if (events.some((e) => e._tag === "InputResolved" && e.requestId === first.requestId)) break;
+              yield* Effect.sleep("10 millis");
+            }
+            afterFirst = (yield* store.getSession(sessionId)).status;
+            yield* proposals.respond(sessionId, card.requestId, { action: "decline", values: {} });
+            yield* Fiber.join(second);
+          }),
+        );
+        expect(afterFirst).toBe("waiting-approval");
+        expect(status).toBe("running");
+      }).pipe(Effect.provide(proposalLayer)),
+    );
+
     it.live("never reuses a workspace left on disk by a deleted bot", () =>
       Effect.gen(function* () {
         const { bots, root } = yield* propose(
