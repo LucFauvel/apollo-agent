@@ -4,8 +4,12 @@
     "noEmit": false,
     "outDir": "dist-electron",
     "rootDir": "src",
-    "allowImportingTsExtensions": false,
-    "rewriteRelativeImportExtensions": false
+    // src/ is also imported by scripts/ (run directly by Node), so its relative imports carry
+    // `.ts` extensions; tsc rewrites them to `.js` in dist-electron.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // Tests run under vitest and are typechecked by tsconfig.scripts.json; never packaged.
+  "exclude": ["src/**/*.test.ts", "src/**/testing/**"]
 }
