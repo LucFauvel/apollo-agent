@@ -1,6 +1,6 @@
-import { type Bot, type BotAvatar as BotAvatarValue, type BotId, type Session, type SessionId, sortBots } from "@apollo/contracts";
+import { type Bot, type BotAvatar as BotAvatarValue, type BotId, type Project, type ProjectId, type Session, type SessionId, sortBots } from "@apollo/contracts";
 import { BlobAvatar } from "./BlobAvatar.tsx";
-import { Archive, Blocks, ChevronRight, MonitorSmartphone, Pause, Plus, Settings, Settings2, Sparkles, SquarePen } from "lucide-react";
+import { Archive, Blocks, ChevronRight, FolderKanban, MonitorSmartphone, Pause, Plus, Settings, Settings2, Sparkles, SquarePen } from "lucide-react";
 import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import { gapAt, moveToGap } from "@apollo/client";
 import { formatUsage, usageTitle } from "../format.ts";
@@ -131,6 +131,46 @@ function SessionRow({ session, selected, onSelect }: { session: Session; selecte
   );
 }
 
+/** A project under its bot, with its sessions nested below it. */
+function ProjectGroup({
+  project,
+  sessions,
+  selectedId,
+  onSelect,
+  onOpen,
+  onNewSession,
+}: {
+  project: Project;
+  sessions: ReadonlyArray<Session>;
+  selectedId: SessionId | null;
+  onSelect: (id: SessionId) => void;
+  onOpen: () => void;
+  onNewSession: () => void;
+}) {
+  const busy = sessions.filter(isBusy).length;
+  return (
+    <div>
+      <div className="group flex items-center rounded-lg pr-1 text-zinc-400 transition-colors hover:bg-zinc-900 hover:text-zinc-200">
+        <button onClick={onOpen} title={project.summary || project.name} className="flex min-w-0 flex-1 items-center gap-2 py-1.5 pl-3 text-left text-[13px]">
+          <FolderKanban className="size-[13px] shrink-0 text-zinc-500" />
+          <span className="min-w-0 flex-1 truncate">{project.name}</span>
+          {busy > 0 ? <span className="text-[10px] text-emerald-400 tabular-nums">{busy}</span> : null}
+        </button>
+        <span className="flex opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+          <IconButton icon={SquarePen} label={`New session in ${project.name}`} size="sm" onClick={onNewSession} />
+        </span>
+      </div>
+      {sessions.length > 0 ? (
+        <div className="ml-[18px] space-y-px border-l border-zinc-800/80 pl-1.5">
+          {sessions.map((s) => (
+            <SessionRow key={s.id} session={s} selected={selectedId === s.id} onSelect={() => onSelect(s.id)} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 /** Where a dragged bot would land: a line above the group (or below the last one). */
 function DropLine({ edge }: { edge: "top" | "bottom" }) {
   return (
@@ -149,9 +189,11 @@ function DropLine({ edge }: { edge: "top" | "bottom" }) {
 function BotGroup({
   bot,
   sessions,
+  projects,
   selectedId,
   onSelect,
   onNewSession,
+  onOpenProject,
   onSettings,
   groupRef,
   dragging,
@@ -161,9 +203,12 @@ function BotGroup({
 }: {
   bot: Bot;
   sessions: ReadonlyArray<Session>;
+  /** The bot's active projects. */
+  projects: ReadonlyArray<Project>;
   selectedId: SessionId | null;
   onSelect: (id: SessionId) => void;
-  onNewSession: (bot: Bot) => void;
+  onNewSession: (bot: Bot, projectId?: ProjectId) => void;
+  onOpenProject: (bot: Bot, projectId: ProjectId) => void;
   onSettings: (bot: Bot) => void;
   groupRef: (el: HTMLDivElement | null) => void;
   /** This bot is being dragged. */
@@ -180,6 +225,8 @@ function BotGroup({
     .sort((a, b) => roleOrder[a.role] - roleOrder[b.role] || b.createdAt - a.createdAt);
   const busy = children.filter(isBusy).length;
   const selected = selectedId === bot.mainSessionId;
+  const shown = new Set(projects.map((p) => p.id));
+  const loose = children.filter((s) => !s.projectId || !shown.has(s.projectId));
 
   return (
     <div ref={groupRef} className={cx("relative transition-opacity", dragging && "opacity-40")}>
@@ -237,9 +284,20 @@ function BotGroup({
           <IconButton icon={SquarePen} label="New session" size="sm" onClick={() => onNewSession(bot)} />
         </span>
       </div>
-      {children.length > 0 ? (
+      {children.length > 0 || projects.length > 0 ? (
         <div className="mt-0.5 ml-[18px] space-y-px border-l border-zinc-800/80 pl-1.5">
-          {children.map((s) => (
+          {projects.map((p) => (
+            <ProjectGroup
+              key={p.id}
+              project={p}
+              sessions={children.filter((s) => s.projectId === p.id)}
+              selectedId={selectedId}
+              onSelect={onSelect}
+              onOpen={() => onOpenProject(bot, p.id)}
+              onNewSession={() => onNewSession(bot, p.id)}
+            />
+          ))}
+          {loose.map((s) => (
             <SessionRow key={s.id} session={s} selected={selectedId === s.id} onSelect={() => onSelect(s.id)} />
           ))}
         </div>
@@ -398,6 +456,7 @@ export function Sidebar({
   onSelect,
   onNewBot,
   onNewSession,
+  onOpenProject,
   onBotSettings,
   onDevices,
   onProviders,
@@ -406,7 +465,8 @@ export function Sidebar({
   selectedId: SessionId | null;
   onSelect: (id: SessionId) => void;
   onNewBot: () => void;
-  onNewSession: (bot: Bot) => void;
+  onNewSession: (bot: Bot, projectId?: ProjectId) => void;
+  onOpenProject: (bot: Bot, projectId: ProjectId) => void;
   onBotSettings: (bot: Bot) => void;
   onDevices: () => void;
   onProviders: () => void;
@@ -415,6 +475,11 @@ export function Sidebar({
   const bots = useApp((s) => s.bots);
   const sessions = useApp((s) => s.sessions);
   const connected = useApp((s) => s.connected);
+  const projects = useApp((s) => s.projects);
+  const activeProjects = useMemo(
+    () => [...projects.values()].filter((p) => p.status === "active").sort((a, b) => a.name.localeCompare(b.name)),
+    [projects],
+  );
   const allSessions = [...sessions.values()];
   const ordered = useMemo(() => sortBots(bots.values()), [bots]);
   const order = useBotDrag(ordered);
@@ -442,9 +507,11 @@ export function Sidebar({
             key={bot.id}
             bot={bot}
             sessions={allSessions.filter((s) => s.botId === bot.id)}
+            projects={activeProjects.filter((p) => p.botId === bot.id)}
             selectedId={selectedId}
             onSelect={onSelect}
             onNewSession={onNewSession}
+            onOpenProject={onOpenProject}
             onSettings={onBotSettings}
             groupRef={order.groupRef(bot.id)}
             dragging={order.dragging === bot.id}

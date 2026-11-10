@@ -14,6 +14,7 @@ import {
   ScheduleRun,
   UpdateScheduleInput,
 } from "./schedule.ts";
+import { CreateProjectInput, Project, ProjectsChange, UpdateProjectInput } from "./projects.ts";
 import { OnePasswordField, OnePasswordItem, OnePasswordStatus, SecretResponse } from "./secrets.ts";
 import { BrowserFrame, BrowserInput, BrowserStatus, BrowserTab } from "./browser.ts";
 import { LlamaBackend, LocalModelsState, ModelCandidate, ModelDetails, SuggestedModel } from "./local.ts";
@@ -37,6 +38,7 @@ import {
   MemoryKind,
   PairedClient,
   PairingToken,
+  ProjectId,
   ModelOption,
   ProviderKind,
   ProviderSettings,
@@ -195,6 +197,8 @@ export const CreateSessionInput = Schema.Struct({
   isolation: Schema.optional(Schema.Literals(["shared", "worktree"])),
   /** Optional first message, sent as soon as the session exists. */
   prompt: Schema.optional(Schema.String),
+  /** Start it in one of the bot's projects: it gets the project's context, and its workspace by default. */
+  projectId: Schema.optional(ProjectId),
 });
 export type CreateSessionInput = typeof CreateSessionInput.Type;
 
@@ -285,6 +289,14 @@ export class ApolloRpcs extends RpcGroup.make(
   Rpc.make("bots.stop", { payload: { botId: BotId }, success: Bot, error }),
   /** Lifts a pause. Fails while the bot is over today's budget. */
   Rpc.make("bots.resume", { payload: { botId: BotId }, success: Bot, error }),
+
+  // --- projects (long-standing work under a bot) --------------------------
+  /** Every project, then each change (its own stream: see ProjectsChange). */
+  Rpc.make("projects.watch", { success: ProjectsChange, stream: true }),
+  Rpc.make("projects.create", { payload: CreateProjectInput, success: Project, error }),
+  Rpc.make("projects.update", { payload: UpdateProjectInput, success: Project, error }),
+  /** Deletes the project and its memories; its sessions stay, outside any project. */
+  Rpc.make("projects.delete", { payload: { projectId: ProjectId }, error }),
 
   // --- sessions ----------------------------------------------------------
   Rpc.make("sessions.create", { payload: CreateSessionInput, success: Session, error }),

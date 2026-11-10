@@ -33,6 +33,9 @@ import {
   type BotAvatar,
   seededAvatar,
   type SessionWorktree,
+  type Project,
+  type ProjectId,
+  type ProjectStatus,
 } from "@apollo/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -99,6 +102,7 @@ const toSession = (r: Row): Session => ({
   runtimeMode: (r.runtime_mode as RuntimeMode | null) ?? null,
   cwd: r.cwd as string,
   worktree: r.worktree ? (JSON.parse(r.worktree as string) as SessionWorktree) : null,
+  projectId: (r.project_id as ProjectId | null) ?? null,
   context: r.context ? (JSON.parse(r.context as string) as Session["context"]) : null,
   // Plan limits are kept per provider account (account_limits), not per session.
   limits: null,
@@ -118,8 +122,21 @@ const toMemory = (r: Row): Memory => ({
   content: r.content as string,
   tags: JSON.parse(r.tags as string) as Array<string>,
   sourceSessionId: (r.source_session_id as SessionId | null) ?? null,
+  projectId: (r.project_id as ProjectId | null) ?? null,
   createdAt: Number(r.created_at),
   lastUsedAt: r.last_used_at === null || r.last_used_at === undefined ? null : Number(r.last_used_at),
+});
+
+const toProject = (r: Row): Project => ({
+  id: r.id as ProjectId,
+  botId: r.bot_id as BotId,
+  name: r.name as string,
+  summary: r.summary as string,
+  context: r.context as string,
+  cwd: (r.cwd as string | null) ?? null,
+  status: r.status as ProjectStatus,
+  createdAt: Number(r.created_at),
+  updatedAt: Number(r.updated_at),
 });
 
 /** Today in the server's time zone, as YYYY-MM-DD. */
@@ -208,6 +225,7 @@ export interface SessionPatch {
   readonly cwd?: string;
   readonly worktree?: SessionWorktree | null;
   readonly context?: Session["context"];
+  readonly projectId?: ProjectId | null;
 }
 
 /**
@@ -390,8 +408,8 @@ const makeStore = (db: DatabaseSync) => {
       Effect.sync(() => {
         run(
           `insert into sessions (id, bot_id, role, parent_session_id, title, provider, model, effort,
-             runtime_mode, cwd, status, resume_id, last_message, completed_turns, created_at, updated_at, worktree)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             runtime_mode, cwd, status, resume_id, last_message, completed_turns, created_at, updated_at, worktree, project_id)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           session.id,
           session.botId,
           session.role,
@@ -409,6 +427,7 @@ const makeStore = (db: DatabaseSync) => {
           session.createdAt,
           session.updatedAt,
           session.worktree ? JSON.stringify(session.worktree) : null,
+          session.projectId ?? null,
         );
         return session;
       }),
@@ -418,7 +437,7 @@ const makeStore = (db: DatabaseSync) => {
         const next: Session = { ...current, ...patch, updatedAt: Date.now() };
         run(
           `update sessions set title = ?, status = ?, resume_id = ?, last_message = ?, model = ?,
-             effort = ?, runtime_mode = ?, updated_at = ?, cwd = ?, worktree = ?, context = ? where id = ?`,
+             effort = ?, runtime_mode = ?, updated_at = ?, cwd = ?, worktree = ?, context = ?, project_id = ? where id = ?`,
           next.title,
           next.status,
           next.resumeId,
@@ -430,6 +449,7 @@ const makeStore = (db: DatabaseSync) => {
           next.cwd,
           next.worktree ? JSON.stringify(next.worktree) : null,
           next.context ? JSON.stringify(next.context) : null,
+          next.projectId ?? null,
           id,
         );
         return next;
@@ -578,16 +598,22 @@ const makeStore = (db: DatabaseSync) => {
             )
         ).map(toMemory),
       ),
-    searchMemories: (botId: BotId, text: string, limit: number) =>
+    /**
+     * The bot's and global memories, plus those of `projectId` when given. Other projects'
+     * memories stay in their project.
+     */
+    searchMemories: (botId: BotId, text: string, limit: number, projectId: ProjectId | null = null) =>
       Effect.sync(() => {
         const match = ftsQuery(text);
         if (match.length === 0) return [];
         const found = all(
           `select m.* from memories_fts f join memories m on m.rowid = f.rowid
            where memories_fts match ? and (m.bot_id = ? or m.bot_id is null)
+             and (m.project_id is null or m.project_id = ?)
            order by bm25(memories_fts) limit ?`,
           match,
           botId,
+          projectId ?? "",
           limit,
         ).map(toMemory);
         // Recall keeps a memory alive: compaction evicts the least recently used.
@@ -601,13 +627,16 @@ const makeStore = (db: DatabaseSync) => {
       readonly content: string;
       readonly tags: ReadonlyArray<string>;
       readonly sourceSessionId: SessionId | null;
+      readonly projectId?: ProjectId | null;
     }) =>
       Effect.sync((): Memory => {
         // Saving something already known refreshes it instead of duplicating it.
         const key = dedupeKey(input.content);
         const sameScope = all(
-          "select * from memories where coalesce(bot_id, '') = ? and length(content) between ? and ?",
+          `select * from memories where coalesce(bot_id, '') = ? and coalesce(project_id, '') = ?
+             and length(content) between ? and ?`,
           input.botId ?? "",
+          input.projectId ?? "",
           key.length - 8,
           input.content.length + 8,
         ).find((r) => dedupeKey(r.content as string) === key);
@@ -623,12 +652,13 @@ const makeStore = (db: DatabaseSync) => {
           content: input.content,
           tags: [...input.tags],
           sourceSessionId: input.sourceSessionId,
+          projectId: input.projectId ?? null,
           createdAt: Date.now(),
           lastUsedAt: null,
         };
         run(
-          `insert into memories (id, bot_id, kind, content, tags, source_session_id, created_at)
-           values (?, ?, ?, ?, ?, ?, ?)`,
+          `insert into memories (id, bot_id, kind, content, tags, source_session_id, created_at, project_id)
+           values (?, ?, ?, ?, ?, ?, ?, ?)`,
           memory.id,
           memory.botId,
           memory.kind,
@@ -636,15 +666,72 @@ const makeStore = (db: DatabaseSync) => {
           JSON.stringify(memory.tags),
           memory.sourceSessionId,
           memory.createdAt,
+          memory.projectId ?? null,
         );
         return memory;
       }),
+    /** A project's memories, most recently used first. */
+    projectMemories: (projectId: ProjectId, limit: number) =>
+      Effect.sync(() =>
+        all(
+          "select * from memories where project_id = ? order by coalesce(last_used_at, created_at) desc limit ?",
+          projectId,
+          limit,
+        ).map(toMemory),
+      ),
     getMemory: (id: MemoryId) =>
       Effect.suspend(() => {
         const row = get("select * from memories where id = ?", id);
         return row ? Effect.succeed(toMemory(row)) : Effect.fail(notFound(`memory ${id}`));
       }),
     deleteMemory: (id: MemoryId) => Effect.sync(() => void run("delete from memories where id = ?", id)),
+
+    // --- projects --------------------------------------------------------
+    listProjects: (botId?: BotId) =>
+      Effect.sync(() =>
+        (botId
+          ? all("select * from projects where bot_id = ? order by created_at", botId)
+          : all("select * from projects order by created_at")
+        ).map(toProject),
+      ),
+    getProject: (id: ProjectId) =>
+      Effect.suspend(() => {
+        const row = get("select * from projects where id = ?", id);
+        return row ? Effect.succeed(toProject(row)) : Effect.fail(notFound(`project ${id}`));
+      }),
+    insertProject: (project: Project) =>
+      Effect.sync(() => {
+        run(
+          `insert into projects (id, bot_id, name, summary, context, cwd, status, created_at, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          project.id,
+          project.botId,
+          project.name,
+          project.summary,
+          project.context,
+          project.cwd,
+          project.status,
+          project.createdAt,
+          project.updatedAt,
+        );
+        return project;
+      }),
+    updateProject: (project: Project) =>
+      Effect.sync(() => {
+        run(
+          "update projects set name = ?, summary = ?, context = ?, cwd = ?, status = ?, updated_at = ? where id = ?",
+          project.name,
+          project.summary,
+          project.context,
+          project.cwd,
+          project.status,
+          project.updatedAt,
+          project.id,
+        );
+        return project;
+      }),
+    /** Deletes the project and its memories; its sessions stay, outside any project. */
+    deleteProject: (id: ProjectId) => Effect.sync(() => void run("delete from projects where id = ?", id)),
 
     // --- core memory -----------------------------------------------------
     /** The user profile (shared by every bot) and this bot's notes. */

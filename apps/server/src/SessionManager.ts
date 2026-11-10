@@ -21,6 +21,7 @@ import {
   EMPTY_USAGE,
   type InputResponse,
   type MessageAuthor,
+  type ProjectId,
   type ProviderKind,
   type ProviderSelection,
   type Session,
@@ -254,6 +255,28 @@ const make = Effect.gen(function* () {
   /** How long a deletion waits for session creations under way (a git worktree, say). */
   const CREATION_DRAIN_MS = 30_000;
 
+  /** Projects being deleted: no session may be created in them meanwhile. */
+  const deletingProjects = new Set<ProjectId>();
+  /** Session creations under way, per project: a project's deletion waits for them. */
+  const creatingInProjects = new Map<ProjectId, number>();
+  const creatingInProject = <A, E, R>(projectId: ProjectId | null | undefined, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E | ApolloError, R> =>
+    Effect.suspend((): Effect.Effect<A, E | ApolloError, R> => {
+      if (!projectId) return effect;
+      if (deletingProjects.has(projectId)) {
+        return Effect.fail(new ApolloError({ code: "not_found", message: `project ${projectId} not found (it is being deleted)` }));
+      }
+      creatingInProjects.set(projectId, (creatingInProjects.get(projectId) ?? 0) + 1);
+      return effect.pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            const left = (creatingInProjects.get(projectId) ?? 1) - 1;
+            if (left > 0) creatingInProjects.set(projectId, left);
+            else creatingInProjects.delete(projectId);
+          }),
+        ),
+      );
+    });
+
   /** Any failure, defects included, as an ApolloError saying what failed (interruptions stay). */
   const asApolloError =
     (what: string) =>
@@ -284,6 +307,7 @@ const make = Effect.gen(function* () {
       const entry = live.get(id);
       if (!entry) return Effect.void;
       live.delete(id);
+      staleLive.delete(id);
       tokens.delete(entry.token);
       return Scope.close(entry.scope, Exit.void);
     });
@@ -439,11 +463,53 @@ const make = Effect.gen(function* () {
       lockFor(id),
       Effect.gen(function* () {
         const existing = live.get(id);
-        if (existing) return existing;
+        if (existing) {
+          if (!staleLive.has(id)) return existing;
+          // A turn still running on it keeps it until it ends (see reopenWithNewSettings).
+          if (isBusy((yield* store.getSession(id)).status)) {
+            pendingReopen.add(id);
+            return existing;
+          }
+          staleLive.delete(id);
+          generations.delete(id);
+          yield* closeLive(id);
+        }
+        for (let attempt = 0; ; attempt++) {
+          opening.add(id);
+          staleWhileOpening.delete(id);
+          const entry = yield* openProcess(id, forTurn).pipe(Effect.ensuring(Effect.sync(() => opening.delete(id))));
+          // Its instructions were read before a change that should reach it: open it again with fresh ones.
+          if (!staleWhileOpening.delete(id)) return entry;
+          if (attempt >= 2) {
+            // Changes keep coming: serve with this one, and replace it once the turn it opened
+            // for ends, or else the next time it is needed.
+            if (forTurn) pendingReopen.add(id);
+            else staleLive.add(id);
+            return entry;
+          }
+          generations.delete(id);
+          yield* closeLive(id);
+        }
+      }),
+    );
 
+  /** Sessions whose agent process is being opened (see `refreshInstructions`). */
+  const opening = new Set<SessionId>();
+  /** Sessions whose instructions went stale while their process was opening. */
+  const staleWhileOpening = new Set<SessionId>();
+  /** Live processes with stale instructions, replaced the next time they are needed. */
+  const staleLive = new Set<SessionId>();
+
+  const openProcess = (id: SessionId, forTurn: boolean): Effect.Effect<LiveSession, ApolloError> =>
+      Effect.gen(function* () {
         const session = yield* store.getSession(id);
         const bot = yield* store.getBot(session.botId);
-        const [core, skills] = yield* Effect.all([store.getCoreMemory(bot.id), store.listSkills(bot.id)]);
+        const [core, skills, projects] = yield* Effect.all([
+          store.getCoreMemory(bot.id),
+          store.listSkills(bot.id),
+          store.listProjects(bot.id),
+        ]);
+        const project = session.projectId ? (projects.find((p) => p.id === session.projectId) ?? null) : null;
         const skillsPluginDir = yield* syncBotSkills(bot.id).pipe(
           Effect.as(pluginDir(config.dataDir, bot.id)),
           Effect.catch((cause) => Effect.logWarning("skill sync failed", cause).pipe(Effect.as(null))),
@@ -474,6 +540,8 @@ const make = Effect.gen(function* () {
                 core,
                 skills,
                 projectFolders,
+                projects: session.role === "main" ? projects : [],
+                project,
                 // Lists come from this machine's logins: not this bot's when it runs on another account.
                 connectors: Object.fromEntries(
                   [...connectorCache]
@@ -507,8 +575,7 @@ const make = Effect.gen(function* () {
         tokens.set(token, id);
         if (!forTurn) yield* updateSession(id, { status: "idle" });
         return entry;
-      }),
-    );
+      });
 
   // --- guardrails -----------------------------------------------------------
 
@@ -955,46 +1022,75 @@ const make = Effect.gen(function* () {
     readonly parentSessionId: SessionId | null;
     readonly id?: SessionId;
     readonly isolation?: "shared" | "worktree" | undefined;
+    readonly projectId?: ProjectId | null | undefined;
   }) =>
-    creatingFor(input.botId, Effect.gen(function* () {
+    creatingFor(input.botId, creatingInProject(input.projectId, Effect.gen(function* () {
       const bot = yield* store.getBot(input.botId);
+      const project = input.projectId ? yield* store.getProject(input.projectId) : null;
+      if (project && project.botId !== bot.id) return yield* invalid("that project belongs to another bot");
       const now = Date.now();
       const id = input.id ?? newId<SessionId>("ses");
-      let cwd = input.cwd?.trim() ? appSettings.expand(input.cwd) : bot.cwd;
-      let worktree: SessionWorktree | null = null;
-      if (input.isolation === "worktree") {
-        const created = yield* Effect.tryPromise({
-          try: () => createWorktree(config.dataDir, id, cwd, input.title),
-          catch: (error) => invalid(`could not create a worktree: ${(error as Error).message}`),
-        });
-        worktree = created.worktree;
-        cwd = created.cwd;
-      }
-      const session = yield* store.insertSession({
-        id,
-        botId: bot.id,
-        role: input.role,
-        parentSessionId: input.parentSessionId,
-        title: input.title.trim() || "Untitled session",
-        provider: input.provider.provider,
-        model: input.provider.model ?? null,
-        effort: input.provider.effort ?? null,
-        runtimeMode: null,
-        cwd,
-        worktree,
-        context: null,
-        limits: null,
-        status: "idle",
-        resumeId: null,
-        lastMessage: null,
-        completedTurns: 0,
-        usage: EMPTY_USAGE,
-        createdAt: now,
-        updatedAt: now,
-      });
+      let cwd = input.cwd?.trim() ? appSettings.expand(input.cwd) : (project?.cwd ?? bot.cwd);
+      // From the worktree to the saved session nothing is cut short: an interruption while Git
+      // runs would leave a checkout and branch that no session owns. It lands once the worktree
+      // exists, and removes it.
+      const session = yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          let worktree: SessionWorktree | null = null;
+          if (input.isolation === "worktree") {
+            const created = yield* Effect.tryPromise({
+              try: () => createWorktree(config.dataDir, id, cwd, input.title),
+              catch: (error) => invalid(`could not create a worktree: ${(error as Error).message}`),
+            });
+            worktree = created.worktree;
+            cwd = created.cwd;
+          }
+          const discard = Effect.suspend(() => {
+            const orphan = worktree;
+            return orphan ? Effect.promise(() => finishWorktree(orphan, "discard").catch(() => undefined)) : Effect.void;
+          });
+          yield* restore(Effect.yieldNow).pipe(Effect.onInterrupt(() => discard));
+          return yield* store
+            .insertSession({
+              id,
+              botId: bot.id,
+              role: input.role,
+              parentSessionId: input.parentSessionId,
+              title: input.title.trim() || "Untitled session",
+              provider: input.provider.provider,
+              model: input.provider.model ?? null,
+              effort: input.provider.effort ?? null,
+              runtimeMode: null,
+              cwd,
+              worktree,
+              projectId: project?.id ?? null,
+              context: null,
+              limits: null,
+              status: "idle",
+              resumeId: null,
+              lastMessage: null,
+              completedTurns: 0,
+              usage: EMPTY_USAGE,
+              createdAt: now,
+              updatedAt: now,
+            })
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.gen(function* () {
+                  yield* discard;
+                  const error = Cause.squash(cause);
+                  return yield* new ApolloError({
+                    code: "internal",
+                    message: `could not save the session: ${error instanceof Error ? error.message : String(error)}`,
+                  });
+                }),
+              ),
+            );
+        }),
+      );
       yield* publish({ _tag: "SessionUpserted", session });
       return session;
-    }));
+    })));
 
   // --- settings -------------------------------------------------------------
 
@@ -1218,6 +1314,7 @@ const make = Effect.gen(function* () {
         cwd: source.cwd,
         role: "reflection",
         parentSessionId: source.id,
+        projectId: source.projectId ?? null,
       });
       reflecting = reflection.id;
       // A reflection that never answers must not hold the line forever.
@@ -1663,6 +1760,7 @@ const make = Effect.gen(function* () {
       readonly parentSessionId?: SessionId | null;
       readonly notifyParent?: boolean;
       readonly author?: MessageAuthor;
+      readonly projectId?: ProjectId | null | undefined;
     }) =>
       // Gated as a whole, so a bot's deletion also waits for its untitled entry and first message.
       creatingFor(input.botId, Effect.gen(function* () {
@@ -1676,6 +1774,7 @@ const make = Effect.gen(function* () {
           isolation: input.isolation,
           role: "worker",
           parentSessionId: input.parentSessionId ?? null,
+          projectId: input.projectId,
         });
         if (!named) {
           untitled.add(session.id);
@@ -1786,6 +1885,37 @@ const make = Effect.gen(function* () {
 
     /** Resolves an MCP bearer token to the session it was issued to. */
     resolveToken: (token: string) => Effect.sync(() => tokens.get(token)),
+
+    /**
+     * Gives a live session fresh instructions (after the bot's projects changed): its process
+     * closes, after a running turn, and the next message resumes the conversation with them.
+     */
+    refreshInstructions: (id: SessionId) =>
+      Effect.suspend(() => {
+        if (opening.has(id)) {
+          staleWhileOpening.add(id);
+          return Effect.void;
+        }
+        return reopenWithNewSettings(id);
+      }).pipe(Effect.catch(() => Effect.void)),
+
+    /**
+     * Runs a project's deletion once the sessions being created in it exist (they are then
+     * moved out of it), with no new ones starting meanwhile.
+     */
+    deletingProject: <A, E, R>(projectId: ProjectId, effect: Effect.Effect<A, E, R>) =>
+      Effect.gen(function* () {
+        if (deletingProjects.has(projectId)) return yield* invalid("that project is already being deleted");
+        deletingProjects.add(projectId);
+        const until = Date.now() + CREATION_DRAIN_MS;
+        while (creatingInProjects.has(projectId)) {
+          if (Date.now() > until) {
+            return yield* new ApolloError({ code: "internal", message: "a session is still being created in the project; try again" });
+          }
+          yield* Effect.sleep("10 millis");
+        }
+        return yield* effect;
+      }).pipe(Effect.ensuring(Effect.sync(() => deletingProjects.delete(projectId)))),
 
     publishMemoryChanged: (botId: BotId | null) => publish({ _tag: "MemoryChanged", botId }),
     /** Announces a skill change and refreshes the native skill folders. */

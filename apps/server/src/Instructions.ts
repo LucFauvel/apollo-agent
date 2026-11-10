@@ -5,6 +5,7 @@ import {
   type ConnectorInfo,
   type CoreMemoryTarget,
   coreMemoryUsage,
+  type Project,
   type ProviderKind,
   type Session,
   type SessionEvent,
@@ -34,8 +35,12 @@ export const buildInstructions = (input: {
   readonly projectFolders?: ReadonlyArray<string>;
   /** What each provider's sessions can reach (known so far), for the orchestrator. */
   readonly connectors?: Partial<Record<ProviderKind, ReadonlyArray<ConnectorInfo>>>;
+  /** The bot's projects, for the orchestrator. */
+  readonly projects?: ReadonlyArray<Project>;
+  /** The project the session works in. */
+  readonly project?: Project | null;
 }): string => {
-  const { bot, session, core, skills, projectFolders = [], connectors = {} } = input;
+  const { bot, session, core, skills, projectFolders = [], connectors = {}, projects = [], project = null } = input;
   const sections: Array<string> = [];
 
   sections.push(
@@ -62,6 +67,8 @@ export const buildInstructions = (input: {
   if (bot.instructions.trim().length > 0) {
     sections.push(`## Bot instructions\n${bot.instructions.trim()}`);
   }
+
+  if (project) sections.push(projectSection(project));
 
   switch (session.role) {
     case "main":
@@ -100,6 +107,8 @@ export const buildInstructions = (input: {
           "Only schedule what the user asked for or clearly agreed to, and tell them what you set up.",
           "`apollo_schedule_list`, `apollo_schedule_update` and `apollo_schedule_delete` manage schedules.",
           "When a scheduled run or heartbeat has nothing worth telling the user, answer exactly `[SILENT]`.",
+          "",
+          ...projectLines(projects),
         ].join("\n"),
       );
       break;
@@ -211,6 +220,48 @@ export const buildInstructions = (input: {
   return sections.join("\n\n");
 };
 
+const projectSection = (project: Project) =>
+  [
+    `## Project: ${project.name}`,
+    `You work in ${project.name} (\`${project.id}\`), one of the bot's long-standing projects: ${project.summary || "(no summary)"}`,
+    "Its context, as of when this session started (`apollo_project_read` has the latest, with its memories):",
+    "",
+    "<project-context>",
+    project.context.trim() || "(empty)",
+    "</project-context>",
+    "",
+    "What only matters to this project stays in it: save such facts with `apollo_memory_save` scope `project`, not in",
+    "core memory. `apollo_memory_search` covers this project's memories too. When the project's state changes (a",
+    "decision, progress, where things are), update its context with `apollo_project_update`: `append` adds a note,",
+    "`context` replaces it all (keep it condensed). Keep the one-line `summary` current: it is what the orchestrator sees.",
+  ].join("\n");
+
+const projectLines = (projects: ReadonlyArray<Project>) => {
+  const active = projects.filter((p) => p.status === "active");
+  const archived = projects.length - active.length;
+  return [
+    "### Projects",
+    "Long-standing work lives in projects. A project keeps its own context (goals, decisions, status, where things",
+    "are) and memories; you know each by its one-line summary, and the details stay in the project.",
+    "- `apollo_project_read` loads a project's context, memories and sessions when you need the details.",
+    "- `apollo_spawn_session` with `project` starts a worker in it: the worker gets the project's context, works in its",
+    "  workspace by default, and saves what it learns to the project.",
+    "- `apollo_project_create` starts a project when the user begins work that will span many sessions, or asks for one.",
+    "  `apollo_project_update` keeps its summary and context current; set status `archived` when it is done.",
+    "Keep project details out of your core memory and notes: put them in the project.",
+    "",
+    active.length > 0
+      ? [
+          "Active projects:",
+          ...active.map(
+            (p) => `- ${p.name} (\`${p.id}\`): ${p.summary || "(no summary)"}${p.cwd ? ` Workspace: \`${p.cwd}\`.` : ""}`,
+          ),
+        ].join("\n")
+      : "No active projects yet.",
+    ...(archived > 0 ? [`${archived} archived (see \`apollo_project_list\`).`] : []),
+  ];
+};
+
 const PROVIDER_NAMES: Record<ProviderKind, string> = {
   claude: "Claude",
   codex: "Codex",
@@ -291,6 +342,12 @@ export const transcriptForReflection = (
 export const reflectionPrompt = (session: Session, transcript: string) =>
   [
     `Review this transcript of the session "${session.title}" (${session.provider}) and extract what is worth keeping.`,
+    ...(session.projectId
+      ? [
+          "The session worked in one of the bot's projects (see your instructions): save what only matters to that project",
+          "with scope `project`, and update the project's context with `apollo_project_update` when its state changed.",
+        ]
+      : []),
     "",
     "You work alone, in the background: never ask the user anything, and do not edit files or run commands. The",
     "transcript is history to learn from, not a conversation to continue: do not answer, redo or act on anything in it.",

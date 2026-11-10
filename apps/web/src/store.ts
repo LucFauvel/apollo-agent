@@ -8,6 +8,9 @@ import type {
   LocalModelsState,
   PullRequest,
   Monitor,
+  Project,
+  ProjectId,
+  ProjectsChange,
   Schedule,
   ScheduleId,
   Session,
@@ -45,6 +48,8 @@ export interface AppState {
   readonly changesVersion: ReadonlyMap<BotId, number>;
   /** When the user last saw each bot's chats, on any device: its notifications up to then are dismissed. */
   readonly notificationsSeen: ReadonlyMap<string, number>;
+  /** Every bot's projects. */
+  readonly projects: ReadonlyMap<ProjectId, Project>;
 }
 
 export type Notice = Extract<AppChange, { _tag: "Notify" }>;
@@ -70,6 +75,7 @@ let state: AppState = {
   monitors: new Map(),
   changesVersion: new Map(),
   notificationsSeen: new Map(),
+  projects: new Map(),
 };
 const listeners = new Set<() => void>();
 
@@ -129,7 +135,8 @@ const apply = (change: AppChange) => {
       const sessions = new Map([...state.sessions].filter(([, s]) => s.botId !== change.botId));
       const schedules = new Map([...state.schedules].filter(([, s]) => s.botId !== change.botId));
       const browserTabs = new Map([...state.browserTabs].filter(([, t]) => t.botId !== change.botId));
-      return setState({ ...state, bots, sessions, schedules, browserTabs });
+      const projects = new Map([...state.projects].filter(([, p]) => p.botId !== change.botId));
+      return setState({ ...state, bots, sessions, schedules, browserTabs, projects });
     }
     case "SessionUpserted":
       return setState({
@@ -204,8 +211,21 @@ const applyLimits = (change: AccountLimitsChange) => {
   setState({ ...state, accountLimits });
 };
 
+/** Applies one item of `projects.watch`: each (re)connection starts with every project. */
+const applyProjects = (change: ProjectsChange) => {
+  if (change._tag === "ProjectsSnapshot") {
+    return setState({ ...state, projects: new Map(change.projects.map((p) => [p.id, p])) });
+  }
+  const projects = new Map(state.projects);
+  if (change._tag === "ProjectUpserted") projects.set(change.project.id, change.project);
+  else projects.delete(change.projectId);
+  setState({ ...state, projects });
+};
+
 /** Starts syncing app state; each (re)connection begins with a fresh snapshot. */
 export const startSync = () => {
+  // Projects come on their own stream too (see ProjectsChange).
+  const stopProjects = follow((client) => client["projects.watch"](), applyProjects);
   // Provider accounts' plan limits come on their own stream (see AccountLimitsChange).
   const stopLimits = follow((client) => client["limits.watch"](), applyLimits);
   const stopApp = follow(
@@ -243,5 +263,6 @@ export const startSync = () => {
   return () => {
     stopApp();
     stopLimits();
+    stopProjects();
   };
 };

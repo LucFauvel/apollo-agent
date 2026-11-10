@@ -26,6 +26,7 @@ import * as PullRequests from "./pullRequests/PullRequests.ts";
 import * as Jobs from "./jobs/Jobs.ts";
 import * as Monitors from "./monitors/Monitors.ts";
 import * as ProviderSettings from "./ProviderSettings.ts";
+import * as Projects from "./projects/Projects.ts";
 import * as RpcHandlers from "./RpcHandlers.ts";
 import * as Scheduler from "./schedule/Scheduler.ts";
 import * as SessionManager from "./SessionManager.ts";
@@ -67,7 +68,7 @@ const layerCore = Compaction.layer.pipe(
   Layer.provideMerge(Secrets.layer),
   Layer.provideMerge(Accounts.layer),
   Layer.provideMerge(Browser.layer),
-  Layer.provideMerge(Scheduler.layer),
+  Layer.provideMerge(Layer.mergeAll(Scheduler.layer, Projects.layer)),
   Layer.provideMerge(SessionManager.layer),
   Layer.provideMerge(SessionManager.layerProviders),
   Layer.provideMerge(LocalModels.layer),

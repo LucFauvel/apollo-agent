@@ -11,6 +11,8 @@ Apollo is a desktop app for running **bots**: long-lived personas that orchestra
   `apollo_wait_session`, …). Workers report back when they finish a turn.
 - Memory and skills live in Apollo, not in either agent, so whatever one provider
   learns, the other can use.
+- A bot can hold long-standing **projects**. Each keeps its own context and memories; the
+  orchestrator knows it by a one-line summary, and workers can be started inside it.
 - A **built-in browser** gives every session a real Chromium to read and drive web pages
   and local dev servers. You watch its tabs live in the Browser panel and can take over.
 - Agents can **show visuals** (charts, tables, mockups) in the conversation, and **ask for
@@ -117,6 +119,27 @@ manifest in them, up to two levels deep. You can pick one of those projects as a
 every session can read and edit them: Claude gets them as `additionalDirectories`, Codex as writable
 sandbox roots. Agents find projects with `apollo_list_projects`. The default workspace root can also
 be changed in Settings.
+
+### Bot projects
+
+Not to be confused with the project folders above: a bot's **projects** are long-standing pieces of work
+(a product, a migration, a launch) that span many sessions. Each has a name, a one-line summary, an
+optional workspace, a markdown **context** (goals, decisions, status, where things are) and its own
+**memories**.
+
+- The orchestrator's prompt lists active projects by name and summary only; the details stay in the project.
+- A session started in a project (from the sidebar, the Projects panel, or `apollo_spawn_session` with
+  `project`) gets the project's context in its prompt and works in its workspace. It saves what only matters
+  to the project with `apollo_memory_save` scope `project`, and `apollo_memory_search` finds those memories
+  only from inside the project. Its reflections save to the project too.
+- `apollo_project_list`, `apollo_project_read`, `apollo_project_create` (orchestrator) and
+  `apollo_project_update` (`append` adds a note to the context) manage them. A session in a project
+  reaches only its own project.
+- The sidebar shows each bot's active projects with their sessions nested under them; the Projects
+  panel edits them. Archive a project when it is done; deleting it deletes its memories and moves its
+  sessions out of it.
+- Projects sync on their own `projects.watch` stream rather than `app.changes`, so installed clients
+  built before projects keep syncing.
 
 ### Built-in browser
 

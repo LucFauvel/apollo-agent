@@ -328,6 +328,23 @@ export const MIGRATIONS: ReadonlyArray<string> = [
   ) group by account;
   update sessions set limits = null;
   `,
+  // 23: projects under a bot, the sessions started in them, and memories kept in them.
+  `
+  create table projects (
+    id text primary key,
+    bot_id text not null references bots(id) on delete cascade,
+    name text not null,
+    summary text not null,
+    context text not null,
+    cwd text,
+    status text not null,               -- 'active' | 'archived'
+    created_at integer not null,
+    updated_at integer not null
+  );
+  create index projects_bot on projects(bot_id);
+  alter table sessions add column project_id text references projects(id) on delete set null;
+  alter table memories add column project_id text references projects(id) on delete cascade;
+  `,
 ];
 
 /**
