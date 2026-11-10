@@ -3,8 +3,10 @@
  * SHA256SUMS) into one release directory: the assets, the merged apollo-update.json and one
  * SHA256SUMS. Every asset is re-hashed against its partial manifest and SUMS first.
  *
- *   node apps/desktop/scripts/release/merge-manifests.ts --out <dir> --version X.Y.Z --commit <sha> <build dir>...
+ *   node apps/desktop/scripts/release/merge-manifests.ts --out <dir> --version X.Y.Z --commit <sha> [--channel release|nightly] <build dir>...
  *
+ * `--channel nightly` (the nightly-publish job) merges a main-branch nightly instead: same targets
+ * and signing policy (an ad-hoc macOS build is never published), channel `nightly`.
  * A release must cover exactly RELEASE_TARGETS (manifest.ts), be signed per RELEASE_SIGNING
  * (release-checks.ts: macOS Developer ID; Windows Authenticode or, for now, unsigned), and its
  * version and commit must be the ones given (the tag's).
@@ -23,7 +25,7 @@ import {
   sha256File,
   SUMS_NAME,
 } from "./manifest.ts";
-import { RELEASE_SIGNING } from "./release-checks.ts";
+import { channelSigning } from "./release-checks.ts";
 
 const args = process.argv.slice(2);
 const take = (name: string) => {
@@ -34,8 +36,9 @@ const take = (name: string) => {
 const out = take("--out");
 const version = take("--version");
 const commit = take("--commit");
-if (!out || !version || !commit || args.length === 0) {
-  console.error("usage: merge-manifests.ts --out <dir> --version X.Y.Z --commit <sha> <build dir>...");
+const channel = take("--channel") ?? "release";
+if (!out || !version || !commit || (channel !== "release" && channel !== "nightly") || args.length === 0) {
+  console.error("usage: merge-manifests.ts --out <dir> --version X.Y.Z --commit <sha> [--channel release|nightly] <build dir>...");
   process.exit(2);
 }
 
@@ -74,10 +77,10 @@ const merged = (() => {
 })();
 if (merged.version !== version) problems.push(`builds are version ${merged.version}, expected ${version}`);
 if (merged.commit !== commit) problems.push(`builds are from ${merged.commit}, expected ${commit}`);
-if (merged.channel !== "release") problems.push(`builds are channel ${merged.channel}, expected release`);
+if (merged.channel !== channel) problems.push(`builds are channel ${merged.channel}, expected ${channel}`);
 for (const asset of merged.assets) {
-  const allowed = RELEASE_SIGNING[asset.platform];
-  if (!allowed.includes(asset.codeSigning.kind)) problems.push(`${asset.name} is ${asset.codeSigning.kind}: a ${asset.platform} release needs ${allowed.join(" or ")}`);
+  const allowed = channelSigning(channel)[asset.platform];
+  if (!allowed.includes(asset.codeSigning.kind)) problems.push(`${asset.name} is ${asset.codeSigning.kind}: a ${asset.platform} ${channel} needs ${allowed.join(" or ")}`);
 }
 if (problems.length) {
   console.error(`✗ ${problems.join("\n  - ")}`);

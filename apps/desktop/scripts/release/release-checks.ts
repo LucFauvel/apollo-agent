@@ -16,6 +16,15 @@ export const RELEASE_SIGNING: Record<Platform, ReadonlyArray<CodeSigning["kind"]
   win32: ["authenticode", "unsigned"],
 };
 
+/**
+ * What a published nightly must be signed with: the same as a release. A nightly that is ad-hoc
+ * on macOS stays a run artifact (the updater would refuse it anyway: no stable designated
+ * requirement, and Gatekeeper blocks it once quarantined).
+ */
+export const NIGHTLY_SIGNING: Record<Platform, ReadonlyArray<CodeSigning["kind"]>> = RELEASE_SIGNING;
+
+export const channelSigning = (channel: "release" | "nightly") => (channel === "release" ? RELEASE_SIGNING : NIGHTLY_SIGNING);
+
 export type Stage = "sign" | "promote";
 
 export interface ReleaseFacts {

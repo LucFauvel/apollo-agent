@@ -4,7 +4,12 @@
 #                 environment (which admits main) holds all five signing secrets, else ad-hoc signed
 #                 (the explicit no-secrets fallback, e.g. forks: a warning, not a failure); Windows
 #                 unsigned; each smoke-tested (Windows arm64 on a native arm64 runner) and uploaded
-#                 as a 14-day run artifact. NEVER a release.
+#                 as a 14-day run artifact. NEVER a stable release.
+#               → nightly-publish (`nightly` environment, main only): when the macOS build is
+#                 Developer ID signed and the nightly key is configured, merges the platforms'
+#                 manifests (channel nightly), signs apollo-update.json with the SEPARATE nightly
+#                 minisign key (never the release key) and publishes a `nightly-<version>`
+#                 PRERELEASE that only apps following nightlies look at; keeps the newest 10.
 #  push tag v*  → release builds (`release-build` environment, no reviewer; these jobs run on v* tags only): tag must
 #                 be vX.Y.Z on origin/main; macOS Developer ID signed + notarized; Windows unsigned
 #                 until Azure Trusted Signing is configured; every platform smoke-tested against old
@@ -62,6 +67,8 @@ jobs:
     # Signing secrets when configured; the environment's deployment policy admits main (this job
     # only runs on main, via nightly-stamp). Without them (forks, not set up yet) → ad-hoc.
     environment: release-build
+    outputs:
+      mode: ${{ steps.signing.outputs.mode }}
     steps:
       - name: Signing mode (Developer ID when all five secrets are set, else ad-hoc)
         id: signing
@@ -217,6 +224,126 @@ jobs:
         env:
           APOLLO_BUILD_VERSION: ${{ needs.nightly-stamp.outputs.version }}
         run: node apps/desktop/scripts/release/smoke.ts --nsis "$RUNNER_TEMP"/dist/*-setup.exe --app-arg --disable-gpu
+
+  nightly-publish:
+    name: Publish the nightly (nightly channel, nightly key)
+    needs: [nightly-stamp, nightly, nightly-windows, nightly-windows-arm64-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The nightly key lives only in this environment (deployment branches: main only). It is NOT
+    # the release key: apps verify nightlies with a separately embedded nightly key, only when the
+    # user follows nightlies, and that key can never verify a stable release.
+    environment: nightly
+    permissions:
+      contents: write # create the nightly prerelease (and its nightly-* tag); prune old ones
+    steps:
+      - name: Publish or not (Developer ID macOS build + nightly key configured)
+        id: gate
+        env:
+          MODE: ${{ needs.nightly.outputs.mode }}
+          NIGHTLY_MINISIGN_SECRET: ${{ secrets.NIGHTLY_MINISIGN_SECRET }}
+          NIGHTLY_MINISIGN_PUBLIC_KEY: ${{ vars.NIGHTLY_MINISIGN_PUBLIC_KEY }}
+        run: |
+          why=()
+          [[ "$MODE" == "developer-id" ]] || why+=("the macOS build is ad-hoc signed (the updater never installs it)")
+          [[ -n "$NIGHTLY_MINISIGN_SECRET" ]] || why+=("secret NIGHTLY_MINISIGN_SECRET is not set in the 'nightly' environment")
+          [[ -n "$NIGHTLY_MINISIGN_PUBLIC_KEY" ]] || why+=("variable NIGHTLY_MINISIGN_PUBLIC_KEY is not set")
+          if (( ${#why[@]} )); then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            msg="$(IFS=';'; echo "${why[*]}")"
+            echo "::notice title=Nightly not published::${msg}. The builds stay run artifacts. See RELEASE-SETUP.md §3.7."
+            echo "### Nightly not published: ${msg}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.publish == 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.gate.outputs.publish == 'true'
+        with:
+          node-version-file: .node-version
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: steps.gate.outputs.publish == 'true'
+        with:
+          pattern: apollo-desktop-${{ needs.nightly-stamp.outputs.version }}-*
+          path: parts # one subdirectory per platform build
+      - name: Merge the platforms (re-hash every file; all three targets; macOS Developer ID)
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          VERSION: ${{ needs.nightly-stamp.outputs.version }}
+          COMMIT: ${{ needs.nightly-stamp.outputs.commit }}
+        run: |
+          node apps/desktop/scripts/release/merge-manifests.ts --channel nightly --out dist --version "$VERSION" --commit "$COMMIT" parts/*
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+      - name: Preflight (nightly key is not a release key; manifest is this run's nightly)
+        if: steps.gate.outputs.publish == 'true'
+        id: preflight
+        env:
+          VERSION: ${{ needs.nightly-stamp.outputs.version }}
+          COMMIT: ${{ needs.nightly-stamp.outputs.commit }}
+          NIGHTLY_MINISIGN_PUBLIC_KEY: ${{ vars.NIGHTLY_MINISIGN_PUBLIC_KEY }}
+          RELEASE_MINISIGN_PUBLIC_KEY: ${{ vars.RELEASE_MINISIGN_PUBLIC_KEY }}
+        run: node apps/desktop/scripts/release/nightly.ts preflight --dir dist --version "$VERSION" --commit "$COMMIT"
+      - name: Install minisign
+        if: steps.gate.outputs.publish == 'true'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq minisign && minisign -v
+      - name: Sign apollo-update.json with the nightly key
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          NIGHTLY_MINISIGN_SECRET: ${{ secrets.NIGHTLY_MINISIGN_SECRET }}
+          NIGHTLY_MINISIGN_PASSWORD: ${{ secrets.NIGHTLY_MINISIGN_PASSWORD }}
+          NIGHTLY_MINISIGN_PUBLIC_KEY: ${{ vars.NIGHTLY_MINISIGN_PUBLIC_KEY }}
+          RELEASE_MINISIGN_PUBLIC_KEY: ${{ vars.RELEASE_MINISIGN_PUBLIC_KEY }}
+        run: |
+          umask 077
+          key="$RUNNER_TEMP/minisign/nightly.key"
+          mkdir -p "$(dirname "$key")"
+          trap 'rm -rf "$RUNNER_TEMP/minisign"' EXIT
+          printf '%s\n' "$NIGHTLY_MINISIGN_SECRET" > "$key"
+          # minisign reads the key password from stdin (empty line for a key made with -W).
+          printf '%s\n' "$NIGHTLY_MINISIGN_PASSWORD" | minisign -S -s "$key" -m dist/apollo-update.json \
+            -t "$(cat dist/.trusted-comment)" -x dist/apollo-update.json.minisig > /dev/null
+          minisign -V -P "$NIGHTLY_MINISIGN_PUBLIC_KEY" -m dist/apollo-update.json -x dist/apollo-update.json.minisig
+          # Belt and braces: the release key must not verify a nightly.
+          if [[ -n "$RELEASE_MINISIGN_PUBLIC_KEY" ]] && minisign -V -q -P "$RELEASE_MINISIGN_PUBLIC_KEY" -m dist/apollo-update.json -x dist/apollo-update.json.minisig 2>/dev/null; then
+            echo "::error::the nightly signature verifies with the RELEASE public key: refusing to publish"
+            exit 1
+          fi
+      - name: Publish the nightly prerelease
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.preflight.outputs.tag }}
+          VERSION: ${{ needs.nightly-stamp.outputs.version }}
+          COMMIT: ${{ needs.nightly-stamp.outputs.commit }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::A release ${TAG} already exists; nightlies are never re-uploaded."
+            exit 1
+          fi
+          {
+            echo "Nightly build of Apollo ${VERSION} from ${COMMIT} (run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})."
+            echo
+            echo "**Nightly:** built and smoke-tested automatically from main, not reviewed. Signed with the nightly key; only apps that follow nightly builds install it. Not a release."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } > notes.md
+          mapfile -t installers < <(jq -r '.assets[].name | "dist/" + .' dist/apollo-update.json)
+          # Prerelease and never "latest": releases/latest (the stable channel) never returns it.
+          # The tag (nightly-*, outside the v* namespace) is created at the commit by the release.
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$COMMIT" --prerelease --latest=false \
+            --title "Apollo ${VERSION} (nightly)" --notes-file notes.md \
+            dist/apollo-update.json dist/apollo-update.json.minisig dist/SHA256SUMS "${installers[@]}"
+          echo "### Nightly ${VERSION} published as ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the newest 10 nightlies
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node apps/desktop/scripts/release/nightly.ts prune --keep 10
 
   release-build:
     name: Release macOS arm64 (Developer ID, notarized)

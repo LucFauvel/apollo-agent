@@ -17,6 +17,10 @@ push to main ─────── desktop.yml nightlies (one shared version sta
                                       "Apollo-<x.y.z>-nightly.<UTC day>.<run>-arm64-adhoc.zip/.dmg"
                        Windows x64    unsigned        "Apollo-<…>-win-x64-unsigned-setup.exe"   (smoke on windows-latest)
                        Windows arm64  unsigned        "Apollo-<…>-win-arm64-unsigned-setup.exe" (built on x64, smoke on windows-11-arm)
+                     → nightly-publish  env nightly (main only, no reviewer)   only when the macOS build is Developer ID AND
+                                        the nightly key is set: merge (channel nightly) → sign with the NIGHTLY minisign
+                                        key (never the release key) → PRERELEASE "nightly-<version>" (never "latest");
+                                        keeps the newest 10. Otherwise a notice, and the nightly stays an artifact.
 
 push tag vX.Y.Z ──── desktop.yml
   1. release builds    env release-build (no reviewer)   tag must be on origin/main;
@@ -92,6 +96,10 @@ manual / tag v* ──── ios-testflight.yml  env release-build   apps/mobile
 |---|---|---|---|
 | `release-build` | no reviewer | tags `v*` **and** branch `main` (macOS nightlies sign from main; iOS manual runs dispatch from main) | Developer ID, App Store Connect key, iOS signing |
 | `release` | **Required reviewers: LucFauvel**; leave "Prevent self-review" **off** (Luc is the only approver, see §5) | tags `v*` only | the minisign secret key |
+| `nightly` | no reviewer (nightlies publish on every push to main) | branch `main` **only** (Selected branches and tags → `main`) | the **nightly** minisign secret key (§3.7), never the release key |
+
+The first run that reaches `nightly-publish` creates the `nightly` environment by itself with no
+deployment policy: set "main only" on it before adding its secret (or create it first).
 
 Why two: the build needs the signing certificates without a click, and the only human gate is
 the manifest signature + publication (`sign-and-publish`). A build that nobody approves stays
@@ -99,7 +107,9 @@ a draft that no client can ever see.
 Admitting `main` lets the macOS nightly job read the Developer ID + App Store Connect secrets so
 nightlies are signed and notarized like releases; it does not change the release flow: the
 release-build, draft-release and sign-and-publish jobs still run only for `v*` tags, a nightly is
-never drafted or published, and `release` (the minisign key) still admits `v*` tags only.
+never drafted as a release or signed with the release key (only, when set up, published as a
+`nightly-*` prerelease signed with the separate nightly key, §3.7), and `release` (the minisign
+release key) still admits `v*` tags only.
 
 ### 2.2 Secrets and variables
 
@@ -127,11 +137,19 @@ never drafted or published, and `release` (the minisign key) still admits `v*` t
 | `RELEASE_MINISIGN_SECRET` | the whole content of the minisign secret key file (§3.5) |
 | `RELEASE_MINISIGN_PASSWORD` | its password (leave unset if the key was made with `-W`) |
 
+`nightly` environment secrets (§3.7; optional: without them nightlies are not published, nothing fails):
+
+| Secret | What |
+|---|---|
+| `NIGHTLY_MINISIGN_SECRET` | the whole content of the **nightly** minisign secret key file |
+| `NIGHTLY_MINISIGN_PASSWORD` | its password (leave unset if the key was made with `-W`) |
+
 Repository **variables** (Settings → Secrets and variables → Actions → Variables; not secret):
 
 | Variable | Value |
 |---|---|
 | `RELEASE_MINISIGN_PUBLIC_KEY` | the public key line (the `RW…` line of `apollo.pub`). Repository level, because promote-to-stable has no environment. |
+| `NIGHTLY_MINISIGN_PUBLIC_KEY` | the nightly public key line (`RW…` of `apollo-nightly.pub`); the job verifies its signature with it and refuses to sign if it is a release key |
 | `APOLLO_TEAM_ID` *(optional)* | defaults to `XA3R5NAN2C` |
 | `APOLLO_AZURE_SIGN_ENDPOINT`, `APOLLO_AZURE_SIGN_ACCOUNT`, `APOLLO_AZURE_SIGN_PROFILE`, `APOLLO_AZURE_SIGN_PUBLISHER` *(future)* | Trusted Signing endpoint (e.g. `https://eus.codesigning.azure.net`), account name, certificate profile name, and the publisher name exactly as on the certificate (§3.6) |
 
@@ -145,6 +163,8 @@ Setting them from a terminal, if you prefer (one value at a time, never echoed):
 base64 -i DeveloperID.p12 | gh secret set RELEASE_DEVELOPER_ID_P12 --env release-build -R LucFauvel/apollo-agent
 gh secret set RELEASE_MINISIGN_SECRET --env release < ~/.minisign/apollo.key
 gh variable set RELEASE_MINISIGN_PUBLIC_KEY -R LucFauvel/apollo-agent --body "$(tail -1 apollo.pub)"
+gh secret set NIGHTLY_MINISIGN_SECRET --env nightly -R LucFauvel/apollo-agent < apollo-nightly.key
+gh variable set NIGHTLY_MINISIGN_PUBLIC_KEY -R LucFauvel/apollo-agent --body "$(tail -1 apollo-nightly.pub)"
 ```
 
 ### 2.3 Rulesets and repository settings
@@ -153,6 +173,8 @@ gh variable set RELEASE_MINISIGN_PUBLIC_KEY -R LucFauvel/apollo-agent --body "$(
   "Block force pushes" and "Restrict deletions"**. Optional: require signed commits.
 - **New tag ruleset** on `refs/tags/v*`: restrict creations, updates and deletions (bypass: repository
   admin = you) and block force pushes. Tags are what trigger release builds.
+  Do **not** extend it to `nightly-*`: the nightly job creates those tags (through `gh release create`)
+  and deletes old ones, with the workflow token. A `nightly-*` tag never triggers a build.
 - **Immutable releases: ON** (Settings → General → Releases). Published releases then can't have
   assets swapped or the tag moved. The pipeline uploads the signature *before* publishing.
 - Actions → General: **"Require approval for all outside collaborators"** for fork PR runs; keep
@@ -242,6 +264,40 @@ says `codeSigning: { kind: "authenticode", publisher }`. That path is **untested
 remove `"unsigned"` from `RELEASE_SIGNING.win32` in `release-checks.ts` so an unsigned Windows
 build can no longer be released.
 
+### 3.7 Nightly key (signs nightly manifests; NOT the release key)
+The nightly channel has its own minisign keypair. It sits in CI with no human gate (every push to
+`main` publishes), so it must never be the release key, and the app treats it accordingly:
+- the app verifies nightlies with `NIGHTLY_PUBLIC_KEY` (`apps/desktop/src/update/keys.ts`) **only**
+  for `nightly`-channel manifests from `nightly-<version>` prereleases, and **only** when the user
+  follows nightlies ("Follow Nightly Builds" in the macOS app menu / Windows tray; a nightly build
+  follows nightlies by default). Stable releases are verified with the release keys only, so the
+  nightly key can never reach someone on the stable channel;
+- an embedded nightly key equal to a release key disables the channel; CI's preflight
+  (`scripts/release/nightly.ts`) refuses to sign with a nightly key that is
+  `RELEASE_MINISIGN_PUBLIC_KEY` or an embedded release key, and checks the release key does not
+  verify the nightly signature.
+
+Setup:
+```sh
+minisign -G -p apollo-nightly.pub -s apollo-nightly.key     # a different password from the release key's
+```
+1. `apollo-nightly.key` content → `NIGHTLY_MINISIGN_SECRET` (environment `nightly`), its password →
+   `NIGHTLY_MINISIGN_PASSWORD`; the `RW…` line of `apollo-nightly.pub` → variable
+   `NIGHTLY_MINISIGN_PUBLIC_KEY`.
+2. Paste the same `RW…` line as `NIGHTLY_PUBLIC_KEY` in `apps/desktop/src/update/keys.ts` and commit:
+   only builds made after that offer "Follow Nightly Builds". Until then the menu item is hidden and
+   the nightly job warns that no app trusts what it publishes.
+3. Keep the secret key in 1Password, then delete the local file. Losing or rotating it only affects
+   nightly followers: embed the new public key, and they pick it up with the next stable release
+   (or install a nightly by hand).
+
+What a nightly follower gets: the newer of the latest stable release and the newest
+`nightly-*` prerelease (by build number = commit count). Turning nightlies off never downgrades:
+the next stable release is offered once its build is newer than the installed nightly.
+macOS nightlies must be Developer ID signed to be published (an ad-hoc build is never installed
+by the updater); Windows nightlies are unsigned like releases and, as for releases, the Windows
+updater only opens the download page.
+
 ## 4. Status: what works today, what waits
 
 | Piece | Works now (after the first push) | Waits for |
@@ -254,7 +310,8 @@ build can no longer be released.
 | Sign + publish (candidate) | stays a draft with "Signing not configured" | minisign key + `release` env with you as reviewer |
 | Promote to stable | refuses without the public-key variable / a signed candidate | the above |
 | iOS TestFlight | fails at once with the list of missing secrets | Apple Distribution .p12 + ASC key (+ profiles optional) |
-| In-app updater (`apps/desktop/src/update/`) | primary key embedded; checks `releases/latest` every ~6 h (jittered, backs off, quiet) and on "Check for Updates…" (macOS app menu + menu bar panel, Windows tray). macOS: verifies minisign signature → trusted comment → policy (release channel only, build strictly newer, schema floor, Developer ID team `XA3R5NAN2C`, exact asset name) → streams the zip (size + SHA-256) → re-checks the unpacked bundle in a private userData directory (codesign requirement, Info.plist, build-info) → a detached helper runs the install:app engine: only it, holding the shared install lock, copies that bundle to the shared staged path and re-checks the copy, then snapshot, swap, relaunch, health, rollback (same marker as install:app). A build is never offered again once it was put in place and failed, or its staged copy failed its checks; an install interrupted before that is offered again. Windows: same check, then opens the release page (manual install for now). Finds nothing until a stable release is published | a published stable release; the backup public key in `keys.ts`; a first real update on a Mac (only simulated + unit-tested so far) |
+| Nightly channel (`nightly-publish` + "Follow Nightly Builds") | code done, unit-tested; the job skips with a notice until set up | the nightly keypair (§3.7: secret + variable + `NIGHTLY_PUBLIC_KEY` in `keys.ts`), the `nightly` environment restricted to `main`, Developer ID nightlies; a first real publish + update |
+| In-app updater (`apps/desktop/src/update/`) | primary key embedded; checks `releases/latest` every ~6 h (jittered, backs off, quiet) and on "Check for Updates…" (macOS app menu + menu bar panel, Windows tray). macOS: verifies minisign signature → trusted comment → policy (stable releases only, or also `nightly-*` prereleases verified with the separate nightly key when the user follows nightlies, §3.7; build strictly newer, schema floor, Developer ID team `XA3R5NAN2C`, exact asset name) → streams the zip (size + SHA-256) → re-checks the unpacked bundle in a private userData directory (codesign requirement, Info.plist, build-info) → a detached helper runs the install:app engine: only it, holding the shared install lock, copies that bundle to the shared staged path and re-checks the copy, then snapshot, swap, relaunch, health, rollback (same marker as install:app). A build is never offered again once it was put in place and failed, or its staged copy failed its checks; an install interrupted before that is offered again. Windows: same check, then opens the release page (manual install for now). Finds nothing until a stable release is published | a published stable release; the backup public key in `keys.ts`; a first real update on a Mac (only simulated + unit-tested so far) |
 
 Verified locally on this branch: root `pnpm typecheck && pnpm test`; a full ad-hoc
 `build-release.ts` (verification of the re-extracted zip passed); the smoke test (pass + broken-build
@@ -317,7 +374,14 @@ it is his work machine and installing Apollo there (HKCU, Start menu) needs his 
    `RELEASE_TARGETS` (manifest.ts) and the two arm64 smoke jobs, or ask GitHub. Also: Electron
    offscreen capture on the hosted Windows session with `--disable-gpu` (the smoke test's
    assumption), and the `/D=` silent install path (electron-builder 26.18's `GetDParameter`).
-9. Tailnet addon under the hardened runtime: whether it needs
+9. **Nightly releases** (`nightly-publish`): (a) with *Immutable releases* on, whether deleting an old
+   nightly release (the prune step, `gh release delete --cleanup-tag`) is allowed; if not, the step
+   only warns and nightlies pile up (each is several hundred MB of installers): turn pruning off or leave immutability
+   off. (b) The updater picks the first `nightly-*` prerelease in `GET /releases?per_page=30`
+   (newest first); a burst of 30+ other releases would hide nightlies until the next one. (c) Once the
+   nightly key is set, a failed publish makes the main run red, and promote-to-stable's
+   same-commit rule then wants another green nightly of that commit.
+10. Tailnet addon under the hardened runtime: whether it needs
    `com.apple.security.cs.disable-library-validation` (`resources/entitlements.mac.plist` doesn't
    add it). The first Developer ID build's smoke test will show it.
 
