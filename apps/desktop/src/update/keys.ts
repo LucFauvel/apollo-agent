@@ -27,8 +27,8 @@ export const PRIMARY_PUBLIC_KEY: string = "RWRIjaaHrGmFOQ5a1wL9XapMvpa4up75SUWrz
 /** The offline backup key's `RW…` line. Empty until Luc fills it in: an empty slot is ignored. */
 export const BACKUP_PUBLIC_KEY: string = "";
 
-/** The nightly signing key's `RW…` line. Empty until Luc generates it (RELEASE-SETUP.md §3.7). */
-export const NIGHTLY_PUBLIC_KEY: string = "";
+/** The nightly signing key's `RW…` line (key id 5F81640F6CA91C86; RELEASE-SETUP.md §3.7). */
+export const NIGHTLY_PUBLIC_KEY: string = "RWSGHKlsD2SBX/b4YNFDbTrtPh+codV1ThT7EcAcNsBMbAHzA/mvftOb";
 
 /**
  * The Apple Developer team every macOS update must be Developer ID-signed by. RELEASE-SETUP.md
