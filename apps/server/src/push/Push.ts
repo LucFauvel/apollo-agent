@@ -9,12 +9,15 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { Auth } from "../auth/Auth.ts";
 import { presentedToken } from "../auth/http.ts";
 import { Database } from "../Database.ts";
+import { Jobs } from "../jobs/Jobs.ts";
 import { SessionManager } from "../SessionManager.ts";
 import { Store } from "../Store.ts";
 
 /**
- * Push notifications to paired phones (the Apollo app), through Expo's push service:
- * when a turn finishes, or an agent needs an approval, an answer or a secret.
+ * Push notifications to paired phones (the Apollo app), through Expo's push service, and
+ * the same notifications for the desktop app (`Notices`) and browser tabs (a `pushed`
+ * Notify): when a turn finishes with something for the user, or an agent needs an
+ * approval, an answer or a secret.
  */
 
 const EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send";
@@ -93,8 +96,9 @@ export const plain = (text: string) =>
     .slice(0, 180);
 
 /**
- * The notification for an event, or null. Reflections and workers a bot spawned are
- * left out: the orchestrator reports on its workers. Stopped turns and silent replies
+ * The notification for an event, or null. Reflections are left out, and so are the turns
+ * of workers a bot spawned (the orchestrator reports on them), though a worker that needs
+ * the user (an approval, a question) still says so. Stopped turns and silent replies
  * (heartbeats with nothing to say) stay quiet.
  */
 export const notificationFor = (
@@ -103,7 +107,9 @@ export const notificationFor = (
   event: AgentEvent,
   lastReply: string | null,
 ): { kind: string; title: string; body: string } | null => {
-  if (session.role === "reflection" || (session.role === "worker" && session.parentSessionId !== null)) return null;
+  if (session.role === "reflection") return null;
+  const spawned = session.role === "worker" && session.parentSessionId !== null;
+  if (spawned && event._tag !== "ApprovalRequested" && event._tag !== "InputRequested") return null;
   const who = session.role === "main" ? (bot?.name ?? "Your bot") : `${session.title} · ${bot?.name ?? "worker"}`;
   switch (event._tag) {
     case "ApprovalRequested":
@@ -124,6 +130,91 @@ export const notificationFor = (
     default:
       return null;
   }
+};
+
+/** What a session's finished turn still waits on (SessionManager.waitingOn, plus its jobs). */
+export interface Waiting {
+  /** A turn is under way, or about to start (a report just arrived). */
+  readonly busy: boolean;
+  /** Workers it spawned that are busy and will report back. */
+  readonly workers: number;
+  /** Background jobs it started that will report back when they end. */
+  readonly jobs: number;
+  /** Other bots' answers to its apollo_ask_bot, still being written. */
+  readonly botReplies: number;
+  /** Its last turn answered another bot: that bot reports to the user, not this turn. */
+  readonly answeredBot: boolean;
+}
+
+/** Work under way that will wake the session with a new turn when it is done. */
+export const isWaiting = (w: Waiting) => w.workers + w.jobs + w.botReplies > 0;
+
+export interface HoldTiming {
+  /** How long a finished turn's notice waits once nothing is pending, so a turn that starts right away replaces it. */
+  readonly settleMs: number;
+  /**
+   * After the work a turn waited on is over, how long to wait for it to wake the session
+   * before telling the user anyway (it died or was stopped without reporting back).
+   */
+  readonly graceMs: number;
+  /** How often held notices are checked. */
+  readonly sweepMs: number;
+}
+
+export const DEFAULT_HOLD: HoldTiming = { settleMs: 1_500, graceMs: 15_000, sweepMs: 500 };
+
+type Note = { readonly kind: string; readonly title: string; readonly body: string };
+
+/**
+ * Decides when a finished turn is worth a notification. A turn that ends while its session
+ * still waits on something (a worker, a background job, another bot's answer) has nothing
+ * ready for the user yet: "I'll report back when the worker is done". Its notice is held,
+ * and dropped when the next turn starts: the turn that ends with nothing pending is the one
+ * the user hears about. When the waited-on work ends without waking the session (a worker
+ * died, a job was stopped), the held notice goes out after a grace period, so an idle
+ * session never goes unannounced. Only finished turns are held: approvals, questions and
+ * errors need the user now.
+ */
+export const makeTurnNotices = (timing: HoldTiming) => {
+  const held = new Map<SessionId, { readonly note: Note; readonly botId: BotId; clearSince: number | null; waited: boolean }>();
+  return {
+    /** A turn started: whatever an earlier turn held back is replaced by this one's outcome. */
+    turnStarted: (id: SessionId) => void held.delete(id),
+    /** A notice for a session event: returned to send now, or held (finished turns). */
+    offer: (id: SessionId, botId: BotId, note: Note): Note | null => {
+      if (note.kind !== "done") return note;
+      held.set(id, { note, botId, clearSince: null, waited: false });
+      return null;
+    },
+    /** Sessions with a held notice. */
+    held: () => [...held.keys()],
+    /**
+     * Rechecks held notices against what their sessions wait on (`null`: the session is
+     * gone) and returns those to send now.
+     */
+    sweep: (now: number, waiting: ReadonlyMap<SessionId, Waiting | null>) => {
+      const due: Array<{ readonly sessionId: SessionId; readonly botId: BotId; readonly note: Note }> = [];
+      for (const [id, hold] of held) {
+        if (!waiting.has(id)) continue;
+        const w = waiting.get(id) ?? null;
+        if (w === null || w.answeredBot) {
+          held.delete(id);
+          continue;
+        }
+        if (w.busy || isWaiting(w)) {
+          hold.clearSince = null;
+          hold.waited ||= isWaiting(w);
+          continue;
+        }
+        hold.clearSince ??= now;
+        if (now - hold.clearSince >= (hold.waited ? timing.graceMs : timing.settleMs)) {
+          held.delete(id);
+          due.push({ sessionId: id, botId: hold.botId, note: hold.note });
+        }
+      }
+      return due;
+    },
+  };
 };
 
 /** Sends to every paired phone and forgets tokens Expo says are gone. */
@@ -180,56 +271,93 @@ export class Notices extends Context.Service<
   });
 }
 
-/** Watches every session and pushes the events above. */
-export const layerWatcher = Layer.effectDiscard(
-  Effect.gen(function* () {
-    const manager = yield* SessionManager;
-    const store = yield* Store;
-    const send = yield* PushSender;
-    const notices = yield* Notices;
-    const tokens = makePushTokens(yield* Database);
-    const lastReply = new Map<SessionId, string>();
-    yield* manager.liveEvents.pipe(
-      Stream.runForEach(({ sessionId, event }) =>
+/** Watches every session and pushes the events above, holding finished turns back while work is pending. */
+export const makeLayerWatcher = (timing: HoldTiming = DEFAULT_HOLD) =>
+  Layer.effectDiscard(
+    Effect.gen(function* () {
+      const manager = yield* SessionManager;
+      const store = yield* Store;
+      const jobs = yield* Jobs;
+      const send = yield* PushSender;
+      const notices = yield* Notices;
+      const tokens = makePushTokens(yield* Database);
+      const lastReply = new Map<SessionId, string>();
+      const turns = makeTurnNotices(timing);
+
+      /** To phones, the desktop app and browser tabs. */
+      const announce = (sessionId: SessionId, botId: BotId, note: Note) =>
         Effect.gen(function* () {
-          if (event._tag === "TurnStarted") lastReply.delete(sessionId);
-          if (event._tag === "AssistantMessage") lastReply.set(sessionId, event.text);
-          // (Secret requests arrive as a Notify from the secrets service, handled below.)
-          if (!["ApprovalRequested", "InputRequested", "BrowserHandoff", "TurnCompleted"].includes(event._tag)) return;
-          const session = yield* store.getSession(sessionId);
-          // Reflections work in the background and never need the user.
-          if (session.role === "reflection") return;
-          const bot = yield* store.getBot(session.botId).pipe(Effect.option);
-          const note = notificationFor(session, bot._tag === "Some" ? bot.value : undefined, event, lastReply.get(sessionId) ?? null);
-          if (event._tag === "TurnCompleted") lastReply.delete(sessionId);
-          if (note) {
-            notices.record({ ...note, sessionId });
-            yield* Effect.forkDetach(deliver(tokens, send, note, sessionId, bot._tag === "Some" ? bot.value : undefined));
-          }
-        }).pipe(Effect.ignore),
-      ),
-      Effect.forkScoped,
-    );
-    // Notifications bots send themselves (apollo_notify, scheduled results, secret requests).
-    yield* manager.changes.pipe(
-      Stream.runForEach((change) =>
-        Effect.gen(function* () {
-          if (change._tag !== "Notify") return;
-          const note = { kind: "notify", title: change.title, body: plain(change.body) };
-          notices.record({ ...note, sessionId: change.sessionId ?? "" });
-          const bot = change.sessionId
-            ? yield* store.getSession(change.sessionId).pipe(
-                Effect.flatMap((session) => store.getBot(session.botId)),
-                Effect.option,
-              )
-            : undefined;
-          yield* Effect.forkDetach(deliver(tokens, send, note, change.sessionId ?? null, bot?._tag === "Some" ? bot.value : undefined));
-        }),
-      ),
-      Effect.forkScoped,
-    );
-  }),
-);
+          const bot = yield* store.getBot(botId).pipe(Effect.option);
+          notices.record({ ...note, sessionId });
+          yield* manager.publish({ _tag: "Notify", botId, sessionId, title: note.title, body: note.body, pushed: true });
+          yield* Effect.forkDetach(deliver(tokens, send, note, sessionId, bot._tag === "Some" ? bot.value : undefined));
+        });
+
+      yield* manager.liveEvents.pipe(
+        Stream.runForEach(({ sessionId, event }) =>
+          Effect.gen(function* () {
+            if (event._tag === "TurnStarted") {
+              lastReply.delete(sessionId);
+              turns.turnStarted(sessionId);
+            }
+            if (event._tag === "AssistantMessage") lastReply.set(sessionId, event.text);
+            // (Secret requests and browser handoffs arrive as a Notify from their services, handled below.)
+            if (!["ApprovalRequested", "InputRequested", "TurnCompleted"].includes(event._tag)) return;
+            const session = yield* store.getSession(sessionId);
+            // Reflections work in the background and never need the user.
+            if (session.role === "reflection") return;
+            const bot = yield* store.getBot(session.botId).pipe(Effect.option);
+            const note = notificationFor(session, bot._tag === "Some" ? bot.value : undefined, event, lastReply.get(sessionId) ?? null);
+            if (event._tag === "TurnCompleted") lastReply.delete(sessionId);
+            const now = note && turns.offer(sessionId, session.botId, note);
+            if (now) yield* announce(sessionId, session.botId, now);
+          }).pipe(Effect.ignore),
+        ),
+        Effect.forkScoped,
+      );
+
+      // Held notices: sent once their session waits on nothing (or dropped by its next turn).
+      const waitingOf = (id: SessionId) =>
+        manager.waitingOn(id).pipe(
+          Effect.map((w): Waiting | null => ({ ...w, jobs: jobs.reportingTo(id) })),
+          Effect.orElseSucceed(() => null),
+        );
+      yield* Effect.gen(function* () {
+        const ids = turns.held();
+        if (ids.length === 0) return;
+        const waiting = new Map<SessionId, Waiting | null>();
+        for (const id of ids) waiting.set(id, yield* waitingOf(id));
+        for (const { sessionId, botId, note } of turns.sweep(Date.now(), waiting)) yield* announce(sessionId, botId, note);
+      }).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("Held notifications check failed", cause)),
+        Effect.andThen(Effect.sleep(timing.sweepMs)),
+        Effect.forever,
+        Effect.forkScoped,
+      );
+
+      // Notifications bots send themselves (apollo_notify, scheduled results, secret requests, browser handoffs).
+      yield* manager.changes.pipe(
+        Stream.runForEach((change) =>
+          Effect.gen(function* () {
+            // (`pushed`: one of ours, above.)
+            if (change._tag !== "Notify" || change.pushed) return;
+            const note = { kind: "notify", title: change.title, body: plain(change.body) };
+            notices.record({ ...note, sessionId: change.sessionId ?? "" });
+            const bot = change.sessionId
+              ? yield* store.getSession(change.sessionId).pipe(
+                  Effect.flatMap((session) => store.getBot(session.botId)),
+                  Effect.option,
+                )
+              : undefined;
+            yield* Effect.forkDetach(deliver(tokens, send, note, change.sessionId ?? null, bot?._tag === "Some" ? bot.value : undefined));
+          }),
+        ),
+        Effect.forkScoped,
+      );
+    }),
+  );
+
+export const layerWatcher = makeLayerWatcher();
 
 const RegisterBody = Schema.Struct({
   token: Schema.String.check(Schema.isMinLength(10), Schema.isMaxLength(512)),

@@ -80,6 +80,12 @@ export const AppChange = Schema.Union([
     sessionId: Schema.NullOr(SessionId),
     title: Schema.String,
     body: Schema.String,
+    /**
+     * Already sent to phones and the desktop app by Apollo's notification watcher: a session
+     * event such as a finished turn or an approval request. Browser tabs show it unless the
+     * user is looking at that session.
+     */
+    pushed: Schema.optional(Schema.Boolean),
   }),
 ]);
 export type AppChange = typeof AppChange.Type;

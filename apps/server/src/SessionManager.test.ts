@@ -186,6 +186,9 @@ const layerWith = (
 
 const layer = layerWith(1e9);
 
+/** Push notification timings short enough for tests. */
+const FAST_HOLD: Push.HoldTiming = { settleMs: 20, graceMs: 100, sweepMs: 10 };
+
 const createBot = (manager: SessionManager.SessionManager["Service"], autoLearn = false) =>
   manager.createBot({
     name: "Atlas",
@@ -203,7 +206,7 @@ const waitIdle = (manager: SessionManager.SessionManager["Service"], id: Session
 describe("SessionManager", () => {
   it.live("pushes finished turns to paired phones and forgets unregistered ones", () => {
     const pushed: Array<Push.PushMessage> = [];
-    const pushLayer = Push.layerWatcher.pipe(
+    const pushLayer = Push.makeLayerWatcher(FAST_HOLD).pipe(
       Layer.provideMerge(Push.Notices.layer),
       Layer.provideMerge(
         Layer.succeed(Push.PushSender, async (messages) => {
@@ -213,6 +216,7 @@ describe("SessionManager", () => {
           );
         }),
       ),
+      Layer.provideMerge(Jobs.layer),
       Layer.provideMerge(layer),
     );
     return Effect.gen(function* () {
@@ -232,7 +236,7 @@ describe("SessionManager", () => {
       const bot = yield* createBot(manager);
       yield* manager.send(bot.mainSessionId, "ship it", "user");
       yield* waitIdle(manager, bot.mainSessionId);
-      yield* Effect.sleep("50 millis");
+      yield* Effect.sleep("200 millis");
 
       expect(pushed.map((m) => m.to).sort()).toEqual(["ExponentPushToken[gone]", "ExponentPushToken[live]"]);
       expect(pushed[0]).toMatchObject({
@@ -248,6 +252,113 @@ describe("SessionManager", () => {
       expect(notices).toEqual([{ id: 1, kind: "done", title: "Atlas", body: "echo: ship it", sessionId: bot.mainSessionId }]);
       expect((yield* Push.Notices).since(1)).toEqual([]);
     }).pipe(Effect.provide(pushLayer));
+  });
+
+  describe("turn notifications while work is pending", () => {
+    /** The watcher with a fake phone: what it pushed, and what the desktop app would show. */
+    const watched = () => {
+      const pushed: Array<Push.PushMessage> = [];
+      const pushLayer = Push.makeLayerWatcher(FAST_HOLD).pipe(
+        Layer.provideMerge(Push.Notices.layer),
+        Layer.provideMerge(Layer.succeed(Push.PushSender, async (messages) => (pushed.push(...messages), messages.map(() => ({ status: "ok" as const }))))),
+        Layer.provideMerge(Jobs.layer),
+        Layer.provideMerge(layer),
+      );
+      const pair = Effect.gen(function* () {
+        const db = yield* Database.Database;
+        const now = Date.now();
+        db.prepare(
+          "insert into client_sessions (id, token_hash, label, method, created_at, expires_at, last_seen_at, revoked_at) values ('phone', 'h', 'phone', 'pairing-link', ?, ?, ?, null)",
+        ).run(now, now + 1e9, now);
+        Push.makePushTokens(db).register("ExponentPushToken[phone]", "phone", "ios");
+      });
+      return { pushed, pushLayer, pair };
+    };
+    const until = (check: () => boolean) =>
+      Effect.gen(function* () {
+        for (let i = 0; i < 200 && !check(); i++) yield* Effect.sleep("25 millis");
+      });
+
+    it.live("holds the orchestrator's turn while its worker runs, and notifies the turn after the report", () => {
+      const { pushed, pushLayer, pair } = watched();
+      return Effect.gen(function* () {
+        yield* pair;
+        const manager = yield* SessionManager.SessionManager;
+        const bot = yield* createBot(manager);
+        // The orchestrator spawns a worker and ends its turn ("I'll report back").
+        yield* manager.createSession({
+          botId: bot.id,
+          title: "task",
+          provider: bot.defaultWorker,
+          prompt: "slow work",
+          parentSessionId: bot.mainSessionId,
+          notifyParent: true,
+          author: "bot",
+        });
+        yield* manager.send(bot.mainSessionId, "spawned a worker", "user");
+        yield* waitIdle(manager, bot.mainSessionId);
+        yield* Effect.sleep("200 millis");
+        expect(pushed).toEqual([]);
+        // The worker reports; the orchestrator's next turn is the one the user hears about.
+        yield* until(() => pushed.length > 0);
+        yield* Effect.sleep("200 millis");
+        expect(pushed).toHaveLength(1);
+        expect(pushed[0]).toMatchObject({ title: "Atlas", data: { sessionId: bot.mainSessionId, kind: "done" } });
+        expect(pushed[0]!.body).toContain('Worker session "task"');
+        // The desktop app shows the same single notice.
+        expect((yield* Push.Notices).since(0)).toHaveLength(1);
+      }).pipe(Effect.provide(pushLayer));
+    });
+
+    it.live("holds a turn while a background job it started runs", () => {
+      const { pushed, pushLayer, pair } = watched();
+      return Effect.gen(function* () {
+        yield* pair;
+        const manager = yield* SessionManager.SessionManager;
+        const jobs = yield* Jobs.Jobs;
+        const bot = yield* createBot(manager);
+        yield* jobs.start({ botId: bot.id, sessionId: bot.mainSessionId }, { command: "sleep 0.6" });
+        // A server it will not hear back from does not hold anything.
+        yield* jobs.start({ botId: bot.id, sessionId: bot.mainSessionId }, { command: "sleep 30", notify: false });
+        yield* manager.send(bot.mainSessionId, "started the build", "user");
+        yield* waitIdle(manager, bot.mainSessionId);
+        yield* Effect.sleep("200 millis");
+        expect(pushed).toEqual([]);
+        yield* until(() => pushed.length > 0);
+        yield* Effect.sleep("200 millis");
+        expect(pushed).toHaveLength(1);
+        expect(pushed[0]!.body).toContain("Background job");
+      }).pipe(Effect.provide(pushLayer));
+    });
+
+    it.live("holds a turn waiting for another bot, whose side conversation stays quiet", () => {
+      const { pushed, pushLayer, pair } = watched();
+      return Effect.gen(function* () {
+        yield* pair;
+        const manager = yield* SessionManager.SessionManager;
+        const atlas = yield* createBot(manager);
+        yield* manager.createBot({
+          name: "Vega",
+          instructions: "",
+          cwd: "/tmp",
+          main: { provider: "claude" },
+          defaultWorker: { provider: "codex" },
+          runtimeMode: "full-access",
+          autoLearn: false,
+        });
+        yield* manager.askBot(atlas.mainSessionId, "Vega", "slow question");
+        yield* manager.send(atlas.mainSessionId, "asked Vega", "user");
+        yield* waitIdle(manager, atlas.mainSessionId);
+        yield* Effect.sleep("200 millis");
+        expect(pushed).toEqual([]);
+        yield* until(() => pushed.length > 0);
+        yield* Effect.sleep("300 millis");
+        // One notification: Atlas's turn with Vega's answer, not Vega's side conversation.
+        expect(pushed).toHaveLength(1);
+        expect(pushed[0]).toMatchObject({ title: "Atlas", data: { sessionId: atlas.mainSessionId } });
+        expect(pushed[0]!.body).toContain("Vega, another of the user's bots, answered");
+      }).pipe(Effect.provide(pushLayer));
+    });
   });
 
   it.live("tracks context usage and runs slash commands", () =>
