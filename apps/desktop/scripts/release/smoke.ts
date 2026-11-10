@@ -33,6 +33,7 @@
  * (not enabled in a fresh data dir). It runs the real packaged binary, not a simulation.
  */
 import { spawn, spawnSync } from "node:child_process";
+import { performance } from "node:perf_hooks";
 import { existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -40,7 +41,9 @@ import { MIGRATIONS, SCHEMA_VERSION } from "../../../server/src/Database.ts";
 import { isHealthyResponse, launchEnv, type BuildInfo } from "../install-app-lib.ts";
 import {
   checkMigratedDatabase,
+  type CommandResult,
   descendantsOf,
+  isNsisUninstaller,
   portAccepts,
   processesUnder,
   type ProcessList,
@@ -64,6 +67,13 @@ const nsis = opt("--nsis")[0];
 const dirArg = opt("--dir")[0];
 const appArgs = opt("--app-arg");
 const timeoutMs = Number(opt("--timeout")[0] ?? 180) * 1000;
+/**
+ * How long the app keeps its window up before capturing and quitting (APOLLO_SCREENSHOT_DELAY):
+ * long enough for /health to be asked from outside AND for at least one process-tree sample to
+ * finish while it runs. Get-CimInstance takes many seconds on the hosted Windows arm64 runner,
+ * hence the larger Windows default.
+ */
+const screenshotDelayMs = Number(opt("--screenshot-delay")[0] ?? (process.platform === "win32" ? 30 : 6)) * 1000;
 /** How long the app's processes and port get to disappear after it exits; anything left after that fails. */
 const shutdownGraceMs = Number(opt("--shutdown-grace")[0] ?? 3) * 1000;
 const seedVersions = (opt("--seed-version").length ? opt("--seed-version").map(Number) : [1, SCHEMA_VERSION - 1]).filter(
@@ -88,6 +98,37 @@ if (nsis && process.env.CI !== "true" && !args.includes("--allow-install")) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const sh = (command: string, argv: ReadonlyArray<string>, timeout = 10_000) => spawnSync(command, argv, { encoding: "utf8", timeout });
+/**
+ * Like `sh`, but without blocking the event loop: while a slow PowerShell runs, /health keeps
+ * being polled and the app's exit is still seen. (A blocking spawnSync here is what made the
+ * Windows arm64 smoke miss /health entirely: the app served, captured and quit while the
+ * harness sat in Get-CimInstance.)
+ */
+const shAsync = (command: string, argv: ReadonlyArray<string>, timeout: number): Promise<CommandResult> =>
+  new Promise((done) => {
+    const child = spawn(command, argv, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    child.stdout.setEncoding("utf8").on("data", (d: string) => (stdout += d));
+    child.stderr.setEncoding("utf8").on("data", (d: string) => (stderr += d));
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeout);
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      done({ status: null, signal: null, stdout, stderr, error });
+    });
+    child.once("close", (status, signal) => {
+      clearTimeout(timer);
+      done(
+        timedOut
+          ? { status, signal, stdout, stderr, error: Object.assign(new Error(`${command} ETIMEDOUT after ${timeout / 1000}s`), { code: "ETIMEDOUT" }) }
+          : { status, signal, stdout, stderr },
+      );
+    });
+  });
 
 const root = mkdtempSync(join(tmpdir(), "apollo-smoke-"));
 /** Where the app is: executable + resources directory. */
@@ -138,18 +179,28 @@ if (info.schemaVersion !== SCHEMA_VERSION) {
 
 /**
  * Every process on the machine (ps on macOS, CIM on Windows), or why it couldn't be read: an
- * unreadable list is never taken for an empty one (readProcessList, survivorVerdict).
+ * unreadable list is never taken for an empty one (readProcessList, survivorVerdict). CIM is slow
+ * and occasionally times out on hosted runners: a generous timeout and ONE retry before the list
+ * counts as unreadable (which still fails closed).
  */
-const listProcesses = (): ProcessList => {
-  const r =
+const listTimeoutMs = process.platform === "win32" ? 90_000 : 10_000;
+const listOnce = async (): Promise<ProcessList> =>
+  readProcessList(
+    process.platform,
     process.platform === "win32"
-      ? sh(
+      ? await shAsync(
           "powershell",
           ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress"],
-          30_000,
+          listTimeoutMs,
         )
-      : sh("ps", ["-axo", "pid=,ppid=,command="]);
-  return readProcessList(process.platform, r, process.pid);
+      : await shAsync("ps", ["-axo", "pid=,ppid=,command="], listTimeoutMs),
+    process.pid,
+  );
+const listProcesses = async (): Promise<ProcessList> => {
+  const first = await listOnce();
+  if (first.ok) return first;
+  console.log(`  (process list unreadable, retrying once: ${first.error})`);
+  return listOnce();
 };
 /** The pids listening on a local TCP port. */
 const portOwners = (port: number): Array<number> => {
@@ -210,8 +261,7 @@ const runOnce = async (seedVersion: number): Promise<Array<string>> => {
       dataDir,
       userDataDir: join(dir, "electron"),
       screenshot,
-      // Long enough for /health to be asked from outside before the app quits.
-      screenshotDelayMs: 6000,
+      screenshotDelayMs,
     }),
   });
   let exit: { code: number | null; signal: string | null } | null = null;
@@ -220,34 +270,36 @@ const runOnce = async (seedVersion: number): Promise<Array<string>> => {
   const deadline = Date.now() + timeoutMs;
   let url: string | null = null;
   let answered = false;
-  // The app's process tree, sampled while it runs. If it could never be read, a detached
-  // descendant could go unseen: that fails the run (unknown is not none).
+  // The app's process tree, sampled while it runs, CONCURRENTLY with the /health polling (a
+  // sample can take seconds on Windows). Only a sample that finished while the app was still
+  // running counts: one that completed after its exit may have missed descendants. If no sample
+  // ever counted, a detached descendant could go unseen: that fails the run (unknown is not none).
   let samples = 0;
   let sampleError: string | null = null;
-  const sample = () => {
-    if (exit || child.pid === undefined) return;
-    const list = listProcesses();
-    if (!list.ok) {
-      sampleError = list.error;
-      return;
+  const sampleTimes: Array<number> = [];
+  const sampler = (async () => {
+    while (!exit && child.pid !== undefined && Date.now() < deadline) {
+      const started = performance.now();
+      const list = await listProcesses();
+      sampleTimes.push(Math.round(performance.now() - started));
+      if (exit) break;
+      if (list.ok) {
+        samples++;
+        for (const pid of descendantsOf(list.procs, child.pid)) tracked.add(pid);
+      } else sampleError = list.error;
+      await Promise.race([exited, sleep(250)]);
     }
-    samples++;
-    for (const pid of descendantsOf(list.procs, child.pid)) tracked.add(pid);
-  };
+  })();
   if (child.pid !== undefined) tracked.add(child.pid);
   while (!answered && !exit && Date.now() < deadline) {
-    sample();
     url ??= serverUrlFromLog(readFileSync(logPath, "utf8"));
     answered = url !== null && (await healthy(url));
-    if (!answered) await sleep(250);
+    if (!answered) await Promise.race([exited, sleep(250)]);
   }
   if (answered) console.log(`  /health answered at ${url}/health`);
   else if (exit) problems.push(`the app exited (${JSON.stringify(exit)}) before /health answered${url ? "" : " (no 'Listening on' line from the server)"}`);
   else problems.push(url ? `/health never answered at ${url}` : "the server never logged 'Listening on http://…'");
-  while (!exit && Date.now() < deadline) {
-    sample();
-    await Promise.race([exited, sleep(250)]);
-  }
+  await Promise.race([exited, sleep(Math.max(0, deadline - Date.now()))]);
   if (!exit) {
     problems.push(`the app did not exit within ${timeoutMs / 1000}s`);
     child.kill("SIGKILL");
@@ -256,6 +308,8 @@ const runOnce = async (seedVersion: number): Promise<Array<string>> => {
   // Nothing of the app may outlive it: no descendant, no process from its directory, and no
   // listener on its server's port (healthy or NOT), once the shutdown grace has passed. An
   // unreadable process list never counts as "nothing left" (survivorVerdict fails closed).
+  await sampler;
+  console.log(`  process-tree samples: ${samples} while it ran (list times ms: ${sampleTimes.join(", ") || "none"}); app exit ${JSON.stringify(exit)}`);
   if (samples === 0) problems.push(`could not read the app's process tree while it ran (${sampleError ?? "no sample taken"}): its descendants can't be checked`);
   const port = url ? Number(new URL(url).port) : null;
   const settleBy = Date.now() + shutdownGraceMs;
@@ -264,7 +318,7 @@ const runOnce = async (seedVersion: number): Promise<Array<string>> => {
   for (;;) {
     listening = port !== null && (await portAccepts(port));
     verdict = survivorVerdict({
-      list: listProcesses(),
+      list: await listProcesses(),
       tracked,
       isAlive: alive,
       appDirs,
@@ -288,14 +342,33 @@ const runOnce = async (seedVersion: number): Promise<Array<string>> => {
 
 const failures: Array<string> = [...stampProblems];
 try {
+  // Warm-up, and a measure of how slow the process list is on this machine (CIM on hosted
+  // Windows runners can take tens of seconds): logged so a failing run says why.
+  const warmStart = performance.now();
+  const warm = await listProcesses();
+  console.log(`▸ process list ${warm.ok ? `read (${warm.procs.length} processes)` : `UNREADABLE (${warm.error})`} in ${Math.round(performance.now() - warmStart)}ms`);
   for (const v of seedVersions) failures.push(...(await runOnce(v)));
 } finally {
   for (const pid of tracked) if (alive(pid)) killTree(pid);
   uninstall?.();
   if (uninstall) {
+    // The NSIS uninstaller copies itself to %TEMP%\~nsuX.tmp\Un_X.exe and relaunches with
+    // `_?=<install dir>`: "Uninstall Apollo.exe" returns while that copy still deletes files. Wait
+    // (bounded) for it to finish before judging what is left in the install directory.
+    const uninstallerDeadline = Date.now() + 120_000;
+    for (;;) {
+      const list = await listProcesses();
+      const pending = list.ok ? processesUnder(list.procs, appDirs, process.platform, new Set([process.pid])).filter(isNsisUninstaller) : [];
+      if (!pending.length) break;
+      if (Date.now() >= uninstallerDeadline) {
+        failures.push(`the NSIS uninstaller was still running 120s after "Uninstall Apollo.exe" returned: ${pending.map((p) => p.pid).join(", ")}`);
+        break;
+      }
+      await sleep(1000);
+    }
     // After the uninstaller: nothing may still run from the install directory.
     await sleep(Math.min(shutdownGraceMs, 3000));
-    const list = listProcesses();
+    const list = await listProcesses();
     if (!list.ok) failures.push(`could not list processes after uninstall (${list.error}): cannot confirm nothing runs from ${appDirs[0]}`);
     const survivors = list.ok ? processesUnder(list.procs, appDirs, process.platform, new Set([process.pid])) : [];
     if (survivors.length) failures.push(`processes still running from ${appDirs[0]} after uninstall: ${survivors.map((p) => `${p.pid} (${p.command.slice(0, 160)})`).join("; ")}`);

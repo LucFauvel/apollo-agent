@@ -8,6 +8,7 @@ import { MIGRATIONS, open, SCHEMA_VERSION } from "../../../server/src/Database.t
 import {
   checkMigratedDatabase,
   descendantsOf,
+  isNsisUninstaller,
   nsisInstallInvocation,
   parsePs,
   parseWinProcesses,
@@ -150,6 +151,18 @@ describe("leftover detection (review P2-2)", () => {
     ];
     expect(processesUnder(win, ["C:/Temp/installed"], "win32").map((p) => p.pid)).toEqual([9]);
     expect(processesUnder(win, ["C:\\Temp\\installed"], "win32", new Set([9]))).toEqual([]);
+  });
+
+  it("recognises the NSIS uninstaller's temp copy, and nothing else", () => {
+    const un = {
+      pid: 5272,
+      ppid: 1,
+      command: 'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\~nsuA.tmp\\Un_A.exe "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\~nsuA.tmp\\Un_A.exe"  /S _?=C:\\Temp\\installed\\',
+    };
+    expect(isNsisUninstaller(un)).toBe(true);
+    expect(isNsisUninstaller({ pid: 1, ppid: 0, command: "C:\\Temp\\installed\\apollo.exe --type=gpu" })).toBe(false);
+    expect(isNsisUninstaller({ pid: 2, ppid: 0, command: "C:\\Temp\\installed\\Uninstall Apollo.exe /S" })).toBe(false);
+    expect(isNsisUninstaller({ pid: 3, ppid: 0, command: "C:\\Temp\\Un_A.exe" })).toBe(false);
   });
 
   it("sees a listener that answers 503 as still there, and a closed port as gone", async () => {

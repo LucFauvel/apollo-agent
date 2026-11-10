@@ -216,6 +216,12 @@ export const processesUnder = (
 };
 
 /** Whether anything accepts a TCP connection on host:port (an unhealthy server still does). */
+/**
+ * The NSIS uninstaller's temp copy (`%TEMP%\\~nsuA.tmp\\Un_A.exe … _?=<install dir>`): it keeps
+ * deleting files after "Uninstall <app>.exe" itself has returned.
+ */
+export const isNsisUninstaller = (p: Proc): boolean => /[\\/]~nsu[^\\/]*\.tmp[\\/]Un_[A-Z]\.exe\b/i.test(p.command);
+
 export const portAccepts = (port: number, host = "127.0.0.1", timeoutMs = 1000): Promise<boolean> =>
   new Promise((resolveAccepts) => {
     const socket = netConnect({ port, host });

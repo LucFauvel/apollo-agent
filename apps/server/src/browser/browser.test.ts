@@ -37,7 +37,13 @@ const PAGE = `<!doctype html><html><head><title>Test form</title></head><body>
 
 const executable = findBrowser(process.env.APOLLO_BROWSER_BIN);
 
-describe.skipIf(!executable)("built-in browser (real Chromium)", () => {
+// Real Chromium on shared CI runners is slow to start and to render: pay the cold
+// start once in beforeAll, give each test a runner-sized budget, and have every
+// test open its own page so one timeout cannot cascade "no tab is open" onward.
+// Deliberately NOT gated out of hosted CI: the macOS runner image ships Chrome, and this
+// suite is the only end-to-end coverage of the built-in browser. It skips only where no
+// Chromium is found (APOLLO_BROWSER_BIN points at one explicitly).
+describe.skipIf(!executable)("built-in browser (real Chromium)", { timeout: 60_000 }, () => {
   const bot = "bot-1" as BotId;
   const session = "session-1" as SessionId;
   let server: Server;
@@ -56,12 +62,17 @@ describe.skipIf(!executable)("built-in browser (real Chromium)", () => {
     base = `http://127.0.0.1:${typeof address === "object" && address ? address.port : 0}`;
     dataDir = mkdtempSync(join(tmpdir(), "apollo-browser-"));
     core = new BrowserCore({ executable, headless: true, dataDir, publish: (c) => void changes.push(c) });
-  });
+    // Launch Chromium before any test asserts, so no test's budget is spent on the cold start.
+    await core.open(bot, session, "about:blank", false);
+    await core.close(bot, session);
+  }, 120_000);
 
   afterAll(async () => {
     await core?.shutdown();
     server?.close();
-    rmSync(dataDir, { recursive: true, force: true });
+    // Chromium may still flush to the profile dir after shutdown resolves; retry so
+    // teardown doesn't fail the run with ENOTEMPTY on slower runners.
+    rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
   });
 
   it("opens a page, reads it, and drives a form by ref", async () => {
@@ -90,6 +101,7 @@ describe.skipIf(!executable)("built-in browser (real Chromium)", () => {
   });
 
   it("reports dialogs and console errors, and follows links", async () => {
+    await core.open(bot, session, base, false);
     const snap = await core.snapshot(bot, session);
     const warn = snap.content.match(/button "Warn" \[ref=(e\d+)\]/)?.[1];
     const result = await core.act(bot, session, undefined, { action: "click", ref: warn });
@@ -106,6 +118,7 @@ describe.skipIf(!executable)("built-in browser (real Chromium)", () => {
   });
 
   it("rejects stale refs and other bots' tabs", async () => {
+    await core.open(bot, session, base, false);
     await expect(core.act(bot, session, undefined, { action: "click", ref: "e999" })).rejects.toThrow(/unknown ref/);
     const { current } = core.tabsFor(bot, session);
     await expect(core.snapshot("bot-2" as BotId, session, current!)).rejects.toThrow(/another bot/);
@@ -148,6 +161,7 @@ describe.skipIf(!executable)("built-in browser (real Chromium)", () => {
   });
 
   it("saves screenshots and streams frames to the live view", async () => {
+    await core.open(bot, session, base, false);
     const shot = await core.screenshot(bot, session, undefined, true);
     expect(existsSync(shot.path)).toBe(true);
     expect(shot.bytes).toBeGreaterThan(1000);
