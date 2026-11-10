@@ -1022,7 +1022,10 @@ export function SessionView({
 
   // A press anywhere ends with the button released, even outside the transcript.
   useEffect(() => {
-    const release = () => follower.press(false);
+    const release = () => {
+      const el = scrollRef.current;
+      if (el && follower.press(el, false)) setFarFromBottom(false);
+    };
     const events = ["pointerup", "pointercancel", "touchend", "touchcancel", "blur"] as const;
     for (const name of events) window.addEventListener(name, release);
     return () => {
@@ -1294,8 +1297,8 @@ export function SessionView({
           const key = scrollKey(e);
           if (key && !(e.target instanceof HTMLElement && e.target.closest("input, textarea, select, [contenteditable]"))) follower.userScroll(key === "up");
         }}
-        onPointerDown={(e) => e.pointerType !== "touch" && follower.press(true)}
-        onTouchStart={() => follower.press(true)}
+        onPointerDown={(e) => e.pointerType !== "touch" && follower.press(e.currentTarget, true)}
+        onTouchStart={(e) => follower.press(e.currentTarget, true)}
       >
         <div
           className={cx("mx-auto max-w-3xl space-y-2 px-4 py-6", loaded ? "animate-fade-in" : "pointer-events-none invisible")}

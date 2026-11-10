@@ -24,6 +24,10 @@ export class ChatScroll {
   private ownUntil = 0;
   private pressed = false;
   private lastHeight = 0;
+  /** A scroll of ours skipped while pressed, retried on release: "auto" if any was. */
+  private skipped: ScrollBehavior | null = null;
+  /** Where a press stopped our smooth scroll: the scroll event that stop fires is not the user's. */
+  private stoppedAt: number | null = null;
 
   private readonly now: () => number;
 
@@ -36,11 +40,17 @@ export class ChatScroll {
     this.following = true;
     this.ownUntil = 0;
     this.lastHeight = 0;
+    this.skipped = null;
+    this.stoppedAt = null;
   }
 
-  /** Scrolls to the latest message and follows from there; does nothing while pressed. */
+  /** Scrolls to the latest message and follows from there; while pressed, waits for the release. */
   toLatest(el: Scroller, behavior: ScrollBehavior): boolean {
-    if (this.pressed) return false;
+    if (this.pressed) {
+      this.skipped = this.skipped === "auto" || behavior === "auto" ? "auto" : behavior;
+      return false;
+    }
+    this.skipped = null;
     this.following = true;
     this.ownUntil = this.now() + OWN_SCROLL_MS;
     this.lastHeight = el.scrollHeight;
@@ -62,7 +72,9 @@ export class ChatScroll {
   /** A scroll event. Returns whether it sits far enough up to offer a way back. */
   scrolled(el: Scroller): boolean {
     const gap = fromBottom(el);
-    if (this.now() < this.ownUntil) {
+    if (this.stoppedAt !== null && el.scrollTop === this.stoppedAt) {
+      this.stoppedAt = null;
+    } else if (this.now() < this.ownUntil) {
       if (gap <= NEAR_BOTTOM) this.ownUntil = 0;
     } else {
       this.following = gap <= NEAR_BOTTOM;
@@ -76,16 +88,35 @@ export class ChatScroll {
     if (up) this.following = false;
   }
 
-  /** The user presses on the transcript (a drag, the scrollbar, a selection) or lets go. */
-  press(down: boolean) {
-    this.pressed = down;
-    if (down) this.ownUntil = 0;
+  /**
+   * The user presses on the transcript (a drag, the scrollbar, a selection): a smooth scroll
+   * of ours stops where it is, to finish on release. Letting go catches up with what was
+   * skipped meanwhile, unless their scrolling stopped following. Returns whether it scrolled.
+   */
+  press(el: Scroller, down: boolean): boolean {
+    if (down) {
+      if (!this.pressed && this.now() < this.ownUntil) {
+        this.stoppedAt = el.scrollTop;
+        el.scrollTo({ top: el.scrollTop, behavior: "auto" });
+        this.skipped = "smooth";
+      }
+      this.pressed = true;
+      this.ownUntil = 0;
+      return false;
+    }
+    if (!this.pressed) return false;
+    this.pressed = false;
+    this.stoppedAt = null;
+    const skipped = this.skipped;
+    this.skipped = null;
+    return skipped !== null && this.following && this.toLatest(el, skipped);
   }
 
   /** We scroll somewhere else (a message, a search match): stop following. */
   leave() {
     this.following = false;
     this.ownUntil = 0;
+    this.skipped = null;
   }
 }
 
