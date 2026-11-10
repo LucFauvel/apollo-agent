@@ -15,6 +15,7 @@ import { errorMessage, rpc } from "../rpc.ts";
 import { updateProvider, useProviderVersions } from "../versions.ts";
 import { setLocalModels, useApp } from "../store.ts";
 import { AccountsSection } from "./Accounts.tsx";
+import { AgentCliSetup } from "./AgentCliSetup.tsx";
 import { ClaudeLogo, CodexLogo, LlamaLogo, ProviderLogo } from "./icons.tsx";
 import { Button, cx, ErrorText, Field, inputClass, Modal, OptionCards, Toggle } from "./ui.tsx";
 
@@ -98,8 +99,9 @@ function VersionBadge({ provider }: { provider: ProviderKind }) {
       </span>
     );
   }
-  // Something Apollo installs itself (Antigravity's server): offer it here.
-  if (v.installed === null && v.canUpdate) {
+  // Something Apollo installs itself (Antigravity's server): offer it here. Claude Code and
+  // Codex have their own setup in their sections.
+  if (v.installed === null && v.canUpdate && provider !== "claude" && provider !== "codex") {
     return (
       <Button size="sm" variant="primary" disabled={busy} onClick={() => void updateProvider(provider)} title={v.note ?? undefined}>
         {busy ? <Loader2 className="animate-spin" /> : <Download />} {busy ? "Installing…" : "Install"}
@@ -388,6 +390,7 @@ export function ProvidersDialog({ onClose, onLocalModels }: { onClose: () => voi
       {settings ? (
         <>
           <ProviderSection provider="claude" logo={<ClaudeLogo size={20} />} name="Claude Code" detail="Anthropic · runs through the Claude Agent SDK">
+            <AgentCliSetup provider="claude" />
             <OptionCards
               value={auth}
               onChange={setAuth}
@@ -423,9 +426,9 @@ export function ProvidersDialog({ onClose, onLocalModels }: { onClose: () => voi
 
           <ProviderSection provider="codex" logo={<CodexLogo size={20} />} name="Codex" detail="OpenAI · runs through codex app-server">
             <p className="text-[11px] text-zinc-500">
-              Uses the <span className="font-mono text-zinc-400">codex</span> CLI on this machine and its login. Run{" "}
-              <span className="font-mono text-zinc-400">codex login</span> to sign in.
+              Uses the <span className="font-mono text-zinc-400">codex</span> CLI on this machine and its login.
             </p>
+            <AgentCliSetup provider="codex" />
             <AccountsSection provider="codex" />
           </ProviderSection>
 

@@ -38,7 +38,7 @@ export function useAccounts() {
 
 const PLANS: Record<string, string> = { pro: "Pro", max: "Max", team: "Team", enterprise: "Enterprise", plus: "Plus", business: "Business", free: "Free" };
 
-export const accountDetail = (a: ProviderAccount) =>
+export const accountDetail = (a: Pick<ProviderAccount, "loggedIn" | "email" | "orgName" | "plan">) =>
   a.loggedIn ? [a.email, a.orgName, a.plan ? (PLANS[a.plan] ?? a.plan) : null].filter(Boolean).join(" · ") : "Not signed in";
 
 function AccountRow({ account, onChange }: { account: ProviderAccount; onChange: () => void }) {

@@ -11,6 +11,7 @@ import { useProviderVersions } from "../versions.ts";
 import { type ModelChoice, ModelPicker } from "./ModelPicker.tsx";
 import { ClaudeLogo, ProviderLogo } from "./icons.tsx";
 import { AccountSelect } from "./Accounts.tsx";
+import { AgentCliMissing } from "./AgentCliSetup.tsx";
 import { LocalModelSetup } from "./LocalModelsDialog.tsx";
 import { BotAvatar } from "./Sidebar.tsx";
 import {
@@ -107,6 +108,7 @@ function ProviderModelPicker({
         <ModelPicker provider={provider} value={choice} onChange={onChoice} quietErrors={provider === "llamacpp"} />
       </ModelRow>
       {provider === "llamacpp" ? <LocalModelSetup onSelect={onSelect} /> : null}
+      {provider === "claude" || provider === "codex" ? <AgentCliMissing provider={provider} /> : null}
     </div>
   );
 }

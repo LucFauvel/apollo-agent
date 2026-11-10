@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Alert, Linking, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { AgentClisCard } from "../AgentClisCard.tsx";
 import { useApollo } from "../AppState.tsx";
 import type { Pairing } from "../connection.ts";
 import { errorMessage } from "../connection.ts";
@@ -61,6 +62,9 @@ export function SettingsScreen({ pairing, onBack, onUnpair }: { pairing: Pairing
             </View>
           </View>
         </View>
+
+        <Text style={styles.section}>Agents on the computer</Text>
+        <AgentClisCard />
 
         <Text style={styles.section}>Notifications</Text>
         <View style={styles.card}>
