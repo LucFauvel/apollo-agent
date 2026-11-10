@@ -2,7 +2,7 @@ import { ApolloError, Memory, PROJECT_CONTEXT_LIMIT, type Project, ProjectStatus
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { Tool, Toolkit } from "effect/ai";
-import { Projects } from "../projects/Projects.ts";
+import { CONTEXT_CONFLICT, Projects } from "../projects/Projects.ts";
 import { Store } from "../Store.ts";
 import { McpCaller } from "./Caller.ts";
 
@@ -154,12 +154,16 @@ export const handlers = ProjectToolkit.toLayer(
         Effect.gen(function* () {
           const project = yield* target(ref);
           if (context !== undefined && append !== undefined) return yield* invalid("give `context` or `append`, not both");
-          const nextContext =
-            append !== undefined && append.trim()
-              ? `${project.context.trimEnd()}${project.context.trim() ? "\n\n" : ""}${append.trim()}`
-              : context;
-          const updated = yield* projects.update({ projectId: project.id, name, summary, context: nextContext, cwd, status });
-          return summarize(updated);
+          const fields = { projectId: project.id, name, summary, cwd, status };
+          if (append === undefined || !append.trim()) return summarize(yield* projects.update({ ...fields, context }));
+          // Appended to the context as stored: another session may append at the same time.
+          for (let attempt = 0; ; attempt++) {
+            const current = (yield* store.getProject(project.id)).context;
+            const next = `${current.trimEnd()}${current.trim() ? "\n\n" : ""}${append.trim()}`;
+            const saved = yield* projects.update({ ...fields, context: next, expectedContext: current }).pipe(Effect.result);
+            if (saved._tag === "Success") return summarize(saved.success);
+            if (saved.failure.message !== CONTEXT_CONFLICT || attempt >= 4) return yield* saved.failure;
+          }
         }),
     };
   }),

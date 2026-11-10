@@ -43,6 +43,9 @@ export const projectProblem = (
   return null;
 };
 
+/** The context changed under an edit: `projects.update` with `expectedContext` refuses to overwrite it. */
+export const CONTEXT_CONFLICT = "the project's context changed since you started editing it (an agent may have updated it)";
+
 /** The bot's project `ref` names: its id, or its name (any case). */
 export const findProject = (projects: ReadonlyArray<Project>, ref: string): Project | undefined => {
   const wanted = ref.trim();
@@ -60,6 +63,13 @@ const make = Effect.gen(function* () {
   const changes = yield* PubSub.unbounded<ProjectsChange>();
 
   const publish = (change: ProjectsChange) => PubSub.publish(changes, change).pipe(Effect.asVoid);
+
+  /** The orchestrator's prompt lists the bot's projects: a change reaches it from its next turn. */
+  const refreshOrchestrator = (botId: BotId) =>
+    store.getBot(botId).pipe(
+      Effect.flatMap((bot) => manager.refreshInstructions(bot.mainSessionId)),
+      Effect.catch(() => Effect.void),
+    );
 
   const workspace = (path: string | null | undefined) =>
     Effect.gen(function* () {
@@ -97,12 +107,16 @@ const make = Effect.gen(function* () {
         updatedAt: now,
       });
       yield* publish({ _tag: "ProjectUpserted", project });
+      yield* refreshOrchestrator(project.botId);
       return project;
     });
 
   const update = (input: UpdateProjectInput) =>
     Effect.gen(function* () {
       const current = yield* store.getProject(input.projectId);
+      if (input.context !== undefined && input.expectedContext !== undefined && input.expectedContext.trim() !== current.context) {
+        return yield* invalid(CONTEXT_CONFLICT);
+      }
       const fields = {
         name: input.name !== undefined ? oneLine(input.name) : current.name,
         summary: input.summary !== undefined ? oneLine(input.summary) : current.summary,
@@ -119,19 +133,31 @@ const make = Effect.gen(function* () {
         updatedAt: Date.now(),
       });
       yield* publish({ _tag: "ProjectUpserted", project });
+      // Only what the orchestrator's prompt shows; the context is not in it.
+      if (project.name !== current.name || project.summary !== current.summary || project.cwd !== current.cwd || project.status !== current.status) {
+        yield* refreshOrchestrator(project.botId);
+      }
       return project;
     });
 
   const remove = (projectId: ProjectId) =>
     Effect.gen(function* () {
       const project = yield* store.getProject(projectId);
-      const inside = (yield* store.listSessions(project.botId)).filter((s) => s.projectId === projectId);
-      yield* store.deleteProject(projectId);
-      for (const s of inside) {
-        yield* manager.publish({ _tag: "SessionUpserted", session: yield* store.getSession(s.id) });
-      }
-      yield* manager.publishMemoryChanged(project.botId);
-      yield* publish({ _tag: "ProjectDeleted", projectId, botId: project.botId });
+      yield* manager.deletingProject(
+        projectId,
+        Effect.gen(function* () {
+          const inside = (yield* store.listSessions(project.botId)).filter((s) => s.projectId === projectId);
+          yield* store.deleteProject(projectId);
+          for (const s of inside) {
+            yield* manager.publish({ _tag: "SessionUpserted", session: yield* store.getSession(s.id) });
+            // Their prompt still shows the project.
+            yield* manager.refreshInstructions(s.id);
+          }
+          yield* manager.publishMemoryChanged(project.botId);
+          yield* publish({ _tag: "ProjectDeleted", projectId, botId: project.botId });
+          yield* refreshOrchestrator(project.botId);
+        }),
+      );
     });
 
   return {

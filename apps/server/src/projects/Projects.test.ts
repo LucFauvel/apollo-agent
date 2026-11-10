@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent, AppChange, Project, ProjectsChange, ProviderKind } from "@apollo/contracts";
@@ -6,6 +7,7 @@ import { ProviderKind as Kinds } from "@apollo/contracts";
 import type { Provider, ProviderSessionOptions } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as AppSettings from "../AppSettings.ts";
@@ -249,6 +251,115 @@ describe("projects", () => {
       yield* projects.create({ botId: bot.id, name: "Send", summary: "" });
       yield* manager.deleteBot(bot.id);
       expect(yield* store.listProjects()).toEqual([]);
+    }).pipe(Effect.provide(f.layer));
+  });
+});
+
+describe("project changes", () => {
+  it.live("refuse a context edit made from an older context", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { projects, bot } = yield* setup(f.cwd);
+      const project = yield* projects.create({ botId: bot.id, name: "Send", summary: "", context: "Goals: ship" });
+      yield* projects.update({ projectId: project.id, context: "Goals: ship\n\nDecided: S3.", expectedContext: "Goals: ship" });
+      const stale = yield* Effect.flip(
+        projects.update({ projectId: project.id, context: "Goals: ship by Friday", expectedContext: "Goals: ship" }),
+      );
+      expect(stale.message).toContain("changed since you started editing");
+      expect((yield* projects.get(project.id)).context).toBe("Goals: ship\n\nDecided: S3.");
+      // Other fields alone leave the context as it is.
+      const renamed = yield* projects.update({ projectId: project.id, name: "Send v2" });
+      expect(renamed.context).toBe("Goals: ship\n\nDecided: S3.");
+    }).pipe(Effect.provide(f.layer));
+  });
+
+  it.live("reach a running orchestrator from its next turn, unless only the context changed", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, projects, store, bot } = yield* setup(f.cwd);
+      const turn = (n: number) =>
+        Effect.gen(function* () {
+          yield* manager.send(bot.mainSessionId, `message ${n}`, "user");
+          yield* until(() => f.opened.length >= 1);
+          yield* Effect.promise(async () => {
+            for (let i = 0; i < 200; i++) {
+              const s = await Effect.runPromise(store.getSession(bot.mainSessionId));
+              if (s.status === "idle" && s.completedTurns >= n) return;
+              await new Promise((r) => setTimeout(r, 10));
+            }
+            throw new Error("turn did not end");
+          });
+        });
+      yield* turn(1);
+      expect(f.opened.at(-1)!.instructions).toContain("No active projects yet.");
+
+      const project = yield* projects.create({ botId: bot.id, name: "Send", summary: "File sharing" });
+      yield* turn(2);
+      expect(f.opened).toHaveLength(2);
+      expect(f.opened.at(-1)!.instructions).toContain("- Send (");
+
+      yield* projects.update({ projectId: project.id, context: "Details only sessions in the project see." });
+      yield* turn(3);
+      expect(f.opened).toHaveLength(2);
+
+      yield* projects.update({ projectId: project.id, status: "archived" });
+      yield* turn(4);
+      expect(f.opened).toHaveLength(3);
+      expect(f.opened.at(-1)!.instructions).toContain("No active projects yet.");
+    }).pipe(Effect.provide(f.layer));
+  });
+});
+
+/** A repository whose checkouts take `seconds`, so a worktree is still being created for a while. */
+const slowRepo = (dir: string, seconds: number) => {
+  const repo = join(dir, "repo");
+  mkdirSync(repo);
+  execSync("git init -q -b main && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", { cwd: repo });
+  const hook = join(repo, ".git", "hooks", "post-checkout");
+  writeFileSync(hook, `#!/bin/sh\nsleep ${seconds}\n`);
+  chmodSync(hook, 0o755);
+  return repo;
+};
+
+const worktrees = (repo: string) => execSync("git worktree list --porcelain", { cwd: repo }).toString().split("\n").filter((l) => l.startsWith("worktree ")).length;
+const branches = (repo: string) => execSync("git branch --list 'apollo/*'", { cwd: repo }).toString().trim();
+
+describe.skipIf(process.platform === "win32")("deleting a project while a session is created in it", () => {
+  it.live("waits for the session, then moves it out of the project", () => {
+    const f = fixture();
+    const repo = slowRepo(f.dir, 0.4);
+    return Effect.gen(function* () {
+      const { manager, projects, store, bot } = yield* setup(f.cwd);
+      const project = yield* projects.create({ botId: bot.id, name: "Send", summary: "", cwd: repo });
+      const creating = yield* manager
+        .createSession({ botId: bot.id, title: "w", provider: { provider: "codex" }, projectId: project.id, isolation: "worktree" })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* until(() => existsSync(join(f.dir, "worktrees")));
+      yield* projects.remove(project.id);
+      const session = yield* Fiber.join(creating);
+      expect((yield* store.getSession(session.id)).projectId).toBeNull();
+      expect(existsSync(session.worktree!.path)).toBe(true);
+      const late = yield* Effect.flip(manager.createSession({ botId: bot.id, title: "x", provider: { provider: "codex" }, projectId: project.id }));
+      expect(late.code).toBe("not_found");
+    }).pipe(Effect.provide(f.layer));
+  });
+
+  it.live("removes the new worktree when the session cannot be saved", () => {
+    const f = fixture();
+    const repo = slowRepo(f.dir, 0.4);
+    return Effect.gen(function* () {
+      const { manager, projects, store, bot } = yield* setup(f.cwd);
+      const project = yield* projects.create({ botId: bot.id, name: "Send", summary: "", cwd: repo });
+      const creating = yield* manager
+        .createSession({ botId: bot.id, title: "w", provider: { provider: "codex" }, projectId: project.id, isolation: "worktree" })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* until(() => existsSync(join(f.dir, "worktrees")));
+      // Behind the manager's back: the insert then fails its foreign key.
+      yield* store.deleteProject(project.id);
+      const error = yield* Effect.flip(Fiber.join(creating));
+      expect(error.message).toContain("could not save the session");
+      expect(worktrees(repo)).toBe(1);
+      expect(branches(repo)).toBe("");
     }).pipe(Effect.provide(f.layer));
   });
 });

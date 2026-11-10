@@ -255,6 +255,28 @@ const make = Effect.gen(function* () {
   /** How long a deletion waits for session creations under way (a git worktree, say). */
   const CREATION_DRAIN_MS = 30_000;
 
+  /** Projects being deleted: no session may be created in them meanwhile. */
+  const deletingProjects = new Set<ProjectId>();
+  /** Session creations under way, per project: a project's deletion waits for them. */
+  const creatingInProjects = new Map<ProjectId, number>();
+  const creatingInProject = <A, E, R>(projectId: ProjectId | null | undefined, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E | ApolloError, R> =>
+    Effect.suspend((): Effect.Effect<A, E | ApolloError, R> => {
+      if (!projectId) return effect;
+      if (deletingProjects.has(projectId)) {
+        return Effect.fail(new ApolloError({ code: "not_found", message: `project ${projectId} not found (it is being deleted)` }));
+      }
+      creatingInProjects.set(projectId, (creatingInProjects.get(projectId) ?? 0) + 1);
+      return effect.pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            const left = (creatingInProjects.get(projectId) ?? 1) - 1;
+            if (left > 0) creatingInProjects.set(projectId, left);
+            else creatingInProjects.delete(projectId);
+          }),
+        ),
+      );
+    });
+
   /** Any failure, defects included, as an ApolloError saying what failed (interruptions stay). */
   const asApolloError =
     (what: string) =>
@@ -965,7 +987,7 @@ const make = Effect.gen(function* () {
     readonly isolation?: "shared" | "worktree" | undefined;
     readonly projectId?: ProjectId | null | undefined;
   }) =>
-    creatingFor(input.botId, Effect.gen(function* () {
+    creatingFor(input.botId, creatingInProject(input.projectId, Effect.gen(function* () {
       const bot = yield* store.getBot(input.botId);
       const project = input.projectId ? yield* store.getProject(input.projectId) : null;
       if (project && project.botId !== bot.id) return yield* invalid("that project belongs to another bot");
@@ -981,7 +1003,7 @@ const make = Effect.gen(function* () {
         worktree = created.worktree;
         cwd = created.cwd;
       }
-      const session = yield* store.insertSession({
+      const insert = store.insertSession({
         id,
         botId: bot.id,
         role: input.role,
@@ -1004,9 +1026,26 @@ const make = Effect.gen(function* () {
         createdAt: now,
         updatedAt: now,
       });
+      // A worktree without its session would never be cleaned up.
+      const session = yield* insert.pipe(
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            if (Cause.hasInterruptsOnly(cause)) return yield* Effect.interrupt;
+            if (worktree) {
+              const orphan = worktree;
+              yield* Effect.promise(() => finishWorktree(orphan, "discard").catch(() => undefined));
+            }
+            const error = Cause.squash(cause);
+            return yield* new ApolloError({
+              code: "internal",
+              message: `could not save the session: ${error instanceof Error ? error.message : String(error)}`,
+            });
+          }),
+        ),
+      );
       yield* publish({ _tag: "SessionUpserted", session });
       return session;
-    }));
+    })));
 
   // --- settings -------------------------------------------------------------
 
@@ -1801,6 +1840,30 @@ const make = Effect.gen(function* () {
 
     /** Resolves an MCP bearer token to the session it was issued to. */
     resolveToken: (token: string) => Effect.sync(() => tokens.get(token)),
+
+    /**
+     * Gives a live session fresh instructions (after the bot's projects changed): its process
+     * closes, after a running turn, and the next message resumes the conversation with them.
+     */
+    refreshInstructions: (id: SessionId) => reopenWithNewSettings(id).pipe(Effect.catch(() => Effect.void)),
+
+    /**
+     * Runs a project's deletion once the sessions being created in it exist (they are then
+     * moved out of it), with no new ones starting meanwhile.
+     */
+    deletingProject: <A, E, R>(projectId: ProjectId, effect: Effect.Effect<A, E, R>) =>
+      Effect.gen(function* () {
+        if (deletingProjects.has(projectId)) return yield* invalid("that project is already being deleted");
+        deletingProjects.add(projectId);
+        const until = Date.now() + CREATION_DRAIN_MS;
+        while (creatingInProjects.has(projectId)) {
+          if (Date.now() > until) {
+            return yield* new ApolloError({ code: "internal", message: "a session is still being created in the project; try again" });
+          }
+          yield* Effect.sleep("10 millis");
+        }
+        return yield* effect;
+      }).pipe(Effect.ensuring(Effect.sync(() => deletingProjects.delete(projectId)))),
 
     publishMemoryChanged: (botId: BotId | null) => publish({ _tag: "MemoryChanged", botId }),
     /** Announces a skill change and refreshes the native skill folders. */

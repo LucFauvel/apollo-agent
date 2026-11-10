@@ -12,6 +12,7 @@ import { useEffect, useMemo, useState } from "react";
 import { relativeTime } from "../format.ts";
 import { errorMessage, rpc } from "../rpc.ts";
 import { useApp } from "../store.ts";
+import { contextConflict, edited, fieldsOf, type ProjectEdit, projectUpdate, rebase, startEdit } from "../projectForm.ts";
 import { ProviderLogo } from "./icons.tsx";
 import { Badge, Button, cx, EmptyState, ErrorText, Field, IconButton, inputClass, Panel, StatusDot } from "./ui.tsx";
 
@@ -55,45 +56,42 @@ function ProjectForm({
   onSaved: (project: Project) => void;
   onCancel?: () => void;
 }) {
-  const [name, setName] = useState(project?.name ?? "");
-  const [summary, setSummary] = useState(project?.summary ?? "");
-  const [cwd, setCwd] = useState(project?.cwd ?? "");
-  const [context, setContext] = useState(project?.context ?? "");
+  const [edit, setEdit] = useState<ProjectEdit>(() => startEdit(project));
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  // Agents update projects too: take their changes while the form is untouched.
-  const [touched, setTouched] = useState(false);
   useEffect(() => {
-    if (!project || touched) return;
-    setName(project.name);
-    setSummary(project.summary);
-    setCwd(project.cwd ?? "");
-    setContext(project.context);
-  }, [project, touched]);
-  const edit = <T,>(set: (value: T) => void) => (value: T) => {
-    setTouched(true);
-    set(value);
-  };
+    if (project) setEdit((current) => rebase(current, fieldsOf(project)));
+  }, [project]);
+  const { name, summary, cwd, context } = edit.draft;
+  const set = (key: keyof ProjectEdit["draft"]) => (value: string) =>
+    setEdit((current) => ({ ...current, draft: { ...current.draft, [key]: value } }));
+  const conflict = project ? contextConflict(edit, fieldsOf(project)) : false;
 
   const save = () => {
     setSaving(true);
     setError(null);
-    const fields = { name, summary, context, cwd: cwd.trim() ? cwd : null };
     rpc((c) =>
-      project ? c["projects.update"]({ projectId: project.id, ...fields }) : c["projects.create"]({ botId: bot.id, ...fields }),
+      project
+        ? c["projects.update"]({ projectId: project.id, ...projectUpdate(edit) })
+        : c["projects.create"]({ botId: bot.id, name, summary, context, cwd: cwd.trim() ? cwd : null }),
     )
       .then((saved) => {
-        setTouched(false);
+        setEdit(startEdit(saved));
         onSaved(saved);
       })
       .catch((e) => setError(errorMessage(e)))
       .finally(() => setSaving(false));
   };
+  /** Drops the user's context edit for the latest context. */
+  const takeLatestContext = () =>
+    project && setEdit((current) => ({ base: { ...current.base, context: project.context }, draft: { ...current.draft, context: project.context } }));
+  /** Keeps the user's context edit, to replace the latest context on save. */
+  const keepMyContext = () => project && setEdit((current) => ({ ...current, base: { ...current.base, context: project.context } }));
 
   return (
     <div className="space-y-3">
       <Field label="Name">
-        <input className={inputClass} value={name} onChange={(e) => edit(setName)(e.target.value)} autoFocus={!project} />
+        <input className={inputClass} value={name} onChange={(e) => set("name")(e.target.value)} autoFocus={!project} />
       </Field>
       <Field
         label="Summary"
@@ -104,10 +102,10 @@ function ProjectForm({
           </>
         }
       >
-        <input className={inputClass} value={summary} onChange={(e) => edit(setSummary)(e.target.value)} />
+        <input className={inputClass} value={summary} onChange={(e) => set("summary")(e.target.value)} />
       </Field>
       <Field label="Workspace" hint={`Where its sessions work. Empty: the bot's (${bot.cwd}).`}>
-        <input className={cx(inputClass, "font-mono text-xs")} value={cwd} onChange={(e) => edit(setCwd)(e.target.value)} placeholder={bot.cwd} />
+        <input className={cx(inputClass, "font-mono text-xs")} value={cwd} onChange={(e) => set("cwd")(e.target.value)} placeholder={bot.cwd} />
       </Field>
       <Field
         label="Context"
@@ -121,9 +119,22 @@ function ProjectForm({
         <textarea
           className={cx(inputClass, "min-h-56 font-mono text-xs leading-relaxed")}
           value={context}
-          onChange={(e) => edit(setContext)(e.target.value)}
+          onChange={(e) => set("context")(e.target.value)}
         />
       </Field>
+      {conflict ? (
+        <div role="alert" className="space-y-2 rounded-md border border-amber-700/30 bg-amber-950/30 px-2.5 py-2 text-[11px] text-amber-200">
+          <div>The context changed while you were editing it (an agent updated it). Saving now would replace that change.</div>
+          <div className="flex gap-2">
+            <Button size="sm" onClick={takeLatestContext}>
+              Use the latest context
+            </Button>
+            <Button size="sm" variant="ghost" onClick={keepMyContext}>
+              Keep my edit
+            </Button>
+          </div>
+        </div>
+      ) : null}
       <ErrorText>{error}</ErrorText>
       <div className="flex justify-end gap-2">
         {onCancel ? (
@@ -131,7 +142,7 @@ function ProjectForm({
             Cancel
           </Button>
         ) : null}
-        <Button variant="primary" size="sm" disabled={saving || (!!project && !touched)} onClick={save}>
+        <Button variant="primary" size="sm" disabled={saving || conflict || (!!project && edited(edit).length === 0)} onClick={save}>
           {project ? "Save" : "Create project"}
         </Button>
       </div>

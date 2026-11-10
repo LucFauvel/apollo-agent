@@ -56,6 +56,11 @@ export const UpdateProjectInput = Schema.Struct({
   name: Schema.optional(Schema.String),
   summary: Schema.optional(Schema.String),
   context: Schema.optional(Schema.String),
+  /**
+   * The context `context` was edited from. When the stored context differs (an agent changed
+   * it meanwhile), the update is refused instead of overwriting that change.
+   */
+  expectedContext: Schema.optional(Schema.String),
   cwd: Schema.optional(Schema.NullOr(Schema.String)),
   status: Schema.optional(ProjectStatus),
 });
