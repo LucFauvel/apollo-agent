@@ -20,12 +20,20 @@ import * as ProjectTools from "../mcp/ProjectTools.ts";
 import { findProject, projectProblem } from "./Projects.ts";
 import * as Projects from "./Projects.ts";
 
+/** Holds providers' startup while `wait` is pending; `started` counts opens begun. */
+interface StartGate {
+  wait: Promise<void>;
+  started: number;
+}
+
 /** A provider that records how each session was opened and ends each turn at once. */
-const recording = (kind: ProviderKind, opened: Array<ProviderSessionOptions>): Provider => ({
+const recording = (kind: ProviderKind, opened: Array<ProviderSessionOptions>, gate: StartGate): Provider => ({
   kind,
   listModels: Effect.succeed([]),
   open: (options, emit) =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
+      gate.started++;
+      yield* Effect.promise(() => gate.wait);
       opened.push(options);
       const agent = (event: AgentEvent) => emit({ _tag: "Event", event });
       return {
@@ -49,12 +57,13 @@ const fixture = () => {
   const cwd = join(dir, "workspace");
   mkdirSync(cwd);
   const opened: Array<ProviderSessionOptions> = [];
+  const gate: StartGate = { wait: Promise.resolve(), started: 0 };
   const layer = Projects.layer.pipe(
     Layer.provideMerge(SessionManager.layer),
     Layer.provideMerge(
       Layer.succeed(
         SessionManager.Providers,
-        Object.fromEntries(Kinds.literals.map((k) => [k, recording(k, opened)])) as Record<ProviderKind, Provider>,
+        Object.fromEntries(Kinds.literals.map((k) => [k, recording(k, opened, gate)])) as Record<ProviderKind, Provider>,
       ),
     ),
     Layer.provideMerge(AppSettings.layer),
@@ -79,7 +88,7 @@ const fixture = () => {
       }),
     ),
   );
-  return { dir, cwd, opened, layer };
+  return { dir, cwd, opened, gate, layer };
 };
 
 const setup = (cwd: string) =>
@@ -324,6 +333,39 @@ const slowRepo = (dir: string, seconds: number) => {
 const worktrees = (repo: string) => execSync("git worktree list --porcelain", { cwd: repo }).toString().split("\n").filter((l) => l.startsWith("worktree ")).length;
 const branches = (repo: string) => execSync("git branch --list 'apollo/*'", { cwd: repo }).toString().trim();
 
+describe("a project change while the orchestrator starts", () => {
+  it.live("opens it again with the new project list", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, projects, store, bot } = yield* setup(f.cwd);
+      let release!: () => void;
+      f.gate.wait = new Promise((resolve) => (release = resolve));
+      const sending = yield* manager.send(bot.mainSessionId, "hello", "user").pipe(Effect.forkChild({ startImmediately: true }));
+      yield* until(() => f.gate.started === 1);
+      yield* projects.create({ botId: bot.id, name: "Send", summary: "File sharing" });
+      release();
+      yield* Fiber.join(sending);
+      const idle = () =>
+        Effect.promise(async () => {
+          for (let i = 0; i < 300; i++) {
+            if ((await Effect.runPromise(store.getSession(bot.mainSessionId))).status === "idle") return;
+            await new Promise((r) => setTimeout(r, 10));
+          }
+          throw new Error("still busy");
+        });
+      yield* idle();
+      // The process that was starting read no projects; it was replaced before serving a turn.
+      expect(f.opened).toHaveLength(2);
+      expect(f.opened[0]!.instructions).toContain("No active projects yet.");
+      expect(f.opened[1]!.instructions).toContain("- Send (");
+      // The process that runs from then on is the fresh one.
+      yield* manager.send(bot.mainSessionId, "again", "user");
+      yield* idle();
+      expect(f.opened).toHaveLength(2);
+    }).pipe(Effect.provide(f.layer));
+  });
+});
+
 describe.skipIf(process.platform === "win32")("deleting a project while a session is created in it", () => {
   it.live("waits for the session, then moves it out of the project", () => {
     const f = fixture();
@@ -358,6 +400,26 @@ describe.skipIf(process.platform === "win32")("deleting a project while a sessio
       yield* store.deleteProject(project.id);
       const error = yield* Effect.flip(Fiber.join(creating));
       expect(error.message).toContain("could not save the session");
+      expect(worktrees(repo)).toBe(1);
+      expect(branches(repo)).toBe("");
+    }).pipe(Effect.provide(f.layer));
+  });
+});
+
+describe.skipIf(process.platform === "win32")("interrupting a session's creation", () => {
+  it.live("removes the worktree it was creating", () => {
+    const f = fixture();
+    const repo = slowRepo(f.dir, 0.4);
+    return Effect.gen(function* () {
+      const { manager, projects, store, bot } = yield* setup(f.cwd);
+      const project = yield* projects.create({ botId: bot.id, name: "Send", summary: "", cwd: repo });
+      const creating = yield* manager
+        .createSession({ botId: bot.id, title: "w", provider: { provider: "codex" }, projectId: project.id, isolation: "worktree" })
+        .pipe(Effect.forkChild({ startImmediately: true }));
+      yield* until(() => existsSync(join(f.dir, "worktrees")));
+      yield* Fiber.interrupt(creating);
+      yield* projects.remove(project.id);
+      expect((yield* store.listSessions(bot.id)).map((s) => s.id)).toEqual([bot.mainSessionId]);
       expect(worktrees(repo)).toBe(1);
       expect(branches(repo)).toBe("");
     }).pipe(Effect.provide(f.layer));
