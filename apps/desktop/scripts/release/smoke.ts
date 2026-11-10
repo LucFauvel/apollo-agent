@@ -34,7 +34,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { performance } from "node:perf_hooks";
-import { existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { MIGRATIONS, SCHEMA_VERSION } from "../../../server/src/Database.ts";
@@ -203,6 +203,14 @@ const listProcesses = async (): Promise<ProcessList> => {
   console.log(`  (process list unreadable, retrying once: ${first.error})`);
   return listOnce();
 };
+/** Files under a directory (0 once it is gone), for progress reporting only. */
+const countFiles = (dir: string): number => {
+  try {
+    return readdirSync(dir, { recursive: true, withFileTypes: true }).filter((e) => e.isFile()).length;
+  } catch {
+    return 0;
+  }
+};
 /** The pids listening on a local TCP port. */
 const portOwners = (port: number): Array<number> => {
   const r =
@@ -357,19 +365,25 @@ try {
   uninstall?.();
   if (uninstall) {
     // The NSIS uninstaller copies itself to %TEMP%\~nsuX.tmp\Un_X.exe and relaunches with
-    // `_?=<install dir>`: "Uninstall Apollo.exe" returns while that copy still deletes files. Wait
-    // (bounded) for it to finish before judging what is left in the install directory.
-    const uninstallerDeadline = Date.now() + 120_000;
-    for (;;) {
-      const list = await listProcesses();
-      const pending = list.ok ? processesUnder(list.procs, appDirs, process.platform, new Set([process.pid])).filter(isNsisUninstaller) : [];
-      if (!pending.length) break;
-      if (Date.now() >= uninstallerDeadline) {
-        failures.push(`the NSIS uninstaller was still running 120s after "Uninstall Apollo.exe" returned: ${pending.map((p) => p.pid).join(", ")}`);
-        break;
+    // `_?=<install dir>`: "Uninstall Apollo.exe" returns while that copy still deletes files, which
+    // takes minutes on the hosted arm64 runner (its silent install takes ~4). Wait, bounded, for it
+    // to exit before judging what is left in the install directory: identified once from the (slow)
+    // process list, then polled cheaply by pid, logging how many files remain (slow vs. stuck).
+    const uninstallWaitMs = 600_000;
+    const startedWaiting = Date.now();
+    const first = await listProcesses();
+    let pending = first.ok ? processesUnder(first.procs, appDirs, process.platform, new Set([process.pid])).filter(isNsisUninstaller).map((p) => p.pid) : [];
+    let lastReport = 0;
+    while (pending.length && Date.now() - startedWaiting < uninstallWaitMs) {
+      if (Date.now() - lastReport >= 30_000) {
+        lastReport = Date.now();
+        console.log(`  waiting for the NSIS uninstaller (${pending.join(", ")}): ${countFiles(appDirs[0]!)} files left in the install directory after ${Math.round((Date.now() - startedWaiting) / 1000)}s`);
       }
       await sleep(1000);
+      pending = pending.filter(alive);
     }
+    if (pending.length) failures.push(`the NSIS uninstaller was still running ${uninstallWaitMs / 1000}s after "Uninstall Apollo.exe" returned: ${pending.join(", ")} (${countFiles(appDirs[0]!)} files left)`);
+    else console.log(`▸ uninstaller finished after ${Math.round((Date.now() - startedWaiting) / 1000)}s (${countFiles(appDirs[0]!)} files left)`);
     // After the uninstaller: nothing may still run from the install directory.
     await sleep(Math.min(shutdownGraceMs, 3000));
     const list = await listProcesses();
