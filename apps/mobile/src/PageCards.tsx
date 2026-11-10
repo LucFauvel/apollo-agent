@@ -1,7 +1,7 @@
-import { pageNavigation, type TranscriptItem } from "@apollo/client";
+import { externalTarget, pageNavigation, type TranscriptItem } from "@apollo/client";
 import type { ArtifactKind, ArtifactRef, AttachmentRef, SessionId } from "@apollo/contracts";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
-import { ActivityIndicator, Image, Linking, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Image, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { useApollo } from "./AppState.tsx";
@@ -46,19 +46,19 @@ const prepare = (html: string) => {
 };
 
 /**
- * An agent-written page. A web or mail link the user taps opens outside the app; script
- * redirects and other apps' URL schemes go nowhere (see pageNavigation).
+ * An agent-written page. It never leaves the app on its own: a web or mail link it opens
+ * (tapped, typed, or a script's) shows a bar asking the user, and only their answer opens it.
+ * Other apps' URL schemes go nowhere (see pageNavigation).
  */
 function Page({ html, height, onHeight, scroll }: { html: string; height: number | "fill"; onHeight?: (h: number) => void; scroll: boolean }) {
   const source = useMemo(() => ({ html: prepare(html) }), [html]);
-  // The user's own touches, seen natively: the page's scripts cannot fake them.
-  const touchedAt = useRef<number | null>(null);
+  const [ask, setAsk] = useState<{ url: string; target: string } | null>(null);
   return (
-    <View style={height === "fill" ? { flex: 1 } : { height }} onTouchStart={() => void (touchedAt.current = Date.now())}>
+    <View style={height === "fill" ? { flex: 1 } : undefined}>
       <WebView
         source={source}
         originWhitelist={["*"]}
-        style={{ flex: 1, backgroundColor: "transparent" }}
+        style={[{ backgroundColor: "transparent" }, height === "fill" ? { flex: 1 } : { height }]}
         scrollEnabled={scroll}
         nestedScrollEnabled
         setSupportMultipleWindows={false}
@@ -68,14 +68,34 @@ function Page({ html, height, onHeight, scroll }: { html: string; height: number
           if (Number.isFinite(next) && next > 0) onHeight?.(Math.max(next, 60));
         }}
         onShouldStartLoadWithRequest={(request): boolean => {
-          const decision = pageNavigation(request, touchedAt.current, Date.now(), Platform.OS);
-          if (decision === "external") {
-            touchedAt.current = null;
-            void Linking.openURL(request.url).catch(() => {});
-          }
+          const decision = pageNavigation(request);
+          const target = decision === "ask" ? externalTarget(request.url) : null;
+          if (target) setAsk({ url: request.url, target });
           return decision === "load";
         }}
       />
+      {ask ? (
+        <View style={styles.ask} accessibilityRole="alert">
+          <Text style={styles.askText} numberOfLines={2}>
+            This page wants to open <Text style={{ color: colors.text, fontWeight: "600" }}>{ask.target}</Text>
+          </Text>
+          <Pressable onPress={() => setAsk(null)} hitSlop={6} accessibilityLabel="Don't open it" style={({ pressed }) => [styles.askButton, pressed && { opacity: 0.5 }]}>
+            <Text style={styles.askCancel}>Cancel</Text>
+          </Pressable>
+          <Pressable
+            onPress={() => {
+              const url = ask.url;
+              setAsk(null);
+              void Linking.openURL(url).catch(() => {});
+            }}
+            hitSlop={6}
+            accessibilityLabel={`Open ${ask.target}`}
+            style={({ pressed }) => [styles.askButton, pressed && { opacity: 0.5 }]}
+          >
+            <Text style={styles.askOpen}>Open</Text>
+          </Pressable>
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -516,6 +536,11 @@ export function RecordingCard({ item }: { item: RecordingItem }) {
 }
 
 const styles = StyleSheet.create({
+  ask: { flexDirection: "row", alignItems: "center", gap: 6, paddingLeft: 12, paddingRight: 6, paddingVertical: 6, borderTopWidth: 1, borderTopColor: colors.border, backgroundColor: colors.panel },
+  askText: { color: colors.muted, fontSize: 13, flex: 1 },
+  askButton: { paddingHorizontal: 10, paddingVertical: 6 },
+  askCancel: { color: colors.muted, fontSize: 14 },
+  askOpen: { color: colors.accent, fontSize: 14, fontWeight: "600" },
   attachments: { flexDirection: "row", flexWrap: "wrap", justifyContent: "flex-end", gap: 6 },
   thumb: { width: 120, height: 96, borderRadius: 12, borderWidth: 1, borderColor: colors.border, overflow: "hidden", alignItems: "center", justifyContent: "center", backgroundColor: colors.panelSoft },
   chip: { flexDirection: "row", alignItems: "center", gap: 8, maxWidth: 240, paddingHorizontal: 10, paddingVertical: 7, borderRadius: 12, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panelSoft },
