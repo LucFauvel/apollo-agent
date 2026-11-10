@@ -41,17 +41,19 @@ const plistValue = async (exec: Exec, app: string, key: string): Promise<string 
 };
 
 /**
- * Unpacks the verified zip into `workDir` (fresh), checks what came out is one Apollo.app of
- * this release (bundle id, CFBundleVersion, build-info.json, Developer ID signature of the team),
- * and copies it to the staged path. Throws on the first problem; the caller cleans `workDir`.
+ * Unpacks the verified zip into `workDir` (fresh, the app's private directory) and checks what
+ * came out is one Apollo.app of this release (bundle id, CFBundleVersion, build-info.json,
+ * Developer ID signature of the team). Returns its path. It never writes the shared staged
+ * path next to the app: only the helper does, under the install lock (helperCore.ts).
+ * Throws on the first problem; the caller cleans `workDir`.
  */
-export const stageFromZip = async (o: {
+export const verifyFromZip = async (o: {
   readonly zip: string;
   readonly workDir: string;
-  readonly job: Pick<UpdateJob, "version" | "build" | "commit" | "schemaVersion" | "teamId" | "bundles">;
+  readonly job: Pick<UpdateJob, "version" | "build" | "commit" | "schemaVersion" | "teamId">;
   readonly exec: Exec;
   readonly files: FileOps;
-}): Promise<void> => {
+}): Promise<string> => {
   const { exec, files, job } = o;
   const out = join(o.workDir, "unpacked");
   files.remove(out);
@@ -74,10 +76,11 @@ export const stageFromZip = async (o: {
   if (problems.length > 0) throw new Error(`the update is not release ${job.version}: ${problems.join("; ")}`);
   const signature = await checkSignature(exec, app, job.teamId);
   if (signature) throw new Error(`the update's code signature is not valid: ${signature}`);
-  files.remove(job.bundles.staged);
-  const copy = await exec("/usr/bin/ditto", [app, job.bundles.staged]);
-  if (copy.status !== 0) {
-    files.remove(job.bundles.staged);
-    throw new Error(`could not stage the update: ${copy.stderr.trim()}`);
-  }
+  return app;
+};
+
+/** The helper's bundle copy: ditto keeps symlinks, permissions and signatures. */
+export const copyBundle = async (exec: Exec, from: string, to: string): Promise<void> => {
+  const r = await exec("/usr/bin/ditto", [from, to]);
+  if (r.status !== 0) throw new Error(`could not copy ${from} to ${to}: ${r.stderr.trim() || `exit ${r.status}`}`);
 };

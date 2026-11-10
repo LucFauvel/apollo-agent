@@ -5,16 +5,23 @@
  * The helper runs the very engine install:app uses (same lock, same pending-install marker, so
  * the two never race and each finishes or undoes the other's interrupted install):
  *
- *   lock → [recovery] → db-check → "build" (= check the staged bundle is this release) →
+ *   lock → [recovery] → db-check → "build" (= copy the app's private verified bundle to the
+ *   shared staged path and check the copy is this release) →
  *   wait for idle bots → quit Apollo → database snapshot → swap → relaunch → stays healthy →
  *   drop previous  |  any failure after the swap → previous bundle + snapshot back → relaunch
+ *
+ * The shared staged path (`.Apollo-update.app`, also install:app's) is only ever written by
+ * whoever holds the install lock: the app verifies the release into a PRIVATE directory under
+ * userData (`job.source`) and never touches the shared path; the helper copies it there in the
+ * engine's build step, which runs under the lock. So neither installer can swap in a bundle the
+ * other staged.
  *
  * This file is the testable core: the job format, the engine's Deps from injected effects,
  * and how the app reads the outcome afterwards (classifyOutcome). No Electron imports.
  */
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { TIMING, type Deps, type Proc } from "../install/engine.ts";
-import type { BuildInfo, Bundles, FileOps, InstallResult, LaunchAttempt, LaunchStrategy, SqliteOps } from "../install/lib.ts";
+import type { BuildInfo, Bundles, FileOps, LaunchAttempt, LaunchStrategy, SqliteOps } from "../install/lib.ts";
 
 export const JOB_FORMAT = 1;
 
@@ -27,6 +34,10 @@ export interface UpdateJob {
   readonly commit: string;
   readonly schemaVersion: number;
   readonly bundles: Bundles;
+  /** The verified Apollo.app the app unpacked, in its private `<userData>/updates/work/` directory. */
+  readonly source: string;
+  /** Evidence of how far the helper got, written by the helper (see Progress). */
+  readonly progressPath: string;
   /** Apollo's data directory (the database, its snapshots, the shared install lock and marker). */
   readonly dataDir: string;
   /** The engine's result file (in userData). */
@@ -60,7 +71,9 @@ export const parseJob = (text: string): UpdateJob => {
   if (typeof target !== "string" || !target.startsWith("/") || !target.endsWith("/Apollo.app")) fail("bundles.target");
   // Only the four fixed names next to the app: the job can never point the swap anywhere else.
   if (JSON.stringify(j.bundles) !== JSON.stringify(bundlesFor(target!))) fail("bundles");
-  for (const key of ["dataDir", "resultPath", "logPath"] as const) if (typeof j[key] !== "string" || !j[key]!.startsWith("/")) fail(key);
+  for (const key of ["dataDir", "resultPath", "logPath", "progressPath", "source"] as const) if (typeof j[key] !== "string" || !j[key]!.startsWith("/") || j[key]!.includes("/../")) fail(key);
+  // The source is the app's own private copy, never one of the shared bundle paths.
+  if (!j.source!.startsWith(`${dirname(j.resultPath!)}/work/`) || !j.source!.endsWith("/Apollo.app")) fail("source");
   if (!Number.isSafeInteger(j.waitTimeoutMs) || j.waitTimeoutMs! <= 0) fail("waitTimeoutMs");
   if (typeof j.teamId !== "string" || !/^[A-Z0-9]{10}$/.test(j.teamId)) fail("teamId");
   return j as UpdateJob;
@@ -93,14 +106,67 @@ export interface HelperEffects {
   readonly launch: (target: string, strategy: LaunchStrategy) => Promise<LaunchAttempt>;
   readonly healthy: (target: string) => Promise<boolean>;
   readonly holdSignals: () => void;
+  /** Copies a bundle (ditto): `to` does not exist. */
+  readonly copyBundle: (from: string, to: string) => Promise<void>;
   /** null when the bundle's code signature is valid and from the team; else why not. */
   readonly checkSignature: (bundle: string, teamId: string) => Promise<string | null>;
   readonly pid: number;
 }
 
+/**
+ * How far the helper got, as evidence for classifyOutcome (written by the helper as it goes):
+ *  - swapped: the new build was renamed into the app's place (the installed app changed);
+ *  - checksFailed: the staged copy is not this release, or its code signature is invalid.
+ * Only these make a build "skipped for good"; a stage name alone never does (the engine records
+ * the `swap` stage before its first rename).
+ */
+export interface Progress {
+  readonly jobId: string;
+  readonly swapped: boolean;
+  readonly checksFailed: boolean;
+}
+
 /** The engine's dependencies for one update job. */
 export const helperDeps = (job: UpdateJob, fx: HelperEffects): Deps => {
   const dbPath = join(job.dataDir, "apollo.db");
+  let progress: Progress = { jobId: job.id, swapped: false, checksFailed: false };
+  const record = (change: Partial<Progress>) => {
+    progress = { ...progress, ...change };
+    try {
+      fx.files.writeText(job.progressPath, `${JSON.stringify(progress)}\n`);
+    } catch (e) {
+      // Without the evidence the build is not held against: it may be offered again.
+      fx.log(`  (could not record progress: ${e instanceof Error ? e.message : String(e)})`);
+    }
+  };
+  record({});
+  const { staged, target } = job.bundles;
+  const files: FileOps = {
+    ...fx.files,
+    rename: (from, to) => {
+      fx.files.rename(from, to);
+      if (from === staged && to === target) record({ swapped: true });
+    },
+  };
+  const check = async (): Promise<BuildInfo> => {
+    let info: Partial<BuildInfo> | null = null;
+    try {
+      info = JSON.parse(fx.files.readText(join(staged, "Contents", "Resources", "build-info.json"))) as Partial<BuildInfo>;
+    } catch {
+      info = null;
+    }
+    const problems = stagedProblems(info, job);
+    if (problems.length > 0) {
+      record({ checksFailed: true });
+      throw new Error(`the staged bundle is not release ${job.version}: ${problems.join("; ")}`);
+    }
+    const signature = await fx.checkSignature(staged, job.teamId);
+    if (signature) {
+      record({ checksFailed: true });
+      throw new Error(`the staged bundle's code signature is not valid: ${signature}`);
+    }
+    return info as BuildInfo;
+  };
   return {
     env: {
       bundles: job.bundles,
@@ -116,7 +182,7 @@ export const helperDeps = (job: UpdateJob, fx: HelperEffects): Deps => {
       pid: fx.pid,
       timing: TIMING,
     },
-    files: fx.files,
+    files,
     sqlite: fx.sqlite,
     now: fx.now,
     sleep: fx.sleep,
@@ -126,63 +192,105 @@ export const helperDeps = (job: UpdateJob, fx: HelperEffects): Deps => {
     kill: fx.kill,
     isInstaller: fx.isInstaller,
     busy: () => fx.busy(dbPath),
-    // Nothing is built: the app staged the verified release. Check it is still exactly that.
+    // The engine calls this holding the install lock: only now is the shared staged path ours.
+    // Stage the app's private verified copy there, then check the copy is exactly this release.
     build: async () => {
-      const { staged } = job.bundles;
-      if (!fx.files.exists(staged)) throw new Error(`nothing staged at ${staged}`);
-      let info: Partial<BuildInfo> | null = null;
-      try {
-        info = JSON.parse(fx.files.readText(join(staged, "Contents", "Resources", "build-info.json"))) as Partial<BuildInfo>;
-      } catch {
-        info = null;
-      }
-      const problems = stagedProblems(info, job);
-      if (problems.length > 0) throw new Error(`the staged bundle is not release ${job.version}: ${problems.join("; ")}`);
-      const signature = await fx.checkSignature(staged, job.teamId);
-      if (signature) throw new Error(`the staged bundle's code signature is not valid: ${signature}`);
-      return info as BuildInfo;
+      if (!fx.files.exists(job.source)) throw new Error(`the verified update is missing from ${job.source}`);
+      fx.files.remove(staged);
+      await fx.copyBundle(job.source, staged);
+      return check();
     },
-    launch: (strategy) => fx.launch(job.bundles.target, strategy),
-    healthy: () => fx.healthy(job.bundles.target),
+    launch: (strategy) => fx.launch(target, strategy),
+    healthy: () => fx.healthy(target),
     holdSignals: fx.holdSignals,
   };
 };
 
-/** Engine stages from which a failure means the new build itself was bad (staged, swapped or unhealthy). */
-const BUILD_FAULT_STAGES = new Set(["build", "swap", "relaunch", "rollback", "rollback-relaunch", "healthy"]);
+// ---------------------------------------------------------------------------------------
+// Reading the outcome back. Everything read here comes from files that may be damaged:
+// parsed without ever throwing, keeping only fields of exactly the expected type.
+
+const own = (o: unknown, key: string): unknown => {
+  if (typeof o !== "object" || o === null) return undefined;
+  const d = Object.getOwnPropertyDescriptor(o, key);
+  return d && "value" in d ? d.value : undefined;
+};
+const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+
+/** The parts of the engine's result file the outcome depends on. */
+export interface ResultSummary {
+  readonly status: string;
+  readonly stage: string;
+  readonly startedAt: string;
+  readonly error: string | null;
+  /** The commit of the build the run installed (null when it never got to the build step). */
+  readonly commit: string | null;
+}
+
+/** From the engine's result JSON (text or object); null when it is not one. Never throws. */
+export const summarizeResult = (raw: unknown): ResultSummary | null => {
+  try {
+    const r = typeof raw === "string" ? (JSON.parse(raw) as unknown) : raw;
+    const status = str(own(r, "status"));
+    const stage = str(own(r, "stage"));
+    const startedAt = str(own(r, "startedAt"));
+    if (status === null || stage === null || startedAt === null) return null;
+    return { status, stage, startedAt, error: str(own(r, "error")), commit: str(own(own(r, "build"), "commit")) };
+  } catch {
+    return null;
+  }
+};
+
+/** The helper's progress file for `jobId`; null when missing, damaged or another job's. Never throws. */
+export const parseProgress = (text: string | null, jobId: string): Progress | null => {
+  try {
+    if (typeof text !== "string") return null;
+    const p: unknown = JSON.parse(text);
+    if (own(p, "jobId") !== jobId) return null;
+    return { jobId, swapped: own(p, "swapped") === true, checksFailed: own(p, "checksFailed") === true };
+  } catch {
+    return null;
+  }
+};
 
 export type Outcome =
   /** The helper still runs: look again later. */
   | { readonly kind: "pending" }
   | { readonly kind: "updated" }
-  /** The build is bad here: rolled back (or failed after the swap). Never offer it again. */
+  /** skip: the build itself is bad here (it was put in place and failed, or failed its checks). */
   | { readonly kind: "failed"; readonly skip: boolean; readonly reason: string }
   /** Nothing changed (bots stayed busy, another install held the lock): may be offered again. */
   | { readonly kind: "postponed"; readonly reason: string };
 
 /**
  * What became of `job`, read by whichever app runs afterwards (the new one, or the old one
- * after a rollback). Conservative: a build is skipped for good only when the evidence says the
- * build itself failed; an install that could not even start is not held against it.
+ * after a rollback). A build is skipped for good only on evidence the helper recorded: it was
+ * renamed into place and the app is not running it, or its staged copy failed the checks.
+ * An install interrupted or failing before that is not held against the build.
  */
-export const classifyOutcome = (job: Pick<UpdateJob, "build" | "commit" | "createdAt">, result: InstallResult | null, runningBuild: number | null, helperAlive: boolean): Outcome => {
+export const classifyOutcome = (
+  job: Pick<UpdateJob, "build" | "commit" | "createdAt">,
+  result: ResultSummary | null,
+  progress: Progress | null,
+  runningBuild: number | null,
+  helperAlive: boolean,
+): Outcome => {
   if (helperAlive) return { kind: "pending" };
-  const mine = result !== null && Date.parse(result.startedAt) >= job.createdAt - 1000;
-  if (!mine) {
-    if (runningBuild === job.build) return { kind: "updated" };
-    return { kind: "failed", skip: false, reason: "the update helper did not run" };
-  }
-  const ours = result.build?.commit === job.commit;
-  if (result.status === "ok") {
-    return ours ? { kind: "updated" } : { kind: "failed", skip: false, reason: "an earlier, interrupted install was finished first; try again" };
-  }
+  if (runningBuild === job.build) return { kind: "updated" };
+  const startedAt = result ? Date.parse(result.startedAt) : Number.NaN;
+  const mine = result !== null && Number.isFinite(startedAt) && startedAt >= job.createdAt - 1000;
+  const ours = mine && result.commit === job.commit;
+  const evidence = progress !== null && (progress.swapped || progress.checksFailed);
+  if (!mine) return { kind: "failed", skip: evidence, reason: "the update helper did not finish" };
   if (result.status === "aborted") return { kind: "postponed", reason: result.error ?? "the update did not start" };
-  if (result.status === "running") {
-    // The helper died mid-way (killed, power loss).
-    if (runningBuild === job.build) return { kind: "updated" };
-    return { kind: "failed", skip: ours && BUILD_FAULT_STAGES.has(result.stage), reason: `the update stopped during "${result.stage}"` };
+  if (result.status === "ok") {
+    // Installed and healthy, yet this app is not that build: e.g. an earlier interrupted install
+    // was finished instead (not ours), or another install replaced it since.
+    return { kind: "failed", skip: false, reason: ours ? "the update was installed, but another build runs now" : "an earlier, interrupted install was finished first; try again" };
   }
+  // The evidence is this job's own (bound to its id), whether or not the result names the build:
+  // a staged copy that failed its checks never got as far as the result's build field.
+  if (result.status === "running") return { kind: "failed", skip: evidence, reason: `the update stopped during "${result.stage}"` };
   // failed / rolled-back
-  if (!ours) return { kind: "failed", skip: false, reason: result.error ?? "an earlier, interrupted install was dealt with first; try again" };
-  return { kind: "failed", skip: BUILD_FAULT_STAGES.has(result.stage), reason: result.error ?? `failed during "${result.stage}"` };
+  return { kind: "failed", skip: evidence, reason: result.error ?? (ours ? `failed during "${result.stage}"` : "an earlier, interrupted install was dealt with first; try again") };
 };

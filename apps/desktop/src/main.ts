@@ -543,23 +543,30 @@ if (!app.requestSingleInstanceLock()) {
     try {
       if (layout.appIcon && process.platform === "darwin") app.dock?.setIcon(layout.appIcon);
       if (!screenshotPath) {
-        updater = new Updater({
-          isPackaged: app.isPackaged,
-          resourcesPath: process.resourcesPath,
-          appPath: app.getAppPath(),
-          userData: app.getPath("userData"),
-          dataDir: resolve(process.env.APOLLO_DATA_DIR ?? join(homedir(), ".apollo")),
-          onChange: () => {
-            setAppMenu();
-            refreshTrayMenu();
-            trayPanel?.setRows(panelRows(trayStatus));
-          },
-          quit: () => {
-            quitting = true;
-            app.quit();
-          },
-          busyBots: () => trayStatus?.bots.reduce((n, b) => n + (b.working > 0 ? 1 : 0), 0) ?? 0,
-        });
+        // The updater never throws from here (it falls back to inert); belt and braces, since
+        // anything thrown in this block quits the app.
+        try {
+          updater = new Updater({
+            isPackaged: app.isPackaged,
+            resourcesPath: process.resourcesPath,
+            appPath: app.getAppPath(),
+            userData: app.getPath("userData"),
+            dataDir: resolve(process.env.APOLLO_DATA_DIR ?? join(homedir(), ".apollo")),
+            onChange: () => {
+              setAppMenu();
+              refreshTrayMenu();
+              trayPanel?.setRows(panelRows(trayStatus));
+            },
+            quit: () => {
+              quitting = true;
+              app.quit();
+            },
+            busyBots: () => trayStatus?.bots.reduce((n, b) => n + (b.working > 0 ? 1 : 0), 0) ?? 0,
+          });
+        } catch (error) {
+          console.error("updater disabled:", error);
+          updater = null;
+        }
         setAppMenu();
       }
       if (!screenshotPath) createTray();

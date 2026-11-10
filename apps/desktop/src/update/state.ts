@@ -6,13 +6,6 @@
  */
 import type { CheckResult } from "./check.ts";
 
-export interface SkippedBuild {
-  readonly build: number;
-  readonly version: string;
-  readonly at: string;
-  readonly why: string;
-}
-
 export interface UpdaterState {
   readonly lastCheckAt: number | null;
   /** Consecutive failed checks (network errors, rate limits). */
@@ -21,37 +14,58 @@ export interface UpdaterState {
   readonly retryAt: number | null;
   /** The newest build a notification was already shown for: never twice for one build. */
   readonly notifiedBuild: number | null;
-  /** Builds that failed their post-update health check here (rolled back): never offered again. */
-  readonly skipped: ReadonlyArray<SkippedBuild>;
+  /**
+   * Builds that failed here after they were put in place (or whose staged bundle failed its
+   * checks): never offered again. Only build numbers, sorted, so the list stays small; a skip is
+   * dropped only once the app runs a build at or above it, when it can no longer be offered.
+   */
+  readonly skipped: ReadonlyArray<number>;
 }
 
 export const EMPTY_STATE: UpdaterState = { lastCheckAt: null, failures: 0, retryAt: null, notifiedBuild: null, skipped: [] };
 
+/** Own-property read that never runs getters, toString or inherited (`__proto__`) values. */
+const own = (o: object, key: string): unknown => {
+  const d = Object.getOwnPropertyDescriptor(o, key);
+  return d && "value" in d ? d.value : undefined;
+};
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+const build = (v: unknown): number | null => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null);
 
-/** Lenient: a damaged file gives the empty state, but skipped builds that still parse are kept. */
+/** A skipped entry: a build number, or an object with a numeric `build` (the first format). */
+const skippedBuild = (v: unknown): number | null =>
+  typeof v === "object" && v !== null && !Array.isArray(v) ? build(own(v, "build")) : build(v);
+
+const sortedUnique = (builds: Iterable<number>): Array<number> => [...new Set(builds)].sort((a, b) => a - b);
+
+/**
+ * Never throws, whatever the file holds: anything not exactly the expected shape falls back to
+ * the default for that field, and skipped builds that still read as build numbers are kept.
+ */
 export const parseState = (text: string | null): UpdaterState => {
-  if (text === null) return EMPTY_STATE;
-  let raw: Record<string, unknown>;
   try {
-    raw = JSON.parse(text) as Record<string, unknown>;
-    if (typeof raw !== "object" || raw === null) return EMPTY_STATE;
+    if (typeof text !== "string") return EMPTY_STATE;
+    const raw: unknown = JSON.parse(text);
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return EMPTY_STATE;
+    const list = own(raw, "skipped");
+    const skipped: Array<number> = [];
+    if (Array.isArray(list)) {
+      // Index loop: holes in a sparse array are just undefined.
+      for (let i = 0; i < Math.min(list.length, 1_000_000); i++) {
+        const b = skippedBuild(own(list, String(i)));
+        if (b !== null) skipped.push(b);
+      }
+    }
+    return {
+      lastCheckAt: num(own(raw, "lastCheckAt")),
+      failures: Math.max(0, Math.min(20, Math.floor(num(own(raw, "failures")) ?? 0))),
+      retryAt: num(own(raw, "retryAt")),
+      notifiedBuild: build(own(raw, "notifiedBuild")),
+      skipped: sortedUnique(skipped),
+    };
   } catch {
     return EMPTY_STATE;
   }
-  const skipped = Array.isArray(raw.skipped)
-    ? raw.skipped.flatMap((s: unknown): Array<SkippedBuild> => {
-        const e = s as Partial<SkippedBuild> | null;
-        return e && Number.isSafeInteger(e.build) ? [{ build: e.build!, version: String(e.version ?? "?"), at: String(e.at ?? ""), why: String(e.why ?? "") }] : [];
-      })
-    : [];
-  return {
-    lastCheckAt: num(raw.lastCheckAt),
-    failures: Math.max(0, Math.min(20, Math.floor(num(raw.failures) ?? 0))),
-    retryAt: num(raw.retryAt),
-    notifiedBuild: num(raw.notifiedBuild),
-    skipped,
-  };
 };
 
 export const CHECK_INTERVAL_MS = 6 * 60 * 60_000;
@@ -91,5 +105,12 @@ export const afterCheck = (s: UpdaterState, result: CheckResult, now: number): U
   }
 };
 
-export const withSkipped = (s: UpdaterState, entry: SkippedBuild): UpdaterState =>
-  s.skipped.some((e) => e.build === entry.build) ? s : { ...s, skipped: [...s.skipped, entry].slice(-50) };
+/**
+ * Adds a permanently skipped build. Skips at or below `runningBuild` are dropped: the policy
+ * never offers those anyway (only builds strictly newer than the running one), so nothing that
+ * can still be offered is ever forgotten.
+ */
+export const withSkipped = (s: UpdaterState, skippedBuildNumber: number, runningBuild: number | null): UpdaterState => ({
+  ...s,
+  skipped: sortedUnique([...s.skipped, skippedBuildNumber]).filter((b) => runningBuild === null || b > runningBuild),
+});

@@ -3,15 +3,15 @@
  * (bundles are directories in a temporary "Applications", a real SQLite database, fake
  * processes, launches, /health and clock). Nothing here touches /Applications or ~/.apollo.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { runInstall, type Proc } from "../install/engine.ts";
-import { type InstallResult, type LaunchAttempt, realFileOps, realSqliteOps } from "../install/lib.ts";
-import { bundlesFor, classifyOutcome, helperDeps, type HelperEffects, JOB_FORMAT, parseJob, stagedProblems, type UpdateJob } from "./helperCore.ts";
-import { checkSignature, developerIdRequirement, type Exec, stageFromZip } from "./macos.ts";
+import { acquireLock, type InstallResult, type LaunchAttempt, realFileOps, realSqliteOps } from "../install/lib.ts";
+import { bundlesFor, classifyOutcome, helperDeps, type HelperEffects, JOB_FORMAT, parseJob, parseProgress, type ResultSummary, stagedProblems, summarizeResult, type UpdateJob } from "./helperCore.ts";
+import { checkSignature, developerIdRequirement, type Exec, verifyFromZip } from "./macos.ts";
 import { COMMIT, TEAM } from "./testing/fixtures.ts";
 
 const makeDb = (path: string, version: number) => {
@@ -47,7 +47,9 @@ const world = (o: { readonly next?: Bundle; readonly signature?: string | null; 
   };
   write(bundles.target, OLD);
   const next = o.next ?? NEW;
-  write(bundles.staged, next, o.stagedInfo);
+  // The app's private verified copy; the helper stages it under the install lock.
+  const source = join(userData, "updates", "work", "500-1", "unpacked", "Apollo.app");
+  write(source, next, o.stagedInfo);
   const dbPath = join(data, "apollo.db");
   makeDb(dbPath, OLD.schema);
 
@@ -87,7 +89,9 @@ const world = (o: { readonly next?: Bundle; readonly signature?: string | null; 
     schemaVersion: NEW.schema,
     bundles,
     dataDir: data,
-    resultPath: join(userData, "last-result.json"),
+    resultPath: join(userData, "updates", "last-result.json"),
+    source,
+    progressPath: join(userData, "updates", "progress.json"),
     logPath: join(userData, "helper.log"),
     waitTimeoutMs: 60_000,
     teamId: TEAM,
@@ -114,16 +118,19 @@ const world = (o: { readonly next?: Bundle; readonly signature?: string | null; 
     },
     healthy: async () => w.running?.health === "good",
     holdSignals: () => {},
+    copyBundle: async (from, to) => cpSync(from, to, { recursive: true }),
     checkSignature: async () => (o.signature === undefined ? null : o.signature),
     pid: 1,
   };
   const installed = () => JSON.parse(readFileSync(join(bundles.target, "Contents", "Resources", "build-info.json"), "utf8")) as { version: string };
-  return { w, job, fx, installed, data };
+  const progress = () => parseProgress(existsSync(job.progressPath) ? readFileSync(job.progressPath, "utf8") : null, job.id);
+  const outcome = (result: InstallResult, running: number) => classifyOutcome(job, summarizeResult(result), progress(), running, false);
+  return { w, job, fx, installed, data, progress, outcome };
 };
 
 describe("applying an update with the install engine", () => {
   it("swaps in the verified build, relaunches it, and keeps it once healthy", async () => {
-    const { w, job, fx, installed } = world();
+    const { w, job, fx, installed, outcome } = world();
     const result = await runInstall(helperDeps(job, fx));
     expect(result.status).toBe("ok");
     expect(installed().version).toBe("1.3.0");
@@ -131,11 +138,11 @@ describe("applying an update with the install engine", () => {
     expect(existsSync(job.bundles.staged)).toBe(false);
     expect(w.quits).toBe(1);
     expect(w.launched).toEqual(["1.3.0"]);
-    expect(classifyOutcome(job, result, 500, false)).toEqual({ kind: "updated" });
+    expect(outcome(result, 500)).toEqual({ kind: "updated" });
   });
 
   it("rolls back to the previous build and database when the new build fails its health check, and skips that build", async () => {
-    const { w, job, fx, installed } = world({ next: { ...NEW, health: "bad" } });
+    const { w, job, fx, installed, outcome: classify, progress } = world({ next: { ...NEW, health: "bad" } });
     const result = await runInstall(helperDeps(job, fx));
     expect(result.status).toBe("rolled-back");
     expect(installed().version).toBe("1.2.0");
@@ -144,36 +151,68 @@ describe("applying an update with the install engine", () => {
     expect(realSqliteOps.inspect(w.dbPath)?.version).toBe(20);
     // One launch of the new build, one of the previous: no loop.
     expect(w.launched).toEqual(["1.3.0", "1.2.0"]);
-    const outcome = classifyOutcome(job, result, 400, false);
-    expect(outcome).toMatchObject({ kind: "failed", skip: true });
+    expect(progress()).toMatchObject({ swapped: true });
+    expect(classify(result, 400)).toMatchObject({ kind: "failed", skip: true });
   });
 
   it("refuses a staged bundle that is not the signed release, before stopping Apollo", async () => {
     for (const stagedInfo of [{ commit: "e".repeat(40) }, { bundleVersion: "499" }, { channel: "nightly" }, { schemaVersion: 22 }]) {
-      const { w, job, fx, installed } = world({ stagedInfo });
+      const { w, job, fx, installed, outcome } = world({ stagedInfo });
       const result = await runInstall(helperDeps(job, fx));
       expect(result.status, JSON.stringify(stagedInfo)).toBe("failed");
       expect(result.stage).toBe("build");
       expect(installed().version).toBe("1.2.0");
       expect(w.quits).toBe(0);
       expect(existsSync(job.bundles.staged)).toBe(false);
+      // A staged copy that is not the signed release: never offered again.
+      expect(outcome(result, 400)).toMatchObject({ kind: "failed", skip: true });
     }
   });
 
   it("refuses a staged bundle whose code signature does not check out", async () => {
-    const { w, job, fx, installed } = world({ signature: "codesign: a sealed resource is missing or invalid" });
+    const { w, job, fx, installed, outcome } = world({ signature: "codesign: a sealed resource is missing or invalid" });
     const result = await runInstall(helperDeps(job, fx));
     expect(result.status).toBe("failed");
     expect(result.error).toMatch(/code signature/);
+    expect(outcome(result, 400)).toMatchObject({ kind: "failed", skip: true });
     expect(installed().version).toBe("1.2.0");
     expect(w.quits).toBe(0);
   });
 
+  it("never touches the shared staged bundle while another installer holds the lock", async () => {
+    const { w, job, fx, installed, outcome } = world();
+    // install:app (pid 999) holds the lock and has staged its own build A, waiting for bots.
+    const A = { ...NEW, commit: "a".repeat(40), version: "9.9.9" };
+    mkdirSync(join(job.bundles.staged, "Contents", "Resources"), { recursive: true });
+    writeFileSync(join(job.bundles.staged, "Contents", "Resources", "build-info.json"), JSON.stringify({ commit: A.commit }));
+    expect(acquireLock(join(job.dataDir, "install-app.lock"), { pid: 999, startedAt: "earlier" }, () => true).ok).toBe(true);
+    const result = await runInstall(helperDeps(job, { ...fx, isInstaller: (pid) => pid === 999 }));
+    expect(result.status).toBe("aborted");
+    expect(JSON.parse(readFileSync(join(job.bundles.staged, "Contents", "Resources", "build-info.json"), "utf8")).commit).toBe(A.commit);
+    expect(installed().version).toBe("1.2.0");
+    expect(w.quits).toBe(0);
+    // Nothing happened to the build: it is offered again later.
+    expect(outcome(result, 400).kind).toBe("postponed");
+  });
+
+  it("stages the private copy only under the lock, so what is swapped in is exactly the job's build", async () => {
+    const { job, fx, installed } = world();
+    // A leftover staged bundle from someone else (no lock held now): replaced by the job's own copy.
+    mkdirSync(join(job.bundles.staged, "Contents", "Resources"), { recursive: true });
+    writeFileSync(join(job.bundles.staged, "Contents", "Resources", "build-info.json"), JSON.stringify({ commit: "b".repeat(40) }));
+    const result = await runInstall(helperDeps(job, fx));
+    expect(result.status).toBe("ok");
+    expect(result.build?.commit).toBe(COMMIT);
+    expect(JSON.parse(readFileSync(join(job.bundles.target, "Contents", "Resources", "build-info.json"), "utf8")).commit).toBe(COMMIT);
+    expect(installed().version).toBe("1.3.0");
+  });
+
   it("refuses to install a build that cannot read the database (schema gate)", async () => {
-    const { job, fx, installed, data } = world();
+    const { job, fx, installed, data, outcome } = world();
     makeDb(join(data, "apollo.db"), 25);
     const result = await runInstall(helperDeps(job, fx));
     expect(result.status).toBe("aborted");
+    expect(outcome(result, 400).kind).toBe("postponed");
     expect(installed().version).toBe("1.2.0");
   });
 });
@@ -195,45 +234,77 @@ describe("parseJob", () => {
 
 describe("classifyOutcome", () => {
   const job = { build: 500, commit: COMMIT, createdAt: Date.parse("2026-11-09T10:00:00Z") };
-  const result = (over: Partial<InstallResult>): InstallResult => ({
-    status: "ok",
-    stage: "healthy",
-    build: { commit: COMMIT, dirty: false, branch: null, schemaVersion: 21, builtAt: "x" },
-    startedAt: "2026-11-09T10:00:01Z",
-    finishedAt: null,
-    error: null,
-    manual: null,
-    log: null,
-    pid: 1,
-    snapshot: null,
-    launches: [],
-    ...over,
-  });
+  const result = (over: Partial<InstallResult>): ResultSummary =>
+    summarizeResult({
+      status: "ok",
+      stage: "healthy",
+      build: { commit: COMMIT, dirty: false, branch: null, schemaVersion: 21, builtAt: "x" },
+      startedAt: "2026-11-09T10:00:01Z",
+      finishedAt: null,
+      error: null,
+      manual: null,
+      log: null,
+      pid: 1,
+      snapshot: null,
+      launches: [],
+      ...over,
+    })!;
+  const none = { jobId: "j", swapped: false, checksFailed: false };
+  const swapped = { ...none, swapped: true };
 
   it("waits while the helper runs", () => {
-    expect(classifyOutcome(job, null, 400, true)).toEqual({ kind: "pending" });
+    expect(classifyOutcome(job, null, null, 400, true)).toEqual({ kind: "pending" });
+  });
+
+  it("is updated when the app runs the job's build", () => {
+    expect(classifyOutcome(job, result({}), swapped, 500, false)).toEqual({ kind: "updated" });
+    expect(classifyOutcome(job, result({ status: "running", stage: "relaunch" }), swapped, 500, false)).toEqual({ kind: "updated" });
   });
 
   it("is postponed (not skipped) when the install never started (bots busy, lock held)", () => {
-    expect(classifyOutcome(job, result({ status: "aborted", stage: "wait-idle", error: "Bots still busy" }), 400, false)).toEqual({ kind: "postponed", reason: "Bots still busy" });
+    expect(classifyOutcome(job, result({ status: "aborted", stage: "wait-idle", error: "Bots still busy" }), none, 400, false)).toEqual({ kind: "postponed", reason: "Bots still busy" });
   });
 
-  it("does not hold a failure before the swap against the build", () => {
-    expect(classifyOutcome(job, result({ status: "failed", stage: "quit" }), 400, false)).toMatchObject({ kind: "failed", skip: false });
-    expect(classifyOutcome(job, result({ status: "failed", stage: "reopen" }), 400, false)).toMatchObject({ kind: "failed", skip: false });
+  it("does not hold a failure before the new build was put in place against it", () => {
+    for (const stage of ["quit", "reopen", "snapshot", "swap", "rollback"]) {
+      expect(classifyOutcome(job, result({ status: "failed", stage }), none, 400, false), stage).toMatchObject({ kind: "failed", skip: false });
+    }
+  });
+
+  it("does not skip a helper killed at the swap stage before anything moved (the engine records the stage first)", () => {
+    expect(classifyOutcome(job, result({ status: "running", stage: "swap" }), none, 400, false)).toMatchObject({ kind: "failed", skip: false });
+    expect(classifyOutcome(job, result({ status: "running", stage: "swap" }), null, 400, false)).toMatchObject({ kind: "failed", skip: false });
+  });
+
+  it("skips the build once it was put in place and the old build runs again", () => {
+    expect(classifyOutcome(job, result({ status: "rolled-back", stage: "rollback-relaunch" }), swapped, 400, false)).toMatchObject({ kind: "failed", skip: true });
+    expect(classifyOutcome(job, result({ status: "running", stage: "relaunch" }), swapped, 400, false)).toMatchObject({ kind: "failed", skip: true });
+  });
+
+  it("skips the build when its staged copy failed the checks", () => {
+    expect(classifyOutcome(job, result({ status: "failed", stage: "build" }), { ...none, checksFailed: true }, 400, false)).toMatchObject({ kind: "failed", skip: true });
+    // A copy that failed (disk full) is not the build's fault.
+    expect(classifyOutcome(job, result({ status: "failed", stage: "build" }), none, 400, false)).toMatchObject({ kind: "failed", skip: false });
   });
 
   it("does not blame the build when the run only recovered an earlier interrupted install", () => {
-    expect(classifyOutcome(job, result({ status: "rolled-back", stage: "recovered", build: null }), 400, false)).toMatchObject({ kind: "failed", skip: false });
+    expect(classifyOutcome(job, result({ status: "rolled-back", stage: "recovered", build: null }), none, 400, false)).toMatchObject({ kind: "failed", skip: false });
   });
 
   it("ignores a result older than the job", () => {
-    expect(classifyOutcome(job, result({ startedAt: "2026-11-08T00:00:00Z" }), 400, false)).toMatchObject({ kind: "failed", skip: false });
+    expect(classifyOutcome(job, result({ startedAt: "2026-11-08T00:00:00Z" }), none, 400, false)).toMatchObject({ kind: "failed", skip: false });
   });
 
-  it("skips the build when the helper died after the swap and the old build runs", () => {
-    expect(classifyOutcome(job, result({ status: "running", stage: "relaunch" }), 400, false)).toMatchObject({ kind: "failed", skip: true });
-    expect(classifyOutcome(job, result({ status: "running", stage: "relaunch" }), 500, false)).toEqual({ kind: "updated" });
+  it("reads damaged result and progress files as nothing, never throwing", () => {
+    for (const text of ["", "{", "null", "[]", '{"status":{"toString":null},"stage":"swap","startedAt":"x"}', '{"__proto__":{"status":"ok"},"stage":"x","startedAt":"y"}']) {
+      expect(() => summarizeResult(text)).not.toThrow();
+      expect(summarizeResult(text)).toBeNull();
+    }
+    expect(summarizeResult('{"status":"failed","stage":"build","startedAt":"2026","build":{"commit":{"toString":null}}}')).toMatchObject({ commit: null });
+    expect(parseProgress('{"jobId":"j","swapped":"yes"}', "j")).toEqual({ jobId: "j", swapped: false, checksFailed: false });
+    expect(parseProgress('{"jobId":"other","swapped":true}', "j")).toBeNull();
+    expect(parseProgress('{"__proto__":{"jobId":"j"},"swapped":true}', "j")).toBeNull();
+    expect(classifyOutcome(job, { status: "running", stage: "swap", startedAt: "garbage", error: null, commit: COMMIT }, none, 400, false)).toMatchObject({ skip: false });
   });
 });
 
@@ -259,7 +330,7 @@ describe("macOS bundle checks", () => {
     expect(await checkSignature(exec, "/x", 'X" or true')).toMatch(/invalid team/);
   });
 
-  it("stages only one Apollo.app of this release, and cleans up what it staged on failure", async () => {
+  it("verifies the unpacked app in the private work directory, and never writes the shared staged path", async () => {
     const { job } = world();
     const work = mkdtempSync(join(tmpdir(), "updater-stage-"));
     const app = (out: string) => join(out, "Apollo.app");
@@ -273,19 +344,17 @@ describe("macOS bundle checks", () => {
           return { status: 0 };
         }
         if (cmd === "/usr/bin/plutil") return { status: 0, stdout: args[1] === "CFBundleIdentifier" ? "dev.apollo.desktop\n" : "500\n" };
-        if (cmd === "/usr/bin/ditto") {
-          mkdirSync(args[1]!, { recursive: true });
-          return { status: 0 };
-        }
-        return { status: 0 };
+        if (cmd === "/usr/bin/codesign") return { status: 0 };
+        return { status: 99, stderr: `unexpected ${cmd}` };
       });
     realFileOps.remove(job.bundles.staged);
-    await stageFromZip({ zip: "z", workDir: work, job, exec: unzipWith({}).exec, files: realFileOps });
-    expect(existsSync(job.bundles.staged)).toBe(true);
+    const ok = unzipWith({});
+    expect(await verifyFromZip({ zip: "z", workDir: work, job, exec: ok.exec, files: realFileOps })).toBe(join(work, "unpacked", "Apollo.app"));
+    expect(ok.calls.some((c) => c.includes(job.bundles.staged))).toBe(false);
+    expect(existsSync(job.bundles.staged)).toBe(false);
 
-    realFileOps.remove(job.bundles.staged);
-    await expect(stageFromZip({ zip: "z", workDir: work, job, exec: unzipWith({}, true).exec, files: realFileOps })).rejects.toThrow(/not just Apollo.app/);
-    await expect(stageFromZip({ zip: "z", workDir: work, job, exec: unzipWith({ commit: "e".repeat(40) }).exec, files: realFileOps })).rejects.toThrow(/not release 1.3.0/);
+    await expect(verifyFromZip({ zip: "z", workDir: work, job, exec: unzipWith({}, true).exec, files: realFileOps })).rejects.toThrow(/not just Apollo.app/);
+    await expect(verifyFromZip({ zip: "z", workDir: work, job, exec: unzipWith({ commit: "e".repeat(40) }).exec, files: realFileOps })).rejects.toThrow(/not release 1.3.0/);
     expect(existsSync(job.bundles.staged)).toBe(false);
   });
 });

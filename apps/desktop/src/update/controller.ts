@@ -5,7 +5,8 @@
  *
  *   check (check.ts: signed manifest, policy) → offer (dialog / notification) → user accepts →
  *   download (streamed, size + SHA-256 against the manifest) → unpack + verify the bundle
- *   (macos.ts) → stage → start the helper (helper.ts: the install engine) → it quits Apollo,
+ *   (macos.ts) in a private directory → start the helper (helper.ts: the install engine) → it
+ *   takes the install lock, copies the bundle to the shared staged path, quits Apollo,
  *   swaps, relaunches, checks health, rolls back if needed → the next Apollo to start reads
  *   the outcome (reconcile) and never re-offers a build that was rolled back.
  *
@@ -18,12 +19,12 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { dialog, Notification, shell } from "electron";
 import { isInstallerPid } from "../install/mac.ts";
-import { type InstallResult, launchEnv, realFileOps } from "../install/lib.ts";
+import { launchEnv, realFileOps } from "../install/lib.ts";
 import { checkForUpdate, type CheckResult, type Offer } from "./check.ts";
 import { downloadVerified } from "./github.ts";
-import { bundlesFor, classifyOutcome, JOB_FORMAT, type UpdateJob } from "./helperCore.ts";
+import { bundlesFor, classifyOutcome, JOB_FORMAT, parseJob, parseProgress, summarizeResult, type UpdateJob } from "./helperCore.ts";
 import { RELEASES_REPO, TEAM_ID, trustedKeys, type TrustedKeys } from "./keys.ts";
-import { realExec, stageFromZip } from "./macos.ts";
+import { realExec, verifyFromZip } from "./macos.ts";
 import type { RunningBuild } from "./policy.ts";
 import { afterCheck, nextCheckAt, parseState, type UpdaterState, withSkipped } from "./state.ts";
 
@@ -58,12 +59,19 @@ const MAC_TARGET = "/Applications/Apollo.app";
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
 const log = (line: string) => console.log(`[updater] ${line}`);
 
-const readJson = <T>(path: string): T | null => {
+const readText = (path: string): string | null => {
   try {
-    return JSON.parse(readFileSync(path, "utf8")) as T;
+    return readFileSync(path, "utf8");
   } catch {
     return null;
   }
+};
+
+/** An own data property, without running getters or reading inherited (`__proto__`) values. */
+const own = (o: unknown, key: string): unknown => {
+  if (typeof o !== "object" || o === null) return undefined;
+  const d = Object.getOwnPropertyDescriptor(o, key);
+  return d && "value" in d ? d.value : undefined;
 };
 
 /** `pragma user_version` only (a full integrity check on a live database is too slow for the main thread). */
@@ -101,12 +109,26 @@ export class Updater {
   #helper: ChildProcess | null = null;
   readonly #notifications = new Set<Notification>();
 
+  /** Never throws: whatever is on disk, a broken updater must not keep Apollo from starting. */
   constructor(o: UpdaterOptions) {
     this.#o = o;
-    this.#keys = o.keys ?? trustedKeys();
     this.#dir = join(o.userData, "updates");
+    let keys: TrustedKeys;
+    try {
+      keys = o.keys ?? trustedKeys();
+    } catch (error) {
+      keys = { configured: false, reason: message(error) };
+    }
+    this.#keys = keys;
+    // parseState never throws; runningBuild reads only exact types.
     this.#state = parseState(this.#read("state.json"));
-    this.#running = this.#runningBuild();
+    let running: RunningBuild | null = null;
+    try {
+      running = this.#runningBuild();
+    } catch (error) {
+      log(`cannot read build-info.json: ${message(error)}`);
+    }
+    this.#running = running;
   }
 
   get phase(): UpdatePhase {
@@ -132,11 +154,16 @@ export class Updater {
     return this.#keys.configured && this.#o.isPackaged && this.#running?.build != null && (process.platform === "darwin" || process.platform === "win32");
   }
 
+  /** Never throws (see the constructor). */
   start() {
-    if (!this.#keys.configured) log(`inert: ${this.#keys.reason}`);
-    else for (const note of this.#keys.notes) log(note);
-    this.#reconcile();
-    if (this.#automatic) this.#schedule(true);
+    try {
+      if (!this.#keys.configured) log(`inert: ${this.#keys.reason}`);
+      else for (const note of this.#keys.notes) log(note);
+      this.#reconcile();
+      if (this.#automatic) this.#schedule(true);
+    } catch (error) {
+      log(`could not start: ${message(error)}`);
+    }
   }
 
   /** The menu entry was clicked. */
@@ -191,7 +218,7 @@ export class Updater {
       keys: this.#keys,
       running: this.#running!,
       teamId: TEAM_ID,
-      skipped: this.#state.skipped.map((s) => s.build),
+      skipped: this.#state.skipped,
       dbSchema: dbSchema(join(this.#o.dataDir, "apollo.db")),
       now: Date.now(),
     });
@@ -304,16 +331,21 @@ export class Updater {
       bundles: bundlesFor(target),
       dataDir: this.#o.dataDir,
       resultPath: join(this.#dir, "last-result.json"),
+      // The verified bundle stays in this private directory; only the helper, holding the
+      // install lock, copies it to the shared staged path (helperCore.ts).
+      source: join(work, "unpacked", "Apollo.app"),
+      progressPath: join(this.#dir, "progress.json"),
       logPath: join(this.#dir, "logs", `helper-${id}.log`),
       waitTimeoutMs: WAIT_FOR_BOTS_MS,
       teamId: TEAM_ID,
     };
-    const cleanup = () => {
-      realFileOps.remove(work);
-      realFileOps.remove(job.bundles.staged);
-    };
+    // An earlier job not reconciled yet (its helper may still run from its work directory).
+    if (existsSync(join(this.#dir, "job.json"))) {
+      await this.#info("An update is already under way", "Apollo will tell you when it is done.");
+      return;
+    }
     try {
-      // Leftovers of earlier attempts.
+      // Leftovers of earlier attempts (no job is pending, so nothing uses them).
       realFileOps.remove(join(this.#dir, "work"));
       mkdirSync(work, { recursive: true });
       const zip = join(work, offer.asset.name);
@@ -333,11 +365,13 @@ export class Updater {
         },
       });
       this.#setPhase({ kind: "installing" });
-      await stageFromZip({ zip, workDir: work, job, exec: realExec, files: realFileOps });
-      realFileOps.remove(work);
+      const source = await verifyFromZip({ zip, workDir: work, job, exec: realExec, files: realFileOps });
+      if (source !== job.source) throw new Error(`verified bundle at ${source}, expected ${job.source}`);
+      realFileOps.remove(zip);
       this.#startHelper(job);
     } catch (error) {
-      cleanup();
+      // Only our private directory: the shared staged path belongs to whoever holds the lock.
+      realFileOps.remove(work);
       log(`install failed: ${message(error)}`);
       this.#setPhase({ kind: "available", offer });
       await this.#info("The update could not be installed", `${message(error)}\n\nNothing was changed.`, "warning");
@@ -351,6 +385,7 @@ export class Updater {
     writeFileSync(join(runner, "package.json"), `${JSON.stringify({ type: "module" })}\n`);
     mkdirSync(dirname(job.logPath), { recursive: true });
     realFileOps.remove(job.resultPath);
+    realFileOps.remove(job.progressPath);
     const jobPath = join(this.#dir, "job.json");
     realFileOps.writeText(jobPath, `${JSON.stringify(job, null, 2)}\n`);
     const logFd = openSync(job.logPath, "a");
@@ -369,9 +404,17 @@ export class Updater {
         this.#o.quit();
       }
     });
-    child.on("error", (error) => log(`helper error: ${message(error)}`));
+    child.on("error", (error) => {
+      // It could not start (an exit may never come): read what is there, so the job is cleared.
+      log(`helper error: ${message(error)}`);
+      if (this.#helper !== child) return;
+      this.#helper = null;
+      this.#setPhase({ kind: "idle" });
+      this.#reconcile();
+    });
     // Still running when it exits: it gave up before stopping Apollo (busy bots, lock, bad bundle).
     child.on("exit", () => {
+      if (this.#helper !== child) return;
       this.#helper = null;
       this.#setPhase({ kind: "idle" });
       this.#reconcile();
@@ -383,9 +426,26 @@ export class Updater {
   // After an update: what happened, told once
 
   #reconcile() {
+    try {
+      this.#reconcileJob();
+    } catch (error) {
+      log(`could not read the last update's outcome: ${message(error)}`);
+    }
+  }
+
+  #reconcileJob() {
     const jobPath = join(this.#dir, "job.json");
-    const job = readJson<UpdateJob>(jobPath);
-    if (!job) return;
+    const text = readText(jobPath);
+    if (text === null) return;
+    let job: UpdateJob;
+    try {
+      job = parseJob(text);
+    } catch (error) {
+      // Damaged: nothing can be attributed to a build. Clear it so updates can go on.
+      log(`discarding a damaged job file: ${message(error)}`);
+      for (const file of [jobPath, join(this.#dir, "helper.pid")]) realFileOps.remove(file);
+      return;
+    }
     const pid = Number(this.#read("helper.pid") ?? NaN);
     let alive = this.#helper !== null;
     if (!alive && Number.isSafeInteger(pid) && pid > 0) {
@@ -395,8 +455,9 @@ export class Updater {
         alive = true; // cannot tell: look again later
       }
     }
-    const result = readJson<InstallResult>(job.resultPath);
-    const outcome = classifyOutcome(job, result, this.#running?.build ?? null, alive);
+    const result = summarizeResult(readText(job.resultPath));
+    const progress = parseProgress(readText(job.progressPath), job.id);
+    const outcome = classifyOutcome(job, result, progress, this.#running?.build ?? null, alive);
     if (outcome.kind === "pending") {
       setTimeout(() => this.#reconcile(), 10_000).unref();
       return;
@@ -405,13 +466,13 @@ export class Updater {
     if (outcome.kind === "updated") this.#notify(`Apollo was updated to ${job.version}`, "The new version passed its health check.");
     else if (outcome.kind === "postponed") this.#notify("The update was postponed", `${outcome.reason}. Apollo was not changed.`);
     else {
-      if (outcome.skip) this.#saveState(withSkipped(this.#state, { build: job.build, version: job.version, at: new Date().toISOString(), why: outcome.reason }));
+      if (outcome.skip) this.#saveState(withSkipped(this.#state, job.build, this.#running?.build ?? null));
       this.#notify(
         `The update to ${job.version} did not work`,
         outcome.skip ? `Apollo went back to the previous version and won't offer ${job.version} again. ${outcome.reason}` : `${outcome.reason}. Details: ${job.logPath}`,
       );
     }
-    for (const file of [jobPath, join(this.#dir, "helper.pid")]) realFileOps.remove(file);
+    for (const file of [jobPath, join(this.#dir, "helper.pid"), job.progressPath]) realFileOps.remove(file);
     realFileOps.remove(join(this.#dir, "work"));
     realFileOps.remove(join(this.#dir, "apollo-update-helper"));
   }
@@ -419,17 +480,26 @@ export class Updater {
   // -------------------------------------------------------------------------------------
 
   #runningBuild(): RunningBuild | null {
-    const info = readJson<{ version?: string; channel?: string; bundleVersion?: string; schemaVersion?: number; arch?: string }>(join(this.#o.resourcesPath, "build-info.json"));
-    if (!info || typeof info.version !== "string" || typeof info.schemaVersion !== "number") return null;
-    const channel = info.channel === "release" || info.channel === "nightly" ? info.channel : "local";
-    const build = info.bundleVersion && /^[1-9]\d{0,15}$/.test(info.bundleVersion) ? Number(info.bundleVersion) : null;
+    let info: unknown;
+    try {
+      info = JSON.parse(readText(join(this.#o.resourcesPath, "build-info.json")) ?? "null");
+    } catch {
+      return null;
+    }
+    const version = own(info, "version");
+    const schemaVersion = own(info, "schemaVersion");
+    const channel = own(info, "channel");
+    const bundleVersion = own(info, "bundleVersion");
+    const arch = own(info, "arch");
+    if (typeof version !== "string" || typeof schemaVersion !== "number" || !Number.isSafeInteger(schemaVersion)) return null;
+    const build = typeof bundleVersion === "string" && /^[1-9]\d{0,15}$/.test(bundleVersion) ? Number(bundleVersion) : null;
     return {
-      version: info.version,
-      channel,
+      version,
+      channel: channel === "release" || channel === "nightly" ? channel : "local",
       build: build !== null && Number.isSafeInteger(build) ? build : null,
-      schemaVersion: info.schemaVersion,
+      schemaVersion,
       platform: process.platform,
-      arch: info.arch ?? process.arch,
+      arch: typeof arch === "string" && arch ? arch : process.arch,
       osVersion: process.getSystemVersion(),
     };
   }

@@ -13,7 +13,7 @@ import { runInstall } from "../install/engine.ts";
 import { launchInstalled, realFileOps, realSqliteOps } from "../install/lib.ts";
 import { busySessions, classifyApollo, installedHealthy, isInstallerPid, processes } from "../install/mac.ts";
 import { helperDeps, parseJob, type HelperEffects } from "./helperCore.ts";
-import { checkSignature, realExec } from "./macos.ts";
+import { checkSignature, copyBundle, realExec } from "./macos.ts";
 
 const log = (line: string) => console.log(line);
 
@@ -62,6 +62,7 @@ const main = async () => {
       holding = true;
       for (const signal of ["SIGTERM", "SIGHUP", "SIGINT"] as const) process.on(signal, () => log(`  (${signal} ignored: the update is under way)`));
     },
+    copyBundle: (from, to) => copyBundle(realExec, from, to),
     checkSignature: (bundle, teamId) => checkSignature(realExec, bundle, teamId),
     pid: process.pid,
   };

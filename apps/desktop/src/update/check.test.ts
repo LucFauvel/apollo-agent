@@ -9,7 +9,7 @@ import { trustedKeys } from "./keys.ts";
 import type { Manifest } from "./manifestFormat.ts";
 import { parsePublicKey } from "./minisign.ts";
 import type { RunningBuild } from "./policy.ts";
-import { afterCheck, EMPTY_STATE, intervalAfter, nextCheckAt, parseState, withSkipped } from "./state.ts";
+import { afterCheck, EMPTY_STATE, intervalAfter, nextCheckAt } from "./state.ts";
 import { comment, makeKey, manifest, minisign, TEAM } from "./testing/fixtures.ts";
 
 const REPO = "LucFauvel/apollo-agent";
@@ -175,12 +175,5 @@ describe("check schedule", () => {
     const limited = afterCheck(EMPTY_STATE, { kind: "rate-limited", retryAt: 10 * H }, 0);
     expect(nextCheckAt(limited, 0, 0, false)).toBe(10 * H);
     expect(afterCheck(limited, { kind: "no-release" }, H)).toMatchObject({ failures: 0, retryAt: null });
-  });
-
-  it("keeps skipped builds through a damaged state file, and never lists one twice", () => {
-    const s = withSkipped(withSkipped(EMPTY_STATE, { build: 5, version: "1", at: "", why: "" }), { build: 5, version: "1", at: "", why: "" });
-    expect(s.skipped).toHaveLength(1);
-    expect(parseState(JSON.stringify({ ...s, failures: "lots", lastCheckAt: "never" })).skipped).toEqual(s.skipped);
-    expect(parseState("{nope")).toEqual(EMPTY_STATE);
   });
 });
