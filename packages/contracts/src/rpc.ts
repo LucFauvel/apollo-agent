@@ -317,7 +317,13 @@ export class ApolloRpcs extends RpcGroup.make(
   Rpc.make("sessions.create", { payload: CreateSessionInput, success: Session, error }),
   Rpc.make("sessions.update", { payload: UpdateSessionInput, success: Session, error }),
   Rpc.make("sessions.send", {
-    payload: { sessionId: SessionId, text: Schema.String, attachments: Schema.optional(Schema.Array(AttachmentRef)) },
+    payload: {
+      sessionId: SessionId,
+      text: Schema.String,
+      attachments: Schema.optional(Schema.Array(AttachmentRef)),
+      /** The seq of an earlier user or assistant message this one replies to. */
+      replyToSeq: Schema.optional(Schema.Number),
+    },
     error,
   }),
   Rpc.make("sessions.interrupt", { payload: { sessionId: SessionId }, error }),

@@ -1,4 +1,4 @@
-import type { AttachmentRef } from "@apollo/contracts";
+import type { AttachmentRef, ReplyRef } from "@apollo/contracts";
 import { useSyncExternalStore } from "react";
 
 /**
@@ -10,6 +10,7 @@ export interface QueuedMessage {
   readonly id: string;
   readonly text: string;
   readonly attachments: ReadonlyArray<AttachmentRef>;
+  readonly replyTo?: ReplyRef;
 }
 
 const KEY = "apollo.queue";
@@ -40,8 +41,8 @@ const commit = (sessionId: string, next: ReadonlyArray<QueuedMessage>) => {
 
 export const queueOf = (sessionId: string) => queues.get(sessionId) ?? EMPTY;
 
-export const enqueue = (sessionId: string, text: string, attachments: ReadonlyArray<AttachmentRef>) =>
-  commit(sessionId, [...queueOf(sessionId), { id: crypto.randomUUID(), text, attachments }]);
+export const enqueue = (sessionId: string, text: string, attachments: ReadonlyArray<AttachmentRef>, replyTo: ReplyRef | null) =>
+  commit(sessionId, [...queueOf(sessionId), { id: crypto.randomUUID(), text, attachments, ...(replyTo ? { replyTo } : {}) }]);
 
 export const dequeue = (sessionId: string, id: string) => {
   const message = queueOf(sessionId).find((m) => m.id === id) ?? null;

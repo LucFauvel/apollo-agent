@@ -387,6 +387,14 @@ export const ArtifactRef = Schema.Struct({
 });
 export type ArtifactRef = typeof ArtifactRef.Type;
 
+/** The earlier message a user message replies to: its seq, who wrote it, and the start of its text. */
+export const ReplyRef = Schema.Struct({
+  seq: Schema.Number,
+  from: Schema.Literals(["user", "assistant"]),
+  text: Schema.String,
+});
+export type ReplyRef = typeof ReplyRef.Type;
+
 export const AgentEvent = Schema.Union([
   Schema.TaggedStruct("UserMessage", {
     text: Schema.String,
@@ -395,6 +403,7 @@ export const AgentEvent = Schema.Union([
     attachments: Schema.optional(Schema.Array(AttachmentRef)),
     /** For `peer` messages: the bot that wrote it. */
     fromBotId: Schema.optional(BotId),
+    replyTo: Schema.optional(ReplyRef),
   }),
   Schema.TaggedStruct("TurnStarted", {}),
   /**
