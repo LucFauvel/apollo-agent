@@ -2,7 +2,7 @@ import type { AgentEvent, Bot, BotId, Session, SessionId } from "@apollo/contrac
 import { describe, expect, it } from "vitest";
 import * as Database from "../Database.ts";
 import { CLIENT_SESSION_TTL_MS, makePairing } from "../auth/Auth.ts";
-import { makePushTokens, makeTurnNotices, notificationFor, plain, type Waiting } from "./Push.ts";
+import { failedToStart, makePushTokens, makeTurnNotices, notificationFor, OWN_NOTICE_WINDOW_MS, plain, type Waiting } from "./Push.ts";
 
 const session = (over: Partial<Session> = {}) =>
   ({ id: "s1", botId: "b1", role: "main", parentSessionId: null, title: "Main", ...over }) as unknown as Session;
@@ -208,5 +208,85 @@ describe("finished turns while work is pending", () => {
     turns.offer(id, botId, finished);
     expect(run(turns, () => new Map([[id, null]]), 0, 5_000)).toEqual([]);
     expect(turns.held()).toEqual([]);
+  });
+
+  it("lets a bot's own notification about a finished turn stand in for the turn's notice", () => {
+    // A scheduled heartbeat: its turn ends (held), then the scheduler sends the result itself.
+    const turns = makeTurnNotices(timing);
+    turns.offer(id, botId, finished, 0);
+    turns.notifiedAfterTurn(id, 200);
+    expect(turns.held()).toEqual([]);
+    expect(run(turns, () => at(), 0, 5_000)).toEqual([]);
+    // The scheduler's notification is handled first (the two streams race): the turn's is dropped.
+    turns.turnStarted(id);
+    turns.notifiedAfterTurn(id, 10_000);
+    expect(turns.offer(id, botId, finished, 10_050)).toBeNull();
+    expect(turns.held()).toEqual([]);
+    // Only once, and not much later: the next turn is announced as usual.
+    turns.offer(id, botId, finished, 11_000);
+    expect(turns.held()).toEqual([id]);
+    turns.turnStarted(id);
+    turns.notifiedAfterTurn(id, 20_000);
+    turns.offer(id, botId, finished, 20_000 + OWN_NOTICE_WINDOW_MS);
+    expect(turns.held()).toEqual([id]);
+    // A new turn forgets it, too.
+    turns.turnStarted(id);
+    turns.notifiedAfterTurn(id, 40_000);
+    turns.turnStarted(id);
+    turns.offer(id, botId, finished, 40_100);
+    expect(turns.held()).toEqual([id]);
+  });
+
+  it("does not let a notification stand in for errors, approvals or questions", () => {
+    const turns = makeTurnNotices(timing);
+    const error = notificationFor(session(), bot, { _tag: "TurnCompleted", outcome: "failed", error: "boom" }, null)!;
+    turns.notifiedAfterTurn(id, 0);
+    expect(turns.offer(id, botId, error, 10)).toBe(error);
+  });
+});
+
+describe("providers that fail to start", () => {
+  const timing = { settleMs: 1_000, graceMs: 10_000, sweepMs: 100, jobCapMs: 600_000 };
+  const id = "s1" as SessionId;
+  const botId = "b1" as BotId;
+  const failure = notificationFor(session({ status: "error" } as Partial<Session>), bot, { _tag: "TurnCompleted", outcome: "failed", error: "logged out" }, null)!;
+  const waiting = (w: Partial<Waiting> = {}) =>
+    new Map([[id, { busy: false, workers: 0, jobs: 0, botReplies: 0, answeredBot: false, ...w } as Waiting]]);
+
+  it("holds the error just long enough for a scheduled run to say so itself", () => {
+    const turns = makeTurnNotices(timing);
+    expect(turns.offer(id, botId, failure, 0, true)).toBeNull();
+    expect(turns.sweep(500, waiting())).toEqual([]);
+    // The scheduler's "… failed" arrives: it is the one the user hears.
+    turns.notifiedAfterTurn(id, 600);
+    expect(turns.sweep(2_000, waiting())).toEqual([]);
+    expect(turns.held()).toEqual([]);
+  });
+
+  it("sends the error after the settle time otherwise, whatever the session waits on", () => {
+    const turns = makeTurnNotices(timing);
+    turns.offer(id, botId, failure, 0, true);
+    expect(turns.sweep(999, waiting({ workers: 1 }))).toEqual([]);
+    expect(turns.sweep(1_000, waiting({ workers: 1, answeredBot: true }))).toEqual([{ sessionId: id, botId, note: failure }]);
+    expect(turns.held()).toEqual([]);
+  });
+
+  const errored = session({ status: "error" } as Partial<Session>);
+  it("counts a turn under way that ends in error", () => {
+    expect(failedToStart("running", errored)).toBe(true);
+    expect(failedToStart("waiting-approval", errored)).toBe(true);
+  });
+  it("ignores other changes, and processes opening for something else", () => {
+    expect(failedToStart("starting", errored)).toBe(false);
+    expect(failedToStart(undefined, errored)).toBe(false);
+    expect(failedToStart("error", errored)).toBe(false);
+    expect(failedToStart("running", session({ status: "idle" } as Partial<Session>))).toBe(false);
+  });
+  it("says so like a failed turn", () => {
+    expect(notificationFor(errored, bot, { _tag: "TurnCompleted", outcome: "failed", error: "claude: not logged in" }, null)).toEqual({
+      kind: "error",
+      title: "Atlas stopped with an error",
+      body: "claude: not logged in",
+    });
   });
 });

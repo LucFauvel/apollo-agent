@@ -216,7 +216,9 @@ const make = Effect.gen(function* () {
       Effect.asVoid,
     );
 
-  const publish = (change: AppChange) => PubSub.publish(changes, change).pipe(Effect.asVoid);
+  const publish = (change: AppChange) =>
+    // Notifications carry when the server sent them: clients compare that with seen marks (server time).
+    PubSub.publish(changes, change._tag === "Notify" && change.at === undefined ? { ...change, at: Date.now() } : change).pipe(Effect.asVoid);
 
   /**
    * Cleanups of services built on the manager (background jobs, browser tabs), run when a

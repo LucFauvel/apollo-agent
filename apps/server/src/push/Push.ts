@@ -134,6 +134,16 @@ export const notificationFor = (
   }
 };
 
+/**
+ * A provider that failed to start for a turn: the session went from a turn under way to
+ * `error` without a TurnCompleted (only a failed start sets `error`). A process starting
+ * for something else (`starting`, e.g. to list commands) is not a turn the user waits on.
+ */
+export const failedToStart = (before: Session["status"] | undefined, session: Session) =>
+  session.status === "error" && (before === "running" || before === "waiting-approval");
+
+const busyStatus = (status: Session["status"]) => status === "starting" || status === "running" || status === "waiting-approval";
+
 /** What a session's finished turn still waits on (SessionManager.waitingOn, plus its jobs). */
 export interface Waiting {
   /** A turn is under way, or about to start (a report just arrived). */
@@ -172,6 +182,12 @@ export interface HoldTiming {
 /** A held notice waiting only on background jobs goes out after this long. */
 export const JOB_HOLD_CAP_MS = 10 * 60_000;
 
+/**
+ * A bot's own notification about a session whose turn just ended (a scheduled run's result)
+ * stands in for that turn's notice, if the turn ends this close to it.
+ */
+export const OWN_NOTICE_WINDOW_MS = 10_000;
+
 export const DEFAULT_HOLD: HoldTiming = { settleMs: 1_500, graceMs: 15_000, sweepMs: 500, jobCapMs: JOB_HOLD_CAP_MS };
 
 type Note = { readonly kind: string; readonly title: string; readonly body: string };
@@ -185,19 +201,54 @@ type Note = { readonly kind: string; readonly title: string; readonly body: stri
  * died, a job was stopped), the held notice goes out after a grace period, so an idle
  * session never goes unannounced. Only finished turns are held: approvals, questions and
  * errors need the user now.
+ *
+ * A notification the server sends itself about a session that just finished a turn (a
+ * scheduled heartbeat's result) replaces that turn's notice: the user hears it once. So
+ * does its notification about a turn whose provider failed to start (a scheduled run that
+ * failed): that error is held for the settle time only, whatever the session waits on.
  */
 export const makeTurnNotices = (timing: HoldTiming) => {
   const held = new Map<
     SessionId,
-    { readonly note: Note; readonly botId: BotId; readonly heldAt: number; clearSince: number | null; waited: boolean }
+    {
+      readonly note: Note;
+      readonly botId: BotId;
+      readonly heldAt: number;
+      /** Sent after the settle time whatever the session waits on: a failed start. */
+      readonly settleOnly: boolean;
+      clearSince: number | null;
+      waited: boolean;
+    }
   >();
+  /** Sessions whose finished turn already got a notification of its own, and when. */
+  const notified = new Map<SessionId, number>();
   return {
     /** A turn started: whatever an earlier turn held back is replaced by this one's outcome. */
-    turnStarted: (id: SessionId) => void held.delete(id),
-    /** A notice for a session event: returned to send now, or held (finished turns). */
-    offer: (id: SessionId, botId: BotId, note: Note, now = Date.now()): Note | null => {
-      if (note.kind !== "done") return note;
-      held.set(id, { note, botId, heldAt: now, clearSince: null, waited: false });
+    turnStarted: (id: SessionId) => {
+      held.delete(id);
+      notified.delete(id);
+    },
+    /**
+     * Another notification about this session went out once its turn was over (it was not
+     * busy): the turn's own notice, held or still to come, is dropped.
+     */
+    notifiedAfterTurn: (id: SessionId, now = Date.now()) => {
+      held.delete(id);
+      notified.set(id, now);
+    },
+    /**
+     * A notice for a session event: returned to send now, or held (finished turns, and a
+     * provider that failed to start: `failedStart`).
+     */
+    offer: (id: SessionId, botId: BotId, note: Note, now = Date.now(), failedStart = false): Note | null => {
+      if (note.kind !== "done" && !failedStart) return note;
+      const own = notified.get(id);
+      if (own !== undefined) {
+        notified.delete(id);
+        // (The bot's notification about this very turn came first: a race between the two streams.)
+        if (now - own < OWN_NOTICE_WINDOW_MS) return null;
+      }
+      held.set(id, { note, botId, heldAt: now, settleOnly: failedStart, clearSince: null, waited: false });
       return null;
     },
     /** Sessions with a held notice. */
@@ -210,6 +261,12 @@ export const makeTurnNotices = (timing: HoldTiming) => {
       const due: Array<{ readonly sessionId: SessionId; readonly botId: BotId; readonly note: Note }> = [];
       for (const [id, hold] of held) {
         if (!waiting.has(id)) continue;
+        if (hold.settleOnly) {
+          if (now - hold.heldAt < timing.settleMs) continue;
+          held.delete(id);
+          due.push({ sessionId: id, botId: hold.botId, note: hold.note });
+          continue;
+        }
         const w = waiting.get(id) ?? null;
         if (w === null || w.answeredBot) {
           held.delete(id);
@@ -373,13 +430,16 @@ export const makeLayerWatcher = (timing: HoldTiming = DEFAULT_HOLD) =>
       const lastReply = new Map<SessionId, string>();
       const turns = makeTurnNotices(timing);
 
+      /** The last status seen per session, to tell a failed start from other errors. */
+      const statuses = new Map<SessionId, Session["status"]>();
+
       /** To phones, the desktop app and browser tabs. */
       const announce = (sessionId: SessionId, botId: BotId, note: Note) =>
         Effect.gen(function* () {
           const bot = yield* store.getBot(botId).pipe(Effect.option);
           const at = Date.now();
           notices.record({ ...note, sessionId, botId, at });
-          yield* manager.publish({ _tag: "Notify", botId, sessionId, title: note.title, body: note.body, pushed: true });
+          yield* manager.publish({ _tag: "Notify", botId, sessionId, title: note.title, body: note.body, pushed: true, at });
           yield* Effect.forkDetach(deliver(tokens, send, note, sessionId, bot._tag === "Some" ? bot.value : undefined, at));
         });
 
@@ -425,18 +485,47 @@ export const makeLayerWatcher = (timing: HoldTiming = DEFAULT_HOLD) =>
         Effect.forkScoped,
       );
 
-      // Notifications bots send themselves (apollo_notify, scheduled results, secret requests, browser handoffs).
+      /** The error a failed start posted (its last error Notice), for the notification's body. */
+      const startError = (id: SessionId) =>
+        Effect.gen(function* () {
+          const latest = yield* store.latestSeq(id);
+          const events = yield* store.listEvents(id, Math.max(0, latest - 10));
+          const notice = events.map((e) => e.event).findLast((e) => e._tag === "Notice" && e.level === "error");
+          return notice?._tag === "Notice" ? notice.message : null;
+        });
+
+      // Notifications bots send themselves (apollo_notify, scheduled results, secret requests,
+      // browser handoffs), and providers that fail to start for a turn.
       yield* manager.changes.pipe(
         Stream.runForEach((change) =>
           Effect.gen(function* () {
+            if (change._tag === "SessionUpserted") {
+              const session = change.session;
+              const before = statuses.get(session.id);
+              statuses.set(session.id, session.status);
+              if (!failedToStart(before, session)) return;
+              const bot = yield* store.getBot(session.botId).pipe(Effect.option);
+              const failed: AgentEvent = { _tag: "TurnCompleted", outcome: "failed", error: yield* startError(session.id) };
+              const note = notificationFor(session, bot._tag === "Some" ? bot.value : undefined, failed, null);
+              // (Held briefly: a scheduled run that failed to start says so itself, just after.)
+              const now = note && turns.offer(session.id, session.botId, note, Date.now(), true);
+              if (now) yield* announce(session.id, session.botId, now);
+              return;
+            }
+            if (change._tag === "SessionDeleted") return void statuses.delete(change.sessionId);
             // (`pushed`: one of ours, above.)
             if (change._tag !== "Notify" || change.pushed) return;
+            if (change.sessionId) {
+              const about = yield* store.getSession(change.sessionId).pipe(Effect.option);
+              // Sent once the session's turn was over (a scheduled result): it is that turn's notice.
+              if (about._tag === "Some" && !busyStatus(about.value.status)) turns.notifiedAfterTurn(change.sessionId);
+            }
             const note = { kind: "notify", title: change.title, body: plain(change.body) };
-            const at = Date.now();
+            const at = change.at ?? Date.now();
             notices.record({ ...note, sessionId: change.sessionId ?? "", botId: change.botId, at });
             const bot = yield* store.getBot(change.botId).pipe(Effect.option);
             yield* Effect.forkDetach(deliver(tokens, send, note, change.sessionId ?? null, bot._tag === "Some" ? bot.value : undefined, at));
-          }),
+          }).pipe(Effect.catchCause((cause) => Effect.logWarning("Notification failed", cause))),
         ),
         Effect.forkScoped,
       );

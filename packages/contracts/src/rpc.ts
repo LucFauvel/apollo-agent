@@ -87,6 +87,12 @@ export const AppChange = Schema.Union([
      * user is looking at that session.
      */
     pushed: Schema.optional(Schema.Boolean),
+    /**
+     * When the server sent it (server time, ms), set on every notification it publishes.
+     * Clients compare it with `NotificationsSeen` marks, which are server time too, so a
+     * device whose clock is off still dismisses the right ones.
+     */
+    at: Schema.optional(Timestamp),
   }),
   /**
    * The user saw this bot's chats at `at` (server time, ms): on some device they opened one

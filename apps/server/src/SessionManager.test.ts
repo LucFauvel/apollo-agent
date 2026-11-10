@@ -35,6 +35,8 @@ const titleRequests: Array<string> = [];
 let skillReloads = 0;
 let modelListings = 0;
 let interrupts = 0;
+/** When set, providers fail to start with this message (a CLI that is not logged in, say). */
+let failToStart: string | null = null;
 /** Answers given to the fake agent's questions. */
 const inputAnswers: Array<{ requestId: string; action: string }> = [];
 
@@ -76,6 +78,7 @@ const echoProvider = (kind: ProviderKind): Provider => ({
   }),
   open: (options, emit) =>
     Effect.gen(function* () {
+      if (failToStart) return yield* Effect.fail(new ProviderError({ provider: kind, message: failToStart }));
       opened.push(options);
       const agent = (event: AgentEvent) => emit({ _tag: "Event", event });
       yield* emit({ _tag: "ResumeId", resumeId: `${kind}-thread` });
@@ -367,6 +370,84 @@ describe("SessionManager", () => {
         // The desktop app shows the same single notice.
         expect((yield* Push.Notices).since(0)).toHaveLength(1);
       }).pipe(Effect.provide(pushLayer));
+    });
+
+    /** Notifications published to clients (browser tabs), while `run` runs. */
+    const notifiesDuring = <A, E, R>(run: (notifies: Array<Extract<AppChange, { _tag: "Notify" }>>) => Effect.Effect<A, E, R>) =>
+      Effect.gen(function* () {
+        const manager = yield* SessionManager.SessionManager;
+        const notifies: Array<Extract<AppChange, { _tag: "Notify" }>> = [];
+        const fiber = yield* manager.changes.pipe(
+          Stream.runForEach((c) => Effect.sync(() => void (c._tag === "Notify" && notifies.push(c)))),
+          Effect.forkChild,
+        );
+        yield* Effect.sleep("20 millis");
+        const result = yield* run(notifies);
+        yield* Fiber.interrupt(fiber);
+        return result;
+      });
+
+    it.live("tells the user when the provider fails to start for their message", () => {
+      const { pushed, pushLayer, pair } = watched();
+      return notifiesDuring((notifies) =>
+        Effect.gen(function* () {
+          yield* pair;
+          const manager = yield* SessionManager.SessionManager;
+          const store = yield* Store.Store;
+          const bot = yield* createBot(manager);
+          failToStart = "claude: not logged in";
+          yield* manager.send(bot.mainSessionId, "hello", "user").pipe(Effect.ignore);
+          failToStart = null;
+          expect((yield* store.getSession(bot.mainSessionId)).status).toBe("error");
+          yield* until(() => pushed.length > 0);
+          yield* Effect.sleep("100 millis");
+          expect(pushed).toHaveLength(1);
+          expect(pushed[0]).toMatchObject({
+            title: "Atlas stopped with an error",
+            body: "claude: not logged in",
+            data: { sessionId: bot.mainSessionId, kind: "error" },
+          });
+          // Browser tabs get it too, with when the server sent it.
+          expect(notifies).toEqual([
+            {
+              _tag: "Notify",
+              botId: bot.id,
+              sessionId: bot.mainSessionId,
+              title: "Atlas stopped with an error",
+              body: "claude: not logged in",
+              pushed: true,
+              at: pushed[0]!.data.at,
+            },
+          ]);
+        }).pipe(Effect.ensuring(Effect.sync(() => void (failToStart = null)))),
+      ).pipe(Effect.provide(pushLayer));
+    });
+
+    it.live("sends a scheduled result once: the bot's notification stands in for the turn's", () => {
+      const { pushed, pushLayer, pair } = watched();
+      return notifiesDuring((notifies) =>
+        Effect.gen(function* () {
+          yield* pair;
+          const manager = yield* SessionManager.SessionManager;
+          const bot = yield* createBot(manager);
+          // What the scheduler does for a heartbeat with something to say.
+          yield* manager.send(bot.mainSessionId, "heartbeat", "system");
+          yield* waitIdle(manager, bot.mainSessionId);
+          yield* manager.publish({ _tag: "Notify", botId: bot.id, sessionId: bot.mainSessionId, title: "Atlas: heartbeat", body: "echo: heartbeat" });
+          yield* Effect.sleep("300 millis");
+          expect(pushed.map((m) => m.title)).toEqual(["Atlas: heartbeat"]);
+          // A browser tab is told once (the scheduler's, stamped with server time), not twice.
+          expect(notifies).toHaveLength(1);
+          expect(notifies[0]).toMatchObject({ title: "Atlas: heartbeat", at: expect.any(Number) });
+          expect(notifies[0]!.pushed).toBeUndefined();
+          expect(pushed[0]!.data.at).toBe(notifies[0]!.at);
+          // The next turn is announced as usual.
+          yield* manager.send(bot.mainSessionId, "thanks", "user");
+          yield* waitIdle(manager, bot.mainSessionId);
+          yield* until(() => pushed.length > 1);
+          expect(pushed.map((m) => m.title)).toEqual(["Atlas: heartbeat", "Atlas"]);
+        }),
+      ).pipe(Effect.provide(pushLayer));
     });
 
     it.live("holds a turn while a background job it started runs", () => {
