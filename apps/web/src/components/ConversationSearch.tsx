@@ -224,10 +224,89 @@ export class JumpTracker {
     if (this.#intent?.serial === serial) this.#intent = null;
   }
 
+  /** Whether the jump `serial` is still to be made (not done, not replaced, not dropped). */
+  holds(serial: number) {
+    return this.#intent?.serial === serial;
+  }
+
   get pending() {
     return this.#intent !== null;
   }
 }
+
+/** The timers `paintAndJump` uses (animation frames and a delay), replaceable in tests. */
+export interface PaintScheduler {
+  frame(run: () => void): number;
+  cancelFrame(id: number): void;
+  later(run: () => void, ms: number): number;
+  cancelLater(id: number): void;
+}
+
+const browserScheduler: PaintScheduler = {
+  frame: (run) => requestAnimationFrame(run),
+  cancelFrame: (id) => cancelAnimationFrame(id),
+  later: (run, ms) => setTimeout(run, ms) as unknown as number,
+  cancelLater: (id) => clearTimeout(id),
+};
+
+/** How long opening a day or message animates its height. */
+export const OPEN_SETTLE_MS = 320;
+
+/**
+ * Paints the matches and, when a search action's jump is due (JumpTracker), brings the
+ * current match into view: once. Every path that scrolls checks that its jump is still
+ * the one to make and reports it done when it succeeded, so nothing scrolls after the jump
+ * was made, for a replaced request, or twice. If the match is on the page at the first
+ * frame, the jump happens then; if its day or message is still opening, frames only paint
+ * and the jump happens once the opening has settled. Returns a cleanup that cancels what
+ * is still scheduled (a jump not made yet stays pending for the next run).
+ */
+export const paintAndJump = ({
+  container,
+  query,
+  current,
+  jumps,
+  state,
+  onJump,
+  show = showSearchMatches,
+  scheduler = browserScheduler,
+}: {
+  container: HTMLElement;
+  query: string;
+  current: CurrentMatch | null;
+  jumps: JumpTracker;
+  state: JumpState;
+  /** Called when this run is going to move the view (the conversation stops sticking to the bottom). */
+  onJump: () => void;
+  show?: typeof showSearchMatches;
+  scheduler?: PaintScheduler;
+}): (() => void) => {
+  const serial = jumps.take(state);
+  if (serial !== null) onJump();
+  const due = () => serial !== null && jumps.holds(serial);
+  let tries = 0;
+  let frame = 0;
+  // The match's day or message may still be mounting: retry for a few frames (painting).
+  const run = () => {
+    // Only the first attempt jumps: a later one means the match is still opening and moving.
+    const jump = tries === 0 && due();
+    if (show(container, query, current, jump)) {
+      if (jump) jumps.done(serial!);
+    } else if (tries++ < 20) frame = scheduler.frame(run);
+  };
+  frame = scheduler.frame(run);
+  // Opening a day or message animates its height: make a jump not made yet once it settled.
+  const settle =
+    serial !== null
+      ? scheduler.later(() => {
+          if (due() && show(container, query, current, true)) jumps.done(serial);
+        }, OPEN_SETTLE_MS)
+      : undefined;
+  return () => {
+    scheduler.cancelFrame(frame);
+    if (settle !== undefined) scheduler.cancelLater(settle);
+  };
+};
 
 /** The find bar over the conversation: query, match count, previous/next, close. */
 export function ConversationSearchBar({

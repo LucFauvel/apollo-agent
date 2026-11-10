@@ -78,7 +78,7 @@ import { BotAvatar } from "./Sidebar.tsx";
 import { MentionMenu, PeerMessage, useMentions, WithMentions } from "./Mentions.tsx";
 import { DayDivider, groupByDay, MessageTime } from "./DayGroups.tsx";
 import { MessageRail, type RailTurn } from "./MessageRail.tsx";
-import { clearSearchHighlights, ConversationSearchBar, type CurrentMatch, JumpTracker, opensSearch, showSearchMatches } from "./ConversationSearch.tsx";
+import { clearSearchHighlights, ConversationSearchBar, type CurrentMatch, JumpTracker, opensSearch, paintAndJump, showSearchMatches } from "./ConversationSearch.tsx";
 import { Badge, Button, Collapse, cx, IconButton, Menu, ModelChip, providerName, StatusDot, statusLabel, Tooltip } from "./ui.tsx";
 
 export type PanelKind = "knowledge" | "schedules" | "browser" | "changes";
@@ -1003,24 +1003,14 @@ export function SessionView({
   useEffect(() => {
     const container = scrollRef.current;
     if (!search || !container) return clearSearchHighlights();
-    const serial = jumps.take({ needle, ready, total: results.total, located: current !== null });
-    const scroll = serial !== null;
-    if (scroll) stick.current = false;
-    let tries = 0;
-    let frame = 0;
-    // The match's day or message may still be mounting: retry for a few frames.
-    const run = () => {
-      if (showSearchMatches(container, searchQuery, current, scroll)) {
-        if (serial !== null) jumps.done(serial);
-      } else if (tries++ < 20) frame = requestAnimationFrame(run);
-    };
-    frame = requestAnimationFrame(run);
-    // Opening a day or message animates its height: place the match again once it settles.
-    const settle = scroll ? setTimeout(() => showSearchMatches(container, searchQuery, current, true), 320) : undefined;
-    return () => {
-      cancelAnimationFrame(frame);
-      clearTimeout(settle);
-    };
+    return paintAndJump({
+      container,
+      query: searchQuery,
+      current,
+      jumps,
+      state: { needle, ready, total: results.total, located: current !== null },
+      onJump: () => (stick.current = false),
+    });
     // `search` changes on every search action (stepping onto the same lone match scrolls again too).
   }, [search, needle, ready, results, current, items, toggledDays]);
   // Only matches near the screen are painted: paint again as the conversation scrolls.

@@ -2,7 +2,7 @@ import { findInSegments, foldQuery, toBlocks, type TranscriptItem } from "@apoll
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it } from "vitest";
 import { MarkdownText } from "./components/Code.tsx";
-import { JumpTracker, type JumpState, opensSearch, showSearchMatches, type ShortcutEvent } from "./components/ConversationSearch.tsx";
+import { JumpTracker, type JumpState, opensSearch, paintAndJump, type PaintScheduler, showSearchMatches, type ShortcutEvent } from "./components/ConversationSearch.tsx";
 import { conversationMatches, locateMatch, prepareSearch, searchTexts } from "./search.ts";
 import { type SearchPort, SearchClient } from "./searchClient.ts";
 import { type FromIndex, SearchIndex, type ToIndex } from "./searchIndex.ts";
@@ -442,5 +442,124 @@ describe("search index off the UI thread", () => {
     expect(starts.every((s) => s % 3 === 0)).toBe(true);
     // A stale location (the page shows other text there) is not shown as current.
     expect(showSearchMatches(page, "aa", { key: "0", occurrence: 0, element: 0, start: 1, end: 3, paintFrom: 1 }, false)).toBe(false);
+  });
+});
+
+describe("reviewer round 3 repros (every scroll goes through the jump rules)", () => {
+  /** Frames and delayed callbacks that run only when the test says so. */
+  const scheduler = () => {
+    let next = 1;
+    const frames = new Map<number, () => void>();
+    const laters = new Map<number, () => void>();
+    const take = (queue: Map<number, () => void>) => {
+      const [id, run] = queue.entries().next().value ?? [];
+      if (id === undefined) return false;
+      queue.delete(id);
+      run!();
+      return true;
+    };
+    return {
+      frames,
+      laters,
+      runFrame: () => take(frames),
+      runLater: () => take(laters),
+      scheduler: {
+        frame: (run: () => void) => (frames.set(next, run), next++),
+        cancelFrame: (id: number) => void frames.delete(id),
+        later: (run: () => void) => (laters.set(next, run), next++),
+        cancelLater: (id: number) => void laters.delete(id),
+      } satisfies PaintScheduler,
+    };
+  };
+  /** The page: whether the match is on it yet; every scroll the painter made. */
+  const page = () => {
+    const state = { present: true, scrolls: 0 };
+    const show = ((_c, _q, _m, scroll: boolean) => {
+      if (state.present && scroll) state.scrolls++;
+      return state.present;
+    }) as typeof showSearchMatches;
+    return { state, show };
+  };
+  const ready: JumpState = { needle: "api", ready: true, total: 3, located: true };
+  const match = { key: "m", occurrence: 0, element: 0, start: 0, end: 3, paintFrom: 0 };
+  const run = (jumps: JumpTracker, show: typeof showSearchMatches, s: PaintScheduler) =>
+    paintAndJump({ container: {} as HTMLElement, query: "api", current: match, jumps, state: ready, onJump() {}, show, scheduler: s });
+
+  it("reviewer round 3 repro: after a successful jump, the delayed settle does not pull the user back once they scrolled away", () => {
+    const jumps = new JumpTracker();
+    jumps.request("api");
+    const { state, show } = page();
+    const timers = scheduler();
+    run(jumps, show, timers.scheduler);
+    // The first frame finds the match and jumps to it.
+    timers.runFrame();
+    expect(state.scrolls).toBe(1);
+    expect(jumps.pending).toBe(false);
+    // The user scrolls away; then the delayed callback fires: no second scroll.
+    while (timers.runLater() || timers.runFrame());
+    expect(state.scrolls).toBe(1);
+  });
+
+  it("reviewer round 3 repro: a jump first made by the delayed settle is complete, so a later streamed update does not jump again", () => {
+    const jumps = new JumpTracker();
+    jumps.request("api");
+    const { state, show } = page();
+    const timers = scheduler();
+    // The match's day is still opening: every frame attempt misses.
+    state.present = false;
+    const cleanup = run(jumps, show, timers.scheduler);
+    let attempts = 0;
+    while (timers.runFrame()) attempts++;
+    expect(attempts).toBe(21);
+    expect(state.scrolls).toBe(0);
+    // Mounted by the time the delayed callback fires: it makes the jump, and that completes it.
+    state.present = true;
+    timers.runLater();
+    expect(state.scrolls).toBe(1);
+    expect(jumps.pending).toBe(false);
+    cleanup();
+    // A token streams in: the effect runs again and only repaints.
+    const again = scheduler();
+    run(jumps, show, again.scheduler);
+    while (again.runFrame() || again.runLater());
+    expect(state.scrolls).toBe(1);
+  });
+
+  it("a match that appears while its day is still opening is jumped to once, after the opening settled", () => {
+    const jumps = new JumpTracker();
+    jumps.request("api");
+    const { state, show } = page();
+    const timers = scheduler();
+    state.present = false;
+    run(jumps, show, timers.scheduler);
+    timers.runFrame();
+    // Mounted on the next frame, still animating: painted, not scrolled to yet.
+    state.present = true;
+    while (timers.runFrame());
+    expect(state.scrolls).toBe(0);
+    timers.runLater();
+    expect(state.scrolls).toBe(1);
+    expect(jumps.pending).toBe(false);
+  });
+
+  it("a jump that is still pending when a newer action replaces it does not scroll from the old run", () => {
+    const jumps = new JumpTracker();
+    jumps.request("api");
+    const { state, show } = page();
+    const timers = scheduler();
+    state.present = false;
+    run(jumps, show, timers.scheduler);
+    while (timers.runFrame());
+    // A step (newer request) arrives before the old run's delayed callback.
+    jumps.request("api");
+    state.present = true;
+    timers.runLater();
+    expect(state.scrolls).toBe(0);
+    // The newer request's own run makes its jump, once.
+    const next = scheduler();
+    run(jumps, show, next.scheduler);
+    while (next.runFrame() || next.runLater());
+    expect(state.scrolls).toBe(1);
+    expect(jumps.pending).toBe(false);
   });
 });
