@@ -117,11 +117,12 @@ const OTHER: Record<string, string> = {
 const looksLikeText = (bytes: Uint8Array) => {
   if (bytes.includes(0)) return false;
   try {
-    new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, 64 * 1024));
+    // `stream: true` tolerates only a multi-byte character cut at the 64 KB mark; any other
+    // invalid byte in the sample still throws.
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, 64 * 1024), { stream: true });
     return true;
   } catch {
-    // A multi-byte character cut at the 64 KB mark is still text.
-    return bytes.byteLength > 64 * 1024;
+    return false;
   }
 };
 

@@ -61,6 +61,14 @@ describe("artifacts", () => {
     expect(classify("blob", new Uint8Array([0, 1, 2]))).toMatchObject({ kind: "file" });
   });
 
+  it("tell large binary files from large text cut mid-character", () => {
+    // Invalid UTF-8 past the 64 KB sample size is still binary.
+    expect(classify("payload.bin", new Uint8Array(64 * 1024 + 1).fill(0xff))).toMatchObject({ kind: "file" });
+    // Text whose sample ends inside a multi-byte character ("é" is 2 bytes) is still text.
+    const big = text("a".repeat(64 * 1024 - 1) + "é".repeat(10));
+    expect(classify("notes", big)).toMatchObject({ kind: "text" });
+  });
+
   it("give older clients a fallback rendering", () => {
     const page = saveArtifact(dir, { botId: bot, sessionId: session, name: "p.html", bytes: text("<b>x</b>") })!;
     expect(fallbackHtml(page, text("<b>x</b>"))).toBe("<b>x</b>");
