@@ -6,6 +6,7 @@ import type {
   BrowserTab,
   LocalModelsState,
   PullRequest,
+  Monitor,
   Schedule,
   ScheduleId,
   Session,
@@ -34,6 +35,8 @@ export interface AppState {
   readonly browserTabs: ReadonlyMap<string, BrowserTab>;
   /** Pull requests linked to sessions, keyed `${sessionId} ${url}`. */
   readonly pullRequests: ReadonlyMap<string, PullRequest>;
+  /** Monitors agents set up, running and recently ended, by id. */
+  readonly monitors: ReadonlyMap<string, Monitor>;
   /** Bumped when a bot's sessions changed files or explained changes: the Changes panel refetches. */
   readonly changesVersion: ReadonlyMap<BotId, number>;
   /** When the user last saw each bot's chats, on any device: its notifications up to then are dismissed. */
@@ -59,6 +62,7 @@ let state: AppState = {
   schedules: new Map(),
   browserTabs: new Map(),
   pullRequests: new Map(),
+  monitors: new Map(),
   changesVersion: new Map(),
   notificationsSeen: new Map(),
 };
@@ -152,6 +156,13 @@ const apply = (change: AppChange) => {
       const pr = change.pullRequest;
       return setState({ ...state, pullRequests: new Map(state.pullRequests).set(`${pr.sessionId} ${pr.url}`, pr) });
     }
+    case "MonitorUpserted":
+      return setState({ ...state, monitors: new Map(state.monitors).set(change.monitor.id, change.monitor) });
+    case "MonitorRemoved": {
+      const monitors = new Map(state.monitors);
+      monitors.delete(change.monitorId);
+      return setState({ ...state, monitors });
+    }
     case "ChangesUpdated":
       return setState({ ...state, changesVersion: new Map(state.changesVersion).set(change.botId, (state.changesVersion.get(change.botId) ?? 0) + 1) });
     case "PullRequestRemoved": {
@@ -198,6 +209,7 @@ export const startSync = () =>
           schedules: new Map(item.schedules.map((s) => [s.id, s])),
           browserTabs: new Map(item.browserTabs.map((t) => [t.id, t])),
           pullRequests: new Map(item.pullRequests.map((p) => [`${p.sessionId} ${p.url}`, p])),
+          monitors: new Map((item.monitors ?? []).map((m) => [m.id, m])),
           // A reconnect may have missed ChangesUpdated: open changes views refetch.
           changesVersion: invalidateChanges(state.changesVersion, item.bots.map((b) => b.id)),
           notificationsSeen: (item.notificationsSeen ?? []).reduce((marks, m) => withSeenMark(marks, m.botId, m.at), state.notificationsSeen),

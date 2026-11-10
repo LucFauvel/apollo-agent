@@ -10,3 +10,4 @@ export * from "./pullRequests.ts";
 export * from "./connectors.ts";
 export * from "./remote.ts";
 export * from "./changes.ts";
+export * from "./monitors.ts";
