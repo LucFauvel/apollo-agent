@@ -1049,7 +1049,9 @@ const INPUT_RESOLVED: Record<string, string> = { accept: "Submitted", decline: "
 
 /** Questions from the agent (AskUserQuestion, MCP forms): choices as buttons, text as inputs. */
 function InputCard({ item, onInput }: { item: Extract<TranscriptItem, { kind: "input" }> } & Pick<Respond, "onInput">) {
-  const [values, setValues] = useState<Record<string, InputValue>>({});
+  const [values, setValues] = useState<Record<string, InputValue>>(() =>
+    Object.fromEntries(item.fields.flatMap((f) => (f.default === null ? [] : [[f.name, f.default]]))),
+  );
   const pending = item.action === null;
   const field = (f: InputField) => {
     if (f.kind === "select" || f.kind === "multi-select") {
@@ -1093,7 +1095,9 @@ function InputCard({ item, onInput }: { item: Extract<TranscriptItem, { kind: "i
       <View key={f.name} style={{ gap: 6 }}>
         <FieldTitle field={f} />
         <TextInput
-          style={styles.fieldInput}
+          style={[styles.fieldInput, f.multiline && styles.fieldInputMultiline]}
+          multiline={f.multiline === true && f.kind === "string"}
+          textAlignVertical={f.multiline ? "top" : undefined}
           secureTextEntry={f.secret}
           keyboardType={f.kind === "string" ? "default" : "numeric"}
           value={typeof values[f.name] === "string" || typeof values[f.name] === "number" ? String(values[f.name]) : ""}
@@ -1426,6 +1430,7 @@ const styles = StyleSheet.create({
     paddingVertical: 9,
     fontSize: 14,
   },
+  fieldInputMultiline: { minHeight: 140, maxHeight: 320, paddingTop: 9, lineHeight: 20 },
   option: { borderRadius: 10, borderWidth: 1, borderColor: colors.border, padding: 10 },
   optionOn: { borderColor: "rgba(125,211,252,0.6)", backgroundColor: "rgba(14,165,233,0.12)" },
   optionLabel: { color: colors.text, fontSize: 14, fontWeight: "500" },

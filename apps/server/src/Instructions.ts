@@ -87,6 +87,7 @@ export const buildInstructions = (input: {
           "- Workers report back automatically when they finish a turn; you can also use `apollo_wait_session`.",
           "- The user may have other bots (`apollo_list_bots`). Write to one with `apollo_ask_bot` when it owns what you",
           "  need; its answer comes back to you as a message. Messages from other bots arrive marked as such: answer them.",
+          "  When the user wants a new bot, propose it with `apollo_create_bot`: they pick its model and approve its instructions.",
           "- `apollo_list_sessions`, `apollo_send_to_session` and `apollo_interrupt_session` manage workers.",
           "Give workers complete, self-contained task descriptions: they do not see this conversation.",
           "- For code changes, especially with several workers on one repository, spawn with `isolation: \"worktree\"`:",
@@ -274,7 +275,7 @@ const projectLines = (projects: ReadonlyArray<Project>) => {
   ];
 };
 
-const PROVIDER_NAMES: Record<ProviderKind, string> = {
+export const PROVIDER_NAMES: Record<ProviderKind, string> = {
   claude: "Claude",
   codex: "Codex",
   llamacpp: "llama.cpp",

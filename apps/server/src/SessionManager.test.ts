@@ -12,6 +12,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import { saveAttachment } from "./attachments.ts";
+import * as BotProposals from "./bots/BotProposals.ts";
 import * as Compaction from "./Compaction.ts";
 import { ServerConfig } from "./Config.ts";
 import * as Database from "./Database.ts";
@@ -1693,6 +1694,95 @@ describe("SessionManager", () => {
         const events = yield* store.listEvents(worker.id, 0);
         expect(events.at(-1)?.event).toMatchObject({ _tag: "TurnCompleted", outcome: "interrupted" });
       }).pipe(Effect.provide(layer)),
+    );
+  });
+
+  describe("bot proposals", () => {
+    const proposalLayer = BotProposals.layer.pipe(Layer.provideMerge(layer));
+
+    /** Proposes a bot from Atlas, answers the card with `response`, and returns the outcome and the card. */
+    const propose = (response: (fields: ReadonlyArray<{ name: string; default: unknown }>) => { action: "accept" | "decline" | "cancel"; values: Record<string, string> }) =>
+      Effect.gen(function* () {
+        const manager = yield* SessionManager.SessionManager;
+        const store = yield* Store.Store;
+        const proposals = yield* BotProposals.BotProposals;
+        yield* (yield* AppSettings.AppSettings).update({ workspaceRoot: join(dataDir, "workspaces") });
+        const creator = yield* createBot(manager);
+        const fiber = yield* proposals
+          .propose(
+            { sessionId: creator.mainSessionId, botId: creator.id },
+            { name: "Scout", instructions: "You are Scout. You watch the news.", provider: undefined, model: undefined, timeoutMs: 5000 },
+          )
+          .pipe(Effect.result, Effect.forkChild);
+        let card: Extract<AgentEvent, { _tag: "InputRequested" }> | undefined;
+        for (let i = 0; i < 200 && !card; i++) {
+          const found = (yield* store.listEvents(creator.mainSessionId, 0)).find((e) => e.event._tag === "InputRequested")?.event;
+          if (found?._tag === "InputRequested") card = found;
+          else yield* Effect.sleep("10 millis");
+        }
+        if (!card) throw new Error("no proposal card");
+        yield* proposals.respond(creator.mainSessionId, card.requestId, response(card.fields));
+        const outcome = yield* Fiber.join(fiber);
+        const events = (yield* store.listEvents(creator.mainSessionId, 0)).map((e) => e.event);
+        return { outcome, card, events, creator, bots: yield* store.listBots };
+      });
+
+    it.live("creates the bot with the model and instructions the user picked", () =>
+      Effect.gen(function* () {
+        const { outcome, card, events, bots } = yield* propose(() => ({
+          action: "accept",
+          values: { name: "Scout", model: "codex:codex-big", instructions: "You are Scout. You watch tech news only." },
+        }));
+        expect(card.fields.map((f) => f.name)).toEqual(["name", "model", "instructions"]);
+        const model = card.fields.find((f) => f.name === "model")!;
+        expect(model.default).toBe("claude:claude-big");
+        expect(model.options.map((o) => o.value)).toEqual(["claude:claude-big", "codex:codex-big"]);
+        expect(card.fields.find((f) => f.name === "instructions")).toMatchObject({ default: "You are Scout. You watch the news.", multiline: true });
+        expect(outcome._tag).toBe("Success");
+        const scout = bots.find((b) => b.name === "Scout")!;
+        expect(scout.main).toEqual({ provider: "codex", model: "codex-big" });
+        expect(scout.instructions).toBe("You are Scout. You watch tech news only.");
+        expect(scout.defaultWorker).toEqual({ provider: "codex" });
+        expect(scout.runtimeMode).toBe("full-access");
+        expect(scout.cwd).toBe(join(dataDir, "workspaces", "scout"));
+        expect(events.at(-1)).toEqual({ _tag: "InputResolved", requestId: card.requestId, action: "accept" });
+        if (outcome._tag === "Success") expect(outcome.success).toMatchObject({ created: true, botId: scout.id, instructionsEdited: true });
+      }).pipe(Effect.provide(proposalLayer)),
+    );
+
+    it.live("keeps the proposal for fields a client left out", () =>
+      Effect.gen(function* () {
+        const { outcome, bots } = yield* propose(() => ({ action: "accept", values: {} }));
+        expect(outcome._tag).toBe("Success");
+        const scout = bots.find((b) => b.name === "Scout")!;
+        expect(scout.main).toEqual({ provider: "claude", model: "claude-big" });
+        expect(scout.instructions).toBe("You are Scout. You watch the news.");
+      }).pipe(Effect.provide(proposalLayer)),
+    );
+
+    it.live("creates nothing when the user declines", () =>
+      Effect.gen(function* () {
+        const { outcome, card, events, bots } = yield* propose(() => ({ action: "decline", values: {} }));
+        expect(outcome._tag).toBe("Failure");
+        expect(bots.some((b) => b.name === "Scout")).toBe(false);
+        expect(events.at(-1)).toEqual({ _tag: "InputResolved", requestId: card.requestId, action: "decline" });
+      }).pipe(Effect.provide(proposalLayer)),
+    );
+
+    it.live("closes a card nobody waits for any more", () =>
+      Effect.gen(function* () {
+        const manager = yield* SessionManager.SessionManager;
+        const store = yield* Store.Store;
+        const proposals = yield* BotProposals.BotProposals;
+        const bot = yield* createBot(manager);
+        const result = yield* proposals.respond(bot.mainSessionId, `${BotProposals.PROPOSAL_PREFIX}gone`, { action: "accept", values: {} }).pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        expect((yield* store.listEvents(bot.mainSessionId, 0)).at(-1)?.event).toEqual({
+          _tag: "InputResolved",
+          requestId: `${BotProposals.PROPOSAL_PREFIX}gone`,
+          action: "cancel",
+        });
+      }).pipe(Effect.provide(proposalLayer)),
     );
   });
 });

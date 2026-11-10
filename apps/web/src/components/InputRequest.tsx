@@ -126,6 +126,16 @@ function FieldInput({
       );
     }
     default:
+      if (field.multiline && field.kind === "string") {
+        return (
+          <textarea
+            className={cx(inputClass, "min-h-32 resize-y leading-relaxed")}
+            rows={Math.min(14, Math.max(5, (typeof value === "string" ? value : "").split("\n").length + 1))}
+            value={typeof value === "string" ? value : ""}
+            onChange={(e) => onChange(e.target.value)}
+          />
+        );
+      }
       return (
         <input
           className={inputClass}
