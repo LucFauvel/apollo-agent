@@ -314,5 +314,10 @@ export const makeLlamaCppProvider = (config: LlamaCppProviderConfig): Provider =
         };
       }),
   };
-  return makeClaudeProvider({ executable: config.executable, backend });
+  return makeClaudeProvider({
+    get executable() {
+      return config.executable;
+    },
+    backend,
+  });
 };

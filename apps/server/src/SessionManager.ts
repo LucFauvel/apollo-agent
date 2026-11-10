@@ -56,6 +56,7 @@ import {
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import { LocalModels } from "./local/LocalModels.ts";
+import { AgentClis } from "./AgentClis.ts";
 import { ProviderSettings } from "./ProviderSettings.ts";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -109,9 +110,13 @@ export const layerProviders = Layer.effect(
     const config = yield* ServerConfig;
     const settings = yield* ProviderSettings;
     const localModels = yield* LocalModels;
+    const clis = yield* AgentClis;
     return {
       claude: makeClaudeProvider({
-        executable: config.claudeExecutable,
+        // Read for each session: Claude Code may be installed while Apollo runs.
+        get executable() {
+          return clis.sessionExecutable("claude");
+        },
         environment: Effect.flatMap(settings.read, ({ claude }): Effect.Effect<Environment, ProviderError> => {
           if (claude.auth === "subscription") {
             // An inherited key would win over the login.
@@ -127,13 +132,19 @@ export const layerProviders = Layer.effect(
               );
         }),
       }),
-      codex: makeCodexProvider({ executable: config.codexExecutable }),
+      codex: makeCodexProvider({
+        get executable() {
+          return clis.sessionExecutable("codex");
+        },
+      }),
       // Third-party agents: their CLIs come from PATH; Antigravity installs into Apollo's data folder.
       ...makeAcpProviders({ stateDir: join(config.dataDir, "agents") }),
       muse: makeMuseProvider(),
       pi: makePiProvider({ stateDir: join(config.dataDir, "agents") }),
       llamacpp: makeLlamaCppProvider({
-        executable: config.claudeExecutable,
+        get executable() {
+          return clis.sessionExecutable("claude");
+        },
         // Auto mode's reviewer: a small local model the user picked (asks when there is none).
         review: (call) => localModels.review(call),
         allowSubagents: Effect.map(settings.read, ({ llamacpp }) => llamacpp.allowSubagents),

@@ -9,6 +9,7 @@ import { RpcSerialization, RpcServer } from "effect/rpc";
 import * as Auth from "./auth/Auth.ts";
 import * as Browser from "./browser/Browser.ts";
 import * as Accounts from "./Accounts.ts";
+import * as AgentClis from "./AgentClis.ts";
 import * as Secrets from "./secrets/Secrets.ts";
 import * as Compaction from "./Compaction.ts";
 import * as AuthHttp from "./auth/http.ts";
@@ -71,7 +72,7 @@ const layerCore = Compaction.layer.pipe(
   Layer.provideMerge(Layer.mergeAll(Scheduler.layer, Projects.layer)),
   Layer.provideMerge(SessionManager.layer),
   Layer.provideMerge(SessionManager.layerProviders),
-  Layer.provideMerge(LocalModels.layer),
+  Layer.provideMerge(Layer.mergeAll(LocalModels.layer, AgentClis.layer)),
   Layer.provideMerge(ProviderSettings.layer),
   Layer.provideMerge(Tailscale.layer),
   Layer.provideMerge(AppSettings.layer),

@@ -12,3 +12,4 @@ export * from "./remote.ts";
 export * from "./changes.ts";
 export * from "./monitors.ts";
 export * from "./projects.ts";
+export * from "./agentClis.ts";

@@ -5,6 +5,7 @@ import { AppSettings } from "./AppSettings.ts";
 import { PullRequests } from "./pullRequests/PullRequests.ts";
 import { Monitors } from "./monitors/Monitors.ts";
 import { ProviderVersions } from "./ProviderVersions.ts";
+import { AgentClis } from "./AgentClis.ts";
 import { Tailscale } from "./remote/Tailscale.ts";
 import { Auth, PAIRING_TOKEN_TTL_MS, PHONE_PAIRING_TTL_MS } from "./auth/Auth.ts";
 import { Browser } from "./browser/Browser.ts";
@@ -37,6 +38,7 @@ export const layer = ApolloRpcs.toLayer(
     const pullRequests = yield* PullRequests;
     const monitors = yield* Monitors;
     const providerVersions = yield* ProviderVersions;
+    const agentClis = yield* AgentClis;
     const tailscale = yield* Tailscale;
     const seen = yield* NotificationsSeen;
     const projects = yield* Projects;
@@ -84,6 +86,11 @@ export const layer = ApolloRpcs.toLayer(
       "localModels.delete": ({ model }) => local(localModels.deleteModel(model)),
       "providers.versions": ({ refresh }) => providerVersions.versions(refresh ?? false),
       "providers.update": ({ provider }) => providerVersions.update(provider),
+      "agentClis.watch": () => agentClis.watch,
+      "agentClis.install": ({ provider }) => agentClis.install(provider),
+      "agentClis.signIn": ({ provider, device }) => agentClis.signIn(provider, device ?? false),
+      "agentClis.submitCode": ({ provider, code }) => agentClis.submitCode(provider, code),
+      "agentClis.cancelSignIn": ({ provider }) => agentClis.cancelSignIn(provider),
       "localModels.setDefault": ({ model }) => localModels.setDefault(model),
       "localModels.setReviewer": ({ model }) => localModels.setReviewer(model),
       // Selected right away; reviews ask the user until the download finishes.

@@ -4,6 +4,7 @@ import { Monitor } from "./monitors.ts";
 import { ChangesOverview, ConversationChanges, SemanticFileDiff } from "./changes.ts";
 import { RemoteAccess } from "./remote.ts";
 import { ProviderVersion } from "./connectors.ts";
+import { AgentCliState } from "./agentClis.ts";
 import * as Schema from "effect/Schema";
 import { Rpc, RpcGroup } from "effect/rpc";
 import {
@@ -245,6 +246,20 @@ export class ApolloRpcs extends RpcGroup.make(
   /** The code Claude's sign-in page shows, when the browser could not hand it back by itself. */
   Rpc.make("accounts.submitCode", { payload: { accountId: Schema.String, code: Schema.String }, error }),
   Rpc.make("providers.updateSettings", { payload: UpdateProviderSettingsInput, success: ProviderSettings, error }),
+  /**
+   * Claude Code and Codex on this computer, then the whole list again on each change (an
+   * install's progress, a sign-in). Its own stream, not an AppChange (see AppChange).
+   */
+  Rpc.make("agentClis.watch", { success: Schema.Array(AgentCliState), stream: true }),
+  /** Runs the CLI's official installer in the background; `install` shows its progress. */
+  Rpc.make("agentClis.install", { payload: { provider: AccountProvider }, success: AgentCliState, error }),
+  /**
+   * Signs this computer's CLI in. `device`: a sign-in finished on another device (a phone):
+   * Codex shows a page and a one-time code, Claude a page whose code is pasted back.
+   */
+  Rpc.make("agentClis.signIn", { payload: { provider: AccountProvider, device: Schema.optional(Schema.Boolean) }, success: AgentCliState, error }),
+  Rpc.make("agentClis.submitCode", { payload: { provider: AccountProvider, code: Schema.String }, success: AgentCliState, error }),
+  Rpc.make("agentClis.cancelSignIn", { payload: { provider: AccountProvider }, success: AgentCliState, error }),
 
   // --- app settings --------------------------------------------------------
   Rpc.make("app.settings", { success: AppSettings, error }),
