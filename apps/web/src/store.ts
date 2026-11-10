@@ -15,7 +15,9 @@ import type {
 import { invalidateChanges } from "@apollo/client";
 import * as Stream from "effect/Stream";
 import { useSyncExternalStore } from "react";
-import { follow } from "./rpc.ts";
+import { sortBots } from "@apollo/contracts";
+import { rollBack, withOrder } from "./botOrder.ts";
+import { follow, rpc } from "./rpc.ts";
 
 export interface AppState {
   readonly connected: boolean;
@@ -72,6 +74,29 @@ const subscribe = (listener: () => void) => {
 /** For non-React code: the current state, and a callback on every change. */
 export const getAppState = () => state;
 export const subscribeApp = subscribe;
+
+/** The first bot in the user's order (a stable reference, safe as a `useApp` selector). */
+export const firstBot = (s: AppState): Bot | undefined => {
+  let first: Bot | undefined;
+  for (const bot of s.bots.values()) if (!first || sortBots([first, bot])[0] === bot) first = bot;
+  return first;
+};
+
+/**
+ * Puts the bot list in `order` (every bot id, first to last): shown at once, saved with
+ * `bots.reorder`, and undone if the server refuses. Other clients follow through `BotUpserted`.
+ */
+export const reorderBots = async (order: ReadonlyArray<BotId>): Promise<void> => {
+  const before = state.bots;
+  const optimistic = withOrder(before, order);
+  setState({ ...state, bots: optimistic });
+  try {
+    await rpc((c) => c["bots.reorder"]({ botIds: order }));
+  } catch (error) {
+    setState({ ...state, bots: rollBack(state.bots, optimistic, before) });
+    throw error;
+  }
+};
 
 export const useApp = <T>(select: (state: AppState) => T): T =>
   useSyncExternalStore(subscribe, () => select(state));
