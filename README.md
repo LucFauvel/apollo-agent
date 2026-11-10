@@ -17,6 +17,9 @@ Apollo is a desktop app for running **bots**: long-lived personas that orchestra
   and local dev servers. You watch its tabs live in the Browser panel and can take over.
 - Agents can **show visuals** (charts, tables, mockups) in the conversation, and **ask for
   secrets** in a private card you fill by typing or from **1Password**; they never see the value.
+- Agents can save **artifacts** (`apollo_artifact_save`): documents, pages, code, images or any file,
+  stored on disk under `<dataDir>/artifacts/<botId>/` with every version kept, and shown in the
+  conversation by kind (rendered page, formatted Markdown, highlighted code, image, download).
 - Agents can set up **monitors** (`apollo_monitor_start`): a command whose every output line
   reaches the agent as a message, so it reacts to events without polling. Running monitors show
   above the message box, with a Stop button.

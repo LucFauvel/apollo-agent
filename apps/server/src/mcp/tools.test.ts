@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import { Tool, type Toolkit } from "effect/ai";
 import { ApolloToolkit, unknownModel } from "./ApolloMcp.ts";
+import { ArtifactToolkit } from "./ArtifactTools.ts";
 import { BotToolkit } from "./BotTools.ts";
 import { BrowserToolkit } from "./BrowserTools.ts";
 import { ChangeToolkit, SEMANTIC_DIFF_ONLY_WHEN_ASKED } from "./ChangeTools.ts";
@@ -19,6 +20,7 @@ import { WorktreeToolkit } from "./WorktreeTools.ts";
  */
 const toolkits: Record<string, Toolkit.Any> = {
   ApolloToolkit,
+  ArtifactToolkit,
   BotToolkit,
   BrowserToolkit,
   ChangeToolkit,

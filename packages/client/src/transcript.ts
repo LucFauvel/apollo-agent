@@ -3,6 +3,7 @@
  * approvals, cards). Shared by the web and phone apps.
  */
 import type {
+  ArtifactRef,
   AttachmentRef,
   ApprovalDecision,
   ChangeReport,
@@ -69,7 +70,14 @@ type TranscriptItemKind =
       readonly action: InputAction | null;
     }
   | { readonly kind: "notice"; readonly key: string; readonly level: string; readonly message: string }
-  | { readonly kind: "visual"; readonly key: string; readonly title: string; readonly html: string; readonly height: number | null }
+  | {
+      readonly kind: "visual";
+      readonly key: string;
+      readonly title: string;
+      readonly html: string;
+      readonly height: number | null;
+      readonly artifact?: ArtifactRef;
+    }
   | {
       readonly kind: "recording";
       readonly key: string;
@@ -277,7 +285,14 @@ export const reduceTranscript = (state: TranscriptState, e: SessionEvent): Trans
       return updated ? { ...state, lastSeq, items: updated } : { ...state, lastSeq };
     }
     case "Visual":
-      return push({ kind: "visual", key: `v${e.seq}`, title: event.title, html: event.html, height: event.height });
+      return push({
+        kind: "visual",
+        key: `v${e.seq}`,
+        title: event.title,
+        html: event.html,
+        height: event.height,
+        ...(event.artifact ? { artifact: event.artifact } : {}),
+      });
     case "Recording":
       return push({
         kind: "recording",
