@@ -6,9 +6,9 @@ import { errorMessage, rpc } from "../rpc.ts";
 import { accountDetail } from "./Accounts.tsx";
 import { Badge, Button, cx, inputClass } from "./ui.tsx";
 
-const COPY: Record<AccountProvider, { name: string; cli: string; site: string }> = {
-  claude: { name: "Claude Code", cli: "claude", site: "Claude" },
-  codex: { name: "Codex", cli: "codex", site: "ChatGPT" },
+const COPY: Record<AccountProvider, { name: string; site: string }> = {
+  claude: { name: "Claude Code", site: "Claude" },
+  codex: { name: "Codex", site: "ChatGPT" },
 };
 
 /** Installs Claude Code or Codex on this computer, and signs its own login in. */
@@ -53,8 +53,7 @@ export function AgentCliSetup({ provider }: { provider: AccountProvider }) {
       <div className={box}>
         <div className="flex items-center gap-3">
           <p className="min-w-0 flex-1 text-zinc-400">
-            {copy.name} is not installed on this computer. Apollo runs its official installer (into{" "}
-            <span className="font-mono text-zinc-300">~/.local/bin</span>), then you sign in.
+            {copy.name} is not installed on this computer. Apollo runs its official installer, then you sign in.
           </p>
           <Button size="sm" variant="primary" disabled={busy} onClick={() => run(() => rpc((c) => c["agentClis.install"]({ provider })))}>
             {busy ? <Loader2 className="animate-spin" /> : <Download />} Install
