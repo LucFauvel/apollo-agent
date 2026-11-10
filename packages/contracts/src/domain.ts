@@ -181,7 +181,7 @@ export const Bot = Schema.Struct({
 export type Bot = typeof Bot.Type;
 
 /** Bots in the user's order: by `position`, then by creation. */
-export const sortBots = <B extends Pick<Bot, "position" | "createdAt" | "id">>(bots: Iterable<B>): Array<B> =>
+export const sortBots = <B extends { readonly position: number; readonly createdAt: number; readonly id: string }>(bots: Iterable<B>): Array<B> =>
   [...bots].sort((a, b) => a.position - b.position || a.createdAt - b.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
 // ---------------------------------------------------------------------------

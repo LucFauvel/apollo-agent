@@ -2,7 +2,7 @@ import type { Bot, BotId } from "@apollo/contracts";
 
 /**
  * The bot order, as pure functions shared by the sidebar's drag-to-reorder and the store's
- * optimistic update (tested in botOrder.test.ts; the web tests have no DOM).
+ * optimistic update, on the web and on the phone (tested in test/botOrder.test.ts).
  */
 
 /**

@@ -2,7 +2,7 @@ import { type Bot, type BotAvatar as BotAvatarValue, type BotId, type Session, t
 import { BlobAvatar } from "./BlobAvatar.tsx";
 import { Archive, Blocks, ChevronRight, MonitorSmartphone, Pause, Plus, Settings, Settings2, Sparkles, SquarePen } from "lucide-react";
 import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
-import { gapAt, moveToGap } from "../botOrder.ts";
+import { gapAt, moveToGap } from "@apollo/client";
 import { formatUsage, usageTitle } from "../format.ts";
 import { errorMessage } from "../rpc.ts";
 import { reorderBots, useApp } from "../store.ts";

@@ -1,6 +1,6 @@
 import { type Bot, type BotId, sortBots } from "@apollo/contracts";
 import { describe, expect, it } from "vitest";
-import { gapAt, moveToGap, rollBack, withOrder } from "./botOrder.ts";
+import { gapAt, moveToGap, rollBack, withOrder } from "../src/botOrder.ts";
 
 const bot = (id: string, position: number): Bot => ({ id: id as BotId, position, createdAt: 0 }) as unknown as Bot;
 const map = (...bots: Array<Bot>) => new Map(bots.map((b) => [b.id, b]));

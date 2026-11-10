@@ -16,7 +16,7 @@ import { invalidateChanges } from "@apollo/client";
 import * as Stream from "effect/Stream";
 import { useSyncExternalStore } from "react";
 import { sortBots } from "@apollo/contracts";
-import { rollBack, withOrder } from "./botOrder.ts";
+import { rollBack, withOrder } from "@apollo/client";
 import { follow, rpc } from "./rpc.ts";
 
 export interface AppState {
