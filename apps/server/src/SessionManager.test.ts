@@ -125,6 +125,11 @@ const echoProvider = (kind: ProviderKind): Provider => ({
               },
             });
             yield* emit({ _tag: "ContextUsage", used: 1000 * n, window: 200_000 });
+            yield* emit({
+              _tag: "UsageLimits",
+              // "api key" stands for a switch to a login without plan limits: the provider reports none.
+              meters: text.includes("api key") ? [] : [{ label: "Session", usedPercent: 10 * n, resetsAt: null, severity: null, headline: true }],
+            });
             yield* agent({
               _tag: "TurnCompleted",
               outcome: interrupted ? "interrupted" : "completed",
@@ -509,6 +514,14 @@ describe("SessionManager", () => {
       yield* manager.send(bot.mainSessionId, "hello", "user");
       yield* waitIdle(manager, bot.mainSessionId);
       expect((yield* store.getSession(bot.mainSessionId)).context).toEqual({ used: 1000, window: 200_000 });
+      // The provider's plan meters are kept with the session, with when they were read.
+      const { limits } = yield* store.getSession(bot.mainSessionId);
+      expect(limits?.meters).toEqual([{ label: "Session", usedPercent: 10, resetsAt: null, severity: null, headline: true }]);
+      expect(limits?.at).toBeGreaterThan(0);
+      // A provider that now reports no meters clears them, rather than leaving the old ones up.
+      yield* manager.send(bot.mainSessionId, "now on an api key", "user");
+      yield* waitIdle(manager, bot.mainSessionId);
+      expect((yield* store.getSession(bot.mainSessionId)).limits).toBeNull();
 
       const commands = yield* manager.listCommands(bot.mainSessionId);
       expect(commands.map((c) => `${c.source}:${c.name}`)).toEqual([

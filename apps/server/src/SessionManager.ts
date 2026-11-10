@@ -301,6 +301,10 @@ const make = Effect.gen(function* () {
             yield* updateSession(id, { context: { used: emission.used, window: emission.window } });
             return;
           }
+          case "UsageLimits": {
+            yield* updateSession(id, { limits: emission.meters.length > 0 ? { meters: emission.meters, at: Date.now() } : null });
+            return;
+          }
           case "Exited": {
             // Ignore exits from a session we already replaced or closed on purpose.
             if (generations.get(id) !== generation) return;
@@ -966,6 +970,7 @@ const make = Effect.gen(function* () {
         cwd,
         worktree,
         context: null,
+        limits: null,
         status: "idle",
         resumeId: null,
         lastMessage: null,

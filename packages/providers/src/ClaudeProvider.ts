@@ -16,6 +16,7 @@ import * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { makeAsyncInbox } from "./AsyncInbox.ts";
+import { makeLimitsRefresher } from "./UsageLimits.ts";
 import { fieldsFromSchema, makeInputRequests } from "./InputRequests.ts";
 import {
   type Emit,
@@ -29,9 +30,91 @@ import {
   cleanTitle,
   isImageAttachment,
 } from "./Provider.ts";
-import type { ConnectorInfo, InputField } from "@apollo/contracts";
+import type { ConnectorInfo, InputField, UsageMeter } from "@apollo/contracts";
 
 const errorMessage = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
+
+type ClaudeWindow = { readonly utilization?: number | null; readonly resets_at?: string | null } | null | undefined;
+type ClaudeLimitRow = {
+  readonly kind?: string;
+  readonly group?: string;
+  readonly percent?: number;
+  readonly resets_at?: string | null;
+  readonly severity?: string;
+  readonly is_active?: boolean;
+  readonly scope?: { readonly model?: { readonly display_name?: string } | null; readonly surface?: { readonly display_name?: string } | null } | null;
+};
+
+const isoTime = (at: string | null | undefined): number | null => {
+  const ms = at ? Date.parse(at) : NaN;
+  return Number.isFinite(ms) ? ms : null;
+};
+
+const capitalized = (s: string) => (s ? s[0]!.toUpperCase() + s.slice(1) : s);
+
+/**
+ * The plan meters in Claude Code's `/usage` data (`rate_limits` of its get_usage reply). The
+ * server's own rows (`limits`) come first: they say which meters apply, their grading and
+ * which one a single indicator shows. Older replies only have the named windows.
+ */
+export const claudeUsageMeters = (rateLimits: unknown): Array<UsageMeter> => {
+  if (!rateLimits || typeof rateLimits !== "object") return [];
+  const r = rateLimits as {
+    readonly limits?: ReadonlyArray<ClaudeLimitRow> | null;
+    readonly five_hour?: ClaudeWindow;
+    readonly seven_day?: ClaudeWindow;
+    readonly seven_day_opus?: ClaudeWindow;
+    readonly seven_day_sonnet?: ClaudeWindow;
+    readonly model_scoped?: ReadonlyArray<{ readonly display_name?: string; readonly utilization?: number | null; readonly resets_at?: string | null }>;
+    readonly extra_usage?: { readonly is_enabled?: boolean; readonly monthly_limit?: number | null; readonly used_credits?: number | null; readonly utilization?: number | null } | null;
+  };
+  const meters: Array<UsageMeter> = [];
+  if (Array.isArray(r.limits)) {
+    for (const row of r.limits) {
+      if (typeof row.percent !== "number" || !Number.isFinite(row.percent)) continue;
+      const scope = row.scope?.model?.display_name ?? row.scope?.surface?.display_name;
+      const base = capitalized(row.group || row.kind || "Usage");
+      meters.push({
+        label: scope ? `${base} · ${scope}` : base,
+        usedPercent: row.percent,
+        resetsAt: isoTime(row.resets_at),
+        severity: row.severity ?? null,
+        headline: row.is_active === true,
+      });
+    }
+  } else {
+    const window = (label: string, w: ClaudeWindow) => {
+      if (w && typeof w.utilization === "number" && Number.isFinite(w.utilization)) {
+        meters.push({ label, usedPercent: w.utilization, resetsAt: isoTime(w.resets_at), severity: null, headline: false });
+      }
+    };
+    window("Session", r.five_hour);
+    window("Weekly", r.seven_day);
+    window("Weekly · Opus", r.seven_day_opus);
+    window("Weekly · Sonnet", r.seven_day_sonnet);
+    for (const m of r.model_scoped ?? []) window(`Weekly · ${m.display_name ?? "model"}`, m);
+  }
+  const extra = r.extra_usage;
+  if (extra?.is_enabled && typeof extra.monthly_limit === "number" && extra.monthly_limit > 0) {
+    const used =
+      typeof extra.utilization === "number"
+        ? extra.utilization
+        : typeof extra.used_credits === "number"
+          ? (extra.used_credits / extra.monthly_limit) * 100
+          : null;
+    if (used !== null && Number.isFinite(used)) {
+      meters.push({ label: "Extra usage (monthly)", usedPercent: used, resetsAt: null, severity: null, headline: false });
+    }
+  }
+  return meters;
+};
+
+/**
+ * The meters in a get_usage reply. None when plan limits do not apply (an API key, Bedrock,
+ * Vertex): `[]` then clears meters saved from an earlier login.
+ */
+export const claudeLimitsFromUsage = (usage: { readonly rate_limits_available: boolean; readonly rate_limits: unknown }): Array<UsageMeter> =>
+  usage.rate_limits_available ? claudeUsageMeters(usage.rate_limits) : [];
 
 /** What a read-only session (a reflection) may not use: questions to the user, edits, commands. */
 const READ_ONLY_DISALLOWED = [
@@ -557,6 +640,22 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
     );
 
     /**
+     * Reads the plan's usage meters (Claude Code's /usage data). Only claude.ai plans have
+     * them: an API key or another backend has none, and Claude Code says so. At most once a
+     * minute unless Claude Code reported that its rate limits changed; never waits a turn.
+     */
+    const refreshLimits = makeLimitsRefresher({
+      read: Effect.tryPromise(() => session.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true })).pipe(
+        Effect.map(claudeLimitsFromUsage),
+      ),
+      emit,
+      scope: yield* Effect.scope,
+      minIntervalMs: 60_000,
+    });
+    const reportLimits = (force: boolean): Effect.Effect<void> =>
+      config.backend || options.readOnly ? Effect.void : refreshLimits(force);
+
+    /**
      * Claude Code starts a turn on its own when a background subagent finishes (to read its
      * result); Apollo has to hear about that turn, or its output lands in an idle session.
      */
@@ -715,6 +814,8 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
             }
             return;
           }
+          case "rate_limit_event":
+            return yield* reportLimits(true);
           case "result": {
             const outcome = interruptRequested
               ? "interrupted"
@@ -743,6 +844,7 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
             });
             // Before TurnCompleted, so the session is up to date once it reads as idle.
             yield* reportContext;
+            yield* reportLimits(false);
             yield* agent({ _tag: "TurnCompleted", outcome, error });
             if ((message.queued_turn_count ?? 0) > 0) {
               inTurn = true;
@@ -773,6 +875,8 @@ export const makeClaudeProvider = (config: ClaudeProviderConfig = {}): Provider 
         abort.abort();
       }),
     );
+    // The meters show before the first turn, too.
+    yield* reportLimits(true);
 
     return {
       send: (text: string, attachments: ReadonlyArray<Attachment> = []) =>

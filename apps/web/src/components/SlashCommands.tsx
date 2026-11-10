@@ -1,7 +1,8 @@
-import type { Session, SlashCommand } from "@apollo/contracts";
+import { headlineMeter, type Session, type SlashCommand, type UsageMeter } from "@apollo/contracts";
 import { Loader2, Slash, TerminalSquare } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { rpc } from "../rpc.ts";
+import { relativeTime } from "../format.ts";
 import { cx, Tooltip } from "./ui.tsx";
 
 /** `/name args` → its parts; `null` when the text is not a command. */
@@ -149,6 +150,63 @@ export function ContextMeter({ context }: { context: NonNullable<Session["contex
           />
         </svg>
         {percent}%
+      </span>
+    </Tooltip>
+  );
+}
+
+const percentLeft = (m: UsageMeter) => Math.max(0, Math.min(100, Math.round(100 - m.usedPercent)));
+
+/** A meter's colour: the provider's own grading when it gives one, else how full it is. */
+const meterColor = (m: UsageMeter) =>
+  m.severity !== null
+    ? m.severity === "critical"
+      ? "text-red-400"
+      : m.severity === "warning"
+        ? "text-amber-300"
+        : "text-zinc-500"
+    : m.usedPercent >= 90
+      ? "text-red-400"
+      : m.usedPercent >= 75
+        ? "text-amber-300"
+        : "text-zinc-500";
+
+/**
+ * How much of the provider plan's usage is left: the headline meter as a small bar and a
+ * percentage, every meter in the tooltip. Only meters the provider reported.
+ */
+export function UsageLimitsMeter({ limits, provider }: { limits: NonNullable<Session["limits"]>; provider: string }) {
+  const headline = headlineMeter(limits.meters);
+  if (!headline) return null;
+  const left = percentLeft(headline);
+  const now = Date.now();
+  return (
+    <Tooltip
+      align="end"
+      content={
+        <>
+          <span className="block font-medium text-zinc-100">{provider} usage left</span>
+          {limits.meters.map((m) => (
+            <span key={m.label} className="flex justify-between gap-3 tabular-nums">
+              <span>{m.label}</span>
+              <span className={m === headline ? "text-zinc-100" : undefined}>
+                {percentLeft(m)}% left{m.resetsAt !== null ? ` · resets ${relativeTime(m.resetsAt, now)}` : ""}
+              </span>
+            </span>
+          ))}
+          <span className="mt-1 block text-zinc-500">As reported by {provider}, {relativeTime(limits.at, now)}.</span>
+        </>
+      }
+    >
+      <span
+        className={cx("flex items-center gap-1 px-1 text-[11px] tabular-nums", meterColor(headline))}
+        aria-label={`${provider} usage: ${left}% left (${headline.label})`}
+      >
+        <svg width="14" height="10" viewBox="0 0 14 10">
+          <rect x="0.75" y="0.75" width="12.5" height="8.5" rx="2" fill="none" stroke="currentColor" strokeOpacity=".4" strokeWidth="1.5" />
+          <rect x="2.5" y="2.5" width={9 * (left / 100)} height="5" rx="1" fill="currentColor" className="transition-[width] duration-500" />
+        </svg>
+        {left}% left
       </span>
     </Tooltip>
   );

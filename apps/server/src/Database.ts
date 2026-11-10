@@ -303,6 +303,10 @@ export const MIGRATIONS: ReadonlyArray<string> = [
        or (earlier.created_at = bots.created_at and earlier.id < bots.id)
   );
   `,
+  // 21: the provider plan's usage meters, as last reported for each session.
+  `
+  alter table sessions add column limits text;      -- JSON UsageLimits
+  `,
 ];
 
 /**

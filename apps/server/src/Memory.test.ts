@@ -48,6 +48,7 @@ const session = (id: string, botId: string, role: SessionRole = "worker"): Sessi
   cwd: "/tmp",
   worktree: null,
   context: null,
+  limits: null,
   status: "idle",
   resumeId: null,
   lastMessage: null,

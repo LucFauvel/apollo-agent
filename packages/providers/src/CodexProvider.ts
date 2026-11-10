@@ -5,6 +5,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import { fieldsFromSchema, makeInputRequests } from "./InputRequests.ts";
 import { JsonRpcFailure, spawnJsonRpcProcess } from "./JsonRpcProcess.ts";
+import { makeLimitsRefresher } from "./UsageLimits.ts";
 import {
   type Emit,
   type Provider,
@@ -16,9 +17,54 @@ import {
   attachmentNote,
   isImageAttachment,
 } from "./Provider.ts";
-import type { ConnectorInfo } from "@apollo/contracts";
+import type { ConnectorInfo, UsageMeter } from "@apollo/contracts";
 
 const fail = (message: string) => new ProviderError({ provider: "codex", message });
+
+type CodexRateLimitWindow = { readonly usedPercent?: number; readonly windowDurationMins?: number | null; readonly resetsAt?: number | null } | null;
+type CodexRateLimitSnapshot = {
+  readonly limitId?: string | null;
+  readonly limitName?: string | null;
+  readonly primary?: CodexRateLimitWindow;
+  readonly secondary?: CodexRateLimitWindow;
+  readonly individualLimit?: { readonly remainingPercent?: number; readonly resetsAt?: number } | null;
+};
+
+/** "5-hour", "Daily", "Weekly", "30-day": a rate-limit window, from its length. */
+const windowName = (mins: number | null | undefined, fallback: string): string => {
+  if (typeof mins !== "number" || !(mins > 0)) return fallback;
+  if (mins === 1440) return "Daily";
+  if (mins === 10080) return "Weekly";
+  return mins < 1440 ? `${Math.round(mins / 60)}-hour` : `${Math.round(mins / 1440)}-day`;
+};
+
+/**
+ * The plan meters in Codex's `account/rateLimits/read` reply: each metered bucket's rolling
+ * windows, and the account's spend-control limit when it has one. API-key accounts have none.
+ */
+export const codexUsageMeters = (response: unknown): Array<UsageMeter> => {
+  if (!response || typeof response !== "object") return [];
+  const r = response as { readonly rateLimits?: CodexRateLimitSnapshot | null; readonly rateLimitsByLimitId?: Record<string, CodexRateLimitSnapshot | undefined> | null };
+  const byId = Object.values(r.rateLimitsByLimitId ?? {}).filter((b): b is CodexRateLimitSnapshot => !!b);
+  const buckets = byId.length > 0 ? byId : r.rateLimits ? [r.rateLimits] : [];
+  const meters: Array<UsageMeter> = [];
+  const seconds = (at: number | null | undefined) => (typeof at === "number" && at > 0 ? at * 1000 : null);
+  for (const bucket of buckets) {
+    const name = bucket.limitName || (bucket.limitId && bucket.limitId !== "codex" ? bucket.limitId : null);
+    const add = (w: CodexRateLimitWindow, fallback: string) => {
+      if (!w || typeof w.usedPercent !== "number" || !Number.isFinite(w.usedPercent)) return;
+      const label = windowName(w.windowDurationMins, fallback);
+      meters.push({ label: name ? `${label} · ${name}` : label, usedPercent: w.usedPercent, resetsAt: seconds(w.resetsAt), severity: null, headline: false });
+    };
+    add(bucket.primary ?? null, "Primary");
+    add(bucket.secondary ?? null, "Secondary");
+    const spend = bucket.individualLimit;
+    if (spend && typeof spend.remainingPercent === "number" && Number.isFinite(spend.remainingPercent) && !meters.some((m) => m.label === "Spend limit")) {
+      meters.push({ label: "Spend limit", usedPercent: 100 - spend.remainingPercent, resetsAt: seconds(spend.resetsAt), severity: null, headline: false });
+    }
+  }
+  return meters;
+};
 
 // Minimal views of the `codex app-server` v2 protocol. Generate the full
 // bindings with `codex app-server generate-ts --out <dir>` when extending.
@@ -313,6 +359,8 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
     const pendingApprovals = new Map<string, Deferred.Deferred<ApprovalDecision>>();
     let threadId: string | null = null;
     let activeTurnId: string | null = null;
+    /** Re-reads the account's rate limits (set once the app-server is up). */
+    let readLimits: Effect.Effect<void> = Effect.void;
 
     const awaitApproval = (requestId: string, title: string, detail: string) =>
       Effect.gen(function* () {
@@ -426,6 +474,9 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
             error: turn.error?.message ?? null,
           });
         }
+        // Sparse: Codex asks clients to re-read the whole snapshot.
+        case "account/rateLimits/updated":
+          return readLimits;
         case "thread/compacted":
           return agent({
             _tag: "Notice",
@@ -618,6 +669,16 @@ export const makeCodexProvider = (config: CodexProviderConfig = {}): Provider =>
         )
       : Effect.void;
     yield* setSkillRoots;
+
+    // The plan's usage meters, now and whenever Codex says they moved. Never waits a turn.
+    const refreshLimits = makeLimitsRefresher({
+      read: call("account/rateLimits/read", undefined).pipe(Effect.map(codexUsageMeters)),
+      emit,
+      scope: yield* Effect.scope,
+      minIntervalMs: 0,
+    });
+    if (!options.readOnly) readLimits = refreshLimits(true);
+    yield* readLimits;
 
     const threadParams = {
       cwd: options.cwd,

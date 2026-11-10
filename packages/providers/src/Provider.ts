@@ -7,6 +7,7 @@ import {
   ProviderKind,
   type RuntimeMode,
   type Usage,
+  type UsageMeter,
 } from "@apollo/contracts";
 import type * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -66,6 +67,11 @@ export type ProviderEmission =
   | { readonly _tag: "UsageTotals"; readonly totals: Usage }
   /** How full the model's context window is now (tokens in the last request vs the window). */
   | { readonly _tag: "ContextUsage"; readonly used: number; readonly window: number }
+  /**
+   * The provider plan's usage meters, as the provider reported them (the whole set, not a
+   * delta). Only from providers that expose them; Apollo never estimates one.
+   */
+  | { readonly _tag: "UsageLimits"; readonly meters: ReadonlyArray<UsageMeter> }
   /** The underlying process/connection ended; the session must be reopened. */
   | { readonly _tag: "Exited"; readonly reason: string };
 
