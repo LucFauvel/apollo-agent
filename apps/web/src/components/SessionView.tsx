@@ -47,7 +47,8 @@ import {
   withoutFullDiffs,
 } from "@apollo/client";
 import { MarkdownText } from "./Code.tsx";
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
+import { ChatScroll, scrollKey } from "../chatScroll.ts";
 import { formatUsage, usageTitle } from "../format.ts";
 import { useModelLabel } from "../models.ts";
 import { errorMessage, rpc } from "../rpc.ts";
@@ -842,7 +843,8 @@ export function SessionView({
   onOpenProject: (id: ProjectId) => void;
 }) {
   const project = useApp((s) => (session.projectId ? s.projects.get(session.projectId) : undefined));
-  const items = useTranscript(session.id);
+  // A conversation with nothing in it yet answers with no event at all: do not wait long.
+  const { items, loaded } = useTranscript(session.id, session.completedTurns === 0 && !session.lastMessage);
   const blocks = useMemo(() => toBlocks(items), [items]);
   // Long chats fold by day: the latest day open, earlier ones folded (each can be toggled).
   const days = useMemo(() => groupByDay(blocks), [blocks]);
@@ -915,11 +917,11 @@ export function SessionView({
   /** Scrolls to a message, opening its day first if it is folded. */
   const jumpToTurn = (key: string) => {
     const dayIndex = days.findIndex((day) => day.blocks.some(({ block }) => block.key === key));
-    stick.current = false;
+    follower.leave();
     const scroll = (behavior: ScrollBehavior) => {
       const el = scrollRef.current?.querySelector<HTMLElement>(`[data-turn="${CSS.escape(key)}"]`);
       if (!el) return false;
-      stick.current = false;
+      follower.leave();
       el.scrollIntoView({ block: "start", behavior });
       return true;
     };
@@ -953,9 +955,11 @@ export function SessionView({
   const pending = showWorking(isBusy(session), session.status === "waiting-approval", lastBlock);
   const busy = isBusy(session);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const stick = useRef(true);
-  // The first scroll after opening a session jumps; later ones glide.
-  const jump = useRef(true);
+  const [follower] = useState(() => new ChatScroll());
+  const [farFromBottom, setFarFromBottom] = useState(false);
+  // The replay is hidden until it sits at the latest message: it appears there, without
+  // scrolling down to it.
+  const revealed = useRef(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // The map itself is stable between changes; a filtered array from the selector would not be.
@@ -994,18 +998,40 @@ export function SessionView({
     return n;
   });
 
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el && stick.current) el.scrollTo({ top: el.scrollHeight, behavior: jump.current ? "auto" : "smooth" });
-    jump.current = false;
-  }, [items]);
-
   // Start at the bottom of a newly opened session.
-  useEffect(() => {
-    stick.current = true;
-    jump.current = true;
+  useLayoutEffect(() => {
+    follower.reset();
+    revealed.current = false;
+    setFarFromBottom(false);
     setActionError(null);
   }, [session.id]);
+
+  // The user's own message just sent: back to the latest message, wherever they were.
+  const lastSent = useMemo(() => blocks.findLast((block) => block.kind === "user" && block.author === "user")?.key ?? null, [blocks]);
+  const sentSeen = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const sent = revealed.current && lastSent !== null && lastSent !== sentSeen.current;
+    sentSeen.current = lastSent;
+    const instant = !loaded || !revealed.current;
+    revealed.current = loaded;
+    if (sent && follower.toLatest(el, "smooth")) setFarFromBottom(false);
+    else follower.contentChanged(el, instant);
+  }, [items, loaded, pending, compacting, waitingFor !== null]);
+
+  // A press anywhere ends with the button released, even outside the transcript.
+  useEffect(() => {
+    const release = () => {
+      const el = scrollRef.current;
+      if (el && follower.press(el, false)) setFarFromBottom(false);
+    };
+    const events = ["pointerup", "pointercancel", "touchend", "touchcancel", "blur"] as const;
+    for (const name of events) window.addEventListener(name, release);
+    return () => {
+      for (const name of events) window.removeEventListener(name, release);
+    };
+  }, []);
 
   // Highlights matches on the page and brings the current one into view; re-runs as the page
   // changes (streamed output, a day opening, new results) but only scrolls for a pending jump.
@@ -1018,7 +1044,7 @@ export function SessionView({
       current,
       jumps,
       state: { needle, ready, total: results.total, located: current !== null },
-      onJump: () => (stick.current = false),
+      onJump: () => follower.leave(),
     });
     // `search` changes on every search action (stepping onto the same lone match scrolls again too).
   }, [search, needle, ready, results, current, items, toggledDays]);
@@ -1262,12 +1288,23 @@ export function SessionView({
         // Room for the rail, so the conversation never runs under it when the column is narrow.
         className={cx("flex-1 overflow-y-auto", railTurns.length >= 3 && "pl-10")}
         onScroll={(e) => {
-          const el = e.currentTarget;
-          stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+          if (!loaded) return;
+          const far = follower.scrolled(e.currentTarget);
+          setFarFromBottom((was) => (was === far ? was : far));
         }}
+        onWheel={(e) => follower.userScroll(e.deltaY < 0)}
+        onKeyDown={(e) => {
+          const key = scrollKey(e);
+          if (key && !(e.target instanceof HTMLElement && e.target.closest("input, textarea, select, [contenteditable]"))) follower.userScroll(key === "up");
+        }}
+        onPointerDown={(e) => e.pointerType !== "touch" && follower.press(e.currentTarget, true)}
+        onTouchStart={(e) => follower.press(e.currentTarget, true)}
       >
-        <div className="mx-auto max-w-3xl space-y-2 px-4 py-6">
-          {items.length === 0 ? (
+        <div
+          className={cx("mx-auto max-w-3xl space-y-2 px-4 py-6", loaded ? "animate-fade-in" : "pointer-events-none invisible")}
+          aria-hidden={!loaded}
+        >
+          {!loaded ? null : items.length === 0 ? (
             <div className="flex flex-col items-center py-24 text-center">
               {main ? <BotAvatar avatar={bot.avatar} size="lg" /> : <ProviderLogo provider={session.provider} size={32} />}
               <div className="mt-4 text-base font-medium text-zinc-200">{main ? `Talk to ${bot.name}` : session.title}</div>
@@ -1318,6 +1355,34 @@ export function SessionView({
             loadingModel ? <LoadProgress model={loadingModel} /> : <WorkingRow />
           ) : null}
         </div>
+      </div>
+      {!loaded ? (
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center gap-2.5 text-xs">
+          <Loader2 className="size-3.5 shrink-0 animate-spin text-zinc-500" />
+          <span className="shimmer-text">Loading the conversation…</span>
+        </div>
+      ) : null}
+      <div
+        className={cx(
+          "pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 transition duration-150 ease-out",
+          farFromBottom ? "opacity-100" : "translate-y-2 opacity-0",
+        )}
+      >
+        <button
+          type="button"
+          aria-label="Scroll to the latest message"
+          tabIndex={farFromBottom ? 0 : -1}
+          onClick={() => {
+            const el = scrollRef.current;
+            if (el && follower.toLatest(el, "smooth")) setFarFromBottom(false);
+          }}
+          className={cx(
+            "flex size-9 items-center justify-center rounded-full border border-zinc-800 bg-zinc-900 text-zinc-300 shadow-lg hover:bg-zinc-800",
+            farFromBottom && "pointer-events-auto",
+          )}
+        >
+          <ChevronDown className="size-4" />
+        </button>
       </div>
       </div>
 
