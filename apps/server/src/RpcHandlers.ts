@@ -60,6 +60,8 @@ export const layer = ApolloRpcs.toLayer(
           localModels.changes.pipe(Stream.map((state): AppChange => ({ _tag: "LocalModelsChanged", state }))),
         ),
 
+      "limits.watch": () => manager.watchLimits,
+
       "notifications.seen": ({ botId }) =>
         Effect.gen(function* () {
           yield* store.getBot(botId);

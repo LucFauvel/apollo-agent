@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statS
 import * as AppSettings from "./AppSettings.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type AppChange, AVATAR_SHAPES, type AgentEvent, type BotId, type BotLimits, DEFAULT_BOT_LIMITS, type ProviderKind, type SessionId } from "@apollo/contracts";
+import { type AccountLimitsChange, type AppChange, AVATAR_SHAPES, type AgentEvent, type BotId, type BotLimits, DEFAULT_BOT_LIMITS, limitsAccount, type ProviderKind, type SessionId } from "@apollo/contracts";
 import { type Provider, ProviderError, type ProviderSessionOptions } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
 import * as Duration from "effect/Duration";
@@ -506,6 +506,59 @@ describe("SessionManager", () => {
     });
   });
 
+  it.live("plan limits reach clients on their own stream, never as an app change older clients cannot decode", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const bot = yield* createBot(manager);
+      const changes: Array<AppChange> = [];
+      yield* Stream.runForEach(manager.changes, (change) => Effect.sync(() => void changes.push(change))).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      const before: Array<AccountLimitsChange> = [];
+      yield* Stream.runForEach(manager.watchLimits, (change) => Effect.sync(() => void before.push(change))).pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* manager.send(bot.mainSessionId, "hello", "user");
+      yield* waitIdle(manager, bot.mainSessionId);
+      yield* Effect.sleep("50 millis");
+
+      // A watcher gets every account's reading first (none yet), then each change.
+      expect(before.map((c) => c._tag)).toEqual(["AccountLimitsSnapshot", "AccountLimitsUpdated"]);
+      expect(before[0]).toEqual({ _tag: "AccountLimitsSnapshot", accounts: [] });
+      expect(before[1]).toMatchObject({ account: "claude:local", limits: { meters: [{ usedPercent: 10 }] } });
+      // One that starts later gets the current readings in its first item.
+      const later = yield* manager.watchLimits.pipe(Stream.take(1), Stream.runCollect);
+      expect(later[0]).toMatchObject({ _tag: "AccountLimitsSnapshot", accounts: [{ account: "claude:local" }] });
+      // The app's change stream only carries tags clients already know.
+      expect(changes.length).toBeGreaterThan(0);
+      expect(changes.filter((c) => /limit/i.test(c._tag))).toEqual([]);
+    }).pipe(Effect.provide(layer)),
+  );
+
+  it.live("a running session's readings stay with the account it was opened on when the bot switches accounts", () =>
+    Effect.gen(function* () {
+      const manager = yield* SessionManager.SessionManager;
+      const store = yield* Store.Store;
+      const bot = yield* createBot(manager);
+      const readings = () => Effect.map(store.listAccountLimits, (all) => new Map(all.map((a) => [a.account, a.limits.meters[0]?.usedPercent])));
+      // The switch lands while the turn runs on this machine's login; the session reopens on
+      // the new account only once the turn is done.
+      yield* manager.send(bot.mainSessionId, "slow work", "user");
+      yield* Effect.sleep("100 millis");
+      expect((yield* store.getSession(bot.mainSessionId)).status).toBe("running");
+      yield* manager.updateBot({ botId: bot.id, claudeAccountId: "acct_work" });
+      yield* waitIdle(manager, bot.mainSessionId);
+      expect(yield* readings()).toEqual(new Map([["claude:local", 10]]));
+      // The next turn runs on the new account and reports to it (once the deferred reopen,
+      // which follows the switch to idle, has closed the old process).
+      yield* Effect.sleep("50 millis");
+      yield* manager.send(bot.mainSessionId, "hello", "user");
+      yield* waitIdle(manager, bot.mainSessionId);
+      expect((yield* readings()).get("claude:acct_work")).toBeDefined();
+      expect((yield* readings()).get("claude:local")).toBe(10);
+    }).pipe(Effect.provide(layer)),
+  );
+
   it.live("tracks context usage and runs slash commands", () =>
     Effect.gen(function* () {
       const manager = yield* SessionManager.SessionManager;
@@ -514,14 +567,40 @@ describe("SessionManager", () => {
       yield* manager.send(bot.mainSessionId, "hello", "user");
       yield* waitIdle(manager, bot.mainSessionId);
       expect((yield* store.getSession(bot.mainSessionId)).context).toEqual({ used: 1000, window: 200_000 });
-      // The provider's plan meters are kept with the session, with when they were read.
-      const { limits } = yield* store.getSession(bot.mainSessionId);
+      // The provider's plan meters are kept for the provider account, with when they were read.
+      const accountLimits = () => Effect.map(store.listAccountLimits, (all) => new Map(all.map((a) => [a.account, a.limits])));
+      const local = limitsAccount("claude", bot);
+      expect(local).toBe("claude:local");
+      const limits = (yield* accountLimits()).get(local);
       expect(limits?.meters).toEqual([{ label: "Session", usedPercent: 10, resetsAt: null, severity: null, headline: true }]);
       expect(limits?.at).toBeGreaterThan(0);
-      // A provider that now reports no meters clears them, rather than leaving the old ones up.
+      expect((yield* store.getSession(bot.mainSessionId)).limits).toBeNull();
+      // An idle chat on the same account reads the same meters: they are the account's.
+      const idle = yield* manager.createSession({ botId: bot.id, title: "Idle", provider: { provider: "claude" } });
+      expect(limitsAccount(idle.provider, bot)).toBe(local);
+      // Another Claude account keeps its own reading, and leaves this one alone.
+      const work = yield* manager.createBot({
+        name: "Vega",
+        instructions: "",
+        cwd: "/tmp",
+        main: { provider: "claude" },
+        defaultWorker: { provider: "codex" },
+        runtimeMode: "full-access",
+        autoLearn: false,
+        claudeAccountId: "acct_work",
+      });
+      yield* manager.send(work.mainSessionId, "hello", "user");
+      yield* waitIdle(manager, work.mainSessionId);
+      yield* manager.send(work.mainSessionId, "again", "user");
+      yield* waitIdle(manager, work.mainSessionId);
+      expect(limitsAccount("claude", work)).toBe("claude:acct_work");
+      expect((yield* accountLimits()).get("claude:acct_work")?.meters[0]?.usedPercent).toBe(20);
+      expect((yield* accountLimits()).get(local)?.meters[0]?.usedPercent).toBe(10);
+      // A provider that now reports no meters clears the account's, rather than leaving the old ones up.
       yield* manager.send(bot.mainSessionId, "now on an api key", "user");
       yield* waitIdle(manager, bot.mainSessionId);
-      expect((yield* store.getSession(bot.mainSessionId)).limits).toBeNull();
+      expect((yield* accountLimits()).has(local)).toBe(false);
+      expect((yield* accountLimits()).has("claude:acct_work")).toBe(true);
 
       const commands = yield* manager.listCommands(bot.mainSessionId);
       expect(commands.map((c) => `${c.source}:${c.name}`)).toEqual([

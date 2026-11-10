@@ -1,4 +1,4 @@
-import type { ApprovalDecision, AttachmentRef, Bot, InputResponse, LocalModel, RepoChanges, Session } from "@apollo/contracts";
+import { limitsAccount, type ApprovalDecision, type AttachmentRef, type Bot, type InputResponse, type LocalModel, type RepoChanges, type Session } from "@apollo/contracts";
 import {
   ArrowUp,
   Ban,
@@ -653,9 +653,6 @@ function Composer({
             <ConversationButton session={session} disabled={waitingFor !== null} />
             <ModelChip provider={session.provider} model={modelLabel ?? providerName(session.provider)} effort={session.effort} className="px-1.5 text-zinc-500" />
             <span className="flex-1" />
-            {session.limits && session.limits.meters.length > 0 ? (
-              <UsageLimitsMeter limits={session.limits} provider={providerName(session.provider)} />
-            ) : null}
             {session.context && session.context.window > 0 ? <ContextMeter context={session.context} /> : null}
             <span className="hidden text-[11px] text-zinc-600 sm:inline">
               <kbd className="font-sans">Enter</kbd> to send · <kbd className="font-sans">Shift+Enter</kbd> for a new line
@@ -977,6 +974,8 @@ export function SessionView({
         ) ?? null)
       : null;
   const botBusy = useApp((s) => [...s.sessions.values()].some((x) => x.botId === bot.id && isBusy(x)));
+  // Plan limits are the provider account's: the latest reading from any session on it.
+  const limits = useApp((s) => s.accountLimits.get(limitsAccount(session.provider, bot)));
   const tokens = session.usage.inputTokens + session.usage.outputTokens;
   const scheduleCount = useApp((s) => {
     let n = 0;
@@ -1111,6 +1110,8 @@ export function SessionView({
             {actionError}
           </span>
         ) : null}
+
+        {limits && limits.meters.length > 0 ? <UsageLimitsMeter limits={limits} provider={providerName(session.provider)} /> : null}
 
         <button
           className="flex h-8 min-w-0 items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-900/60 pr-2 pl-2.5 transition-colors hover:border-zinc-700 hover:bg-zinc-900"

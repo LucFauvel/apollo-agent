@@ -27,6 +27,8 @@ import {
   BotLimits,
   Timestamp,
   Usage,
+  UsageLimits,
+  AccountLimits,
   ClientId,
   CoreMemory,
   CoreMemoryTarget,
@@ -57,7 +59,14 @@ export class ApolloError extends Schema.TaggedError<ApolloError>()("ApolloError"
   message: Schema.String,
 }) {}
 
-/** Pushed to every connected client whenever server-side state changes. */
+/**
+ * Pushed to every connected client whenever server-side state changes.
+ *
+ * Installed clients decode this with the union they were built with, and a tag they do not
+ * know fails their whole `app.changes` stream (it reconnects and fails again on the next
+ * one). New kinds of change that clients built before them cannot ignore safely go on their
+ * own stream instead, as `limits.watch` does.
+ */
 export const AppChange = Schema.Union([
   Schema.TaggedStruct("BotUpserted", { bot: Bot }),
   Schema.TaggedStruct("BotDeleted", { botId: BotId }),
@@ -121,6 +130,18 @@ export const AppSnapshot = Schema.Struct({
   notificationsSeen: Schema.optional(Schema.Array(Schema.Struct({ botId: BotId, at: Timestamp }))),
 });
 export type AppSnapshot = typeof AppSnapshot.Type;
+
+/**
+ * `limits.watch`: every provider account's latest plan meters, then each change. Its own
+ * stream, not an AppChange, so clients built before it keep syncing (see AppChange).
+ */
+export const AccountLimitsChange = Schema.Union([
+  /** Sent first: every account that has a reading (see `limitsAccount`). */
+  Schema.TaggedStruct("AccountLimitsSnapshot", { accounts: Schema.Array(AccountLimits) }),
+  /** An account's plan meters changed (`null`: it has none now). */
+  Schema.TaggedStruct("AccountLimitsUpdated", { account: Schema.String, limits: Schema.NullOr(UsageLimits) }),
+]);
+export type AccountLimitsChange = typeof AccountLimitsChange.Type;
 
 /** A command typed as `/name args` in the message box. */
 export const SlashCommand = Schema.Struct({
@@ -193,6 +214,7 @@ export class ApolloRpcs extends RpcGroup.make(
   // --- app ---------------------------------------------------------------
   Rpc.make("app.snapshot", { success: AppSnapshot, error }),
   Rpc.make("app.changes", { success: AppChange, stream: true }),
+  Rpc.make("limits.watch", { success: AccountLimitsChange, stream: true }),
   /** The user is looking at one of this bot's chats: its notifications are dismissed everywhere. */
   Rpc.make("notifications.seen", { payload: { botId: BotId }, success: Schema.Void, error }),
 

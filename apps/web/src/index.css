@@ -109,7 +109,7 @@ select { appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmln
   app-region: drag;
   user-select: none;
 }
-.titlebar-hidden .app-drag :is(button, a, input, select, textarea, [role="button"], [role="menu"]) {
+.titlebar-hidden .app-drag :is(button, a, input, select, textarea, [role="button"], [role="menu"], [data-no-drag]) {
   -webkit-app-region: no-drag;
   app-region: no-drag;
 }

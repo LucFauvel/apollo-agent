@@ -95,12 +95,29 @@ export const UsageMeter = Schema.Struct({
 });
 export type UsageMeter = typeof UsageMeter.Type;
 
-/** A session's provider plan meters, and when they were read. */
+/** A provider account's plan meters, and when they were read. */
 export const UsageLimits = Schema.Struct({
   meters: Schema.Array(UsageMeter),
   at: Timestamp,
 });
 export type UsageLimits = typeof UsageLimits.Type;
+
+/**
+ * Plan limits belong to a provider account, not to a session: every session on the same
+ * account shows its latest reading. The key is `<provider>:<account id>`, with `local` for
+ * this machine's own login.
+ */
+export const limitsAccount = (
+  provider: ProviderKind,
+  bot: { readonly claudeAccountId: string | null; readonly codexAccountId: string | null },
+): string => `${provider}:${(provider === "claude" ? bot.claudeAccountId : provider === "codex" ? bot.codexAccountId : null) ?? "local"}`;
+
+/** The latest plan meters of one provider account (see `limitsAccount`). */
+export const AccountLimits = Schema.Struct({
+  account: Schema.String,
+  limits: UsageLimits,
+});
+export type AccountLimits = typeof AccountLimits.Type;
 
 /** The meter a single indicator shows: the provider's pick, else the fullest. */
 export const headlineMeter = (meters: ReadonlyArray<UsageMeter>): UsageMeter | null =>
@@ -264,7 +281,10 @@ export const Session = Schema.Struct({
   worktree: Schema.NullOr(SessionWorktree),
   /** How full the model's context window was after the last turn, when the provider reports it. */
   context: Schema.NullOr(Schema.Struct({ used: Schema.Number, window: Schema.Number })),
-  /** How much of the provider plan's usage is left, for providers that expose their meters. */
+  /**
+   * Always `null`: plan limits are kept per provider account (`AccountLimits`). Still sent
+   * so clients built when they were per session keep decoding sessions.
+   */
   limits: Schema.NullOr(UsageLimits),
   status: SessionStatus,
   /** Provider-native id used to resume the conversation (Claude session id / Codex thread id). */

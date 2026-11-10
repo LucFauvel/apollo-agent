@@ -10,6 +10,8 @@ import {
   DEFAULT_BOT_LIMITS,
   EMPTY_USAGE,
   type Usage,
+  type UsageLimits,
+  type AccountLimits,
   type CoreMemory,
   type CoreMemoryTarget,
   coreMemoryUsage,
@@ -98,7 +100,8 @@ const toSession = (r: Row): Session => ({
   cwd: r.cwd as string,
   worktree: r.worktree ? (JSON.parse(r.worktree as string) as SessionWorktree) : null,
   context: r.context ? (JSON.parse(r.context as string) as Session["context"]) : null,
-  limits: r.limits ? (JSON.parse(r.limits as string) as Session["limits"]) : null,
+  // Plan limits are kept per provider account (account_limits), not per session.
+  limits: null,
   status: r.status as SessionStatus,
   resumeId: (r.resume_id as string | null) ?? null,
   lastMessage: (r.last_message as string | null) ?? null,
@@ -205,7 +208,6 @@ export interface SessionPatch {
   readonly cwd?: string;
   readonly worktree?: SessionWorktree | null;
   readonly context?: Session["context"];
-  readonly limits?: Session["limits"];
 }
 
 /**
@@ -254,6 +256,31 @@ const makeStore = (db: DatabaseSync) => {
       Effect.sync(() => {
         if (value === null) run("delete from settings where key = ?", key);
         else run("insert into settings (key, value) values (?, ?) on conflict (key) do update set value = excluded.value", key, value);
+      }),
+
+    // --- provider accounts' plan limits ---------------------------------
+    /** Each provider account's latest plan meters. */
+    listAccountLimits: Effect.sync(() =>
+      all("select account, limits from account_limits order by account").map(
+        (r): AccountLimits => ({ account: r.account as string, limits: JSON.parse(r.limits as string) as UsageLimits }),
+      ),
+    ),
+    /**
+     * Records an account's reading; `null` clears it. An older reading than the one kept
+     * (two sessions on the account reporting out of order) is ignored: returns false.
+     */
+    setAccountLimits: (account: string, limits: UsageLimits | null) =>
+      Effect.sync(() => {
+        if (limits === null) return run("delete from account_limits where account = ?", account).changes > 0;
+        return (
+          run(
+            `insert into account_limits (account, limits, at) values (?, ?, ?)
+             on conflict (account) do update set limits = excluded.limits, at = excluded.at where excluded.at >= account_limits.at`,
+            account,
+            JSON.stringify(limits),
+            limits.at,
+          ).changes > 0
+        );
       }),
 
     // --- bots ------------------------------------------------------------
@@ -391,7 +418,7 @@ const makeStore = (db: DatabaseSync) => {
         const next: Session = { ...current, ...patch, updatedAt: Date.now() };
         run(
           `update sessions set title = ?, status = ?, resume_id = ?, last_message = ?, model = ?,
-             effort = ?, runtime_mode = ?, updated_at = ?, cwd = ?, worktree = ?, context = ?, limits = ? where id = ?`,
+             effort = ?, runtime_mode = ?, updated_at = ?, cwd = ?, worktree = ?, context = ? where id = ?`,
           next.title,
           next.status,
           next.resumeId,
@@ -403,7 +430,6 @@ const makeStore = (db: DatabaseSync) => {
           next.cwd,
           next.worktree ? JSON.stringify(next.worktree) : null,
           next.context ? JSON.stringify(next.context) : null,
-          next.limits ? JSON.stringify(next.limits) : null,
           id,
         );
         return next;

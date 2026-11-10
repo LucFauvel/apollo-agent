@@ -1,4 +1,5 @@
 import type {
+  AccountLimitsChange,
   AppChange,
   AppSnapshot,
   Bot,
@@ -12,6 +13,7 @@ import type {
   Session,
   SessionId,
   Usage,
+  UsageLimits,
 } from "@apollo/contracts";
 import { invalidateChanges, withSeenMark } from "@apollo/client";
 import * as Stream from "effect/Stream";
@@ -26,6 +28,8 @@ export interface AppState {
   readonly sessions: ReadonlyMap<SessionId, Session>;
   /** Each bot's usage today. */
   readonly usageToday: ReadonlyMap<BotId, Usage>;
+  /** Each provider account's latest plan meters, keyed by `limitsAccount`. */
+  readonly accountLimits: ReadonlyMap<string, UsageLimits>;
   /** Bumped when memories/skills of a bot (or global, key "global") change. */
   readonly knowledgeVersion: ReadonlyMap<BotId | "global", number>;
   /** llama.cpp engine, server and model library; loaded when first needed. */
@@ -57,6 +61,7 @@ let state: AppState = {
   bots: new Map(),
   sessions: new Map(),
   usageToday: new Map(),
+  accountLimits: new Map(),
   knowledgeVersion: new Map(),
   localModels: null,
   schedules: new Map(),
@@ -188,9 +193,22 @@ export const setLocalModels = (localModels: LocalModelsState) => setState({ ...s
 
 type Incoming = ({ readonly _tag: "Snapshot" } & AppSnapshot) | AppChange;
 
+/** Applies one item of `limits.watch`: each (re)connection starts with every account's reading. */
+const applyLimits = (change: AccountLimitsChange) => {
+  if (change._tag === "AccountLimitsSnapshot") {
+    return setState({ ...state, accountLimits: new Map(change.accounts.map((a) => [a.account, a.limits])) });
+  }
+  const accountLimits = new Map(state.accountLimits);
+  if (change.limits) accountLimits.set(change.account, change.limits);
+  else accountLimits.delete(change.account);
+  setState({ ...state, accountLimits });
+};
+
 /** Starts syncing app state; each (re)connection begins with a fresh snapshot. */
-export const startSync = () =>
-  follow(
+export const startSync = () => {
+  // Provider accounts' plan limits come on their own stream (see AccountLimitsChange).
+  const stopLimits = follow((client) => client["limits.watch"](), applyLimits);
+  const stopApp = follow(
     (client) =>
       Stream.concat(
         Stream.fromEffect(client["app.snapshot"]()).pipe(
@@ -222,3 +240,8 @@ export const startSync = () =>
       if (state.connected) setState({ ...state, connected: false });
     },
   );
+  return () => {
+    stopApp();
+    stopLimits();
+  };
+};
