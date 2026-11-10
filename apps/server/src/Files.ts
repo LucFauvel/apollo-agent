@@ -4,6 +4,7 @@ import * as Effect from "effect/Effect";
 import type { SessionId } from "@apollo/contracts";
 import * as Layer from "effect/Layer";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { findArtifact } from "./artifacts.ts";
 import { findAttachment, MAX_ATTACHMENT_BYTES, saveAttachment } from "./attachments.ts";
 import { Store } from "./Store.ts";
 import { ServerConfig } from "./Config.ts";
@@ -87,4 +88,36 @@ const layerDownload = HttpRouter.add(
   }),
 );
 
-export const layer = Layer.mergeAll(layerRecordings, layerUpload, layerDownload);
+/**
+ * `GET /api/artifacts/<botId>/<artifactId>/<version>`: a version of an artifact a bot saved.
+ * `?download=1` serves it as a download.
+ */
+const layerArtifacts = HttpRouter.add(
+  "GET",
+  "/api/artifacts/:botId/:id/:version",
+  Effect.gen(function* () {
+    const config = yield* ServerConfig;
+    const { botId, id, version } = yield* HttpRouter.params;
+    const query = yield* HttpServerRequest.ParsedSearchParams;
+    if (!botId || !id || !version || !/^\d+$/.test(version)) return notFound;
+    const found = findArtifact(config.dataDir, botId, id, Number(version));
+    if (!found) return notFound;
+    try {
+      const download = query.download === "1";
+      return HttpServerResponse.uint8Array(readFileSync(found.path), { contentType: found.mime }).pipe(
+        HttpServerResponse.setHeader("cache-control", "private, max-age=86400, immutable"),
+        HttpServerResponse.setHeader(
+          "content-disposition",
+          `${download ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(found.name)}`,
+        ),
+        // Agent-written HTML or SVG must never run as a page on Apollo's origin.
+        HttpServerResponse.setHeader("content-security-policy", "sandbox"),
+        HttpServerResponse.setHeader("x-content-type-options", "nosniff"),
+      );
+    } catch {
+      return notFound;
+    }
+  }),
+);
+
+export const layer = Layer.mergeAll(layerRecordings, layerUpload, layerDownload, layerArtifacts);

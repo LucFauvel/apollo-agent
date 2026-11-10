@@ -24,51 +24,64 @@ const prepare = (html: string, id: string) => {
   return withBase + sizer;
 };
 
-export function VisualItem({ item }: { item: Extract<TranscriptItem, { kind: "visual" }> }) {
+/**
+ * A blob URL has Apollo's origin, so the page itself must not run there: the window holds a
+ * script-free wrapper, and the page stays in a sandboxed frame.
+ */
+export const openHtmlWindow = (html: string, title: string) => {
+  const escaped = html.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+  const wrapper = `<!doctype html><meta charset="utf-8"><title>${title.replace(/</g, "&lt;")}</title><style>html,body{margin:0;height:100%;background:#09090b}iframe{border:0;width:100%;height:100%}</style><iframe sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" srcdoc="${escaped}"></iframe>`;
+  const url = URL.createObjectURL(new Blob([wrapper], { type: "text/html" }));
+  window.open(url, "_blank", "noopener");
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+};
+
+/** An agent-written page in a sandboxed frame that fits its content, up to MAX_HEIGHT unless expanded. */
+export function useSandboxedPage(html: string, id: string, initialHeight: number | null) {
   const frame = useRef<HTMLIFrameElement>(null);
-  const [height, setHeight] = useState(item.height ?? 240);
+  const [height, setHeight] = useState(initialHeight ?? 240);
   const [expanded, setExpanded] = useState(false);
-  const srcDoc = useMemo(() => prepare(item.html, item.key), [item.html, item.key]);
+  const srcDoc = useMemo(() => prepare(html, id), [html, id]);
 
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {
-      if (e.source !== frame.current?.contentWindow || e.data?.apolloVisual !== item.key) return;
+      if (e.source !== frame.current?.contentWindow || e.data?.apolloVisual !== id) return;
       const next = Number(e.data.height);
       if (Number.isFinite(next) && next > 0) setHeight(Math.max(next, 60));
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [item.key]);
+  }, [id]);
 
-  const shown = expanded ? height : Math.min(height, MAX_HEIGHT);
-  const openWindow = () => {
-    // A blob URL has Apollo's origin, so the page itself must not run there:
-    // the window holds a script-free wrapper, and the page stays in a sandboxed frame.
-    const escaped = item.html.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
-    const wrapper = `<!doctype html><meta charset="utf-8"><title>${(item.title || "Visual").replace(/</g, "&lt;")}</title><style>html,body{margin:0;height:100%;background:#09090b}iframe{border:0;width:100%;height:100%}</style><iframe sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" srcdoc="${escaped}"></iframe>`;
-    const url = URL.createObjectURL(new Blob([wrapper], { type: "text/html" }));
-    window.open(url, "_blank", "noopener");
-    setTimeout(() => URL.revokeObjectURL(url), 60_000);
-  };
+  const toggle =
+    height > MAX_HEIGHT ? (
+      <IconButton icon={expanded ? Minimize2 : Maximize2} label={expanded ? "Collapse" : "Show all"} size="sm" onClick={() => setExpanded(!expanded)} />
+    ) : null;
+  const page = (title: string) => (
+    <iframe
+      ref={frame}
+      title={title}
+      sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+      srcDoc={srcDoc}
+      style={{ height: expanded ? height : Math.min(height, MAX_HEIGHT) }}
+      className={cx("block w-full border-0 bg-transparent transition-[height] duration-300 ease-out")}
+    />
+  );
+  return { toggle, page };
+}
 
+export function VisualItem({ item }: { item: Extract<TranscriptItem, { kind: "visual" }> }) {
+  const { toggle, page } = useSandboxedPage(item.html, item.key, item.height);
+  const title = item.title || "Visual";
   return (
     <figure className="animate-fade-up overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950">
       <figcaption className="flex h-9 items-center gap-2 border-b border-zinc-800/80 bg-zinc-900/40 pr-1.5 pl-3 text-xs">
         <LayoutTemplate className="size-3.5 shrink-0 text-teal-300" strokeWidth={1.75} />
-        <span className="min-w-0 flex-1 truncate font-medium text-zinc-300">{item.title || "Visual"}</span>
-        {height > MAX_HEIGHT ? (
-          <IconButton icon={expanded ? Minimize2 : Maximize2} label={expanded ? "Collapse" : "Show all"} size="sm" onClick={() => setExpanded(!expanded)} />
-        ) : null}
-        <IconButton icon={ExternalLink} label="Open in a new window" size="sm" onClick={openWindow} />
+        <span className="min-w-0 flex-1 truncate font-medium text-zinc-300">{title}</span>
+        {toggle}
+        <IconButton icon={ExternalLink} label="Open in a new window" size="sm" onClick={() => openHtmlWindow(item.html, title)} />
       </figcaption>
-      <iframe
-        ref={frame}
-        title={item.title || "Visual"}
-        sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
-        srcDoc={srcDoc}
-        style={{ height: shown }}
-        className={cx("block w-full border-0 bg-transparent transition-[height] duration-300 ease-out")}
-      />
+      {page(title)}
     </figure>
   );
 }

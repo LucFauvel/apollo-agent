@@ -70,6 +70,7 @@ import {
 import { SecretItem } from "./SecretItem.tsx";
 import { HandoffItem } from "./HandoffItem.tsx";
 import { MessageAttachments, PendingAttachments, useAttachments } from "./Attachments.tsx";
+import { ArtifactItem } from "./ArtifactItem.tsx";
 import { RecordingItem } from "./RecordingItem.tsx";
 import { FullDiff } from "./FullDiff.tsx";
 import { ContextMeter, parseCommand, UsageLimitsMeter, SlashMenu, useSlashCommands } from "./SlashCommands.tsx";
@@ -276,7 +277,7 @@ function Item({
     case "compacting":
       return null; // shown as the working row at the end
     case "visual":
-      return <VisualItem item={item} />;
+      return item.artifact ? <ArtifactItem item={item} artifact={item.artifact} /> : <VisualItem item={item} />;
     case "recording":
       return <RecordingItem item={item} />;
     case "secret":

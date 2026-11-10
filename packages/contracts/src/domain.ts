@@ -361,6 +361,30 @@ export const AttachmentRef = Schema.Struct({
 });
 export type AttachmentRef = typeof AttachmentRef.Type;
 
+/** How the UI shows an artifact; `file` is anything it can only offer as a download. */
+export const ArtifactKind = Schema.Literals(["html", "markdown", "code", "text", "image", "file"]);
+export type ArtifactKind = typeof ArtifactKind.Type;
+
+/**
+ * One version of a file a bot saved with `apollo_artifact_save`, stored on disk under
+ * `<dataDir>/artifacts/<botId>/<artifactId>/` and served at
+ * `/api/artifacts/<botId>/<artifactId>/<version>`. Versions never change once saved.
+ */
+export const ArtifactRef = Schema.Struct({
+  artifactId: Schema.String,
+  botId: BotId,
+  version: Schema.Number,
+  /** File name, with its extension. */
+  name: Schema.String,
+  title: Schema.String,
+  kind: ArtifactKind,
+  mime: Schema.String,
+  size: Schema.Number,
+  /** Language for `code` artifacts (from the extension), e.g. "ts". */
+  language: Schema.optional(Schema.String),
+});
+export type ArtifactRef = typeof ArtifactRef.Type;
+
 export const AgentEvent = Schema.Union([
   Schema.TaggedStruct("UserMessage", {
     text: Schema.String,
@@ -450,6 +474,11 @@ export const AgentEvent = Schema.Union([
     html: Schema.String,
     /** Preferred height in CSS pixels; the page can grow to its content. */
     height: Schema.NullOr(Schema.Number),
+    /**
+     * Set when the visual shows an artifact (`apollo_artifact_save`/`_show`). Clients that know
+     * it show the stored file; older ones ignore it and render `html`, a fallback rendering of it.
+     */
+    artifact: Schema.optional(ArtifactRef),
   }),
   /** An agent asked the user for a secret (`apollo_request_secret`). The value never enters the log. */
   Schema.TaggedStruct("SecretRequested", {

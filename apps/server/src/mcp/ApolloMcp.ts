@@ -23,6 +23,7 @@ import * as Schema from "effect/Schema";
 import { McpProtocol, McpServer, Tool, Toolkit } from "effect/ai";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
 import { transcriptForReflection, withoutExcluded } from "../Instructions.ts";
+import * as ArtifactTools from "./ArtifactTools.ts";
 import * as BrowserTools from "./BrowserTools.ts";
 import * as BotTools from "./BotTools.ts";
 import * as ChangeTools from "./ChangeTools.ts";
@@ -811,5 +812,6 @@ export const layer = McpServer.layerHttp({
     McpServer.toolkit(BotTools.BotToolkit).pipe(Layer.provide(BotTools.handlers)),
     McpServer.toolkit(PullRequestTools.PullRequestToolkit).pipe(Layer.provide(PullRequestTools.handlers)),
     McpServer.toolkit(ProjectTools.ProjectToolkit).pipe(Layer.provide(ProjectTools.handlers)),
+    McpServer.toolkit(ArtifactTools.ArtifactToolkit).pipe(Layer.provide(ArtifactTools.handlers)),
   ),
 }).pipe(Layer.provide(authMiddleware));
