@@ -1862,6 +1862,8 @@ const make = Effect.gen(function* () {
       modelLists[provider][0].pipe(Effect.mapError((error) => providerFailure(error.message))),
     /** Forgets cached model lists, after credentials or endpoints change. */
     refreshModels: Effect.forEach(Object.values(modelLists), ([, invalidate]) => invalidate, { discard: true }),
+    /** Forgets one provider's cached model list (its CLI was just installed or signed in). */
+    refreshProviderModels: (provider: ProviderKind) => modelLists[provider][1],
 
     deleteSession: (id: SessionId) =>
       Effect.gen(function* () {

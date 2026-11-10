@@ -37,8 +37,10 @@ const str = (v: unknown) => (typeof v === "string" && v ? v : null);
 const isScript = (exe: string) => process.platform === "win32" && /\.(cmd|bat)$/i.test(exe);
 
 export const runCli = (exe: string, args: ReadonlyArray<string>, env: NodeJS.ProcessEnv) =>
-  new Promise<{ ok: boolean; stdout: string }>((resolve) =>
-    execFile(exe, [...args], { env, timeout: 20_000, shell: isScript(exe) }, (error, stdout) => resolve({ ok: !error, stdout: String(stdout) })),
+  new Promise<{ ok: boolean; stdout: string; stderr: string }>((resolve) =>
+    execFile(exe, [...args], { env, timeout: 20_000, shell: isScript(exe) }, (error, stdout, stderr) =>
+      resolve({ ok: !error, stdout: String(stdout), stderr: String(stderr) }),
+    ),
   );
 
 export const DRIVERS: Record<AccountProvider, Driver> = {
@@ -69,8 +71,10 @@ export const DRIVERS: Record<AccountProvider, Driver> = {
     deviceSignInArgs: ["login", "--device-auth"],
     signOutArgs: ["logout"],
     status: async (exe, env, dir) => {
-      const { ok, stdout } = await runCli(exe, ["login", "status"], env);
-      if (!ok || !/logged in/i.test(stdout)) return NOT_SIGNED_IN;
+      // Codex prints its status on stderr; signed in exits 0, signed out exits 1.
+      const { ok, stdout, stderr } = await runCli(exe, ["login", "status"], env);
+      const said = `${stdout}\n${stderr}`;
+      if (!ok || /not logged in/i.test(said)) return NOT_SIGNED_IN;
       // The ChatGPT login's id token names the account and its plan.
       try {
         const auth = JSON.parse(readFileSync(join(dir, "auth.json"), "utf8")) as { tokens?: { id_token?: string } };
@@ -78,7 +82,7 @@ export const DRIVERS: Record<AccountProvider, Driver> = {
         const openai = (claims["https://api.openai.com/auth"] ?? {}) as Record<string, unknown>;
         return { loggedIn: true, email: str(claims.email), orgName: null, plan: str(openai.chatgpt_plan_type) };
       } catch {
-        return { loggedIn: true, email: null, orgName: null, plan: /api key/i.test(stdout) ? "API key" : null };
+        return { loggedIn: true, email: null, orgName: null, plan: /api key/i.test(said) ? "API key" : null };
       }
     },
   },

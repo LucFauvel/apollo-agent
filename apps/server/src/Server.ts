@@ -10,6 +10,7 @@ import * as Auth from "./auth/Auth.ts";
 import * as Browser from "./browser/Browser.ts";
 import * as Accounts from "./Accounts.ts";
 import * as AgentClis from "./AgentClis.ts";
+import * as AgentCliModels from "./agentCliModels.ts";
 import * as Secrets from "./secrets/Secrets.ts";
 import * as Compaction from "./Compaction.ts";
 import * as AuthHttp from "./auth/http.ts";
@@ -63,7 +64,7 @@ const layerCore = Compaction.layer.pipe(
   Layer.provideMerge(Push.NotificationsSeen.layer),
   Layer.provideMerge(Push.PushSender.expo),
   Layer.provideMerge(Push.Notices.layer),
-  Layer.provideMerge(ProviderVersions.layer),
+  Layer.provideMerge(Layer.mergeAll(ProviderVersions.layer, AgentCliModels.layer)),
   Layer.provideMerge(PullRequests.layer),
   Layer.provideMerge(Layer.mergeAll(Jobs.layer, Monitors.layer)),
   Layer.provideMerge(Secrets.layer),

@@ -1,12 +1,18 @@
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AccountProvider, AgentCliState } from "@apollo/contracts";
+import { type AccountProvider, type AgentCliState, type ProviderKind, ProviderKind as Kinds } from "@apollo/contracts";
+import { type Provider, ProviderError } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as AgentClis from "./AgentClis.ts";
+import * as AgentCliModels from "./agentCliModels.ts";
+import * as AppSettings from "./AppSettings.ts";
+import * as Database from "./Database.ts";
+import * as SessionManager from "./SessionManager.ts";
+import * as Store from "./Store.ts";
 import { deviceCode, signInUrl } from "./cliLogin.ts";
 import { ServerConfig, type ServerConfigShape } from "./Config.ts";
 
@@ -55,7 +61,7 @@ const fs = require("fs"), path = require("path");
 const dir = process.env.CODEX_HOME || path.join(process.env.HOME, ".codex"), file = path.join(dir, "auth.json");
 const args = process.argv.slice(2);
 if (args[0] === "login" && args[1] === "status") {
-  if (fs.existsSync(file)) console.log("Logged in using ChatGPT"); else { console.error("Not logged in"); process.exit(1); }
+  if (fs.existsSync(file)) console.error("Logged in using ChatGPT"); else { console.error("Not logged in"); process.exit(1); }
 } else if (args[0] === "login" && args[1] === "--device-auth") {
   console.log("\\x1b[1mFollow these steps to sign in with ChatGPT using device code authorization:\\x1b[0m");
   console.log("1. Open this link in your browser and sign in to your account\\n   \\x1b[94mhttps://auth.openai.com/codex/device\\x1b[0m");
@@ -183,6 +189,47 @@ describe("AgentClis", () => {
       const failed = yield* clis.install("codex").pipe(Effect.andThen(settle("codex", (s) => s.install === null)));
       expect(failed.installError).toMatch(/Could not download the installer: offline/);
     }).pipe(Effect.scoped, Effect.provide(layer));
+  });
+
+  it.live("forgets the model lists cached before the CLI was installed and signed in", () => {
+    const { home, layer } = setup({ "https://chatgpt.com/codex/install.sh": installerFor(fakeCodex) });
+    const signedIn = join(home, ".codex", "auth.json");
+    // Codex lists models once it is installed and signed in, like the real app-server.
+    const codex: Provider = {
+      kind: "codex",
+      listModels: Effect.suspend(() =>
+        existsSync(signedIn)
+          ? Effect.succeed([{ id: "gpt-5.5", label: "GPT-5.5", description: "", isDefault: true, efforts: [], defaultEffort: null }])
+          : Effect.fail(new ProviderError({ provider: "codex", message: existsSync(join(home, ".local", "bin", "codex")) ? "not signed in" : "spawn codex ENOENT" })),
+      ),
+      open: () => Effect.die("not used"),
+    };
+    const idle = (kind: ProviderKind): Provider => ({ kind, listModels: Effect.succeed([]), open: () => Effect.die("not used") });
+    const full = AgentCliModels.layer.pipe(
+      Layer.provideMerge(SessionManager.layer),
+      Layer.provideMerge(
+        Layer.succeed(SessionManager.Providers, Object.fromEntries(Kinds.literals.map((k) => [k, k === "codex" ? codex : idle(k)])) as Record<ProviderKind, Provider>),
+      ),
+      Layer.provideMerge(AppSettings.layer),
+      Layer.provideMerge(Store.layer),
+      Layer.provideMerge(Database.layerMemory),
+      Layer.provideMerge(layer),
+      Layer.provideMerge(Layer.succeed(ServerConfig, config(home, false))),
+    );
+    return Effect.gen(function* () {
+      const clis = yield* AgentClis.AgentClis;
+      const manager = yield* SessionManager.SessionManager;
+      expect(yield* manager.listModels("codex").pipe(Effect.flip)).toMatchObject({ message: expect.stringMatching(/ENOENT/) });
+
+      yield* clis.install("codex");
+      yield* settle("codex", (s) => s.install === null);
+      // Fresh by the time clients hear the install finished.
+      expect(yield* manager.listModels("codex").pipe(Effect.flip)).toMatchObject({ message: expect.stringMatching(/not signed in/) });
+
+      yield* clis.signIn("codex", true);
+      yield* settle("codex", (s) => s.signIn === null);
+      expect((yield* manager.listModels("codex")).map((m) => m.id)).toEqual(["gpt-5.5"]);
+    }).pipe(Effect.scoped, Effect.provide(full));
   });
 
   it("reads sign-in pages and device codes from CLI output", () => {

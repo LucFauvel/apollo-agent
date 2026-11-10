@@ -1,5 +1,7 @@
 import type { AccountProvider, AgentCliState } from "@apollo/contracts";
 import { useEffect, useSyncExternalStore } from "react";
+import { becameUsable } from "./agentCliChanges.ts";
+import { forgetModels } from "./models.ts";
 import { follow } from "./rpc.ts";
 import { refreshVersions } from "./versions.ts";
 
@@ -9,10 +11,11 @@ const listeners = new Set<() => void>();
 let started = false;
 
 const apply = (next: ReadonlyArray<AgentCliState>) => {
+  const usable = becameUsable(clis, next);
+  // Model lists that failed before the install or sign-in can load now (the server forgot its own first).
+  if (usable.length > 0) forgetModels();
   // A finished install has a version to show now.
-  if (next.some((n) => n.executable !== null && clis.some((c) => c.provider === n.provider && c.executable === null))) {
-    void refreshVersions();
-  }
+  if (usable.some((u) => u.installed)) void refreshVersions();
   clis = next;
   for (const l of listeners) l();
 };

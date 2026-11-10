@@ -76,6 +76,11 @@ export const make = (options: AgentClisOptions = {}) =>
     const changes = yield* PubSub.unbounded<ReadonlyArray<AgentCliState>>();
     const context = yield* Effect.context<never>();
     const runFork = Effect.runForkWith(context);
+    const runPromise = Effect.runPromiseWith(context);
+    const readyHooks: Array<(provider: AccountProvider) => Effect.Effect<void>> = [];
+    /** Runs the hooks before clients hear of the change, so what they reload is fresh. */
+    const ready = (provider: AccountProvider) =>
+      runPromise(Effect.forEach(readyHooks, (hook) => hook(provider), { discard: true }).pipe(Effect.ignore));
     const slots: Record<AccountProvider, Slot> = {
       claude: { install: null, installError: null, login: null, signIn: null },
       codex: { install: null, installError: null, login: null, signIn: null },
@@ -219,6 +224,7 @@ export const make = (options: AgentClisOptions = {}) =>
       if (!executable(provider)) {
         return fail(`The installer finished, but ${provider} is not in ${join(home, ".local", "bin")}.`);
       }
+      await ready(provider);
       slot.install = null;
       slot.installError = null;
       notify();
@@ -254,9 +260,14 @@ export const make = (options: AgentClisOptions = {}) =>
           onOutput: () => notify(),
           onExit: (done) => {
             if (slots[provider].signIn !== done) return;
-            if (done.error === null) slots[provider].signIn = null;
-            notify();
-            void refreshLogin(provider);
+            void (async () => {
+              if (done.error === null) {
+                await ready(provider);
+                slots[provider].signIn = null;
+              }
+              await refreshLogin(provider);
+              notify();
+            })();
           },
         });
         slot.signIn = entry;
@@ -276,6 +287,8 @@ export const make = (options: AgentClisOptions = {}) =>
         entry.child.stdin.write(`${code.trim()}\n`);
         for (let i = 0; i < 100 && entry.child.exitCode === null; i++) yield* Effect.sleep("100 millis");
         if (entry.error) return yield* invalid(entry.error);
+        // A finished sign-in clears itself once the model lists are fresh.
+        for (let i = 0; i < 100 && slots[provider].signIn === entry; i++) yield* Effect.sleep("50 millis");
         yield* Effect.promise(() => refreshLogin(provider));
         return view(provider);
       });
@@ -298,6 +311,8 @@ export const make = (options: AgentClisOptions = {}) =>
       });
 
     return {
+      /** Runs `hook` when a CLI becomes usable (installed, or signed in), before clients are told. */
+      whenReady: (hook: (provider: AccountProvider) => Effect.Effect<void>) => Effect.sync(() => void readyHooks.push(hook)),
       executable,
       sessionExecutable,
       state: Effect.sync(snapshot),
