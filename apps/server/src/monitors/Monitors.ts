@@ -40,7 +40,12 @@ export interface StartMonitor {
 interface Entry {
   monitor: Monitor;
   readonly process: ChildProcess;
+  /** Its ending is recorded and published (see `finish`). */
   readonly exited: Deferred.Deferred<void>;
+  /** The shell's output closed, with its exit code. */
+  readonly closed: Deferred.Deferred<number | null>;
+  /** A stop is under way: it, not the shell closing, ends the monitor once the group is gone. */
+  halting: boolean;
   pending: Array<string>;
   dropped: number;
   partial: string;
@@ -241,6 +246,7 @@ const make = Effect.gen(function* () {
     Effect.gen(function* () {
       if (entry.monitor.status !== "running") return;
       entry.stopping ??= { by };
+      entry.halting = true;
       if (groupAlive(entry)) {
         signalGroup(entry, "SIGTERM");
         if (!(yield* groupGone(entry, TERM_GRACE_MS))) {
@@ -248,13 +254,14 @@ const make = Effect.gen(function* () {
           yield* groupGone(entry, 2000);
         }
       }
-      const closed = yield* Deferred.await(entry.exited).pipe(Effect.timeoutOption("2 seconds"));
-      // Its pipes may stay open after it died (a process outside the group holding them): count it as ended.
-      if (Option.isNone(closed)) {
-        finish(entry, null);
-        yield* Deferred.await(entry.exited);
-      }
-    });
+      // Its pipes may stay open after it died (a process outside the group holding them): end it anyway.
+      const closed = yield* Deferred.await(entry.closed).pipe(Effect.timeoutOption("2 seconds"));
+      // Only now, with nothing of it left, does it read as stopped and its agent hear of it.
+      finish(entry, Option.getOrNull(closed));
+      yield* Deferred.await(entry.exited);
+      // Once begun, it runs to the end (a few seconds at most): cut short, the monitor would
+      // stay "running" with nothing left to end it.
+    }).pipe(Effect.uninterruptible);
 
   const own = (caller: MonitorCaller, monitorId: string) => {
     const entry = entries.get(monitorId);
@@ -304,6 +311,8 @@ const make = Effect.gen(function* () {
         },
         process: child,
         exited: yield* Deferred.make<void>(),
+        closed: yield* Deferred.make<number | null>(),
+        halting: false,
         pending: [],
         dropped: 0,
         partial: "",
@@ -329,10 +338,15 @@ const make = Effect.gen(function* () {
         if (entry.stderr.length > STDERR_TAIL) entry.stderr = entry.stderr.slice(-STDERR_TAIL);
       });
       // "close": after its output is read to the end, so the last lines are delivered.
-      child.on("close", (code) => finish(entry, code));
+      // While a stop is under way, it ends the monitor (once the whole group is gone).
+      const closed = (code: number | null) => {
+        runFork(Deferred.succeed(entry.closed, code));
+        if (!entry.halting) finish(entry, code);
+      };
+      child.on("close", (code) => closed(code));
       child.on("error", (error) => {
         entry.stderr.push(error.message);
-        finish(entry, 127);
+        closed(127);
       });
       if (input.timeoutMs !== null) {
         entry.deadlineTimer = setTimeout(() => runFork(halt(entry, "timeout")), input.timeoutMs);
@@ -360,14 +374,14 @@ const make = Effect.gen(function* () {
     Effect.forkScoped,
   );
 
+  // On shutdown, every monitor still running (or being stopped) is stopped for good:
+  // SIGTERM, then SIGKILL to whatever of its group is left.
   yield* Effect.addFinalizer(() =>
-    Effect.sync(() => {
-      for (const entry of entries.values()) {
-        if (entry.monitor.status !== "running") continue;
-        entry.stopping ??= { by: "silent" };
-        signalGroup(entry, "SIGTERM");
-      }
-    }),
+    Effect.forEach(
+      [...entries.values()].filter((e) => e.monitor.status === "running"),
+      (entry) => halt(entry, "silent"),
+      { concurrency: "unbounded", discard: true },
+    ),
   );
 
   return {

@@ -6,6 +6,7 @@ import { ProviderKind as Kinds } from "@apollo/contracts";
 import type { Provider } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as AppSettings from "../AppSettings.ts";
@@ -351,4 +352,47 @@ describe.skipIf(process.platform === "win32")("monitors", () => {
       yield* monitors.stop(caller, started.id);
     }).pipe(Effect.scoped, Effect.provide(f.layer));
   });
+
+  it.live(
+    "reads as stopped, and its agent hears of it, only once nothing of it is left",
+    () => {
+      const f = fixture();
+      const child = stubbornChild(f.dir);
+      return Effect.gen(function* () {
+        const { monitors, caller, upserts } = yield* setup(f.cwd);
+        const started = yield* monitors.start(caller, { command: child.command, description: "stubborn", timeoutMs: null });
+        const pid = yield* child.pid;
+        const stopping = yield* monitors.stopByUser(started.id).pipe(Effect.forkChild({ startImmediately: true }));
+        // The shell is gone at once; the child outlives SIGTERM until the grace period ends.
+        yield* until(() => upserts(started.id).at(-1)?.status !== "running" || !alive(pid), 15_000);
+        expect(alive(pid)).toBe(false);
+        yield* Fiber.join(stopping);
+        expect(upserts(started.id).at(-1)).toMatchObject({ status: "stopped", stoppedBy: "user" });
+        yield* monitors.settled;
+        expect(f.sent.filter((t) => t.includes(started.id))).toHaveLength(1);
+      }).pipe(Effect.scoped, Effect.provide(f.layer));
+    },
+    20_000,
+  );
+
+  it.live(
+    "quitting Apollo while a stop is under way still kills what is left of the monitor",
+    () => {
+      const f = fixture();
+      const child = stubbornChild(f.dir);
+      let pid = 0;
+      return Effect.gen(function* () {
+        yield* Effect.gen(function* () {
+          const { monitors, caller } = yield* setup(f.cwd);
+          const started = yield* monitors.start(caller, { command: child.command, description: "stubborn", timeoutMs: null });
+          pid = yield* child.pid;
+          yield* monitors.stopByUser(started.id).pipe(Effect.forkDetach);
+          yield* Effect.sleep("200 millis"); // the shell has exited; the child ignores SIGTERM
+          expect(alive(pid)).toBe(true);
+        }).pipe(Effect.scoped, Effect.provide(f.layer));
+        expect(alive(pid)).toBe(false);
+      });
+    },
+    20_000,
+  );
 });
