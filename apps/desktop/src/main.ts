@@ -145,6 +145,23 @@ const updateMenuItem = (): Electron.MenuItemConstructorOptions =>
     ? { label: updater.menuLabel(), enabled: updater.menuEnabled(), click: () => updateClicked() }
     : { label: "Check for Updates…", enabled: true, click: () => updateClicked() };
 
+/**
+ * "Follow Nightly Builds": shown only when this build can verify nightlies (it embeds the
+ * nightly key) and while no update is downloading or installing.
+ */
+const nightlyMenuItems = (): Array<Electron.MenuItemConstructorOptions> =>
+  updater?.nightlyAvailable()
+    ? [
+        {
+          label: "Follow Nightly Builds",
+          type: "checkbox",
+          checked: updater.channel === "nightly",
+          enabled: updater.menuEnabled(),
+          click: (item) => void updater?.setFollowNightly(item.checked),
+        },
+      ]
+    : [];
+
 /** The menu entry or tray row was clicked. */
 const updateClicked = () => {
   if (!updater) {
@@ -177,6 +194,7 @@ const setAppMenu = () => {
         submenu: [
           { role: "about" },
           updateMenuItem(),
+          ...nightlyMenuItems(),
           { type: "separator" },
           { role: "services" },
           { type: "separator" },
@@ -496,7 +514,7 @@ const trayMenu = (status: DesktopStatus | null) => {
     }
     items.push({ type: "separator" });
   }
-  items.push({ label: "Open Apollo", click: showWindow }, updateMenuItem(), { type: "separator" }, { label: "Quit Apollo", role: "quit" });
+  items.push({ label: "Open Apollo", click: showWindow }, updateMenuItem(), ...nightlyMenuItems(), { type: "separator" }, { label: "Quit Apollo", role: "quit" });
   return Menu.buildFromTemplate(items);
 };
 

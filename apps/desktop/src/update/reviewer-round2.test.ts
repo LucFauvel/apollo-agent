@@ -123,7 +123,7 @@ describe('tolerant readers',()=>{
   let s=EMPTY_STATE;for(let n=500;n<750;n++)s=withSkipped(s,n,400);s=parseState(JSON.stringify(s));expect(s.skipped).toHaveLength(250);
   const running:RunningBuild={version:'1',channel:'release',build:600,schemaVersion:20,platform:'darwin',arch:'arm64',osVersion:'15'};
   s=withSkipped(s,800,600);s=parseState(JSON.stringify(s));
-  for(let build=500;build<=800;build++){const d=decide(manifest({build}),running,{tag:'v1.3.0',teamId:TEAM,skipped:s.skipped,dbSchema:20});if(build<=600)expect(d.kind).toBe('up-to-date');else if(build<750||build===800)expect(d.kind).toBe('skipped');}
+  for(let build=500;build<=800;build++){const d=decide(manifest({build}),running,{channel:'release',tag:'v1.3.0',teamId:TEAM,skipped:s.skipped,dbSchema:20});if(build<=600)expect(d.kind).toBe('up-to-date');else if(build<750||build===800)expect(d.kind).toBe('skipped');}
  });
 });
 

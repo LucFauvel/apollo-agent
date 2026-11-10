@@ -265,6 +265,8 @@ describe("parseJob", () => {
     expect(() => parseJob(JSON.stringify({ ...job, bundles: { ...job.bundles, previous: "/tmp/elsewhere.app" } }))).toThrow(/bundles/);
     expect(() => parseJob(JSON.stringify({ ...job, bundles: bundlesFor("/Users/x/Evil.app") }))).toThrow(/bundles.target/);
     expect(() => parseJob(JSON.stringify({ ...job, dataDir: "relative" }))).toThrow(/dataDir/);
+    expect(() => parseJob(JSON.stringify({ ...job, channel: "beta" }))).toThrow(/channel/);
+    expect(parseJob(JSON.stringify({ ...job, channel: "nightly" })).channel).toBe("nightly");
     expect(() => parseJob(JSON.stringify({ ...job, commit: "abc" }))).toThrow(/commit/);
   });
 });

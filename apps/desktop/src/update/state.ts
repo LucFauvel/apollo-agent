@@ -5,6 +5,7 @@
  * restarts, and back off on failures and rate limits.
  */
 import type { CheckResult } from "./check.ts";
+import type { Channel, UpdateChannel } from "./manifestFormat.ts";
 
 export interface UpdaterState {
   readonly lastCheckAt: number | null;
@@ -20,9 +21,21 @@ export interface UpdaterState {
    * dropped only once the app runs a build at or above it, when it can no longer be offered.
    */
   readonly skipped: ReadonlyArray<number>;
+  /** The channel the user chose ("Follow Nightly Builds"); null = the default (followedChannel). */
+  readonly channel: UpdateChannel | null;
 }
 
-export const EMPTY_STATE: UpdaterState = { lastCheckAt: null, failures: 0, retryAt: null, notifiedBuild: null, skipped: [] };
+export const EMPTY_STATE: UpdaterState = { lastCheckAt: null, failures: 0, retryAt: null, notifiedBuild: null, skipped: [], channel: null };
+
+/**
+ * The channel the updater follows: the user's choice, else the running build's own channel (a
+ * nightly build follows nightlies, anything else stable releases). Nightlies only when this
+ * build can verify them; otherwise stable releases, whatever was chosen.
+ */
+export const followedChannel = (s: Pick<UpdaterState, "channel">, runningChannel: Channel | null, nightlyConfigured: boolean): UpdateChannel => {
+  const wanted = s.channel ?? (runningChannel === "nightly" ? "nightly" : "release");
+  return wanted === "nightly" && nightlyConfigured ? "nightly" : "release";
+};
 
 /** Own-property read that never runs getters, toString or inherited (`__proto__`) values. */
 const own = (o: object, key: string): unknown => {
@@ -62,6 +75,7 @@ export const parseState = (text: string | null): UpdaterState => {
       retryAt: num(own(raw, "retryAt")),
       notifiedBuild: build(own(raw, "notifiedBuild")),
       skipped: sortedUnique(skipped),
+      channel: ((c) => (c === "release" || c === "nightly" ? c : null))(own(raw, "channel")),
     };
   } catch {
     return EMPTY_STATE;
@@ -89,6 +103,16 @@ export const nextCheckAt = (s: UpdaterState, now: number, random: number, startu
   const earliest = now + (startup ? 2 * 60_000 + random * 5 * 60_000 : 60_000);
   return Math.max(due, earliest);
 };
+
+/**
+ * Saves the channel a fresh install starts on, so it is the user's from then on: an update to a
+ * build of the other channel (a nightly follower taking a newer stable release) must not change
+ * what is followed. Only release and nightly builds pin it (a local build is never updated);
+ * a choice already saved is kept. It pins what the build's channel asks for, even when this build
+ * cannot verify nightlies yet, so a later build that can still follows them.
+ */
+export const withInitialChannel = (s: UpdaterState, runningChannel: Channel | null): UpdaterState =>
+  s.channel !== null || (runningChannel !== "release" && runningChannel !== "nightly") ? s : { ...s, channel: runningChannel };
 
 /** The state after a check with `result` at `now`. */
 export const afterCheck = (s: UpdaterState, result: CheckResult, now: number): UpdaterState => {

@@ -17,7 +17,7 @@ const parts = (): Array<Manifest> => [
 ];
 
 /** Writes each part as a build output dir (files with real hashes), runs the CLI. */
-const runMerge = (manifests: Array<Manifest>) => {
+const runMerge = (manifests: Array<Manifest>, extra: Array<string> = []) => {
   const root = mkdtempSync(join(tmpdir(), "merge-cli-"));
   const dirs = manifests.map((m, i) => {
     const dir = join(root, `part${i}`);
@@ -32,7 +32,7 @@ const runMerge = (manifests: Array<Manifest>) => {
     writeFileSync(join(dir, "SHA256SUMS"), formatSums(assets));
     return dir;
   });
-  const r = spawnSync(process.execPath, [script, "--out", join(root, "out"), "--version", "1.2.3", "--commit", commit, ...dirs], { encoding: "utf8" });
+  const r = spawnSync(process.execPath, [script, "--out", join(root, "out"), "--version", "1.2.3", "--commit", commit, ...extra, ...dirs], { encoding: "utf8" });
   return { status: r.status, output: `${r.stdout}${r.stderr}`, out: join(root, "out") };
 };
 
@@ -50,5 +50,20 @@ describe("merge-manifests CLI", () => {
     expect(r.status).toBe(1);
     expect(r.output).toMatch(/Apollo-1.2.3-win-x64-setup.exe: name disagrees/);
     expect(r.output).toMatch(/Apollo-1.2.3-win-x64-wrongarch-setup.exe: name disagrees/);
+  });
+  it("merges a nightly with --channel nightly, and only then", () => {
+    const nightly = parts().map((m) => ({ ...m, channel: "nightly" as const }));
+    const ok = runMerge(nightly, ["--channel", "nightly"]);
+    expect(ok.status, ok.output).toBe(0);
+    expect(parseManifest(readFileSync(join(ok.out, "apollo-update.json"), "utf8")).channel).toBe("nightly");
+    expect(runMerge(nightly).output).toMatch(/expected release/);
+    expect(runMerge(parts(), ["--channel", "nightly"]).output).toMatch(/expected nightly/);
+  });
+  it("never publishes an ad-hoc macOS nightly", () => {
+    const p = parts().map((m) => ({ ...m, channel: "nightly" as const }));
+    p[0] = { ...p[0]!, assets: [{ ...p[0]!.assets[0]!, name: "Apollo-1.2.3-arm64-adhoc.zip", codeSigning: { kind: "adhoc" } }] };
+    const r = runMerge(p, ["--channel", "nightly"]);
+    expect(r.status).toBe(1);
+    expect(r.output).toMatch(/adhoc: a darwin nightly needs developer-id/);
   });
 });
