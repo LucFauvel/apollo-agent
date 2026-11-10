@@ -119,7 +119,7 @@ export default function App() {
             }}
           />
         ) : (
-          <AppStateProvider connection={connection}>
+          <AppStateProvider connection={connection} pairing={pairing}>
             <AvatarSync pairing={pairing} />
             <NotificationsSync open={open} />
             {/* Home stays under the screens pushed over it, so going back slides to it. The

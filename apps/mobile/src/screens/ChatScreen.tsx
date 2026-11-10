@@ -44,6 +44,7 @@ import { useApollo } from "../AppState.tsx";
 import { BlobAvatar } from "../BlobAvatar.tsx";
 import { Markdown } from "../Markdown.tsx";
 import { MonitorStrip } from "../MonitorStrip.tsx";
+import { ArtifactCard, RecordingCard, VisualCard } from "../PageCards.tsx";
 import { ActivityGroup } from "../Activity.tsx";
 import { BrowserScreen, type Handoff } from "./BrowserScreen.tsx";
 import { ChangesScreen, FullDiff } from "./ChangesScreen.tsx";
@@ -751,13 +752,9 @@ function Item({
     case "handoff":
       return <HandoffCard item={item} onOpen={() => onOpenBrowser(item.tabId, item.outcome === null ? { requestId: item.requestId, reason: item.reason } : undefined)} />;
     case "visual":
+      return item.artifact ? <ArtifactCard item={item} artifact={item.artifact} /> : <VisualCard item={item} />;
     case "recording":
-      return (
-        <View style={styles.notice}>
-          <InfoIcon size={14} color={colors.faint} />
-          <Text style={styles.noticeText}>{item.title}: open Apollo on your computer to view it.</Text>
-        </View>
-      );
+      return <RecordingCard item={item} />;
     default:
       return null;
   }
