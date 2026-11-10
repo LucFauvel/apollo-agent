@@ -17,6 +17,16 @@ describe("dismissing notifications of seen chats", () => {
     expect(seenNotifications(delivered, new Map())).toEqual([]);
   });
 
+  it("goes by when the server sent it, not by this device's clock", () => {
+    // This device's clock runs 5 minutes behind the server's; the user saw Atlas at 1_000 (server time).
+    const skew = -300_000;
+    const before = n("before", "atlas", 900, 900 + skew);
+    const after = n("after", "atlas", 1_100, 1_100 + skew);
+    expect(seenNotifications([before, after], marks).map((x) => x.id)).toEqual(["before"]);
+    // Ahead instead: a notification sent after the mark still stays.
+    expect(seenNotifications([n("ahead", "atlas", 1_100, 1_100 + 300_000)], marks)).toEqual([]);
+  });
+
   it("keeps the latest mark per bot", () => {
     const later = withSeenMark(marks, "atlas", 2_000);
     expect(later.get("atlas")).toBe(2_000);

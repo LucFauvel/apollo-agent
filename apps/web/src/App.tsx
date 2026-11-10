@@ -31,7 +31,7 @@ const useDesktopNotifications = (open: (id: SessionId) => void, selected: () => 
         if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
         // Not for the conversation the user is looking at.
         if (notice.sessionId && document.hasFocus() && selected() === notice.sessionId) return;
-        showNotification(notice.botId, notice.title, { body: notice.body }, () => {
+        showNotification(notice, notice.title, { body: notice.body }, () => {
           showApp();
           if (notice.sessionId) open(notice.sessionId);
         });
