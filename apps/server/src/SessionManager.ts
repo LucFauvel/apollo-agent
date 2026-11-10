@@ -21,6 +21,7 @@ import {
   EMPTY_USAGE,
   type InputResponse,
   type MessageAuthor,
+  type ProjectId,
   type ProviderKind,
   type ProviderSelection,
   type Session,
@@ -443,7 +444,12 @@ const make = Effect.gen(function* () {
 
         const session = yield* store.getSession(id);
         const bot = yield* store.getBot(session.botId);
-        const [core, skills] = yield* Effect.all([store.getCoreMemory(bot.id), store.listSkills(bot.id)]);
+        const [core, skills, projects] = yield* Effect.all([
+          store.getCoreMemory(bot.id),
+          store.listSkills(bot.id),
+          store.listProjects(bot.id),
+        ]);
+        const project = session.projectId ? (projects.find((p) => p.id === session.projectId) ?? null) : null;
         const skillsPluginDir = yield* syncBotSkills(bot.id).pipe(
           Effect.as(pluginDir(config.dataDir, bot.id)),
           Effect.catch((cause) => Effect.logWarning("skill sync failed", cause).pipe(Effect.as(null))),
@@ -474,6 +480,8 @@ const make = Effect.gen(function* () {
                 core,
                 skills,
                 projectFolders,
+                projects: session.role === "main" ? projects : [],
+                project,
                 // Lists come from this machine's logins: not this bot's when it runs on another account.
                 connectors: Object.fromEntries(
                   [...connectorCache]
@@ -955,12 +963,15 @@ const make = Effect.gen(function* () {
     readonly parentSessionId: SessionId | null;
     readonly id?: SessionId;
     readonly isolation?: "shared" | "worktree" | undefined;
+    readonly projectId?: ProjectId | null | undefined;
   }) =>
     creatingFor(input.botId, Effect.gen(function* () {
       const bot = yield* store.getBot(input.botId);
+      const project = input.projectId ? yield* store.getProject(input.projectId) : null;
+      if (project && project.botId !== bot.id) return yield* invalid("that project belongs to another bot");
       const now = Date.now();
       const id = input.id ?? newId<SessionId>("ses");
-      let cwd = input.cwd?.trim() ? appSettings.expand(input.cwd) : bot.cwd;
+      let cwd = input.cwd?.trim() ? appSettings.expand(input.cwd) : (project?.cwd ?? bot.cwd);
       let worktree: SessionWorktree | null = null;
       if (input.isolation === "worktree") {
         const created = yield* Effect.tryPromise({
@@ -982,6 +993,7 @@ const make = Effect.gen(function* () {
         runtimeMode: null,
         cwd,
         worktree,
+        projectId: project?.id ?? null,
         context: null,
         limits: null,
         status: "idle",
@@ -1218,6 +1230,7 @@ const make = Effect.gen(function* () {
         cwd: source.cwd,
         role: "reflection",
         parentSessionId: source.id,
+        projectId: source.projectId ?? null,
       });
       reflecting = reflection.id;
       // A reflection that never answers must not hold the line forever.
@@ -1663,6 +1676,7 @@ const make = Effect.gen(function* () {
       readonly parentSessionId?: SessionId | null;
       readonly notifyParent?: boolean;
       readonly author?: MessageAuthor;
+      readonly projectId?: ProjectId | null | undefined;
     }) =>
       // Gated as a whole, so a bot's deletion also waits for its untitled entry and first message.
       creatingFor(input.botId, Effect.gen(function* () {
@@ -1676,6 +1690,7 @@ const make = Effect.gen(function* () {
           isolation: input.isolation,
           role: "worker",
           parentSessionId: input.parentSessionId ?? null,
+          projectId: input.projectId,
         });
         if (!named) {
           untitled.add(session.id);

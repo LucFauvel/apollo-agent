@@ -15,6 +15,7 @@ import { LocalModels } from "./local/LocalModels.ts";
 import { RECOMMENDED_REVIEWER } from "./local/Reviewer.ts";
 import { ProviderSettings } from "./ProviderSettings.ts";
 import { NotificationsSeen } from "./push/Push.ts";
+import { Projects } from "./projects/Projects.ts";
 import { Scheduler } from "./schedule/Scheduler.ts";
 import { SessionManager } from "./SessionManager.ts";
 import { Store } from "./Store.ts";
@@ -38,6 +39,7 @@ export const layer = ApolloRpcs.toLayer(
     const providerVersions = yield* ProviderVersions;
     const tailscale = yield* Tailscale;
     const seen = yield* NotificationsSeen;
+    const projects = yield* Projects;
     // Errors from the local-model service reach the UI as plain messages.
     const local = <A, R>(effect: Effect.Effect<A, Error, R>) =>
       effect.pipe(Effect.mapError((error) => new ApolloError({ code: "internal", message: error.message })));
@@ -154,8 +156,13 @@ export const layer = ApolloRpcs.toLayer(
       "bots.stop": ({ botId }) => manager.stopBot(botId),
       "bots.resume": ({ botId }) => manager.resumeBot(botId),
 
-      "sessions.create": ({ botId, title, provider, cwd, isolation, prompt }) =>
-        manager.createSession({ botId, title, provider, cwd, isolation, prompt }),
+      "projects.watch": () => projects.watch,
+      "projects.create": (input) => projects.create(input),
+      "projects.update": (input) => projects.update(input),
+      "projects.delete": ({ projectId }) => projects.remove(projectId),
+
+      "sessions.create": ({ botId, title, provider, cwd, isolation, prompt, projectId }) =>
+        manager.createSession({ botId, title, provider, cwd, isolation, prompt, projectId }),
       "sessions.update": (input) => manager.updateSessionSettings(input),
       "sessions.send": ({ sessionId, text, attachments }) => manager.send(sessionId, text, "user", attachments ?? []),
       "sessions.interrupt": ({ sessionId }) => manager.interrupt(sessionId),

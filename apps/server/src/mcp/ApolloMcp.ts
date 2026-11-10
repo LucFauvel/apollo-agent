@@ -28,11 +28,13 @@ import * as BotTools from "./BotTools.ts";
 import * as ChangeTools from "./ChangeTools.ts";
 import * as JobTools from "./JobTools.ts";
 import * as MonitorTools from "./MonitorTools.ts";
+import * as ProjectTools from "./ProjectTools.ts";
 import * as PullRequestTools from "./PullRequestTools.ts";
 import * as UserTools from "./UserTools.ts";
 import * as WorktreeTools from "./WorktreeTools.ts";
 import { McpCaller } from "./Caller.ts";
 import { AppSettings } from "../AppSettings.ts";
+import { Projects } from "../projects/Projects.ts";
 import { Scheduler } from "../schedule/Scheduler.ts";
 import { SessionManager } from "../SessionManager.ts";
 import { Store } from "../Store.ts";
@@ -99,24 +101,31 @@ const shared = {
 
 const MemorySearch = Tool.make("apollo_memory_search", {
   ...shared,
-  description:
-    "Search the bot's long-term memory (shared across all sessions and providers) by keywords.",
+  description: [
+    "Search the bot's long-term memory (shared across all sessions and providers) by keywords. In a session that works",
+    "in a project, the project's memories are searched too; `project` (id or name) searches one project's as well.",
+  ].join(" "),
   parameters: Schema.Struct({
     query: Schema.String,
     limit: Schema.optional(Schema.Number),
+    project: Schema.optional(Schema.String),
   }),
   success: Schema.Struct({ memories: Schema.Array(Memory) }),
 }).annotate(Tool.Readonly, true);
 
 const MemorySave = Tool.make("apollo_memory_save", {
   ...shared,
-  description:
-    "Save a durable memory: a user preference, a fact about a project or environment, or a lesson learned. Keep it short and self-contained. Never save secrets.",
+  description: [
+    "Save a durable memory: a user preference, a fact about a project or environment, or a lesson learned. Keep it",
+    "short and self-contained. Never save secrets. scope `project`: it stays in a project (yours, or the one named by",
+    "`project`), and only sessions in that project find it.",
+  ].join(" "),
   parameters: Schema.Struct({
     content: Schema.String,
     kind: MemoryKind,
     tags: Schema.optional(Schema.Array(Schema.String)),
-    scope: Schema.optional(Schema.Literals(["bot", "global"])),
+    scope: Schema.optional(Schema.Literals(["bot", "global", "project"])),
+    project: Schema.optional(Schema.String),
   }),
   success: Memory,
 }).annotate(Tool.Destructive, false);
@@ -235,7 +244,8 @@ const SpawnSession = Tool.make("apollo_spawn_session", {
     "Start a worker session for a task (orchestrator only). It runs in parallel and reports back to you when it",
     "finishes a turn. Choose the provider that fits the task. `model` must be an id from the provider's available",
     "models: check it with apollo_list_models first, never guess or reuse a name from memory (an unknown id is",
-    "refused). Leave `model` out to use the default.",
+    "refused). Leave `model` out to use the default. `project` (id or name): start it in one of the bot's projects;",
+    "it gets the project's context and works in the project's workspace unless `cwd` says otherwise.",
   ].join(" "),
   parameters: Schema.Struct({
     title: Schema.String,
@@ -252,6 +262,7 @@ const SpawnSession = Tool.make("apollo_spawn_session", {
      */
     isolation: Schema.optional(Schema.Literals(["shared", "worktree"])),
     notifyOnCompletion: Schema.optional(Schema.Boolean),
+    project: Schema.optional(Schema.String),
   }),
   success: SessionSummary,
 });
@@ -423,6 +434,21 @@ const handlers = ApolloToolkit.toLayer(
     const store = yield* Store;
     const manager = yield* SessionManager;
     const scheduler = yield* Scheduler;
+    const projects = yield* Projects;
+
+    /**
+     * The project a memory call is about: the one named, else the caller's own (or none). A
+     * session in a project reaches only its own project.
+     */
+    const memoryProject = (ref: string | undefined) =>
+      Effect.gen(function* () {
+        const caller = yield* McpCaller;
+        const own = (yield* store.getSession(caller.sessionId)).projectId ?? null;
+        if (!ref?.trim()) return own;
+        const project = yield* projects.resolve(caller.botId, ref);
+        if (own && project.id !== own) return yield* invalid("a session in a project can only reach its own project");
+        return project.id;
+      });
 
     /**
      * Schedules belong to the orchestrator, and never to a turn a schedule started:
@@ -468,21 +494,27 @@ const handlers = ApolloToolkit.toLayer(
           return { sent: true };
         }),
 
-      apollo_memory_search: ({ query, limit }) =>
+      apollo_memory_search: ({ query, limit, project }) =>
         Effect.gen(function* () {
           const caller = yield* McpCaller;
           const memories = yield* store.searchMemories(
             caller.botId,
             query,
             Math.min(Math.max(limit ?? 8, 1), 25),
+            yield* memoryProject(project),
           );
           return { memories };
         }),
 
-      apollo_memory_save: ({ content, kind, tags, scope }) =>
+      apollo_memory_save: ({ content, kind, tags, scope, project }) =>
         Effect.gen(function* () {
           const caller = yield* McpCaller;
           if (content.trim().length === 0) return yield* invalid("content is empty");
+          if (project?.trim() && scope !== "project") return yield* invalid("`project` goes with scope `project`");
+          const projectId = scope === "project" ? yield* memoryProject(project) : null;
+          if (scope === "project" && !projectId) {
+            return yield* invalid("scope `project` needs a project: name it (`project`), or save from a session in one");
+          }
           const botId = scope === "global" ? null : caller.botId;
           const memory = yield* store.insertMemory({
             botId,
@@ -490,6 +522,7 @@ const handlers = ApolloToolkit.toLayer(
             content: content.trim(),
             tags: tags ?? [],
             sourceSessionId: caller.sessionId,
+            projectId,
           });
           yield* manager.publishMemoryChanged(botId);
           return memory;
@@ -655,7 +688,7 @@ const handlers = ApolloToolkit.toLayer(
           return { provider, models: models.map((m) => ({ id: m.id, label: m.label, isDefault: m.isDefault, efforts: m.efforts })) };
         }),
 
-      apollo_spawn_session: ({ title, prompt, provider, model, effort, cwd, isolation, notifyOnCompletion }) =>
+      apollo_spawn_session: ({ title, prompt, provider, model, effort, cwd, isolation, notifyOnCompletion, project }) =>
         Effect.gen(function* () {
           const caller = yield* McpCaller;
           if (caller.role !== "main") {
@@ -665,6 +698,7 @@ const handlers = ApolloToolkit.toLayer(
           if (bot.pausedReason !== null) {
             return yield* invalid(`${bot.name} is paused (${bot.pausedReason}). Only the user can resume it.`);
           }
+          const projectId = project?.trim() ? (yield* projects.resolve(bot.id, project)).id : null;
           yield* manager.guardWorkerCapacity(bot.id);
           // A different provider starts from its own defaults; the same one inherits the bot's.
           const base = provider && provider !== bot.defaultWorker.provider ? { provider } : bot.defaultWorker;
@@ -685,6 +719,7 @@ const handlers = ApolloToolkit.toLayer(
             parentSessionId: caller.sessionId,
             notifyParent: notifyOnCompletion ?? true,
             author: "bot",
+            projectId,
           });
           return summarize(yield* store.getSession(session.id));
         }),
@@ -775,5 +810,6 @@ export const layer = McpServer.layerHttp({
     McpServer.toolkit(ChangeTools.ChangeToolkit).pipe(Layer.provide(ChangeTools.handlers)),
     McpServer.toolkit(BotTools.BotToolkit).pipe(Layer.provide(BotTools.handlers)),
     McpServer.toolkit(PullRequestTools.PullRequestToolkit).pipe(Layer.provide(PullRequestTools.handlers)),
+    McpServer.toolkit(ProjectTools.ProjectToolkit).pipe(Layer.provide(ProjectTools.handlers)),
   ),
 }).pipe(Layer.provide(authMiddleware));

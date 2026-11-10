@@ -17,6 +17,9 @@ export type MemoryId = typeof MemoryId.Type;
 export const SkillId = Schema.String.pipe(Schema.brand("SkillId"));
 export type SkillId = typeof SkillId.Type;
 
+export const ProjectId = Schema.String.pipe(Schema.brand("ProjectId"));
+export type ProjectId = typeof ProjectId.Type;
+
 /** Epoch milliseconds. */
 export const Timestamp = Schema.Number;
 
@@ -279,6 +282,8 @@ export const Session = Schema.Struct({
   cwd: Schema.String,
   /** Its own git worktree, while it has one. */
   worktree: Schema.NullOr(SessionWorktree),
+  /** The bot's project it works in (see `Project`). Optional: servers before projects omit it. */
+  projectId: Schema.optional(Schema.NullOr(ProjectId)),
   /** How full the model's context window was after the last turn, when the provider reports it. */
   context: Schema.NullOr(Schema.Struct({ used: Schema.Number, window: Schema.Number })),
   /**
@@ -501,6 +506,8 @@ export const Memory = Schema.Struct({
   tags: Schema.Array(Schema.String),
   /** Session that produced it, when learned automatically or saved by an agent. */
   sourceSessionId: Schema.NullOr(SessionId),
+  /** Belongs to one of the bot's projects: only that project's sessions find it by search. */
+  projectId: Schema.optional(Schema.NullOr(ProjectId)),
   createdAt: Timestamp,
   /** Last time a search returned it; compaction evicts the least used first. */
   lastUsedAt: Schema.NullOr(Timestamp),

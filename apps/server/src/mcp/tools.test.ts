@@ -7,6 +7,7 @@ import { BrowserToolkit } from "./BrowserTools.ts";
 import { ChangeToolkit, SEMANTIC_DIFF_ONLY_WHEN_ASKED } from "./ChangeTools.ts";
 import { JobToolkit } from "./JobTools.ts";
 import { MonitorToolkit, timeoutMs } from "./MonitorTools.ts";
+import { ProjectToolkit } from "./ProjectTools.ts";
 import { PullRequestToolkit } from "./PullRequestTools.ts";
 import { UserToolkit } from "./UserTools.ts";
 import { WorktreeToolkit } from "./WorktreeTools.ts";
@@ -23,6 +24,7 @@ const toolkits: Record<string, Toolkit.Any> = {
   ChangeToolkit,
   JobToolkit,
   MonitorToolkit,
+  ProjectToolkit,
   PullRequestToolkit,
   UserToolkit,
   WorktreeToolkit,
