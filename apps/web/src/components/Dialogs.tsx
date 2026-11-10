@@ -1,4 +1,4 @@
-import type { Bot, BotLimits, ProviderKind, ProviderSelection, RuntimeMode, Session } from "@apollo/contracts";
+import type { Bot, BotLimits, ProjectId, ProviderKind, ProviderSelection, RuntimeMode, Session } from "@apollo/contracts";
 import { type BotAvatar as BotAvatarValue, type ProjectInfo, randomAvatar } from "@apollo/contracts";
 import { AvatarPicker } from "./BlobAvatar.tsx";
 import { FolderGit2 } from "lucide-react";
@@ -320,13 +320,20 @@ export function NewBotDialog({ onClose, onCreated }: { onClose: () => void; onCr
 
 export function NewSessionDialog({
   bot,
+  projectId: initialProject = null,
   onClose,
   onCreated,
 }: {
   bot: Bot;
+  /** Start it in this project. */
+  projectId?: ProjectId | null;
   onClose: () => void;
   onCreated: (session: Session) => void;
 }) {
+  const allProjects = useApp((s) => s.projects);
+  const projects = [...allProjects.values()].filter((p) => p.botId === bot.id && (p.status === "active" || p.id === initialProject));
+  const [projectId, setProjectId] = useState<ProjectId | null>(initialProject);
+  const workspaceOf = (id: ProjectId | null) => (id ? allProjects.get(id)?.cwd : null) ?? bot.cwd;
   const [title, setTitle] = useState("");
   const [provider, setProvider] = useState<ProviderKind>(bot.defaultWorker.provider);
   const workerDefaults = (p: ProviderKind): ModelChoice =>
@@ -334,7 +341,7 @@ export function NewSessionDialog({
       ? { model: bot.defaultWorker.model ?? null, effort: bot.defaultWorker.effort ?? null }
       : NO_CHOICE;
   const [model, setModel] = useState<ModelChoice>(() => workerDefaults(bot.defaultWorker.provider));
-  const [cwd, setCwd] = useState(bot.cwd);
+  const [cwd, setCwd] = useState(() => workspaceOf(initialProject));
   const [worktree, setWorktree] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -351,6 +358,7 @@ export function NewSessionDialog({
         cwd,
         ...(worktree ? { isolation: "worktree" as const } : {}),
         ...(prompt.trim() ? { prompt } : {}),
+        ...(projectId ? { projectId } : {}),
       }),
     )
       .then(onCreated)
@@ -392,6 +400,27 @@ export function NewSessionDialog({
           <input className={cx(inputClass, "font-mono text-xs")} value={cwd} onChange={(e) => setCwd(e.target.value)} />
         </Field>
       </div>
+      {projects.length > 0 ? (
+        <Field label="Project" hint="A session in a project gets its context and saves what it learns there.">
+          <select
+            className={inputClass}
+            value={projectId ?? ""}
+            onChange={(e) => {
+              const next = (e.target.value || null) as ProjectId | null;
+              // The workspace follows the project, unless it was changed by hand.
+              if (cwd === workspaceOf(projectId)) setCwd(workspaceOf(next));
+              setProjectId(next);
+            }}
+          >
+            <option value="">None</option>
+            {projects.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        </Field>
+      ) : null}
       <Toggle
         checked={worktree}
         onChange={setWorktree}

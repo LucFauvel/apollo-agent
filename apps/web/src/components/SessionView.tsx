@@ -1,7 +1,8 @@
-import { limitsAccount, type ApprovalDecision, type AttachmentRef, type Bot, type InputResponse, type LocalModel, type RepoChanges, type Session } from "@apollo/contracts";
+import { limitsAccount, type ApprovalDecision, type AttachmentRef, type Bot, type InputResponse, type LocalModel, type ProjectId, type RepoChanges, type Session } from "@apollo/contracts";
 import {
   ArrowUp,
   Ban,
+  FolderKanban,
   Clock,
   CornerDownLeft,
   Pencil,
@@ -82,7 +83,7 @@ import { MessageRail, type RailTurn } from "./MessageRail.tsx";
 import { clearSearchHighlights, ConversationSearchBar, type CurrentMatch, JumpTracker, opensSearch, paintAndJump, showSearchMatches } from "./ConversationSearch.tsx";
 import { Badge, Button, Collapse, cx, IconButton, Menu, ModelChip, providerName, StatusDot, statusLabel, Tooltip } from "./ui.tsx";
 
-export type PanelKind = "knowledge" | "schedules" | "browser" | "changes";
+export type PanelKind = "knowledge" | "schedules" | "browser" | "changes" | "projects";
 
 const findShortcut = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘F" : "Ctrl+F";
 
@@ -831,12 +832,15 @@ export function SessionView({
   bot,
   panel,
   onTogglePanel,
+  onOpenProject,
 }: {
   session: Session;
   bot: Bot;
   panel: PanelKind | null;
   onTogglePanel: (panel: PanelKind) => void;
+  onOpenProject: (id: ProjectId) => void;
 }) {
+  const project = useApp((s) => (session.projectId ? s.projects.get(session.projectId) : undefined));
   const items = useTranscript(session.id);
   const blocks = useMemo(() => toBlocks(items), [items]);
   // Long chats fold by day: the latest day open, earlier ones folded (each can be toggled).
@@ -1071,6 +1075,19 @@ export function SessionView({
           <div className="flex min-w-0 items-center gap-2 text-[11px] text-zinc-500">
             {!main ? <span className="shrink-0">{bot.name}</span> : null}
             {!main ? <span className="text-zinc-700">/</span> : null}
+            {project ? (
+              <>
+                <button
+                  className="flex shrink-0 items-center gap-1 text-zinc-400 hover:text-zinc-200"
+                  title={project.summary || project.name}
+                  onClick={() => onOpenProject(project.id)}
+                >
+                  <FolderKanban className="size-3" />
+                  {project.name}
+                </button>
+                <span className="text-zinc-700">/</span>
+              </>
+            ) : null}
             {session.worktree ? (
               <Tooltip
                 align="start"
@@ -1169,6 +1186,7 @@ export function SessionView({
               <span className="absolute top-1 right-1 size-1.5 rounded-full bg-emerald-400 ring-2 ring-zinc-950" />
             ) : null}
           </IconButton>
+          <IconButton icon={FolderKanban} label="Projects" active={panel === "projects"} onClick={() => onTogglePanel("projects")} />
           <IconButton icon={Library} label="Memory and skills" active={panel === "knowledge"} onClick={() => onTogglePanel("knowledge")} />
           <Menu
             icon={MoreHorizontal}

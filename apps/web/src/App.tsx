@@ -1,6 +1,6 @@
 import { useBrowserFocus } from "./browserFocus.ts";
 import { showApp, showNotification, watchSeen, watchTurns } from "./turnNotifications.ts";
-import type { Bot, SessionId } from "@apollo/contracts";
+import type { Bot, ProjectId, SessionId } from "@apollo/contracts";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { BotSettingsDialog, NewBotDialog, NewSessionDialog } from "./components/Dialogs.tsx";
 import { BrowserPanel } from "./components/BrowserPanel.tsx";
@@ -10,6 +10,7 @@ import { LocalModelsDialog } from "./components/LocalModelsDialog.tsx";
 import { ProvidersDialog } from "./components/ProvidersDialog.tsx";
 import { SettingsDialog } from "./components/SettingsDialog.tsx";
 import { KnowledgePanel } from "./components/KnowledgePanel.tsx";
+import { ProjectsPanel } from "./components/ProjectsPanel.tsx";
 import { SchedulesPanel } from "./components/SchedulesPanel.tsx";
 import { type PanelKind, SessionView } from "./components/SessionView.tsx";
 import { Sidebar } from "./components/Sidebar.tsx";
@@ -46,10 +47,16 @@ export function App() {
 
   const [selectedId, setSelectedId] = useState<SessionId | null>(null);
   const [dialog, setDialog] = useState<
-    { kind: "bot" } | { kind: "session"; bot: Bot } | { kind: "botSettings"; bot: Bot } | { kind: "devices" } | { kind: "providers" } | { kind: "localModels" } | { kind: "settings" } | null
+    { kind: "bot" } | { kind: "session"; bot: Bot; projectId?: ProjectId | undefined } | { kind: "botSettings"; bot: Bot } | { kind: "devices" } | { kind: "providers" } | { kind: "localModels" } | { kind: "settings" } | null
   >(null);
   const [panel, setPanel] = useState<PanelKind | null>(null);
   const togglePanel = (next: PanelKind) => setPanel((current) => (current === next ? null : next));
+  const [projectFocus, setProjectFocus] = useState<ProjectId | null>(null);
+  const projects = useApp((s) => s.projects);
+  const openProject = (id: ProjectId) => {
+    setProjectFocus(id);
+    setPanel("projects");
+  };
   // An agent handed the browser over and the user asked to see the tab.
   const browserFocus = useBrowserFocus();
   useEffect(() => {
@@ -97,14 +104,18 @@ export function App() {
         selectedId={selectedId}
         onSelect={setSelectedId}
         onNewBot={() => setDialog({ kind: "bot" })}
-        onNewSession={(b) => setDialog({ kind: "session", bot: b })}
+        onNewSession={(b, projectId) => setDialog({ kind: "session", bot: b, projectId })}
+        onOpenProject={(b, projectId) => {
+          if (session?.botId !== b.id) setSelectedId(b.mainSessionId);
+          openProject(projectId);
+        }}
         onBotSettings={(b) => setDialog({ kind: "botSettings", bot: b })}
         onDevices={() => setDialog({ kind: "devices" })}
         onProviders={() => setDialog({ kind: "providers" })}
         onSettings={() => setDialog({ kind: "settings" })}
       />
       {session && bot ? (
-        <SessionView session={session} bot={bot} panel={panel} onTogglePanel={togglePanel} />
+        <SessionView session={session} bot={bot} panel={panel} onTogglePanel={togglePanel} onOpenProject={openProject} />
       ) : (
         <main className="relative flex flex-1 flex-col items-center justify-center gap-4 text-center">
           <div className="app-drag absolute inset-x-0 top-0 h-12" />
@@ -130,6 +141,16 @@ export function App() {
       ) : null}
       {panel === "browser" && bot ? <BrowserPanel bot={bot} onClose={() => setPanel(null)} /> : null}
       {panel === "knowledge" && bot ? <KnowledgePanel bot={bot} onClose={() => setPanel(null)} /> : null}
+      {panel === "projects" && bot ? (
+        <ProjectsPanel
+          bot={bot}
+          focus={projectFocus && projects.get(projectFocus)?.botId === bot.id ? projectFocus : null}
+          onFocus={setProjectFocus}
+          onClose={() => setPanel(null)}
+          onNewSession={(projectId) => setDialog({ kind: "session", bot, projectId })}
+          onOpenSession={setSelectedId}
+        />
+      ) : null}
       {panel === "schedules" && bot ? (
         <SchedulesPanel bot={bot} onClose={() => setPanel(null)} onOpenSession={setSelectedId} />
       ) : null}
@@ -153,6 +174,7 @@ export function App() {
       {dialog?.kind === "session" ? (
         <NewSessionDialog
           bot={dialog.bot}
+          projectId={dialog.projectId ?? null}
           onClose={() => setDialog(null)}
           onCreated={(s) => {
             setDialog(null);
