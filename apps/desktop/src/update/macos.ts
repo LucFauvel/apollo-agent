@@ -50,7 +50,7 @@ const plistValue = async (exec: Exec, app: string, key: string): Promise<string 
 export const verifyFromZip = async (o: {
   readonly zip: string;
   readonly workDir: string;
-  readonly job: Pick<UpdateJob, "version" | "build" | "commit" | "schemaVersion" | "teamId">;
+  readonly job: Pick<UpdateJob, "version" | "build" | "commit" | "schemaVersion" | "teamId" | "channel">;
   readonly exec: Exec;
   readonly files: FileOps;
 }): Promise<string> => {
@@ -73,7 +73,7 @@ export const verifyFromZip = async (o: {
     info = null;
   }
   const problems = stagedProblems(info, job);
-  if (problems.length > 0) throw new Error(`the update is not release ${job.version}: ${problems.join("; ")}`);
+  if (problems.length > 0) throw new Error(`the update is not ${job.channel === "nightly" ? "nightly" : "release"} ${job.version}: ${problems.join("; ")}`);
   const signature = await checkSignature(exec, app, job.teamId);
   if (signature) throw new Error(`the update's code signature is not valid: ${signature}`);
   return app;

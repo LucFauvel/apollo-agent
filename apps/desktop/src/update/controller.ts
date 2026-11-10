@@ -10,6 +10,9 @@
  *   swaps, relaunches, checks health, rolls back if needed → the next Apollo to start reads
  *   the outcome (reconcile) and never re-offers a build that was rolled back.
  *
+ * Channels: stable releases by default; "Follow Nightly Builds" (or running a nightly build)
+ * also looks at nightlies, verified with their own key (check.ts). The choice is in state.json.
+ *
  * macOS updates in place. Windows (P1) checks the same signed manifest, then sends the user to
  * the release page to run the installer: `applyStrategy` is where a silent NSIS hand-off goes.
  */
@@ -23,10 +26,11 @@ import { launchEnv, realFileOps } from "../install/lib.ts";
 import { checkForUpdate, type CheckResult, type Offer } from "./check.ts";
 import { downloadVerified } from "./github.ts";
 import { bundlesFor, classifyOutcome, JOB_FORMAT, parseJob, parseProgress, summarizeResult, type UpdateJob } from "./helperCore.ts";
-import { RELEASES_REPO, TEAM_ID, trustedKeys, type TrustedKeys } from "./keys.ts";
+import { nightlyTrustedKeys, RELEASES_REPO, TEAM_ID, trustedKeys, type TrustedKeys } from "./keys.ts";
+import type { UpdateChannel } from "./manifestFormat.ts";
 import { realExec, verifyFromZip } from "./macos.ts";
 import type { RunningBuild } from "./policy.ts";
-import { afterCheck, nextCheckAt, parseState, type UpdaterState, withSkipped } from "./state.ts";
+import { afterCheck, followedChannel, nextCheckAt, parseState, type UpdaterState, withSkipped } from "./state.ts";
 
 export type UpdatePhase =
   | { readonly kind: "idle" }
@@ -49,6 +53,7 @@ export interface UpdaterOptions {
   /** How many bots are mid-turn now (the update waits for them). */
   readonly busyBots: () => number;
   readonly keys?: TrustedKeys;
+  readonly nightlyKeys?: TrustedKeys;
 }
 
 /** Whether the update helper waits for busy bots before giving up (Apollo then stays as it is). */
@@ -100,6 +105,7 @@ const copyJs = (from: string, to: string) => {
 export class Updater {
   readonly #o: UpdaterOptions;
   readonly #keys: TrustedKeys;
+  readonly #nightlyKeys: TrustedKeys;
   readonly #dir: string;
   #phase: UpdatePhase = { kind: "idle" };
   #state: UpdaterState;
@@ -120,6 +126,13 @@ export class Updater {
       keys = { configured: false, reason: message(error) };
     }
     this.#keys = keys;
+    let nightly: TrustedKeys;
+    try {
+      nightly = o.nightlyKeys ?? nightlyTrustedKeys(undefined, keys);
+    } catch (error) {
+      nightly = { configured: false, reason: message(error) };
+    }
+    this.#nightlyKeys = nightly;
     // parseState never throws; runningBuild reads only exact types.
     this.#state = parseState(this.#read("state.json"));
     let running: RunningBuild | null = null;
@@ -149,6 +162,56 @@ export class Updater {
     return this.#phase.kind === "idle" || this.#phase.kind === "available";
   }
 
+  /** The channel checks follow now. */
+  get channel(): UpdateChannel {
+    return followedChannel(this.#state, this.#running?.channel ?? null, this.#keys.configured && this.#nightlyKeys.configured);
+  }
+
+  /** Whether "Follow Nightly Builds" can be turned on in this build (it embeds a nightly key). */
+  nightlyAvailable(): boolean {
+    return this.#keys.configured && this.#nightlyKeys.configured;
+  }
+
+  /**
+   * The "Follow Nightly Builds" menu checkbox was toggled. Turning it on asks first (nightlies
+   * ship without a human review) and then checks right away; turning it off never downgrades:
+   * the next stable release is offered once it is newer than the build installed.
+   */
+  async setFollowNightly(on: boolean): Promise<void> {
+    try {
+      if (on === (this.channel === "nightly")) return;
+      if (on) {
+        if (!this.nightlyAvailable()) {
+          const why = !this.#keys.configured ? this.#keys.reason : !this.#nightlyKeys.configured ? this.#nightlyKeys.reason : "";
+          await this.#info("Nightly builds are not available", `This build of Apollo can't verify nightly builds: ${why}.`);
+          return;
+        }
+        const { response } = await dialog.showMessageBox({
+          type: "warning",
+          message: "Follow nightly builds?",
+          detail:
+            "Nightly builds are made from every change to Apollo's main branch. They pass the automated tests, but nobody reviews them before they ship, and they can break things. " +
+            "They are signed with a separate nightly key that can never sign a stable release.\n\n" +
+            "Apollo then offers whichever is newer: the latest nightly or the latest stable release. " +
+            "If you turn this off later, Apollo does not go back to an older version: it waits until a stable release is newer than the build you have.",
+          buttons: ["Follow Nightly Builds", "Cancel"],
+          defaultId: 1,
+          cancelId: 1,
+        });
+        if (response !== 0) return;
+      }
+      this.#saveState({ ...this.#state, channel: on ? "nightly" : "release" });
+      log(`following ${this.channel} builds`);
+      // An offer from the channel just left is withdrawn.
+      if (this.#phase.kind === "available" && this.#phase.offer.manifest.channel !== this.channel) this.#setPhase({ kind: "idle" });
+      if (on) void this.check(true);
+      else if (this.#automatic) this.#schedule(false);
+    } finally {
+      // The checkbox reflects the saved choice, also when the dialog was cancelled.
+      this.#o.onChange();
+    }
+  }
+
   /** Background checks only when everything needed is there: keys, a packaged app, a build number. */
   get #automatic(): boolean {
     return this.#keys.configured && this.#o.isPackaged && this.#running?.build != null && (process.platform === "darwin" || process.platform === "win32");
@@ -159,6 +222,8 @@ export class Updater {
     try {
       if (!this.#keys.configured) log(`inert: ${this.#keys.reason}`);
       else for (const note of this.#keys.notes) log(note);
+      if (!this.#nightlyKeys.configured) log(`nightly channel unavailable: ${this.#nightlyKeys.reason}`);
+      log(`following ${this.channel} builds`);
       this.#reconcile();
       if (this.#automatic) this.#schedule(true);
     } catch (error) {
@@ -216,13 +281,15 @@ export class Updater {
     const result = await checkForUpdate({
       fetchFn: (input, init) => fetch(input, init),
       keys: this.#keys,
+      channel: this.channel,
+      nightlyKeys: this.#nightlyKeys,
       running: this.#running!,
       teamId: TEAM_ID,
       skipped: this.#state.skipped,
       dbSchema: dbSchema(join(this.#o.dataDir, "apollo.db")),
       now: Date.now(),
     });
-    log(`check: ${result.kind}${result.kind === "refused" ? ` (${result.reason})` : result.kind === "error" ? ` (${result.message})` : result.kind === "available" ? ` ${result.offer.manifest.version}` : ""}`);
+    log(`check (${this.channel}): ${result.kind}${result.kind === "refused" ? ` (${result.reason})` : result.kind === "error" ? ` (${result.message})` : result.kind === "available" ? ` ${result.offer.manifest.version}` : ""}`);
     this.#saveState(afterCheck(this.#state, result, Date.now()));
     this.#setPhase(result.kind === "available" ? { kind: "available", offer: result.offer } : previous.kind === "available" && result.kind === "error" ? previous : { kind: "idle" });
     if (this.#automatic) this.#schedule(false);
@@ -237,9 +304,9 @@ export class Updater {
       case "not-configured":
         return this.#info("Updates are not configured yet", r.reason);
       case "no-release":
-        return this.#info("No release yet", `No stable release of Apollo has been published yet. You have ${current}.`);
+        return this.#info("No release yet", `No ${this.channel === "nightly" ? "nightly build or stable release" : "stable release"} of Apollo has been published yet. You have ${current}.`);
       case "up-to-date":
-        return this.#info("Apollo is up to date", `You have ${current}${r.latest ? `; the latest release is ${r.latest}` : ""}.`);
+        return this.#info("Apollo is up to date", `You have ${current}${r.latest ? `; the latest ${this.channel === "nightly" ? "build" : "release"} is ${r.latest}` : ""}.`);
       case "skipped":
         return this.#info("No update offered", `Apollo ${r.version} failed its health check on this computer and was rolled back, so it is not offered again. The next release will be.`);
       case "rate-limited":
@@ -283,13 +350,14 @@ export class Updater {
 
   async #offer(offer: Offer) {
     const m = offer.manifest;
+    const nightly = m.channel === "nightly" ? " (nightly build)" : "";
     const strategy = this.#applyStrategy();
     const page = `https://github.com/${RELEASES_REPO}/releases/tag/${encodeURIComponent(offer.release.tag)}`;
     const notes = m.notes.trim() ? `\n\n${m.notes.trim().slice(0, 1500)}` : "";
     if (strategy.kind === "manual") {
       const { response } = await dialog.showMessageBox({
         type: "info",
-        message: `Apollo ${m.version} is available`,
+        message: `Apollo ${m.version} is available${nightly}`,
         detail: `You have ${this.#running?.version}. ${strategy.why}${notes}`,
         buttons: ["Open Download Page", "Later"],
         defaultId: 0,
@@ -301,7 +369,7 @@ export class Updater {
     const busy = this.#o.busyBots();
     const { response } = await dialog.showMessageBox({
       type: "info",
-      message: `Apollo ${m.version} is available`,
+      message: `Apollo ${m.version} is available${nightly}`,
       detail:
         `You have ${this.#running?.version}. Apollo downloads ${Math.round(offer.asset.size / 1e6)} MB, checks it, then restarts into the new version. ` +
         `If the new version doesn't start properly, Apollo goes back to this one.` +
@@ -328,6 +396,7 @@ export class Updater {
       build: m.build,
       commit: m.commit,
       schemaVersion: m.schemaVersion,
+      channel: m.channel === "nightly" ? "nightly" : "release",
       bundles: bundlesFor(target),
       dataDir: this.#o.dataDir,
       resultPath: join(this.#dir, "last-result.json"),

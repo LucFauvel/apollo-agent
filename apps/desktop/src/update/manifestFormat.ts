@@ -13,6 +13,18 @@ export const SIGNATURE_NAME = `${MANIFEST_NAME}.minisig`;
 export const SUMS_NAME = "SHA256SUMS";
 export const MANIFEST_FORMAT = 2;
 
+/** The channels the updater can follow: stable releases, or nightlies (which also take newer stable releases). */
+export type UpdateChannel = "release" | "nightly";
+
+/**
+ * Nightlies are published as prereleases tagged `nightly-<version>` (never `v*`, which is the
+ * release tag namespace and triggers release builds), signed with the separate nightly key.
+ */
+export const NIGHTLY_TAG_PREFIX = "nightly-";
+
+/** The one GitHub Release tag a manifest of `channel` and `version` may come from. */
+export const releaseTagFor = (channel: UpdateChannel, version: string): string => (channel === "release" ? `v${version}` : `${NIGHTLY_TAG_PREFIX}${version}`);
+
 export type Platform = "darwin" | "win32";
 export type AssetKind = "zip" | "dmg" | "nsis";
 

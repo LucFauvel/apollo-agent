@@ -6,9 +6,12 @@
  * Rules:
  *  - The trusted comment is exactly `apollo-update version=… build=… commit=…` and agrees with
  *    the manifest (it is what binds the signature to that version, build and commit).
- *  - Only `release` manifests, from the release whose tag is `v<version>`, are ever offered.
- *    A release-channel app takes nothing else; a nightly (or local) app takes a release only
- *    when its build is strictly newer.
+ *  - A manifest is offered only for the channel it was looked up on (`DecideOptions.channel`,
+ *    which also decided the key that verified it, check.ts): a `release` manifest from the
+ *    release tagged `v<version>`, or a `nightly` manifest from the prerelease tagged
+ *    `nightly-<version>`. Which channels are looked up depends on what the user follows, not
+ *    on the running build's own channel: a build of any channel takes a newer stable release,
+ *    and nightlies only when the user follows them.
  *  - Never a downgrade: offered only when `manifest.build` > the running `bundleVersion`. An app
  *    without a bundleVersion (a local build) is never updated.
  *  - Never a schema downgrade: the manifest's `schemaVersion` must be ≥ the running build's, and
@@ -17,7 +20,7 @@
  *    on macOS it is the zip, Developer ID-signed by the pinned team.
  */
 import { checkSchema } from "../install/lib.ts";
-import { expectedAssetName, type Manifest, type ManifestAsset, type Channel } from "./manifestFormat.ts";
+import { expectedAssetName, type Manifest, type ManifestAsset, type Channel, releaseTagFor, type UpdateChannel } from "./manifestFormat.ts";
 
 /** Largest asset the updater will download (the macOS zip is ~200 MB today). */
 export const MAX_ASSET_BYTES = 2 * 1024 ** 3;
@@ -80,7 +83,9 @@ export type Decision =
   | { readonly kind: "refuse"; readonly reason: string };
 
 export interface DecideOptions {
-  /** The GitHub release's tag (must be `v<manifest.version>`). */
+  /** The channel this manifest was looked up (and its signature verified) for. */
+  readonly channel: UpdateChannel;
+  /** The GitHub release's tag (must be releaseTagFor(channel, manifest.version)). */
   readonly tag: string;
   readonly teamId: string;
   /** Builds rolled back after a failed post-update health check. */
@@ -95,8 +100,8 @@ export const UPDATE_KIND: Partial<Record<NodeJS.Platform, ManifestAsset["kind"]>
 /** Whether `m` (signature verified, comment checked) may be offered to `running`, and with which asset. */
 export const decide = (m: Manifest, running: RunningBuild, o: DecideOptions): Decision => {
   if (running.build === null) return { kind: "refuse", reason: "this build has no build number (a local build), so it is never updated automatically" };
-  if (m.channel !== "release") return { kind: "refuse", reason: `the release manifest is for the ${m.channel} channel` };
-  if (o.tag !== `v${m.version}`) return { kind: "refuse", reason: `the manifest (version ${m.version}) does not belong to release ${o.tag}` };
+  if (m.channel !== o.channel) return { kind: "refuse", reason: `the ${o.channel} manifest is for the ${m.channel} channel` };
+  if (o.tag !== releaseTagFor(o.channel, m.version)) return { kind: "refuse", reason: `the manifest (version ${m.version}) does not belong to release ${o.tag}` };
   if (m.build <= running.build) return { kind: "up-to-date" };
   if (o.skipped.includes(m.build)) return { kind: "skipped", build: m.build };
   if (typeof m.schemaVersion !== "number" || !Number.isSafeInteger(m.schemaVersion) || m.schemaVersion < running.schemaVersion) {

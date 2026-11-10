@@ -69,7 +69,7 @@ describe("permanent skips", () => {
     for (let build = 500; build <= 1500; build++) s = withSkipped(s, build, running.build);
     s = roundTrip(s);
     for (const build of [500, 501, 1000, 1500]) {
-      expect(decide(manifest({ build }), running, { tag: "v1.3.0", teamId: TEAM, skipped: s.skipped, dbSchema: 20 }).kind, String(build)).toBe("skipped");
+      expect(decide(manifest({ build }), running, { channel: "release", tag: "v1.3.0", teamId: TEAM, skipped: s.skipped, dbSchema: 20 }).kind, String(build)).toBe("skipped");
     }
   });
 
@@ -81,6 +81,6 @@ describe("permanent skips", () => {
   it("drops only skips the running build has reached, which the policy can never offer again", () => {
     const s = withSkipped(withSkipped(EMPTY_STATE, 500, 400), 600, 400);
     expect(withSkipped(s, 700, 550).skipped).toEqual([600, 700]);
-    expect(decide(manifest({ build: 500 }), { ...running, build: 550 }, { tag: "v1.3.0", teamId: TEAM, skipped: [600, 700], dbSchema: 20 }).kind).toBe("up-to-date");
+    expect(decide(manifest({ build: 500 }), { ...running, build: 550 }, { channel: "release", tag: "v1.3.0", teamId: TEAM, skipped: [600, 700], dbSchema: 20 }).kind).toBe("up-to-date");
   });
 });

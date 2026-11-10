@@ -27,7 +27,7 @@ import { isInstallerPid } from '../install/mac.ts';
 
 const temp = () => mkdtempSync(join(tmpdir(), 'updater-probe-'));
 const running = { version:'1.2.0', channel:'release' as const, build:400, schemaVersion:20, platform:'darwin' as const, arch:'arm64', osVersion:'15.0' };
-const opts = {tag:'v1.3.0', teamId:TEAM, skipped:[], dbSchema:20};
+const opts = {channel:'release' as const, tag:'v1.3.0', teamId:TEAM, skipped:[], dbSchema:20};
 const kp = generateKeyPairSync('ed25519');
 const id = randomBytes(8);
 const pub = parsePublicKey(Buffer.concat([Buffer.from('Ed'), id, Buffer.from(kp.publicKey.export({format:'jwk'}).x!, 'base64url')]).toString('base64'));

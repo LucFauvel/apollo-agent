@@ -22,6 +22,7 @@
 import { dirname, join } from "node:path";
 import { TIMING, type Deps, type Proc } from "../install/engine.ts";
 import type { BuildInfo, Bundles, FileOps, LaunchAttempt, LaunchStrategy, SqliteOps } from "../install/lib.ts";
+import type { UpdateChannel } from "./manifestFormat.ts";
 
 export const JOB_FORMAT = 1;
 
@@ -33,6 +34,8 @@ export interface UpdateJob {
   readonly build: number;
   readonly commit: string;
   readonly schemaVersion: number;
+  /** The signed manifest's channel; absent (jobs written before nightlies existed) = release. */
+  readonly channel?: UpdateChannel;
   readonly bundles: Bundles;
   /** The verified Apollo.app the app unpacked, in its private `<userData>/updates/work/` directory. */
   readonly source: string;
@@ -67,6 +70,7 @@ export const parseJob = (text: string): UpdateJob => {
   if (!Number.isSafeInteger(j.build) || j.build! < 1) fail("build");
   if (typeof j.commit !== "string" || !/^[0-9a-f]{40}$/.test(j.commit)) fail("commit");
   if (!Number.isSafeInteger(j.schemaVersion)) fail("schemaVersion");
+  if (j.channel !== undefined && j.channel !== "release" && j.channel !== "nightly") fail("channel");
   const target = j.bundles?.target;
   if (typeof target !== "string" || !target.startsWith("/") || !target.endsWith("/Apollo.app")) fail("bundles.target");
   // Only the four fixed names next to the app: the job can never point the swap anywhere else.
@@ -87,7 +91,7 @@ const ownProperty = (o: unknown, key: string): unknown => {
 };
 
 /** Every way the staged bundle's build-info.json disagrees with the job (the signed manifest). */
-export const stagedProblems = (info: unknown, job: Pick<UpdateJob, "version" | "build" | "commit" | "schemaVersion">): Array<string> => {
+export const stagedProblems = (info: unknown, job: Pick<UpdateJob, "version" | "build" | "commit" | "schemaVersion" | "channel">): Array<string> => {
   // The bundle's metadata is untrusted input: own data properties of exact types only, never
   // coerced (an object with `toString: null` must not throw), and never a throw out of here.
   try {
@@ -98,7 +102,7 @@ export const stagedProblems = (info: unknown, job: Pick<UpdateJob, "version" | "
       ["version", job.version],
       ["bundleVersion", String(job.build)],
       ["schemaVersion", job.schemaVersion],
-      ["channel", "release"],
+      ["channel", job.channel ?? "release"],
     ];
     return expected.flatMap(([key, want]) => {
       const got = ownProperty(info, key);

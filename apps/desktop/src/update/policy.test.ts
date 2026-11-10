@@ -3,7 +3,7 @@ import { commentProblems, compareOsVersions, decide, type DecideOptions, parseTr
 import { COMMIT, comment, manifest, TEAM } from "./testing/fixtures.ts";
 
 const mac: RunningBuild = { version: "1.2.0", channel: "release", build: 400, schemaVersion: 20, platform: "darwin", arch: "arm64", osVersion: "15.3.1" };
-const opts: DecideOptions = { tag: "v1.3.0", teamId: TEAM, skipped: [], dbSchema: 20 };
+const opts: DecideOptions = { channel: "release", tag: "v1.3.0", teamId: TEAM, skipped: [], dbSchema: 20 };
 
 describe("trusted comment", () => {
   it("parses exactly CI's format", () => {

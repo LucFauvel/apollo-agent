@@ -1,6 +1,6 @@
 /**
- * Anonymous reads of the public repository's latest GitHub Release, and downloads of its
- * assets. Nothing fetched here is trusted by itself: the manifest is trusted only after its
+ * Anonymous reads of the public repository's latest GitHub Release (and, for the nightly channel,
+ * its newest `nightly-*` prerelease), and downloads of their assets. Nothing fetched here is trusted by itself: the manifest is trusted only after its
  * minisign signature verifies, and an asset only after its size and SHA-256 match that manifest.
  * GitHub's own asset `digest` is a cross-check, never a source of trust.
  *
@@ -9,6 +9,7 @@
 import { createHash } from "node:crypto";
 import { closeSync, openSync, writeSync } from "node:fs";
 import { RELEASES_REPO } from "./keys.ts";
+import { NIGHTLY_TAG_PREFIX } from "./manifestFormat.ts";
 
 export type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -16,6 +17,8 @@ export type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 export const USER_AGENT = "Apollo-Desktop-Updater";
 
 export const latestReleaseUrl = (repo = RELEASES_REPO) => `https://api.github.com/repos/${repo}/releases/latest`;
+/** The newest releases first (GitHub orders by creation); drafts are not listed anonymously. */
+export const releasesListUrl = (repo = RELEASES_REPO) => `https://api.github.com/repos/${repo}/releases?per_page=30`;
 export const releasesPageUrl = (repo = RELEASES_REPO) => `https://github.com/${repo}/releases`;
 
 export interface ReleaseAsset {
@@ -61,7 +64,7 @@ export const expectedAssetUrl = (tag: string, name: string, repo = RELEASES_REPO
 
 export type LatestRelease =
   | { readonly kind: "ok"; readonly release: Release }
-  /** No published (non-draft, non-prerelease) release yet. */
+  /** Nothing published for that channel yet (no stable release / no nightly in the list). */
   | { readonly kind: "none" }
   | { readonly kind: "rate-limited"; readonly retryAt: number };
 
@@ -74,18 +77,41 @@ export const retryAt = (headers: Headers, now: number): number => {
   return now + 60 * 60_000;
 };
 
-export const fetchLatestRelease = async (fetchFn: Fetch, now: number, repo = RELEASES_REPO): Promise<LatestRelease> => {
-  const response = await fetchFn(latestReleaseUrl(repo), {
+const apiGet = (fetchFn: Fetch, url: string) =>
+  fetchFn(url, {
     headers: { accept: "application/vnd.github+json", "user-agent": USER_AGENT, "x-github-api-version": "2022-11-28" },
     signal: AbortSignal.timeout(20_000),
     redirect: "follow",
   });
+
+const rateLimited = (response: Response) => response.status === 429 || (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0");
+
+export const fetchLatestRelease = async (fetchFn: Fetch, now: number, repo = RELEASES_REPO): Promise<LatestRelease> => {
+  const response = await apiGet(fetchFn, latestReleaseUrl(repo));
   if (response.status === 404) return { kind: "none" };
-  if (response.status === 429 || (response.status === 403 && response.headers.get("x-ratelimit-remaining") === "0")) {
-    return { kind: "rate-limited", retryAt: retryAt(response.headers, now) };
-  }
+  if (rateLimited(response)) return { kind: "rate-limited", retryAt: retryAt(response.headers, now) };
   if (!response.ok) throw new Error(`GitHub answered ${response.status}`);
   return { kind: "ok", release: parseRelease(await response.json()) };
+};
+
+/**
+ * The newest published nightly: the first `nightly-*` prerelease in GitHub's newest-first
+ * list. Which one is picked does not matter for trust (its signed manifest decides), only for
+ * freshness. `none` when the list holds no nightly.
+ */
+export const fetchLatestNightly = async (fetchFn: Fetch, now: number, repo = RELEASES_REPO): Promise<LatestRelease> => {
+  const response = await apiGet(fetchFn, releasesListUrl(repo));
+  if (response.status === 404) return { kind: "none" };
+  if (rateLimited(response)) return { kind: "rate-limited", retryAt: retryAt(response.headers, now) };
+  if (!response.ok) throw new Error(`GitHub answered ${response.status}`);
+  const json: unknown = await response.json();
+  if (!Array.isArray(json)) throw new Error("the release list is not a list");
+  for (const entry of json) {
+    // Only nightly-tagged prereleases are parsed: anything else in the list is not ours to judge.
+    if (!isObject(entry) || typeof entry.tag_name !== "string" || !entry.tag_name.startsWith(NIGHTLY_TAG_PREFIX) || entry.draft !== false || entry.prerelease !== true) continue;
+    return { kind: "ok", release: parseRelease(entry) };
+  }
+  return { kind: "none" };
 };
 
 /** Reads a response body, failing as soon as it is longer than `maxBytes`. */
