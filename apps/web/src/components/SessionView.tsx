@@ -71,7 +71,7 @@ import { HandoffItem } from "./HandoffItem.tsx";
 import { MessageAttachments, PendingAttachments, useAttachments } from "./Attachments.tsx";
 import { RecordingItem } from "./RecordingItem.tsx";
 import { FullDiff } from "./FullDiff.tsx";
-import { ContextMeter, parseCommand, SlashMenu, useSlashCommands } from "./SlashCommands.tsx";
+import { ContextMeter, parseCommand, UsageLimitsMeter, SlashMenu, useSlashCommands } from "./SlashCommands.tsx";
 import { VisualItem } from "./VisualItem.tsx";
 import { MonitorStrip } from "./MonitorStrip.tsx";
 import { ConversationBar, ConversationButton, DictateButton, ReadAloudButton, useConversation } from "./Voice.tsx";
@@ -653,6 +653,9 @@ function Composer({
             <ConversationButton session={session} disabled={waitingFor !== null} />
             <ModelChip provider={session.provider} model={modelLabel ?? providerName(session.provider)} effort={session.effort} className="px-1.5 text-zinc-500" />
             <span className="flex-1" />
+            {session.limits && session.limits.meters.length > 0 ? (
+              <UsageLimitsMeter limits={session.limits} provider={providerName(session.provider)} />
+            ) : null}
             {session.context && session.context.window > 0 ? <ContextMeter context={session.context} /> : null}
             <span className="hidden text-[11px] text-zinc-600 sm:inline">
               <kbd className="font-sans">Enter</kbd> to send · <kbd className="font-sans">Shift+Enter</kbd> for a new line

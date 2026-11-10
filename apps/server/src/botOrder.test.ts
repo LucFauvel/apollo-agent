@@ -76,7 +76,9 @@ const collect = (manager: Manager) =>
 describe("bot order", () => {
   it("the migration keeps existing bots in the order they were shown (creation order)", () => {
     const path = join(mkdtempSync(join(tmpdir(), "apollo-bot-order-db-")), "apollo.db");
-    const before = Database.MIGRATIONS.length - 1;
+    // The database as it was just before the bot-order migration (later ones may follow it).
+    const before = Database.MIGRATIONS.findIndex((m) => m.includes("add column position"));
+    expect(before).toBeGreaterThan(0);
     const db = new DatabaseSync(path);
     for (let v = 0; v < before; v++) db.exec(Database.MIGRATIONS[v]!);
     db.exec(`pragma user_version = ${before}`);

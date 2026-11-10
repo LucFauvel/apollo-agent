@@ -8,6 +8,8 @@ import { createInterface } from "node:readline";
 const send = (message) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
 const pending = new Map();
 let nextId = 1000;
+// Each read of the account's rate limits finds 10% more of the 5-hour window used.
+let limitReads = 0;
 const request = (method, params) =>
   new Promise((resolve) => {
     const id = nextId++;
@@ -50,6 +52,19 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
               nextCursor: "page-2",
             },
       });
+    }
+    case "account/rateLimits/read": {
+      limitReads++;
+      const snapshot = {
+        limitId: "codex",
+        limitName: null,
+        primary: { usedPercent: 10 * limitReads, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+        secondary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: null },
+        credits: null,
+        individualLimit: null,
+        planType: "plus",
+      };
+      return send({ id: msg.id, result: { rateLimits: snapshot, rateLimitsByLimitId: { codex: snapshot } } });
     }
     case "thread/start":
     case "thread/resume":
@@ -114,6 +129,8 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
         method: "thread/tokenUsage/updated",
         params: { threadId: "thread-1", turnId: "turn-1", tokenUsage: { total: breakdown, last: breakdown, modelContextWindow: null } },
       });
+      // Sparse, as Codex sends it: the client re-reads the whole snapshot.
+      send({ method: "account/rateLimits/updated", params: { rateLimits: { limitId: "codex", primary: { usedPercent: 99 } } } });
       return send({
         method: "turn/completed",
         params: { threadId: "thread-1", turn: { ...turn, status: "completed" } },

@@ -98,6 +98,7 @@ const toSession = (r: Row): Session => ({
   cwd: r.cwd as string,
   worktree: r.worktree ? (JSON.parse(r.worktree as string) as SessionWorktree) : null,
   context: r.context ? (JSON.parse(r.context as string) as Session["context"]) : null,
+  limits: r.limits ? (JSON.parse(r.limits as string) as Session["limits"]) : null,
   status: r.status as SessionStatus,
   resumeId: (r.resume_id as string | null) ?? null,
   lastMessage: (r.last_message as string | null) ?? null,
@@ -204,6 +205,7 @@ export interface SessionPatch {
   readonly cwd?: string;
   readonly worktree?: SessionWorktree | null;
   readonly context?: Session["context"];
+  readonly limits?: Session["limits"];
 }
 
 /**
@@ -389,7 +391,7 @@ const makeStore = (db: DatabaseSync) => {
         const next: Session = { ...current, ...patch, updatedAt: Date.now() };
         run(
           `update sessions set title = ?, status = ?, resume_id = ?, last_message = ?, model = ?,
-             effort = ?, runtime_mode = ?, updated_at = ?, cwd = ?, worktree = ?, context = ? where id = ?`,
+             effort = ?, runtime_mode = ?, updated_at = ?, cwd = ?, worktree = ?, context = ?, limits = ? where id = ?`,
           next.title,
           next.status,
           next.resumeId,
@@ -401,6 +403,7 @@ const makeStore = (db: DatabaseSync) => {
           next.cwd,
           next.worktree ? JSON.stringify(next.worktree) : null,
           next.context ? JSON.stringify(next.context) : null,
+          next.limits ? JSON.stringify(next.limits) : null,
           id,
         );
         return next;

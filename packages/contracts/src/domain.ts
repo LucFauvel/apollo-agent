@@ -77,6 +77,35 @@ export const Usage = Schema.Struct({
 });
 export type Usage = typeof Usage.Type;
 
+/**
+ * One of a provider's plan meters (a usage window or spend cap), exactly as the provider
+ * reported it. Apollo never estimates these: a provider that exposes none has none.
+ */
+export const UsageMeter = Schema.Struct({
+  /** What it limits, worded for display: "Session (5 h)", "Weekly", "Weekly · Fable", "Spend limit". */
+  label: Schema.String,
+  /** Share of the meter used, 0-100. */
+  usedPercent: Schema.Number,
+  /** When it resets, if the provider says. */
+  resetsAt: Schema.NullOr(Timestamp),
+  /** The provider's own grading of it ("normal", "warning", "critical"), if it gives one. */
+  severity: Schema.NullOr(Schema.String),
+  /** The provider picked this one as the meter a single indicator shows. */
+  headline: Schema.Boolean,
+});
+export type UsageMeter = typeof UsageMeter.Type;
+
+/** A session's provider plan meters, and when they were read. */
+export const UsageLimits = Schema.Struct({
+  meters: Schema.Array(UsageMeter),
+  at: Timestamp,
+});
+export type UsageLimits = typeof UsageLimits.Type;
+
+/** The meter a single indicator shows: the provider's pick, else the fullest. */
+export const headlineMeter = (meters: ReadonlyArray<UsageMeter>): UsageMeter | null =>
+  meters.find((m) => m.headline) ?? meters.reduce<UsageMeter | null>((max, m) => (max && max.usedPercent >= m.usedPercent ? max : m), null);
+
 export const EMPTY_USAGE: Usage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, costUsd: 0 };
 
 /** "$12.34" for a dollar or more; two significant digits below ("$0.0034"). */
@@ -235,6 +264,8 @@ export const Session = Schema.Struct({
   worktree: Schema.NullOr(SessionWorktree),
   /** How full the model's context window was after the last turn, when the provider reports it. */
   context: Schema.NullOr(Schema.Struct({ used: Schema.Number, window: Schema.Number })),
+  /** How much of the provider plan's usage is left, for providers that expose their meters. */
+  limits: Schema.NullOr(UsageLimits),
   status: SessionStatus,
   /** Provider-native id used to resume the conversation (Claude session id / Codex thread id). */
   resumeId: Schema.NullOr(Schema.String),

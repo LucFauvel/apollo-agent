@@ -3,7 +3,7 @@ import type { AgentEvent, ApprovalDecision, InputResponse } from "@apollo/contra
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
-import { makeCodexProvider } from "../src/CodexProvider.ts";
+import { codexUsageMeters, makeCodexProvider } from "../src/CodexProvider.ts";
 import type { ProviderEmission, ProviderSession } from "../src/Provider.ts";
 
 const fakeCodex = fileURLToPath(new URL("./fixtures/fake-codex.mjs", import.meta.url));
@@ -66,6 +66,54 @@ const fill = (response: InputResponse) => (session: ProviderSession, request: Pe
   session.respondInput(request.requestId, response);
 
 describe("CodexProvider", () => {
+  it.live("reads the plan's usage meters when it opens, and again when Codex says they moved", () =>
+    Effect.gen(function* () {
+      const limits: Array<ReadonlyArray<unknown>> = [];
+      const twice = yield* Deferred.make<void>();
+      let session: ProviderSession | undefined;
+      session = yield* makeCodexProvider({ executable: fakeCodex }).open(
+        { cwd: process.cwd(), model: null, effort: null, resumeId: null, instructions: "", runtimeMode: "full-access", mcp: null, skillsPluginDir: null },
+        (emission) =>
+          Effect.gen(function* () {
+            if (emission._tag === "Event" && emission.event._tag === "ApprovalRequested") {
+              if (session) yield* Effect.ignore(session.respondApproval(emission.event.requestId, "accept"));
+            }
+            if (emission._tag !== "UsageLimits") return;
+            limits.push(emission.meters);
+            if (limits.length === 2) yield* Deferred.succeed(twice, undefined);
+          }),
+      );
+      yield* session.send("hi");
+      yield* Deferred.await(twice).pipe(Effect.timeout("5 seconds"));
+      expect(limits[0]).toEqual([
+        { label: "5-hour", usedPercent: 10, resetsAt: 1_800_000_000_000, severity: null, headline: false },
+        { label: "Weekly", usedPercent: 40, resetsAt: null, severity: null, headline: false },
+      ]);
+      // The sparse update is not taken as is (it would drop the weekly window): Codex is asked again.
+      expect(limits[1]).toEqual([
+        { label: "5-hour", usedPercent: 20, resetsAt: 1_800_000_000_000, severity: null, headline: false },
+        { label: "Weekly", usedPercent: 40, resetsAt: null, severity: null, headline: false },
+      ]);
+    }).pipe(Effect.scoped),
+  );
+
+  it("maps Codex rate-limit snapshots to meters, and has none for an account without them", () => {
+    expect(codexUsageMeters({})).toEqual([]);
+    expect(codexUsageMeters({ rateLimits: { limitId: "codex", primary: null, secondary: null, individualLimit: null } })).toEqual([]);
+    expect(
+      codexUsageMeters({
+        rateLimits: { limitId: "codex" },
+        rateLimitsByLimitId: {
+          codex: { limitId: "codex", primary: null, secondary: null, individualLimit: { limit: "10000", used: "754", remainingPercent: 92, resetsAt: 1_796_083_201 } },
+          other: { limitId: "other", limitName: "GPT Spark", primary: { usedPercent: 5, windowDurationMins: 1440, resetsAt: null }, secondary: null, individualLimit: { remainingPercent: 92, resetsAt: 1_796_083_201 } },
+        },
+      }),
+    ).toEqual([
+      { label: "Spend limit", usedPercent: 8, resetsAt: 1_796_083_201_000, severity: null, headline: false },
+      { label: "Daily · GPT Spark", usedPercent: 5, resetsAt: null, severity: null, headline: false },
+    ]);
+  });
+
   it.live("shows a subagent's steps under it, without taking over the session's turn", () =>
     Effect.gen(function* () {
       const { events, tags } = yield* runTurn("use a subagent", approve("accept"));
