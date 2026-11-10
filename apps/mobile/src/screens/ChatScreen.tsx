@@ -43,6 +43,7 @@ import {
 import { useApollo } from "../AppState.tsx";
 import { BlobAvatar } from "../BlobAvatar.tsx";
 import { Markdown } from "../Markdown.tsx";
+import { ModelMenu } from "../ModelPicker.tsx";
 import { MonitorStrip } from "../MonitorStrip.tsx";
 import { ArtifactCard, MessageAttachments, RecordingCard, VisualCard } from "../PageCards.tsx";
 import { ActivityGroup } from "../Activity.tsx";
@@ -639,35 +640,42 @@ export function ChatScreen({
           </View>
         </FadeIn>
       ) : null}
-      <View style={styles.composer}>
-        <MicButton
-          disabled={talking}
-          onError={setError}
-          onText={(spoken) => setText((current) => (current.trim() ? `${current.trimEnd()} ${spoken}` : spoken))}
-        />
-        <TextInput
-          style={styles.input}
-          value={text}
-          onChangeText={setText}
-          placeholder={`Message ${bot?.name ?? "Apollo"}…`}
-          placeholderTextColor={colors.faint}
-          multiline
-        />
-        {working ? (
-          <Pressable
-            style={[styles.sendButton, styles.stop]}
-            onPress={() => act((c) => c["sessions.interrupt"]({ sessionId }))}
-          >
-            <SquareIcon size={14} color={colors.textSoft} />
-          </Pressable>
+      <View style={styles.composerWrap}>
+        {session ? (
+          <View style={styles.composerTools}>
+            <ModelMenu session={session} />
+          </View>
         ) : null}
-        <Pressable
-          style={[styles.sendButton, !text.trim() && styles.disabled]}
-          onPress={send}
-          disabled={!text.trim()}
-        >
-          <ArrowUpIcon size={18} strokeWidth={2.5} color={colors.bg} />
-        </Pressable>
+        <View style={styles.composer}>
+          <MicButton
+            disabled={talking}
+            onError={setError}
+            onText={(spoken) => setText((current) => (current.trim() ? `${current.trimEnd()} ${spoken}` : spoken))}
+          />
+          <TextInput
+            style={styles.input}
+            value={text}
+            onChangeText={setText}
+            placeholder={`Message ${bot?.name ?? "Apollo"}…`}
+            placeholderTextColor={colors.faint}
+            multiline
+          />
+          {working ? (
+            <Pressable
+              style={[styles.sendButton, styles.stop]}
+              onPress={() => act((c) => c["sessions.interrupt"]({ sessionId }))}
+            >
+              <SquareIcon size={14} color={colors.textSoft} />
+            </Pressable>
+          ) : null}
+          <Pressable
+            style={[styles.sendButton, !text.trim() && styles.disabled]}
+            onPress={send}
+            disabled={!text.trim()}
+          >
+            <ArrowUpIcon size={18} strokeWidth={2.5} color={colors.bg} />
+          </Pressable>
+        </View>
       </View>
     </Animated.View>
       {browser && session ? (
@@ -1515,13 +1523,14 @@ const styles = StyleSheet.create({
   secretHint: { flex: 1, color: "#52525b", fontSize: 11 },
   // The message box.
   error: { color: colors.red, fontSize: 13, paddingHorizontal: 16 },
+  composerWrap: { borderTopWidth: 1, borderTopColor: colors.border },
+  composerTools: { flexDirection: "row", alignItems: "center", paddingHorizontal: 10, paddingTop: 6 },
   composer: {
     flexDirection: "row",
     alignItems: "flex-end",
     gap: 8,
     padding: 10,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
+    paddingTop: 6,
   },
   input: {
     flex: 1,

@@ -58,6 +58,7 @@ import { type TranscriptItem, useTranscript } from "../transcript.ts";
 import { useConversationSearch } from "../searchClient.ts";
 import { ActivityGroup, type Block, toBlocks } from "./Activity.tsx";
 import { SessionSettingsDialog } from "./Dialogs.tsx";
+import { ModelMenu } from "./ModelPicker.tsx";
 import { ProviderLogo } from "./icons.tsx";
 import { InputRequestItem } from "./InputRequest.tsx";
 import {
@@ -83,7 +84,7 @@ import { MentionMenu, PeerMessage, useMentions, WithMentions } from "./Mentions.
 import { DayDivider, groupByDay, MessageTime } from "./DayGroups.tsx";
 import { MessageRail, type RailTurn } from "./MessageRail.tsx";
 import { clearSearchHighlights, ConversationSearchBar, type CurrentMatch, JumpTracker, opensSearch, paintAndJump, showSearchMatches } from "./ConversationSearch.tsx";
-import { Badge, Button, Collapse, cx, IconButton, Menu, ModelChip, providerName, StatusDot, statusLabel, Tooltip } from "./ui.tsx";
+import { Badge, Button, Collapse, cx, IconButton, Menu, providerName, StatusDot, statusLabel, Tooltip } from "./ui.tsx";
 
 export type PanelKind = "knowledge" | "schedules" | "browser" | "changes" | "projects";
 
@@ -427,10 +428,12 @@ function Composer({
   botName,
   modelLabel,
   waitingFor,
+  onOpenSettings,
 }: {
   session: Session;
   botName: string;
   modelLabel: string | null;
+  onOpenSettings: () => void;
   /** A local model still downloading: the conversation cannot start yet. */
   waitingFor: LocalModel | null;
 }) {
@@ -654,7 +657,7 @@ function Composer({
               }}
             />
             <ConversationButton session={session} disabled={waitingFor !== null} />
-            <ModelChip provider={session.provider} model={modelLabel ?? providerName(session.provider)} effort={session.effort} className="px-1.5 text-zinc-500" />
+            <ModelMenu session={session} label={modelLabel} onMoreSettings={onOpenSettings} />
             <span className="flex-1" />
             {session.context && session.context.window > 0 ? <ContextMeter context={session.context} /> : null}
             <span className="hidden text-[11px] text-zinc-600 sm:inline">
@@ -1157,15 +1160,6 @@ export function SessionView({
 
         {limits && limits.meters.length > 0 ? <UsageLimitsMeter limits={limits} provider={providerName(session.provider)} /> : null}
 
-        <button
-          className="flex h-8 min-w-0 items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-900/60 pr-2 pl-2.5 transition-colors hover:border-zinc-700 hover:bg-zinc-900"
-          title="Model, effort and permissions"
-          onClick={() => setSettingsOpen(true)}
-        >
-          <ModelChip provider={session.provider} model={modelLabel ?? providerName(session.provider)} effort={session.effort} className="max-w-56" />
-          <ChevronDown className="size-3.5 shrink-0 text-zinc-500" />
-        </button>
-
         {botBusy ? (
           <Button
             size="sm"
@@ -1387,7 +1381,7 @@ export function SessionView({
       </div>
 
       {session.role === "reflection" ? null : (
-        <Composer key={session.id} session={session} botName={bot.name} modelLabel={modelLabel} waitingFor={waitingFor} />
+        <Composer key={session.id} session={session} botName={bot.name} modelLabel={modelLabel} waitingFor={waitingFor} onOpenSettings={() => setSettingsOpen(true)} />
       )}
     </section>
   );
