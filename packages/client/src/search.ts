@@ -30,34 +30,57 @@ const foldChar = (char: string) => {
   return lower === "ς" ? "σ" : lower;
 };
 
-export const foldText = (text: string): FoldedText => {
-  let folded = "";
+/**
+ * Folds `text` a chunk at a time: each `step(maxChars)` folds about that many more
+ * characters and returns the result once the whole text is done (null until then).
+ */
+export const foldInSteps = (text: string) => {
+  const parts: Array<string> = [];
   const map: Array<number> = [];
   const boundary: Array<number> = [];
-  for (let i = 0; i < text.length; ) {
-    const char = String.fromCodePoint(text.codePointAt(i)!);
-    const lower = foldChar(char);
-    for (let k = 0; k < lower.length; k++) {
-      map.push(i);
-      boundary.push(k === 0 ? 1 : 0);
-    }
-    folded += lower;
-    i += char.length;
-  }
-  map.push(text.length);
-  boundary.push(1);
-  return { folded, map: Int32Array.from(map), boundary: Uint8Array.from(boundary) };
+  let i = 0;
+  return {
+    step(maxChars: number): FoldedText | null {
+      const stop = Math.min(text.length, i + maxChars);
+      while (i < stop) {
+        const char = String.fromCodePoint(text.codePointAt(i)!);
+        const lower = foldChar(char);
+        for (let k = 0; k < lower.length; k++) {
+          map.push(i);
+          boundary.push(k === 0 ? 1 : 0);
+        }
+        parts.push(lower);
+        i += char.length;
+      }
+      if (i < text.length) return null;
+      map.push(text.length);
+      boundary.push(1);
+      return { folded: parts.join(""), map: Int32Array.from(map), boundary: Uint8Array.from(boundary) };
+    },
+  };
 };
+
+export const foldText = (text: string): FoldedText => foldInSteps(text).step(Number.POSITIVE_INFINITY)!;
 
 /** The folded form of a query; empty when it is blank (nothing to search for). */
 export const foldQuery = (query: string): string => (query.trim() ? foldText(query).folded : "");
 
-/** Where a folded query occurs in a folded text, as [start, end) offsets in the original text. */
-export const occurrencesIn = (text: FoldedText, needle: string, limit = Number.POSITIVE_INFINITY): Array<readonly [number, number]> => {
+/**
+ * Where a folded query occurs in a folded text, as [start, end) offsets in the original
+ * text: at most `limit` of them, and at most `maxSteps` candidate positions looked at (so
+ * the work is bounded however many matches the text has).
+ */
+export const occurrencesIn = (
+  text: FoldedText,
+  needle: string,
+  limit = Number.POSITIVE_INFINITY,
+  maxSteps = Number.POSITIVE_INFINITY,
+): Array<readonly [number, number]> => {
   const found: Array<readonly [number, number]> = [];
   if (!needle) return found;
   const { folded, map, boundary } = text;
-  for (let at = folded.indexOf(needle); at >= 0 && found.length < limit; ) {
+  let steps = 0;
+  for (let at = folded.indexOf(needle); at >= 0 && found.length < limit && ++steps <= maxSteps; ) {
     const end = at + needle.length;
     if (boundary[at] && boundary[end]) {
       found.push([map[at]!, map[end]!]);

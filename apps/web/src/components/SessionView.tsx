@@ -46,14 +46,14 @@ import {
   withoutFullDiffs,
 } from "@apollo/client";
 import { MarkdownText } from "./Code.tsx";
-import { useDeferredValue, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { formatUsage, usageTitle } from "../format.ts";
 import { useModelLabel } from "../models.ts";
 import { errorMessage, rpc } from "../rpc.ts";
 import { dequeue, enqueue, type QueuedMessage, useQueue } from "../queue.ts";
 import { useApp } from "../store.ts";
 import { type TranscriptItem, useTranscript } from "../transcript.ts";
-import { conversationMatches, prepareSearch } from "../search.ts";
+import { useConversationSearch } from "../searchClient.ts";
 import { ActivityGroup, type Block, toBlocks } from "./Activity.tsx";
 import { SessionSettingsDialog } from "./Dialogs.tsx";
 import { ProviderLogo } from "./icons.tsx";
@@ -78,7 +78,7 @@ import { BotAvatar } from "./Sidebar.tsx";
 import { MentionMenu, PeerMessage, useMentions, WithMentions } from "./Mentions.tsx";
 import { DayDivider, groupByDay, MessageTime } from "./DayGroups.tsx";
 import { MessageRail, type RailTurn } from "./MessageRail.tsx";
-import { clearSearchHighlights, ConversationSearchBar, opensSearch, showSearchMatches } from "./ConversationSearch.tsx";
+import { clearSearchHighlights, ConversationSearchBar, type CurrentMatch, JumpTracker, opensSearch, showSearchMatches } from "./ConversationSearch.tsx";
 import { Badge, Button, Collapse, cx, IconButton, Menu, ModelChip, providerName, StatusDot, statusLabel, Tooltip } from "./ui.tsx";
 
 export type PanelKind = "knowledge" | "schedules" | "browser" | "changes";
@@ -847,33 +847,26 @@ export function SessionView({
   // `index` counts matches in conversation order; a new query starts at the most recent one.
   const [search, setSearch] = useState<{ readonly query: string; readonly index: number } | null>(null);
   const searchInput = useRef<HTMLInputElement>(null);
-  // Counting runs on the deferred query, so typing stays responsive in long conversations.
-  const searchQuery = useDeferredValue(search?.query ?? "");
+  const searchQuery = search?.query ?? "";
   const needle = useMemo(() => foldQuery(searchQuery), [searchQuery]);
-  // Messages are prepared for search a slice at a time once it opens (a long conversation
-  // would otherwise stall a frame); until then the bar says it is still searching.
-  const [indexed, setIndexed] = useState(false);
-  useEffect(() => {
-    if (!search) return setIndexed(false);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const step = (first: boolean) => {
-      if (prepareSearch(blocks, 8)) return setIndexed(true);
-      if (first) setIndexed(false);
-      timer = setTimeout(() => step(false), 0);
-    };
-    step(true);
-    return () => clearTimeout(timer);
-  }, [search !== null, blocks]);
-  // Per-message results are cached: a streamed update only recounts the message that changed.
-  const results = useMemo(
-    () => (search && needle && indexed ? conversationMatches(blocks, needle) : emptyResults),
-    [blocks, search !== null, needle, indexed],
-  );
+  // The index (in a Web Worker) prepares, counts and locates; this thread only sends what
+  // changed and paints. Results for an older query, or before preparation is done, are not shown.
+  const { counted, located, locate } = useConversationSearch(blocks, search !== null, needle);
+  const ready = counted !== null && counted.needle === needle;
+  const results = ready && needle ? counted.results : emptyResults;
   const matchIndex = Math.min(search?.index ?? 0, Math.max(results.total - 1, 0));
   const currentMatch: SearchMatch | null = matchAt(results, matchIndex);
+  // Where the current match is in its message, asked again whenever results change (a
+  // streamed message moves offsets).
+  useEffect(() => {
+    if (currentMatch) locate(currentMatch.key, currentMatch.occurrence);
+  }, [counted, currentMatch?.key, currentMatch?.occurrence]);
+  const current: CurrentMatch | null =
+    currentMatch && located?.needle === needle && located.key === currentMatch.key && located.occurrence === currentMatch.occurrence ? located : null;
   const matchDay = currentMatch ? (days.find((day) => day.blocks.some(({ block }) => block.key === currentMatch.key))?.key ?? null) : null;
-  // Set by the user's own search actions: only those move the conversation, not streamed output.
-  const scrollToMatch = useRef(false);
+  // The user's own search actions ask for a jump to their match, taken once it can be shown;
+  // streamed output and scrolling only repaint.
+  const [jumps] = useState(() => new JumpTracker());
   const openSearch = () => {
     setSearch((current) => current ?? { query: "", index: Number.POSITIVE_INFINITY });
     requestAnimationFrame(() => {
@@ -1006,29 +999,30 @@ export function SessionView({
   }, [session.id]);
 
   // Highlights matches on the page and brings the current one into view; re-runs as the page
-  // changes (streamed output, a day opening) but only scrolls after a search action.
+  // changes (streamed output, a day opening, new results) but only scrolls for a pending jump.
   useEffect(() => {
     const container = scrollRef.current;
     if (!search || !container) return clearSearchHighlights();
-    // A search action scrolls once its query is the one counted (typing is deferred).
-    const scroll = scrollToMatch.current && searchQuery === search.query;
-    if (scroll) scrollToMatch.current = false;
+    const serial = jumps.take({ needle, ready, total: results.total, located: current !== null });
+    const scroll = serial !== null;
     if (scroll) stick.current = false;
     let tries = 0;
     let frame = 0;
     // The match's day or message may still be mounting: retry for a few frames.
     const run = () => {
-      if (!showSearchMatches(container, searchQuery, currentMatch, scroll) && tries++ < 20) frame = requestAnimationFrame(run);
+      if (showSearchMatches(container, searchQuery, current, scroll)) {
+        if (serial !== null) jumps.done(serial);
+      } else if (tries++ < 20) frame = requestAnimationFrame(run);
     };
     frame = requestAnimationFrame(run);
     // Opening a day or message animates its height: place the match again once it settles.
-    const settle = scroll ? setTimeout(() => showSearchMatches(container, searchQuery, currentMatch, true), 320) : undefined;
+    const settle = scroll ? setTimeout(() => showSearchMatches(container, searchQuery, current, true), 320) : undefined;
     return () => {
       cancelAnimationFrame(frame);
       clearTimeout(settle);
     };
     // `search` changes on every search action (stepping onto the same lone match scrolls again too).
-  }, [search, searchQuery, currentMatch?.key, currentMatch?.occurrence, items, toggledDays]);
+  }, [search, needle, ready, results, current, items, toggledDays]);
   // Only matches near the screen are painted: paint again as the conversation scrolls.
   useEffect(() => {
     const container = scrollRef.current;
@@ -1036,14 +1030,14 @@ export function SessionView({
     let frame = 0;
     const onScroll = () => {
       cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => showSearchMatches(container, searchQuery, currentMatch, false));
+      frame = requestAnimationFrame(() => showSearchMatches(container, searchQuery, current, false));
     };
     container.addEventListener("scroll", onScroll, { passive: true });
     return () => {
       container.removeEventListener("scroll", onScroll);
       cancelAnimationFrame(frame);
     };
-  }, [search !== null, searchQuery, currentMatch?.key, currentMatch?.occurrence]);
+  }, [search !== null, searchQuery, current]);
   useEffect(() => clearSearchHighlights, []);
 
   const act = (f: Parameters<typeof rpc>[0]) => {
@@ -1233,15 +1227,15 @@ export function SessionView({
           query={search.query}
           index={matchIndex}
           count={results.total}
-          pending={!indexed || searchQuery !== search.query}
+          pending={!ready}
           inputRef={searchInput}
           onQuery={(query) => {
-            scrollToMatch.current = true;
+            jumps.request(foldQuery(query));
             setSearch({ query, index: Number.POSITIVE_INFINITY });
           }}
           onStep={(step) => {
             if (results.total === 0) return;
-            scrollToMatch.current = true;
+            jumps.request(needle);
             setSearch({ query: search.query, index: stepMatch(matchIndex, step, results.total) });
           }}
           onClose={closeSearch}

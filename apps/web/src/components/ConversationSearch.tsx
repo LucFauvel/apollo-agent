@@ -1,4 +1,5 @@
-import { findInSegments, type SearchMatch } from "@apollo/client";
+import { foldQuery, foldText, occurrencesIn, type SearchMatch } from "@apollo/client";
+import type { MatchPlace } from "../search.ts";
 import { ChevronDown, ChevronUp, Search, X } from "lucide-react";
 import { type RefObject, useEffect } from "react";
 import { cx, IconButton } from "./ui.tsx";
@@ -14,15 +15,6 @@ const CURRENT = "conversation-search-current";
 
 const highlights = () => (typeof CSS !== "undefined" && "highlights" in CSS ? CSS.highlights : null);
 
-const textNodes = (root: Element) => {
-  const nodes: Array<Text> = [];
-  // Controls inside rendered text (a code block's language and copy button) are not content.
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-    acceptNode: (node) => (node.parentElement?.closest("[data-search-skip]") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
-  });
-  for (let node = walker.nextNode(); node; node = walker.nextNode()) nodes.push(node as Text);
-  return nodes;
-};
 
 /** The keys of an event, and where it happened. */
 export interface ShortcutEvent {
@@ -59,71 +51,183 @@ export const clearSearchHighlights = () => {
 
 /** At most this many matches are painted at once (the current one always is). */
 export const PAINT_LIMIT = 2000;
+/** Characters of one element's text matched per paint (around the current match, or from its start). */
+export const PAINT_WINDOW = 20_000;
+/** Candidate positions looked at per element and paint, matches or not. */
+const PAINT_STEPS = 2 * PAINT_LIMIT;
+
+/** The current match and where the index located it (element of its message, offsets there). */
+export type CurrentMatch = SearchMatch & MatchPlace;
+
+/** Text nodes of an element with their offsets: those ending after `from`, until one reaches `until`. */
+const nodesBetween = (root: Element, from: number, until: number) => {
+  // Controls inside rendered text (a code block's language and copy button) are not content.
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode: (node) => (node.parentElement?.closest("[data-search-skip]") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+  });
+  const nodes: Array<{ readonly node: Text; readonly start: number }> = [];
+  let pos = 0;
+  for (let node = walker.nextNode() as Text | null; node && pos < until; node = walker.nextNode() as Text | null) {
+    if (pos + node.data.length > from) nodes.push({ node, start: pos });
+    pos += node.data.length;
+  }
+  return nodes;
+};
+
+/** A DOM range for [start, end) of an element's text, from its nodes (sorted by offset). */
+const rangeFor = (nodes: ReadonlyArray<{ readonly node: Text; readonly start: number }>, start: number, end: number, hint = { i: 0 }) => {
+  while (hint.i < nodes.length - 1 && start >= nodes[hint.i]!.start + nodes[hint.i]!.node.data.length) hint.i++;
+  let j = hint.i;
+  while (j < nodes.length - 1 && end > nodes[j]!.start + nodes[j]!.node.data.length) j++;
+  const range = document.createRange();
+  range.setStart(nodes[hint.i]!.node, start - nodes[hint.i]!.start);
+  range.setEnd(nodes[j]!.node, end - nodes[j]!.start);
+  return range;
+};
+
+/** Text of the nodes from offset `from`, at most `length` characters. */
+const windowText = (nodes: ReadonlyArray<{ readonly node: Text; readonly start: number }>, from: number, length: number) => {
+  let text = "";
+  for (const { node, start } of nodes) {
+    text += node.data.slice(Math.max(0, from - start), Math.max(0, from + length - start));
+    if (text.length >= length) break;
+  }
+  return text.slice(0, length);
+};
+
+/** Ranges of the matches in an element's text from `from` (a match start, or 0), bounded in characters, steps and count. */
+const paintIn = (element: Element, needle: string, from: number, limit: number): Array<Range> => {
+  if (limit <= 0) return [];
+  const nodes = nodesBetween(element, from, from + PAINT_WINDOW);
+  const found = occurrencesIn(foldText(windowText(nodes, from, PAINT_WINDOW)), needle, limit, PAINT_STEPS);
+  const hint = { i: 0 };
+  return found.map(([start, end]) => rangeFor(nodes, from + start, from + end, hint));
+};
+
+/** The current match's range, if the page shows the text the index located it in. */
+const currentRangeIn = (element: Element, needle: string, current: CurrentMatch) => {
+  const nodes = nodesBetween(element, current.start, current.end);
+  if (nodes.length === 0) return null;
+  if (foldText(windowText(nodes, current.start, current.end - current.start)).folded !== needle) return null;
+  return rangeFor(nodes, current.start, current.end);
+};
+
+/** The first element whose bottom is at or below `top` (elements are in page order). */
+const firstBelow = (elements: ArrayLike<HTMLElement>, top: number) => {
+  let lo = 0;
+  let hi = elements.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (elements[mid]!.getBoundingClientRect().bottom < top) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+};
 
 /**
  * Highlights the current match and the others on or near the screen, and scrolls the
- * current one into view. The work is bounded: elements more than a screen away are
- * skipped (their highlights come with the next call, on scroll), at most PAINT_LIMIT
- * ranges are built, and no call takes all of them as arguments. Returns false while the
- * current match is not on the page yet (its day or message is still opening).
+ * current one into view. Bounded work whatever the conversation or a message's size: the
+ * on-screen elements are found by binary search, each is matched over at most PAINT_WINDOW
+ * characters and PAINT_STEPS candidates, at most PAINT_LIMIT ranges are built, and the
+ * current match comes located from the index (no scan up to it). Returns false while the
+ * current match is not on the page yet (its day or message is still opening, or the page
+ * is a render behind the index).
  */
-export const showSearchMatches = (container: HTMLElement, query: string, current: SearchMatch | null, scroll: boolean): boolean => {
+export const showSearchMatches = (container: HTMLElement, query: string, current: CurrentMatch | null, scroll: boolean): boolean => {
+  const needle = foldQuery(query);
   const box = container.getBoundingClientRect();
   const margin = box.height;
+  const elements = container.querySelectorAll<HTMLElement>(`[${SEARCH_TEXT_ATTR}]`);
   const all: Array<Range> = [];
   let currentRange: Range | null = null;
   let currentElement: HTMLElement | null = null;
-  // Matches in earlier elements of the current match's message.
-  let before = 0;
-  for (const element of container.querySelectorAll<HTMLElement>(`[${SEARCH_TEXT_ATTR}]`)) {
-    const isCurrent = current !== null && element.getAttribute(SEARCH_TEXT_ATTR) === current.key;
-    if (!isCurrent) {
-      if (all.length >= PAINT_LIMIT) continue;
-      const rect = element.getBoundingClientRect();
-      if (rect.bottom < box.top - margin || rect.top > box.bottom + margin) continue;
+  if (current && needle) {
+    let seen = 0;
+    for (let i = 0; i < elements.length && !currentElement; i++) {
+      if (elements[i]!.getAttribute(SEARCH_TEXT_ATTR) !== current.key) continue;
+      if (seen++ === current.element) currentElement = elements[i]!;
     }
-    const nodes = textNodes(element);
-    const points = findInSegments(
-      nodes.map((n) => n.data),
-      query,
-    );
-    const range = (i: number) => {
-      const { start, end } = points[i]!;
-      const r = document.createRange();
-      r.setStart(nodes[start.segment]!, start.offset);
-      r.setEnd(nodes[end.segment]!, end.offset);
-      return r;
-    };
-    let from = 0;
-    if (isCurrent) {
-      currentElement ??= element;
-      const wanted = current.occurrence - before;
-      before += points.length;
-      if (wanted >= 0 && wanted < points.length) {
-        currentRange = range(wanted);
-        // Paint the matches around the current one.
-        from = Math.max(0, wanted - Math.floor((PAINT_LIMIT - all.length) / 2));
-      }
+    if (currentElement) {
+      currentRange = currentRangeIn(currentElement, needle, current);
+      if (currentRange) for (const range of paintIn(currentElement, needle, current.paintFrom, PAINT_LIMIT / 2)) all.push(range);
     }
-    for (let i = from; i < points.length && all.length < PAINT_LIMIT; i++) all.push(range(i));
+  }
+  if (needle) {
+    for (let i = firstBelow(elements, box.top - margin); i < elements.length && all.length < PAINT_LIMIT; i++) {
+      const element = elements[i]!;
+      if (element === currentElement) continue;
+      if (element.getBoundingClientRect().top > box.bottom + margin) break;
+      for (const range of paintIn(element, needle, 0, PAINT_LIMIT - all.length)) all.push(range);
+    }
   }
   const registry = highlights();
   if (registry) {
     const painted = new Highlight();
-    for (const r of all) painted.add(r);
+    for (const range of all) painted.add(range);
     registry.set(ALL, painted);
     if (currentRange) registry.set(CURRENT, new Highlight(currentRange));
     else registry.delete(CURRENT);
   }
   if (current && !currentRange) return false;
-  if (scroll && currentElement) {
-    const target = currentRange?.getBoundingClientRect() ?? currentElement.getBoundingClientRect();
+  if (scroll && currentRange) {
+    const target = currentRange.getBoundingClientRect();
     if (target.top < box.top + 48 || target.bottom > box.bottom - 24) {
       container.scrollTo({ top: container.scrollTop + target.top - box.top - container.clientHeight / 2 + target.height / 2 });
     }
   }
   return true;
 };
+
+/** Where search stands for the query it last counted. */
+export interface JumpState {
+  /** The folded query whose results are on hand. */
+  readonly needle: string;
+  /** Its results have arrived (not still preparing the conversation). */
+  readonly ready: boolean;
+  readonly total: number;
+  /** The current match is located on the page for this query. */
+  readonly located: boolean;
+}
+
+/**
+ * The jump to the current match that a search action asks for (typing a query, stepping),
+ * taken once: when its query's results are ready and the match can be shown. A newer
+ * request replaces an older one.
+ */
+export class JumpTracker {
+  #intent: { readonly needle: string; readonly serial: number } | null = null;
+  #serial = 0;
+
+  /** A search action for `needle` wants its match brought into view. */
+  request(needle: string): number {
+    this.#intent = { needle, serial: ++this.#serial };
+    return this.#serial;
+  }
+
+  /**
+   * The serial of the jump to make now, or null to wait (results or the match not there
+   * yet) or because there is nothing to do. The request stays until `done(serial)` reports
+   * the match shown, or its query turns out to have no match.
+   */
+  take(state: JumpState): number | null {
+    const intent = this.#intent;
+    if (!intent || state.needle !== intent.needle || !state.ready) return null;
+    if (state.total === 0) {
+      this.#intent = null;
+      return null;
+    }
+    return state.located ? intent.serial : null;
+  }
+
+  /** The jump `serial` was made (a newer request since then stays). */
+  done(serial: number) {
+    if (this.#intent?.serial === serial) this.#intent = null;
+  }
+
+  get pending() {
+    return this.#intent !== null;
+  }
+}
 
 /** The find bar over the conversation: query, match count, previous/next, close. */
 export function ConversationSearchBar({

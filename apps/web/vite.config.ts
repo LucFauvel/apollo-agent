@@ -15,4 +15,20 @@ export default defineConfig({
     },
   },
   build: { outDir: "dist", emptyOutDir: true },
+  worker: {
+    plugins: () => [
+      {
+        // Workers have no DOM: the markdown parser's entity decoder has a DOM build for
+        // browsers (index.dom.js, document.createElement) and a plain one, used here
+        // (the search index renders markdown in src/searchWorker.ts).
+        name: "worker-without-dom",
+        enforce: "pre",
+        async resolveId(source, importer, options) {
+          if (source !== "decode-named-character-reference") return null;
+          const resolved = await this.resolve(source, importer, { ...options, skipSelf: true });
+          return resolved ? { ...resolved, id: resolved.id.replace(/index\.dom\.js$/, "index.js") } : null;
+        },
+      },
+    ],
+  },
 });
