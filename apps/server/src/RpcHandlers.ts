@@ -3,6 +3,7 @@ import * as Stream from "effect/Stream";
 import * as Effect from "effect/Effect";
 import { AppSettings } from "./AppSettings.ts";
 import { PullRequests } from "./pullRequests/PullRequests.ts";
+import { Monitors } from "./monitors/Monitors.ts";
 import { ProviderVersions } from "./ProviderVersions.ts";
 import { Tailscale } from "./remote/Tailscale.ts";
 import { Auth, PAIRING_TOKEN_TTL_MS, PHONE_PAIRING_TTL_MS } from "./auth/Auth.ts";
@@ -33,6 +34,7 @@ export const layer = ApolloRpcs.toLayer(
     const secrets = yield* Secrets;
     const appSettings = yield* AppSettings;
     const pullRequests = yield* PullRequests;
+    const monitors = yield* Monitors;
     const providerVersions = yield* ProviderVersions;
     const tailscale = yield* Tailscale;
     const seen = yield* NotificationsSeen;
@@ -42,13 +44,14 @@ export const layer = ApolloRpcs.toLayer(
 
     return {
       "app.snapshot": () =>
-        Effect.all([manager.snapshot, scheduler.list(), browser.list(), pullRequests.list, seen.all]).pipe(
-          Effect.map(([snapshot, schedules, browserTabs, prs, notificationsSeen]) => ({
+        Effect.all([manager.snapshot, scheduler.list(), browser.list(), pullRequests.list, seen.all, monitors.list]).pipe(
+          Effect.map(([snapshot, schedules, browserTabs, prs, notificationsSeen, monitorList]) => ({
             ...snapshot,
             schedules,
             browserTabs,
             pullRequests: prs,
             notificationsSeen,
+            monitors: monitorList,
           })),
         ),
       "app.changes": () =>
@@ -157,6 +160,7 @@ export const layer = ApolloRpcs.toLayer(
       "sessions.commands": ({ sessionId }) => manager.listCommands(sessionId),
       "sessions.runCommand": ({ sessionId, name, args }) => manager.runCommand(sessionId, name, args),
       "pullRequests.unlink": ({ sessionId, url }) => pullRequests.unlink(sessionId, url),
+      "monitors.stop": ({ monitorId }) => monitors.stopByUser(monitorId),
       "sessions.setMemoryExclusion": ({ sessionId, seq, excluded }) =>
         manager.setMemoryExclusion(sessionId, seq, excluded),
       "sessions.close": ({ sessionId }) => manager.closeSession(sessionId),

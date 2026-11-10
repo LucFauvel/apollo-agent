@@ -1,5 +1,6 @@
 import { AppSettings, ProjectInfo, UpdateAppSettingsInput } from "./appSettings.ts";
 import { PullRequest } from "./pullRequests.ts";
+import { Monitor } from "./monitors.ts";
 import { ChangesOverview, ConversationChanges, SemanticFileDiff } from "./changes.ts";
 import { RemoteAccess } from "./remote.ts";
 import { ProviderVersion } from "./connectors.ts";
@@ -72,6 +73,9 @@ export const AppChange = Schema.Union([
   Schema.TaggedStruct("BrowserTabClosed", { tabId: Schema.String, botId: BotId }),
   Schema.TaggedStruct("PullRequestUpserted", { pullRequest: PullRequest }),
   Schema.TaggedStruct("PullRequestRemoved", { url: Schema.String, sessionId: SessionId }),
+  /** A monitor started, delivered events or ended; ended ones are kept for a while, then removed. */
+  Schema.TaggedStruct("MonitorUpserted", { monitor: Monitor }),
+  Schema.TaggedStruct("MonitorRemoved", { monitorId: Schema.String, sessionId: SessionId }),
   /** A session's changes or their explanations changed: refetch `changes.list`. */
   Schema.TaggedStruct("ChangesUpdated", { sessionId: SessionId, botId: BotId }),
   /** Something the user should see now: clients show it as a desktop notification. */
@@ -111,6 +115,8 @@ export const AppSnapshot = Schema.Struct({
   schedules: Schema.Array(Schedule),
   browserTabs: Schema.Array(BrowserTab),
   pullRequests: Schema.Array(PullRequest),
+  /** Monitors agents set up (running, and recently ended). */
+  monitors: Schema.optional(Schema.Array(Monitor)),
   /** When the user last saw each bot's chats (see the NotificationsSeen change). */
   notificationsSeen: Schema.optional(Schema.Array(Schema.Struct({ botId: BotId, at: Timestamp }))),
 });
@@ -274,6 +280,8 @@ export class ApolloRpcs extends RpcGroup.make(
   }),
   /** Stops watching (or forgets) a pull request linked to a session. */
   Rpc.make("pullRequests.unlink", { payload: { sessionId: SessionId, url: Schema.String }, error }),
+  /** Stops a monitor; its agent is told the user stopped it. */
+  Rpc.make("monitors.stop", { payload: { monitorId: Schema.String }, error }),
   /**
    * Keeps a message out of the bot's memory: session search, apollo_session_read and the
    * reflection pass skip it. The live conversation with the agent is not changed.

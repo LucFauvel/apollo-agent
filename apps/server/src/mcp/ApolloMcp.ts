@@ -27,6 +27,7 @@ import * as BrowserTools from "./BrowserTools.ts";
 import * as BotTools from "./BotTools.ts";
 import * as ChangeTools from "./ChangeTools.ts";
 import * as JobTools from "./JobTools.ts";
+import * as MonitorTools from "./MonitorTools.ts";
 import * as PullRequestTools from "./PullRequestTools.ts";
 import * as UserTools from "./UserTools.ts";
 import * as WorktreeTools from "./WorktreeTools.ts";
@@ -769,6 +770,7 @@ export const layer = McpServer.layerHttp({
     McpServer.toolkit(BrowserTools.BrowserToolkit).pipe(Layer.provide(BrowserTools.handlers)),
     McpServer.toolkit(UserTools.UserToolkit).pipe(Layer.provide(UserTools.handlers)),
     McpServer.toolkit(JobTools.JobToolkit).pipe(Layer.provide(JobTools.handlers)),
+    McpServer.toolkit(MonitorTools.MonitorToolkit).pipe(Layer.provide(MonitorTools.handlers)),
     McpServer.toolkit(WorktreeTools.WorktreeToolkit).pipe(Layer.provide(WorktreeTools.handlers)),
     McpServer.toolkit(ChangeTools.ChangeToolkit).pipe(Layer.provide(ChangeTools.handlers)),
     McpServer.toolkit(BotTools.BotToolkit).pipe(Layer.provide(BotTools.handlers)),

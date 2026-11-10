@@ -116,7 +116,7 @@ export const toolCategory = (name: string): ActivityCategory => {
   if (/(^|__)apollo_browser_/.test(n)) return "browser";
   if (/(^|__)apollo_(show|preview)_html$/.test(n)) return "visual";
   if (/(^|__)apollo_request_secret$/.test(n)) return "secret";
-  if (/(^|__)apollo_job_/.test(n)) return "command";
+  if (/(^|__)apollo_(job|monitor)_/.test(n)) return "command";
   if (/(^|__)apollo_(pr|worktree)_/.test(n)) return "git";
   if (n.startsWith("mcp__apollo__") || n.startsWith("apollo_")) return "apollo";
   if (n.startsWith("mcp__claude_ai_")) return "connector";

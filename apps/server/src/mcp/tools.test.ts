@@ -6,6 +6,7 @@ import { BotToolkit } from "./BotTools.ts";
 import { BrowserToolkit } from "./BrowserTools.ts";
 import { ChangeToolkit, SEMANTIC_DIFF_ONLY_WHEN_ASKED } from "./ChangeTools.ts";
 import { JobToolkit } from "./JobTools.ts";
+import { MonitorToolkit, timeoutMs } from "./MonitorTools.ts";
 import { PullRequestToolkit } from "./PullRequestTools.ts";
 import { UserToolkit } from "./UserTools.ts";
 import { WorktreeToolkit } from "./WorktreeTools.ts";
@@ -21,6 +22,7 @@ const toolkits: Record<string, Toolkit.Any> = {
   BrowserToolkit,
   ChangeToolkit,
   JobToolkit,
+  MonitorToolkit,
   PullRequestToolkit,
   UserToolkit,
   WorktreeToolkit,
@@ -67,5 +69,14 @@ describe("the full semantic diff", () => {
     expect(tool.description!.startsWith(SEMANTIC_DIFF_ONLY_WHEN_ASKED)).toBe(true);
     expect(SEMANTIC_DIFF_ONLY_WHEN_ASKED).toContain("never on your own initiative");
     expect((Tool.getJsonSchema(tool) as { required?: Array<string> }).required).toEqual(["request"]);
+  });
+});
+
+describe("monitors", () => {
+  it("time out after an hour by default, within 1 minute and 24 hours, or never when persistent", () => {
+    expect(timeoutMs(undefined, undefined)).toBe(60 * 60_000);
+    expect(timeoutMs(0, false)).toBe(60_000);
+    expect(timeoutMs(10_000, undefined)).toBe(24 * 60 * 60_000);
+    expect(timeoutMs(5, true)).toBeNull();
   });
 });
