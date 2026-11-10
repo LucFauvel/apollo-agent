@@ -182,6 +182,8 @@ describe("search at scale", () => {
   const conversation = (n: number) =>
     toBlocks(Array.from({ length: n }, (_, i) => said(`m${i}`, `Answer ${i}: the **API** is up, see \`api.log\` and [the API docs](https://example.com/api). ${"a ".repeat(30)}`)));
 
+  // Building and first-counting 5,000 messages can exceed vitest's 5 s default on a
+  // loaded CI runner; the per-query budgets asserted below are what this test is about.
   it("counts 5,000 messages once, then answers new queries and streamed updates from its cache", () => {
     const blocks = conversation(5000);
     let started = performance.now();
@@ -202,7 +204,7 @@ describe("search at scale", () => {
     console.info(`search scale: first ${first.toFixed(0)} ms, new query ${keystroke.toFixed(0)} ms, stream update ${stream.toFixed(0)} ms`);
     expect(keystroke).toBeLessThan(250);
     expect(stream).toBeLessThan(50);
-  });
+  }, 30_000);
 
   it("prepares a long conversation a slice at a time", () => {
     const blocks = conversation(400);
