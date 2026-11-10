@@ -1,9 +1,11 @@
 # Desktop builds and releases: macOS arm64, Windows x64 and Windows arm64. See RELEASE-SETUP.md.
 #
-#  push to main → nightlies: macOS ad-hoc signed, Windows unsigned (the explicit no-secrets
-#                 fallback); each smoke-tested (Windows arm64 on a native arm64 runner) and uploaded
+#  push to main → nightlies: macOS Developer ID signed + notarized when the `release-build`
+#                 environment (which admits main) holds all five signing secrets, else ad-hoc signed
+#                 (the explicit no-secrets fallback, e.g. forks: a warning, not a failure); Windows
+#                 unsigned; each smoke-tested (Windows arm64 on a native arm64 runner) and uploaded
 #                 as a 14-day run artifact. NEVER a release.
-#  push tag v*  → release builds (`release-build` environment, no reviewer; v* tags only): tag must
+#  push tag v*  → release builds (`release-build` environment, no reviewer; these jobs run on v* tags only): tag must
 #                 be vX.Y.Z on origin/main; macOS Developer ID signed + notarized; Windows unsigned
 #                 until Azure Trusted Signing is configured; every platform smoke-tested against old
 #                 databases (any failure = no draft).
@@ -53,11 +55,34 @@ jobs:
         run: node apps/desktop/scripts/release/stamp.ts
 
   nightly:
-    name: Nightly macOS arm64 (ad-hoc, artifact only)
+    name: Nightly macOS arm64 (Developer ID when configured, else ad-hoc; artifact only)
     needs: nightly-stamp
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 120 # notarizing the app and the dmg adds minutes
+    # Signing secrets when configured; the environment's deployment policy admits main (this job
+    # only runs on main, via nightly-stamp). Without them (forks, not set up yet) → ad-hoc.
+    environment: release-build
     steps:
+      - name: Signing mode (Developer ID when all five secrets are set, else ad-hoc)
+        id: signing
+        env:
+          RELEASE_DEVELOPER_ID_P12: ${{ secrets.RELEASE_DEVELOPER_ID_P12 }}
+          RELEASE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.RELEASE_DEVELOPER_ID_P12_PASSWORD }}
+          RELEASE_ASC_KEY_ID: ${{ secrets.RELEASE_ASC_KEY_ID }}
+          RELEASE_ASC_ISSUER_ID: ${{ secrets.RELEASE_ASC_ISSUER_ID }}
+          RELEASE_ASC_KEY_P8: ${{ secrets.RELEASE_ASC_KEY_P8 }}
+        run: |
+          missing=()
+          for name in RELEASE_DEVELOPER_ID_P12 RELEASE_DEVELOPER_ID_P12_PASSWORD RELEASE_ASC_KEY_ID RELEASE_ASC_ISSUER_ID RELEASE_ASC_KEY_P8; do
+            [[ -n "${!name}" ]] || missing+=("$name")
+          done
+          if (( ${#missing[@]} )); then
+            echo "mode=adhoc" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Unsigned nightly::Nightly builds are ad-hoc signed and not releasable: missing in the 'release-build' environment: ${missing[*]}. See RELEASE-SETUP.md."
+          else
+            echo "mode=developer-id" >> "$GITHUB_OUTPUT"
+            echo "All signing secrets are present: Developer ID signed + notarized nightly."
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # tags + history: version and CFBundleVersion come from them
@@ -65,16 +90,39 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           native: "true"
-      - name: Build (ad-hoc signed, NOT releasable)
+      - name: Write the App Store Connect key for notarytool
+        if: steps.signing.outputs.mode == 'developer-id'
+        env:
+          RELEASE_ASC_KEY_P8: ${{ secrets.RELEASE_ASC_KEY_P8 }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/asc"
+          # Accept the .p8 as pasted (PEM) or base64 of the file.
+          if [[ "$RELEASE_ASC_KEY_P8" == *"BEGIN PRIVATE KEY"* ]]; then
+            printf '%s\n' "$RELEASE_ASC_KEY_P8" > "$RUNNER_TEMP/asc/AuthKey.p8"
+          else
+            printf '%s' "$RELEASE_ASC_KEY_P8" | base64 --decode > "$RUNNER_TEMP/asc/AuthKey.p8"
+          fi
+          grep -q "BEGIN PRIVATE KEY" "$RUNNER_TEMP/asc/AuthKey.p8" || { echo "::error::RELEASE_ASC_KEY_P8 is not a .p8 private key (PEM or base64 of it)"; exit 1; }
+      - name: Build (Developer ID signed + notarized when configured, else ad-hoc and NOT releasable)
         env:
           APOLLO_BUILD_VERSION: ${{ needs.nightly-stamp.outputs.version }}
           APOLLO_BUILD_CHANNEL: ${{ needs.nightly-stamp.outputs.channel }}
           APOLLO_BUILD_NUMBER: ${{ needs.nightly-stamp.outputs.bundle_version }}
           APOLLO_BUILD_COMMIT: ${{ needs.nightly-stamp.outputs.commit }}
-          APOLLO_CODESIGN: adhoc
-        run: |
-          echo "::warning title=Unsigned nightly::Nightly builds are ad-hoc signed and not releasable (Developer ID signing runs only for v* tags, in the release environment)."
-          node apps/desktop/scripts/release/build-release.ts --out "$RUNNER_TEMP/dist"
+          APOLLO_CODESIGN: ${{ steps.signing.outputs.mode }}
+          # Everything below is empty in ad-hoc mode (build-release.ts drops an empty CSC_LINK).
+          APOLLO_TEAM_ID: ${{ steps.signing.outputs.mode == 'developer-id' && (vars.APOLLO_TEAM_ID || 'XA3R5NAN2C') || '' }}
+          # electron-builder imports the base64 .p12 into a temporary keychain it deletes afterwards.
+          CSC_LINK: ${{ steps.signing.outputs.mode == 'developer-id' && secrets.RELEASE_DEVELOPER_ID_P12 || '' }}
+          CSC_KEY_PASSWORD: ${{ steps.signing.outputs.mode == 'developer-id' && secrets.RELEASE_DEVELOPER_ID_P12_PASSWORD || '' }}
+          APPLE_API_KEY: ${{ steps.signing.outputs.mode == 'developer-id' && format('{0}/asc/AuthKey.p8', runner.temp) || '' }}
+          APPLE_API_KEY_ID: ${{ steps.signing.outputs.mode == 'developer-id' && secrets.RELEASE_ASC_KEY_ID || '' }}
+          APPLE_API_ISSUER: ${{ steps.signing.outputs.mode == 'developer-id' && secrets.RELEASE_ASC_ISSUER_ID || '' }}
+        run: node apps/desktop/scripts/release/build-release.ts --out "$RUNNER_TEMP/dist"
+      - name: Remove the App Store Connect key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc"
       - name: Smoke test (packaged app against old databases)
         run: node apps/desktop/scripts/release/smoke.ts --zip "$RUNNER_TEMP"/dist/*.zip
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -86,9 +134,14 @@ jobs:
       - name: Summary
         env:
           VERSION: ${{ needs.nightly-stamp.outputs.version }}
+          MODE: ${{ steps.signing.outputs.mode }}
         run: |
           {
-            echo "### Nightly ${VERSION} (ad-hoc signed — not releasable)"
+            if [[ "$MODE" == "developer-id" ]]; then
+              echo "### Nightly ${VERSION} (Developer ID signed + notarized)"
+            else
+              echo "### Nightly ${VERSION} (ad-hoc signed — not releasable)"
+            fi
             echo '```'
             cat "$RUNNER_TEMP/dist/SHA256SUMS"
             echo '```'
@@ -171,7 +224,8 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 150
     # Developer ID + App Store Connect secrets. No reviewer (the approval gate is on signing the
-    # manifest below); the environment's deployment policy admits v* tags only.
+    # manifest below); the environment's deployment policy admits v* tags and main (main: nightlies
+    # and manual iOS runs); this job itself runs on v* tags only.
     environment: release-build
     outputs:
       version: ${{ steps.stamp.outputs.version }}

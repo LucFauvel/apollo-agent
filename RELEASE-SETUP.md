@@ -10,7 +10,11 @@ GitHub yet: the first run needs a push of this branch (Luc's go).
 PR / push to main ── ci.yml ─────────── typecheck + test (no secrets)
 
 push to main ─────── desktop.yml nightlies (one shared version stamp) → each smoke-tested → run artifacts (14 days)
-                       macOS arm64    ad-hoc signed   "Apollo-<x.y.z>-nightly.<UTC day>.<run>-arm64-adhoc.zip/.dmg"
+                       macOS arm64    Developer ID signed + notarized (app + dmg) when the release-build env
+                                      holds all five signing secrets (env release-build, admits main):
+                                      "Apollo-<x.y.z>-nightly.<UTC day>.<run>-arm64.zip/.dmg";
+                                      else ad-hoc signed (warning, not a failure; forks / not set up):
+                                      "Apollo-<x.y.z>-nightly.<UTC day>.<run>-arm64-adhoc.zip/.dmg"
                        Windows x64    unsigned        "Apollo-<…>-win-x64-unsigned-setup.exe"   (smoke on windows-latest)
                        Windows arm64  unsigned        "Apollo-<…>-win-arm64-unsigned-setup.exe" (built on x64, smoke on windows-11-arm)
 
@@ -86,12 +90,16 @@ manual / tag v* ──── ios-testflight.yml  env release-build   apps/mobile
 
 | Environment | Protection | Deployment branches and tags | Holds |
 |---|---|---|---|
-| `release-build` | no reviewer | tags `v*` **and** branch `main` (iOS manual runs dispatch from main) | Developer ID, App Store Connect key, iOS signing |
+| `release-build` | no reviewer | tags `v*` **and** branch `main` (macOS nightlies sign from main; iOS manual runs dispatch from main) | Developer ID, App Store Connect key, iOS signing |
 | `release` | **Required reviewers: LucFauvel**; leave "Prevent self-review" **off** (Luc is the only approver, see §5) | tags `v*` only | the minisign secret key |
 
 Why two: the build needs the signing certificates without a click, and the only human gate is
 the manifest signature + publication (`sign-and-publish`). A build that nobody approves stays
 a draft that no client can ever see.
+Admitting `main` lets the macOS nightly job read the Developer ID + App Store Connect secrets so
+nightlies are signed and notarized like releases; it does not change the release flow: the
+release-build, draft-release and sign-and-publish jobs still run only for `v*` tags, a nightly is
+never drafted or published, and `release` (the minisign key) still admits `v*` tags only.
 
 ### 2.2 Secrets and variables
 
@@ -233,7 +241,7 @@ build can no longer be released.
 | Piece | Works now (after the first push) | Waits for |
 |---|---|---|
 | `ci.yml` checks | yes | — |
-| Nightly macOS ad-hoc build + smoke + artifact | yes (no secrets used) | — |
+| Nightly macOS build + smoke + artifact | ad-hoc: yes. Developer ID + notarized when the five `release-build` secrets (`RELEASE_DEVELOPER_ID_P12`, `RELEASE_DEVELOPER_ID_P12_PASSWORD`, `RELEASE_ASC_KEY_ID`, `RELEASE_ASC_ISSUER_ID`, `RELEASE_ASC_KEY_P8`) are visible to main: the build script's codesign/spctl/notarization checks gate the job; any missing → ad-hoc with an "Unsigned nightly" warning | first real signed nightly on GitHub |
 | Nightly Windows x64 + arm64 unsigned builds + smoke + artifacts | should, first real run on GitHub (§4.1) | — |
 | Tag → release build | macOS fails at once with "Release secrets missing"; Windows builds unsigned; no draft (all platforms are required) | Developer ID cert (P0) + ASC key secrets + `release-build` env |
 | Draft release | after a successful release build | same |
