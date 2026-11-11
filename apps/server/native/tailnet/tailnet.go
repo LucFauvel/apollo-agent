@@ -431,14 +431,42 @@ func nextCertRetry(prev time.Duration) time.Duration {
 	return min(prev*2, certRetryMax)
 }
 
-// certAttemptDue decides whether to ask Tailscale for the certificate now: once the
-// backoff after the last failure has passed, and while the tailnet does not list the
-// domain, only every httpsOffRetry.
-func certAttemptDue(listed bool, sinceLast, backoff time.Duration) bool {
-	if !listed {
-		return sinceLast >= httpsOffRetry
+// certSchedule decides when to ask Tailscale for the certificate. Delays count from the
+// end of the failed request, so a slow failure does not use up its own backoff. Every
+// failure while the tailnet lists the domain backs off from certRetryMin, HTTPS-off ones
+// included (control may briefly disagree with the status after a toggle); while the
+// domain is not listed, requests go out only every httpsOffRetry.
+type certSchedule struct {
+	listed      bool
+	backoff     time.Duration
+	lastFailure time.Time
+}
+
+// observe records whether the tailnet lists the domain, and reports whether it just
+// started to: the backoff starts over then.
+func (c *certSchedule) observe(listed bool) bool {
+	became := listed && !c.listed
+	if became {
+		c.backoff = 0
 	}
-	return sinceLast >= backoff
+	c.listed = listed
+	return became
+}
+
+func (c *certSchedule) due(now time.Time) bool {
+	if c.lastFailure.IsZero() {
+		return true
+	}
+	wait := c.backoff
+	if !c.listed {
+		wait = httpsOffRetry
+	}
+	return now.Sub(c.lastFailure) >= wait
+}
+
+func (c *certSchedule) failed(now time.Time) {
+	c.lastFailure = now
+	c.backoff = nextCertRetry(c.backoff)
 }
 
 // logf records a connection event in <state dir>/connections.log (the node's own logs are
@@ -465,9 +493,7 @@ func (p *publisher) run() {
 		p.setErr(err.Error())
 		return
 	}
-	var backoff time.Duration
-	var lastAttempt time.Time
-	wasListed := false
+	var sched certSchedule
 	for {
 		select {
 		case <-p.quit:
@@ -488,31 +514,23 @@ func (p *publisher) run() {
 		if !listed && p.setHTTPSOff(true) {
 			p.logf("HTTPS certificates are off for this tailnet: waiting for MagicDNS and HTTPS Certificates to be turned on")
 		}
-		if listed && !wasListed {
+		if sched.observe(listed) {
 			p.setHTTPSOff(false)
-			backoff = 0
 		}
-		wasListed = listed
-		sinceLast := time.Since(lastAttempt)
-		if lastAttempt.IsZero() {
-			sinceLast = httpsOffRetry
-		}
-		if !certAttemptDue(listed, sinceLast, backoff) {
+		if !sched.due(time.Now()) {
 			continue
 		}
-		lastAttempt = time.Now()
 		cctx, ccancel := context.WithTimeout(context.Background(), certTimeout)
 		_, _, err = lc.CertPair(cctx, domain)
 		ccancel()
 		if err != nil {
+			sched.failed(time.Now())
 			p.logf("certificate for %s failed: %v", domain, err)
 			if isHTTPSOff(err) {
 				p.setHTTPSOff(true)
-				backoff = httpsOffRetry
 			} else {
 				p.setHTTPSOff(false)
 				p.setErr("could not get the tailnet HTTPS certificate: " + err.Error())
-				backoff = nextCertRetry(backoff)
 			}
 			continue
 		}

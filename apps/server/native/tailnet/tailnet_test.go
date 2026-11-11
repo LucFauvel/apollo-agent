@@ -76,16 +76,58 @@ func TestCertRetriesBackOff(t *testing.T) {
 			t.Fatalf("got %v, want %v", d, want)
 		}
 	}
-	if certAttemptDue(false, 29*time.Minute, 0) {
+}
+
+func TestCertScheduleWaitsWhileHTTPSIsOff(t *testing.T) {
+	t0 := time.Unix(0, 0)
+	var c certSchedule
+	c.observe(false)
+	if !c.due(t0) {
+		t.Fatal("first request not sent")
+	}
+	c.failed(t0)
+	if c.due(t0.Add(29 * time.Minute)) {
 		t.Error("asked Tailscale for a certificate while HTTPS is off")
 	}
-	if !certAttemptDue(false, httpsOffRetry, 0) {
+	if !c.due(t0.Add(httpsOffRetry)) {
 		t.Error("never checks again while HTTPS is off")
 	}
-	if !certAttemptDue(true, 0, 0) {
+	if !c.observe(true) || !c.due(t0.Add(time.Second)) {
 		t.Error("did not ask right away once HTTPS is on")
 	}
-	if certAttemptDue(true, time.Minute, 2*time.Minute) {
-		t.Error("did not wait out the backoff")
+}
+
+func TestCertScheduleRecoversFromAnHTTPSOffFlapWhileListed(t *testing.T) {
+	t0 := time.Unix(0, 0)
+	var c certSchedule
+	c.observe(true)
+	// HTTPS was turned off and on again between two status reads: the request was refused.
+	c.failed(t0)
+	if c.observe(true) {
+		t.Fatal("still listed: not a new listing")
+	}
+	if c.due(t0.Add(29 * time.Second)) {
+		t.Error("retried without waiting")
+	}
+	if !c.due(t0.Add(certRetryMin)) {
+		t.Error("kept the 30-minute HTTPS-off delay while the domain is listed")
+	}
+}
+
+func TestCertScheduleCountsBackoffFromTheFailure(t *testing.T) {
+	t0 := time.Unix(0, 0)
+	var c certSchedule
+	c.observe(true)
+	start := t0
+	for _, wait := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute} {
+		if !c.due(start) {
+			t.Fatalf("not due at %v", start)
+		}
+		end := start.Add(certTimeout)
+		c.failed(end)
+		if c.due(end.Add(500 * time.Millisecond)) {
+			t.Fatalf("slow failure used up its own %v backoff", wait)
+		}
+		start = end.Add(wait)
 	}
 }
