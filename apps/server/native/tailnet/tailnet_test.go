@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"testing"
+	"time"
 
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
@@ -44,5 +46,88 @@ func TestRefusesOtherUsersTaggedAndSharedNodes(t *testing.T) {
 		if p, err := admitWho(who, owner); err == nil {
 			t.Errorf("%s: admitted %+v", name, p)
 		}
+	}
+}
+
+func TestCertDomainListed(t *testing.T) {
+	if !certDomainListed("apollo-mac.tail0393de.ts.net", []string{"Apollo-Mac.tail0393de.ts.net."}) {
+		t.Error("listed domain not found")
+	}
+	if certDomainListed("apollo-mac.tail0393de.ts.net", nil) {
+		t.Error("no cert domains: HTTPS is off")
+	}
+}
+
+func TestRecognisesTailnetsWithHTTPSOff(t *testing.T) {
+	off := errors.New("500 Internal Server Error: your Tailscale account does not support getting TLS certs")
+	if !isHTTPSOff(off) {
+		t.Error("not recognised")
+	}
+	if isHTTPSOff(errors.New("context deadline exceeded")) || isHTTPSOff(nil) {
+		t.Error("other errors are not HTTPS being off")
+	}
+}
+
+func TestCertRetriesBackOff(t *testing.T) {
+	d := time.Duration(0)
+	for _, want := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 10 * time.Minute, 10 * time.Minute} {
+		d = nextCertRetry(d)
+		if d != want {
+			t.Fatalf("got %v, want %v", d, want)
+		}
+	}
+}
+
+func TestCertScheduleWaitsWhileHTTPSIsOff(t *testing.T) {
+	t0 := time.Unix(0, 0)
+	var c certSchedule
+	c.observe(false)
+	if !c.due(t0) {
+		t.Fatal("first request not sent")
+	}
+	c.failed(t0)
+	if c.due(t0.Add(29 * time.Minute)) {
+		t.Error("asked Tailscale for a certificate while HTTPS is off")
+	}
+	if !c.due(t0.Add(httpsOffRetry)) {
+		t.Error("never checks again while HTTPS is off")
+	}
+	if !c.observe(true) || !c.due(t0.Add(time.Second)) {
+		t.Error("did not ask right away once HTTPS is on")
+	}
+}
+
+func TestCertScheduleRecoversFromAnHTTPSOffFlapWhileListed(t *testing.T) {
+	t0 := time.Unix(0, 0)
+	var c certSchedule
+	c.observe(true)
+	// HTTPS was turned off and on again between two status reads: the request was refused.
+	c.failed(t0)
+	if c.observe(true) {
+		t.Fatal("still listed: not a new listing")
+	}
+	if c.due(t0.Add(29 * time.Second)) {
+		t.Error("retried without waiting")
+	}
+	if !c.due(t0.Add(certRetryMin)) {
+		t.Error("kept the 30-minute HTTPS-off delay while the domain is listed")
+	}
+}
+
+func TestCertScheduleCountsBackoffFromTheFailure(t *testing.T) {
+	t0 := time.Unix(0, 0)
+	var c certSchedule
+	c.observe(true)
+	start := t0
+	for _, wait := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute} {
+		if !c.due(start) {
+			t.Fatalf("not due at %v", start)
+		}
+		end := start.Add(certTimeout)
+		c.failed(end)
+		if c.due(end.Add(500 * time.Millisecond)) {
+			t.Fatalf("slow failure used up its own %v backoff", wait)
+		}
+		start = end.Add(wait)
 	}
 }
