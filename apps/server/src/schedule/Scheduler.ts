@@ -123,6 +123,8 @@ export interface SchedulerOptions {
   /** A task run that has not finished by then is interrupted and counts as failed. */
   readonly taskTimeout: Duration.Input;
   readonly heartbeatTimeout: Duration.Input;
+  /** How long after startup the loop first checks (default 5 s). */
+  readonly startDelay?: Duration.Input;
 }
 
 type Outcome = { readonly ok: true; readonly message: string | null } | { readonly ok: false; readonly error: string };
@@ -489,10 +491,12 @@ const make = (options: SchedulerOptions) =>
 
     if (options.tickEvery !== null) {
       const every = options.tickEvery;
-      yield* Effect.sleep(Duration.seconds(5)).pipe(
+      yield* Effect.sleep(options.startDelay ?? Duration.seconds(5)).pipe(
         Effect.andThen(
           Effect.forever(
-            tick().pipe(
+            // Suspended so each check reads the clock anew: `tick()` alone would build one effect
+            // whose `now` is frozen at startup, and nothing due after that would ever run.
+            Effect.suspend(() => tick()).pipe(
               Effect.catchCause((cause) => Effect.logWarning("scheduler tick failed", cause)),
               Effect.andThen(Effect.sleep(every)),
             ),

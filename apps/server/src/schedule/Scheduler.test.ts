@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { type AgentEvent, type AppChange, DEFAULT_BOT_LIMITS, type ProviderKind, type ScheduleId } from "@apollo/contracts";
 import { type Provider, ProviderError } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
+import { vi } from "vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -94,6 +95,12 @@ const layer = Scheduler.layerWith({ tickEvery: null, taskTimeout: "5 seconds", h
       storage: { budgetBytes: 1e9, archiveLimit: 2000, detailRetentionMs: 30 * 86_400_000 },
     }),
   ),
+);
+
+/** The real check loop, fast: what runs in the app (tests above call `tick` by hand). */
+const loopLayer = Layer.provideMerge(
+  Scheduler.layerWith({ tickEvery: "20 millis", startDelay: "10 millis", taskTimeout: "5 seconds", heartbeatTimeout: "5 seconds" }),
+  layer,
 );
 
 /** With Apollo's notification watcher, as in the app (fast hold timings, no phone). */
@@ -338,5 +345,24 @@ describe("Scheduler", () => {
       expect(preview).toMatchObject({ description: "Weekdays at 9:00 AM", timezone: "UTC" });
       expect(preview.nextRuns.length).toBe(5);
     }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
+  it.live("its loop runs a schedule that comes due after Apollo started", () =>
+    Effect.gen(function* () {
+      const { scheduler, bot, settled } = yield* setup;
+      const schedule = yield* scheduler.create(
+        { botId: bot.id, kind: "task", name: "Morning brief", prompt: "Brief me", spec: "every 10m" },
+        "user",
+      );
+      // The loop started before the run was due; now the clock reaches it.
+      const due = schedule.nextRunAt!;
+      const now = vi.spyOn(Date, "now").mockReturnValue(due + 1000);
+      try {
+        for (let i = 0; i < 200 && (yield* scheduler.runs(schedule.id)).length === 0; i++) yield* Effect.sleep("10 millis");
+        const [run] = yield* settled(schedule.id);
+        expect(run).toMatchObject({ status: "delivered", summary: "echo: Brief me" });
+      } finally {
+        now.mockRestore();
+      }
+    }).pipe(Effect.scoped, Effect.provide(loopLayer)),
   );
 });
