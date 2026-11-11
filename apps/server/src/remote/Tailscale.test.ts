@@ -26,7 +26,12 @@ const addonPath = join(root, "fake.node");
 writeFileSync(addonPath, "never loaded: process.dlopen is replaced below");
 
 /** The native node, faked: what its state dir says it last announced, and each `start`. */
-let node: { savedHostname: string | null | "fail"; starts: Array<string>; dnsName: string | null };
+let node: {
+  savedHostname: string | null | "fail";
+  starts: Array<string>;
+  dnsName: string | null;
+  status?: { listening: boolean; needsHttps?: boolean };
+};
 let settings: Map<string, string>;
 /** Every value written to the machine-name setting, in order. */
 let nameWrites: Array<string>;
@@ -62,6 +67,7 @@ beforeEach(() => {
           dnsName: node.dnsName,
           listening: true,
           error: null,
+          ...node.status,
         });
       },
     };
@@ -194,6 +200,29 @@ describe("a malformed machine name", () => {
     await startApollo();
     expect(node.starts).toEqual(["apollo-mac-lan", "apollo-mac-lan"]);
     expect(settings.get(HOSTNAME_SETTING)).toBe("apollo-mac-lan");
+  });
+});
+
+describe("a tailnet with HTTPS certificates off", () => {
+  it("asks the user to turn them on instead of reporting an error", async () => {
+    node.status = { listening: false, needsHttps: true };
+    const remote = await startApollo();
+    expect(remote.tailscale).toBe("running");
+    expect(remote.needsHttps).toBe(true);
+    expect(remote.url).toBeNull();
+    expect(remote.error).toBeNull();
+  });
+
+  it("publishes Apollo once the certificate is in hand", async () => {
+    node.status = { listening: true, needsHttps: false };
+    const remote = await startApollo();
+    expect(remote.needsHttps).toBe(false);
+    expect(remote.url).toBe("https://apollo-devolutions652.example.ts.net:8443");
+  });
+
+  it("reads an older addon without the field as HTTPS being fine", async () => {
+    node.status = { listening: false };
+    expect((await startApollo()).needsHttps).toBe(false);
   });
 });
 

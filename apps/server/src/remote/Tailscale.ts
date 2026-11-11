@@ -33,6 +33,8 @@ interface NodeStatus {
   readonly loginName: string | null;
   readonly dnsName: string | null;
   readonly listening: boolean;
+  /** Absent from addons built before it was added. */
+  readonly needsHttps?: boolean;
   readonly error: string | null;
 }
 
@@ -195,6 +197,7 @@ const make = Effect.gen(function* () {
       userId: node.userId,
       loginUrl: enabled && node.state === "NeedsLogin" ? node.authUrl : null,
       loginName: node.loginName,
+      needsHttps: enabled && node.state === "Running" && !node.listening && node.needsHttps === true,
     };
   });
 

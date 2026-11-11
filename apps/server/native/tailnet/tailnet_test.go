@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"testing"
+	"time"
 
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
@@ -44,5 +46,46 @@ func TestRefusesOtherUsersTaggedAndSharedNodes(t *testing.T) {
 		if p, err := admitWho(who, owner); err == nil {
 			t.Errorf("%s: admitted %+v", name, p)
 		}
+	}
+}
+
+func TestCertDomainListed(t *testing.T) {
+	if !certDomainListed("apollo-mac.tail0393de.ts.net", []string{"Apollo-Mac.tail0393de.ts.net."}) {
+		t.Error("listed domain not found")
+	}
+	if certDomainListed("apollo-mac.tail0393de.ts.net", nil) {
+		t.Error("no cert domains: HTTPS is off")
+	}
+}
+
+func TestRecognisesTailnetsWithHTTPSOff(t *testing.T) {
+	off := errors.New("500 Internal Server Error: your Tailscale account does not support getting TLS certs")
+	if !isHTTPSOff(off) {
+		t.Error("not recognised")
+	}
+	if isHTTPSOff(errors.New("context deadline exceeded")) || isHTTPSOff(nil) {
+		t.Error("other errors are not HTTPS being off")
+	}
+}
+
+func TestCertRetriesBackOff(t *testing.T) {
+	d := time.Duration(0)
+	for _, want := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 10 * time.Minute, 10 * time.Minute} {
+		d = nextCertRetry(d)
+		if d != want {
+			t.Fatalf("got %v, want %v", d, want)
+		}
+	}
+	if certAttemptDue(false, 29*time.Minute, 0) {
+		t.Error("asked Tailscale for a certificate while HTTPS is off")
+	}
+	if !certAttemptDue(false, httpsOffRetry, 0) {
+		t.Error("never checks again while HTTPS is off")
+	}
+	if !certAttemptDue(true, 0, 0) {
+		t.Error("did not ask right away once HTTPS is on")
+	}
+	if certAttemptDue(true, time.Minute, 2*time.Minute) {
+		t.Error("did not wait out the backoff")
 	}
 }

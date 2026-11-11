@@ -54,6 +54,16 @@ const certTimeout = 3 * time.Minute
 // connLogMax caps connections.log; past it the file starts over.
 const connLogMax = 256 << 10
 
+// Retry delays for the certificate: failures back off from certRetryMin to certRetryMax.
+// While the tailnet has HTTPS off, the node waits for control to list its domain in
+// CertDomains (local status, no request to Tailscale) and asks again only every
+// httpsOffRetry, in case that list is late.
+const (
+	certRetryMin  = 30 * time.Second
+	certRetryMax  = 10 * time.Minute
+	httpsOffRetry = 30 * time.Minute
+)
+
 type peer struct {
 	NodeID    string `json:"nodeId"`
 	UserID    string `json:"userId"`
@@ -71,8 +81,11 @@ type status struct {
 	LoginName *string `json:"loginName"`
 	DNSName   *string `json:"dnsName"`
 	// Listening is true once Apollo is published on the tailnet.
-	Listening bool    `json:"listening"`
-	Error     *string `json:"error"`
+	Listening bool `json:"listening"`
+	// NeedsHTTPS is true while the tailnet has MagicDNS or HTTPS certificates turned off,
+	// so the node cannot get the certificate it publishes Apollo with.
+	NeedsHTTPS bool    `json:"needsHttps"`
+	Error      *string `json:"error"`
 }
 
 type startArgs struct {
@@ -304,6 +317,7 @@ func statusLocked(ctx context.Context, kick bool) (*status, error) {
 	out := toStatus(st)
 	if pub != nil {
 		out.Listening = pub.listening()
+		out.NeedsHTTPS = pub.needsHTTPS()
 		if e := pub.err(); e != "" {
 			out.Error = &e
 		}
@@ -347,7 +361,9 @@ type publisher struct {
 	conns  map[net.Conn]struct{}
 	done   bool
 	failed string
-	quit   chan struct{}
+	// httpsOff: the tailnet does not issue certificates (HTTPS or MagicDNS off).
+	httpsOff bool
+	quit     chan struct{}
 }
 
 func newPublisher(s *tsnet.Server, a startArgs) *publisher {
@@ -370,6 +386,59 @@ func (p *publisher) setErr(e string) {
 	p.mu.Lock()
 	p.failed = e
 	p.mu.Unlock()
+}
+
+func (p *publisher) needsHTTPS() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.httpsOff
+}
+
+// setHTTPSOff records whether the tailnet refuses certificates, and reports whether
+// that changed.
+func (p *publisher) setHTTPSOff(off bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	changed := p.httpsOff != off
+	p.httpsOff = off
+	if off {
+		p.failed = ""
+	}
+	return changed
+}
+
+// certDomainListed reports whether control lists domain among the tailnet's certificate
+// domains: it does only once MagicDNS and HTTPS certificates are both on.
+func certDomainListed(domain string, certDomains []string) bool {
+	for _, d := range certDomains {
+		if strings.EqualFold(strings.TrimSuffix(d, "."), domain) {
+			return true
+		}
+	}
+	return false
+}
+
+// isHTTPSOff reports whether a certificate error is control refusing certificates for the
+// tailnet ("your Tailscale account does not support getting TLS certs").
+func isHTTPSOff(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "support getting tls cert")
+}
+
+func nextCertRetry(prev time.Duration) time.Duration {
+	if prev < certRetryMin {
+		return certRetryMin
+	}
+	return min(prev*2, certRetryMax)
+}
+
+// certAttemptDue decides whether to ask Tailscale for the certificate now: once the
+// backoff after the last failure has passed, and while the tailnet does not list the
+// domain, only every httpsOffRetry.
+func certAttemptDue(listed bool, sinceLast, backoff time.Duration) bool {
+	if !listed {
+		return sinceLast >= httpsOffRetry
+	}
+	return sinceLast >= backoff
 }
 
 // logf records a connection event in <state dir>/connections.log (the node's own logs are
@@ -396,6 +465,9 @@ func (p *publisher) run() {
 		p.setErr(err.Error())
 		return
 	}
+	var backoff time.Duration
+	var lastAttempt time.Time
+	wasListed := false
 	for {
 		select {
 		case <-p.quit:
@@ -412,19 +484,39 @@ func (p *publisher) run() {
 		if domain == "" {
 			continue
 		}
+		listed := certDomainListed(domain, st.CertDomains)
+		if !listed && p.setHTTPSOff(true) {
+			p.logf("HTTPS certificates are off for this tailnet: waiting for MagicDNS and HTTPS Certificates to be turned on")
+		}
+		if listed && !wasListed {
+			p.setHTTPSOff(false)
+			backoff = 0
+		}
+		wasListed = listed
+		sinceLast := time.Since(lastAttempt)
+		if lastAttempt.IsZero() {
+			sinceLast = httpsOffRetry
+		}
+		if !certAttemptDue(listed, sinceLast, backoff) {
+			continue
+		}
+		lastAttempt = time.Now()
 		cctx, ccancel := context.WithTimeout(context.Background(), certTimeout)
 		_, _, err = lc.CertPair(cctx, domain)
 		ccancel()
 		if err != nil {
-			p.setErr("could not get the tailnet HTTPS certificate (is HTTPS enabled for your tailnet?): " + err.Error())
 			p.logf("certificate for %s failed: %v", domain, err)
-			select {
-			case <-p.quit:
-				return
-			case <-time.After(30 * time.Second):
+			if isHTTPSOff(err) {
+				p.setHTTPSOff(true)
+				backoff = httpsOffRetry
+			} else {
+				p.setHTTPSOff(false)
+				p.setErr("could not get the tailnet HTTPS certificate: " + err.Error())
+				backoff = nextCertRetry(backoff)
 			}
 			continue
 		}
+		p.setHTTPSOff(false)
 		p.logf("certificate for %s ready", domain)
 		ln, err := p.srv.Listen("tcp", ":"+strconv.Itoa(p.args.Port))
 		if err != nil {

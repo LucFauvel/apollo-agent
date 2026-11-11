@@ -21,8 +21,17 @@ export const RemoteAccess = Schema.Struct({
   loginUrl: Schema.NullOr(Schema.String),
   /** The Tailscale account Apollo's node is signed in as. */
   loginName: Schema.NullOr(Schema.String),
+  /**
+   * The tailnet has MagicDNS or HTTPS Certificates turned off (new tailnets start that
+   * way), so Apollo cannot get its certificate yet. Turned on at `TAILSCALE_DNS_ADMIN_URL`,
+   * Apollo picks the certificate up by itself.
+   */
+  needsHttps: Schema.optionalKey(Schema.Boolean),
 });
 export type RemoteAccess = typeof RemoteAccess.Type;
+
+/** The tailnet admin console page with the MagicDNS and HTTPS Certificates switches. */
+export const TAILSCALE_DNS_ADMIN_URL = "https://login.tailscale.com/admin/dns";
 
 /**
  * What the phone app's QR code holds:

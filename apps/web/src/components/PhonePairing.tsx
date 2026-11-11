@@ -1,5 +1,5 @@
-import { type PendingPairing, pairingQrPayload, type RemoteAccess } from "@apollo/contracts";
-import { KeyRound, Loader2, LogIn, LogOut, QrCode, RefreshCw, ShieldCheck, Smartphone } from "lucide-react";
+import { type PendingPairing, pairingQrPayload, type RemoteAccess, TAILSCALE_DNS_ADMIN_URL } from "@apollo/contracts";
+import { ExternalLink, KeyRound, Loader2, LogIn, LogOut, QrCode, RefreshCw, ShieldCheck, Smartphone } from "lucide-react";
 import QRCode from "qrcode";
 import { useEffect, useState } from "react";
 import { errorMessage, rpc } from "../rpc.ts";
@@ -144,6 +144,38 @@ export function PhonePairing({ onPaired }: { onPaired: () => void }) {
                 </span>
               )}
             </div>
+          ) : null}
+          {remote.enabled && remote.tailscale === "running" && remote.needsHttps ? (
+            <div className="space-y-2 rounded-xl border border-sky-700/40 bg-sky-950/20 p-3 text-xs leading-relaxed text-zinc-300">
+              <p className="font-medium text-zinc-100">One more step: turn on HTTPS for your tailnet</p>
+              <p>
+                Apollo is on your tailnet, but it needs an HTTPS certificate so your phone can connect securely, and new
+                Tailscale accounts start with certificates turned off.
+              </p>
+              <ol className="list-decimal space-y-0.5 pl-4">
+                <li>Open the DNS page of your tailnet's admin console.</li>
+                <li>
+                  Turn on <span className="font-medium text-zinc-100">MagicDNS</span> if it is off.
+                </li>
+                <li>
+                  Under <span className="font-medium text-zinc-100">HTTPS Certificates</span>, click{" "}
+                  <span className="font-medium text-zinc-100">Enable HTTPS</span>.
+                </li>
+              </ol>
+              <a href={TAILSCALE_DNS_ADMIN_URL} target="_blank" rel="noreferrer" className="inline-block">
+                <Button size="sm">
+                  <ExternalLink /> Open Tailscale DNS settings
+                </Button>
+              </a>
+              <p className="flex items-center gap-1.5 text-zinc-500">
+                <Loader2 className="size-3 animate-spin" /> Apollo gets its certificate as soon as HTTPS is on: no need to come back here.
+              </p>
+            </div>
+          ) : null}
+          {remote.enabled && remote.tailscale === "running" && !remote.url && !remote.needsHttps && !remote.error ? (
+            <p className="flex items-center gap-1.5 text-xs text-zinc-500">
+              <Loader2 className="size-3 animate-spin" /> Getting Apollo's HTTPS certificate (about half a minute)…
+            </p>
           ) : null}
           {remote.enabled && remote.tailscale === "starting" ? (
             <p className="flex items-center gap-1.5 text-xs text-zinc-500">
