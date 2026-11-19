@@ -135,6 +135,7 @@ const toProject = (r: Row): Project => ({
   context: r.context as string,
   cwd: (r.cwd as string | null) ?? null,
   status: r.status as ProjectStatus,
+  leadSessionId: (r.lead_session_id as SessionId | null) ?? null,
   createdAt: Number(r.created_at),
   updatedAt: Number(r.updated_at),
 });
@@ -702,8 +703,8 @@ const makeStore = (db: DatabaseSync) => {
     insertProject: (project: Project) =>
       Effect.sync(() => {
         run(
-          `insert into projects (id, bot_id, name, summary, context, cwd, status, created_at, updated_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `insert into projects (id, bot_id, name, summary, context, cwd, status, lead_session_id, created_at, updated_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           project.id,
           project.botId,
           project.name,
@@ -711,6 +712,7 @@ const makeStore = (db: DatabaseSync) => {
           project.context,
           project.cwd,
           project.status,
+          project.leadSessionId ?? null,
           project.createdAt,
           project.updatedAt,
         );
@@ -719,12 +721,13 @@ const makeStore = (db: DatabaseSync) => {
     updateProject: (project: Project) =>
       Effect.sync(() => {
         run(
-          "update projects set name = ?, summary = ?, context = ?, cwd = ?, status = ?, updated_at = ? where id = ?",
+          "update projects set name = ?, summary = ?, context = ?, cwd = ?, status = ?, lead_session_id = ?, updated_at = ? where id = ?",
           project.name,
           project.summary,
           project.context,
           project.cwd,
           project.status,
+          project.leadSessionId ?? null,
           project.updatedAt,
           project.id,
         );

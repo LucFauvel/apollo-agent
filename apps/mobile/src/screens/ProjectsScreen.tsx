@@ -170,14 +170,28 @@ function ProjectDetail({
   onNewSession: (projectId: ProjectId) => void;
 }) {
   const { state, connection } = useApollo();
+  const lead = project.leadSessionId ?? null;
   const inside = useMemo(
-    () => [...state.sessions.values()].filter((s) => s.projectId === project.id && s.role !== "reflection").sort((a, b) => b.updatedAt - a.updatedAt),
-    [state.sessions, project.id],
+    () =>
+      [...state.sessions.values()]
+        .filter((s) => s.projectId === project.id && s.role !== "reflection")
+        .sort((a, b) => Number(b.id === lead) - Number(a.id === lead) || b.updatedAt - a.updatedAt),
+    [state.sessions, project.id, lead],
   );
   const memories = useProjectMemories(project);
   const [error, setError] = useState<string | null>(null);
   const archived = project.status === "archived";
   const act = (call: Parameters<typeof connection.rpc>[0]) => connection.rpc(call).catch((e: unknown) => setError(errorMessage(e)));
+  const chooseLead = (session: { id: SessionId; title: string }) =>
+    session.id === lead
+      ? Alert.alert(`${session.title} leads ${project.name}`, "The lead owns the project: it starts workers in it, and they report to it.", [
+          { text: "Cancel", style: "cancel" },
+          { text: "Remove as lead", style: "destructive", onPress: () => act((c) => c["projects.update"]({ projectId: project.id, leadSessionId: null })) },
+        ])
+      : Alert.alert("Make it the project's lead?", `${session.title} will own ${project.name}: it starts workers in it, and they report to it.`, [
+          { text: "Cancel", style: "cancel" },
+          { text: "Make lead", onPress: () => act((c) => c["projects.update"]({ projectId: project.id, leadSessionId: session.id })) },
+        ]);
 
   return (
     <View style={{ gap: 8 }}>
@@ -225,16 +239,27 @@ function ProjectDetail({
           <Text style={styles.empty}>No sessions yet. Start one here, or ask {bot.name} to delegate work to the project.</Text>
         ) : (
           inside.map((s, i) => (
-            <Pressable key={s.id} onPress={() => onOpenSession(s.id)} style={({ pressed }) => [styles.row, i > 0 && styles.rowBorder, pressed && styles.pressed]}>
+            <Pressable
+              key={s.id}
+              onPress={() => onOpenSession(s.id)}
+              onLongPress={s.role === "worker" ? () => chooseLead(s) : undefined}
+              style={({ pressed }) => [styles.row, i > 0 && styles.rowBorder, pressed && styles.pressed]}
+            >
               <View style={[styles.dot, { backgroundColor: s.status === "waiting-approval" ? colors.amber : s.status === "error" ? colors.red : isBusy(s) ? colors.green : "transparent" }]} />
               <Text style={styles.rowTitle} numberOfLines={1}>
                 {s.title}
               </Text>
+              {s.id === lead ? <Text style={[styles.badge, styles.leadBadge]}>Lead</Text> : null}
               <Text style={styles.rowMeta}>{relativeTime(s.updatedAt, Date.now())}</Text>
             </Pressable>
           ))
         )}
       </View>
+      <Text style={[styles.hint, styles.leadHint]}>
+        {lead
+          ? "The lead owns the project: it starts workers in it, and they report to it. Long-press a session to change the lead."
+          : `A lead is a long-lived session that owns the project and starts its workers. Long-press one of its sessions to make it the lead, or ask ${bot.name} to start one.`}
+      </Text>
 
       <Text style={styles.section}>Project</Text>
       <ProjectForm key={project.id} bot={bot} project={project} onSaved={() => {}} />
@@ -342,6 +367,7 @@ export function ProjectsScreen({
         ) : (
           projects.map((p) => {
             const count = [...state.sessions.values()].filter((s) => s.projectId === p.id && s.role !== "reflection").length;
+            const lead = p.leadSessionId ? state.sessions.get(p.leadSessionId) : undefined;
             return (
               <Pressable
                 key={p.id}
@@ -359,6 +385,11 @@ export function ProjectsScreen({
                   </Text>
                 </View>
                 {p.summary ? <Text style={styles.summary}>{p.summary}</Text> : null}
+                {lead ? (
+                  <Text style={styles.rowMeta} numberOfLines={1}>
+                    Lead: {lead.title}
+                  </Text>
+                ) : null}
               </Pressable>
             );
           })
@@ -374,6 +405,8 @@ const styles = StyleSheet.create({
   back: { color: colors.accent, fontSize: 16, marginRight: 4 },
   title: { color: colors.text, fontSize: 17, fontWeight: "600", flex: 1 },
   headerButton: { padding: 2 },
+  leadHint: { marginTop: 6, marginHorizontal: 4 },
+  leadBadge: { color: colors.amber, borderColor: colors.amber },
   badge: { color: colors.muted, fontSize: 11, borderWidth: 1, borderColor: colors.border, borderRadius: 6, paddingHorizontal: 6, paddingVertical: 1, overflow: "hidden" },
   body: { padding: 16, gap: 10, paddingBottom: 40 },
   section: { color: colors.faint, fontSize: 11, fontWeight: "600", letterSpacing: 0.6, textTransform: "uppercase", marginTop: 14, marginLeft: 4 },

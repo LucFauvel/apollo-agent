@@ -1200,6 +1200,7 @@ export function SessionView({
                 >
                   <FolderKanban className="size-3" />
                   {project.name}
+                  {project.leadSessionId === session.id ? <span className="text-amber-400/90">· lead</span> : null}
                 </button>
                 <span className="text-zinc-700">/</span>
               </>

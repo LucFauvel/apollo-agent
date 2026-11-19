@@ -445,6 +445,7 @@ export function ChatScreen({
                 <FolderKanbanIcon size={11} color={colors.muted} />
                 <Text style={styles.projectLinkText} numberOfLines={1}>
                   {project.name}
+                  {project.leadSessionId === session?.id ? " · lead" : ""}
                 </Text>
               </Pressable>
             ) : null}

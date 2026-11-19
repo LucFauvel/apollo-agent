@@ -9,11 +9,14 @@ import {
   PROJECT_SUMMARY_LIMIT,
   type ProjectId,
   type ProjectsChange,
+  type Session,
+  type SessionId,
   type UpdateProjectInput,
 } from "@apollo/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Stream from "effect/Stream";
 import { AppSettings } from "../AppSettings.ts";
@@ -45,6 +48,18 @@ export const projectProblem = (
 
 /** The context changed under an edit: `projects.update` with `expectedContext` refuses to overwrite it. */
 export const CONTEXT_CONFLICT = "the project's context changed since you started editing it (an agent may have updated it)";
+
+/** Why a session cannot lead the project, or null. */
+export const leadProblem = (
+  project: Pick<Project, "id" | "botId">,
+  session: Option.Option<Pick<Session, "botId" | "role" | "projectId">>,
+): string | null => {
+  if (Option.isNone(session)) return "no such session";
+  if (session.value.botId !== project.botId) return "that session belongs to another bot";
+  if (session.value.role !== "worker") return "only a worker session can lead a project";
+  if (session.value.projectId !== project.id) return "a project's lead must be one of its sessions: start it in the project";
+  return null;
+};
 
 /** The bot's project `ref` names: its id, or its name (any case). */
 export const findProject = (projects: ReadonlyArray<Project>, ref: string): Project | undefined => {
@@ -103,6 +118,7 @@ const make = Effect.gen(function* () {
         ...fields,
         cwd: yield* workspace(input.cwd),
         status: "active",
+        leadSessionId: null,
         createdAt: now,
         updatedAt: now,
       });
@@ -125,17 +141,35 @@ const make = Effect.gen(function* () {
       const others = (yield* store.listProjects(current.botId)).filter((p) => p.id !== current.id);
       const problem = projectProblem(fields, others);
       if (problem) return yield* invalid(problem);
+      const previousLead = current.leadSessionId ?? null;
+      const lead = input.leadSessionId !== undefined ? input.leadSessionId : previousLead;
+      if (lead !== null && lead !== previousLead) {
+        const problem = leadProblem(current, yield* Effect.option(store.getSession(lead)));
+        if (problem) return yield* invalid(problem);
+      }
       const project = yield* store.updateProject({
         ...current,
         ...fields,
         cwd: input.cwd !== undefined ? yield* workspace(input.cwd) : current.cwd,
         status: input.status ?? current.status,
+        leadSessionId: lead,
         updatedAt: Date.now(),
       });
       yield* publish({ _tag: "ProjectUpserted", project });
       // Only what the orchestrator's prompt shows; the context is not in it.
-      if (project.name !== current.name || project.summary !== current.summary || project.cwd !== current.cwd || project.status !== current.status) {
+      if (
+        project.name !== current.name ||
+        project.summary !== current.summary ||
+        project.cwd !== current.cwd ||
+        project.status !== current.status ||
+        lead !== previousLead
+      ) {
         yield* refreshOrchestrator(project.botId);
+      }
+      // A lead's prompt says it leads the project, and how.
+      if (lead !== previousLead) {
+        if (previousLead) yield* manager.refreshInstructions(previousLead);
+        if (lead) yield* manager.refreshInstructions(lead);
       }
       return project;
     });
@@ -160,8 +194,41 @@ const make = Effect.gen(function* () {
       );
     });
 
+  /** Its lead's session went: the project has no lead. */
+  const leadGone = (sessionId: SessionId) =>
+    Effect.gen(function* () {
+      for (const project of yield* store.listProjects()) {
+        if (project.leadSessionId !== sessionId) continue;
+        const saved = yield* store.updateProject({ ...project, leadSessionId: null, updatedAt: Date.now() });
+        yield* publish({ _tag: "ProjectUpserted", project: saved });
+        yield* refreshOrchestrator(saved.botId);
+      }
+    });
+
+  {
+    const known = new Set((yield* store.listSessions()).map((s) => s.id));
+    for (const project of yield* store.listProjects()) {
+      if (project.leadSessionId && !known.has(project.leadSessionId)) {
+        yield* store.updateProject({ ...project, leadSessionId: null });
+      }
+    }
+  }
+  yield* Stream.runForEach(manager.changes, (change) =>
+    change._tag === "SessionDeleted" ? leadGone(change.sessionId).pipe(Effect.catch(() => Effect.void)) : Effect.void,
+  ).pipe(Effect.forkScoped);
+
+  /** The project a session leads, if any. */
+  const ledBy = (sessionId: SessionId) =>
+    Effect.gen(function* () {
+      const session = yield* store.getSession(sessionId);
+      if (!session.projectId) return null;
+      const project = yield* store.getProject(session.projectId);
+      return project.leadSessionId === sessionId ? project : null;
+    });
+
   return {
     list: (botId: BotId) => store.listProjects(botId),
+    ledBy,
     get: store.getProject,
     resolve,
     create,

@@ -345,6 +345,10 @@ export const MIGRATIONS: ReadonlyArray<string> = [
   alter table sessions add column project_id text references projects(id) on delete set null;
   alter table memories add column project_id text references projects(id) on delete cascade;
   `,
+  // 24: a project's lead, a worker session in it (cleared when the session goes, see Projects).
+  `
+  alter table projects add column lead_session_id text;
+  `,
 ];
 
 /**
