@@ -528,6 +528,12 @@ const makeStore = (db: DatabaseSync) => {
       }),
     setNotifyParent: (id: SessionId, notify: boolean) =>
       Effect.sync(() => void run("update sessions set notify_parent = ? where id = ?", notify ? 1 : 0, id)),
+    /** The session reports each finished turn to `parentId` from now on. */
+    reportTo: (id: SessionId, parentId: SessionId) =>
+      Effect.gen(function* () {
+        run("update sessions set parent_session_id = ?, notify_parent = 1 where id = ?", parentId, id);
+        return yield* getSession(id);
+      }),
     notifiesParent: (id: SessionId) =>
       Effect.sync(() => get("select notify_parent from sessions where id = ?", id)?.notify_parent === 1),
     resetReflectionCounter: (id: SessionId) =>

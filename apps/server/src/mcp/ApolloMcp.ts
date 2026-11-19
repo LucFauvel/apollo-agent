@@ -740,7 +740,12 @@ export const handlers = ApolloToolkit.toLayer(
             projectId,
           });
           if (lead && projectId) {
-            yield* projects.update({ projectId, leadSessionId: session.id });
+            // Another spawn may have made its worker the lead meanwhile: this one then never starts.
+            const claimed = yield* Effect.result(projects.claimLead(projectId, session.id));
+            if (claimed._tag === "Failure") {
+              yield* manager.deleteSession(session.id).pipe(Effect.ignore);
+              return yield* claimed.failure;
+            }
             yield* manager.send(session.id, prompt, "bot");
           }
           return summarize(yield* store.getSession(session.id));

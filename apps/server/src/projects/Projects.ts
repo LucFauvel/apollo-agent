@@ -18,6 +18,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { AppSettings } from "../AppSettings.ts";
 import { SessionManager } from "../SessionManager.ts";
@@ -127,35 +128,63 @@ const make = Effect.gen(function* () {
       return project;
     });
 
-  const update = (input: UpdateProjectInput) =>
+  /** Project writes read the project and write it whole: one at a time, so none undoes another. */
+  const writing = Semaphore.makeUnsafe(1);
+
+  /**
+   * A new lead reports its turns to the orchestrator, which hands it the project's work: a
+   * session the user started has no parent, and a lead's own workers report to it instead.
+   */
+  const reportToOrchestrator = (sessionId: SessionId) =>
     Effect.gen(function* () {
-      const current = yield* store.getProject(input.projectId);
-      if (input.context !== undefined && input.expectedContext !== undefined && input.expectedContext.trim() !== current.context) {
-        return yield* invalid(CONTEXT_CONFLICT);
-      }
-      const fields = {
-        name: input.name !== undefined ? oneLine(input.name) : current.name,
-        summary: input.summary !== undefined ? oneLine(input.summary) : current.summary,
-        context: input.context !== undefined ? input.context.trim() : current.context,
-      };
-      const others = (yield* store.listProjects(current.botId)).filter((p) => p.id !== current.id);
-      const problem = projectProblem(fields, others);
-      if (problem) return yield* invalid(problem);
+      const session = yield* store.getSession(sessionId);
+      const bot = yield* store.getBot(session.botId);
+      if (session.parentSessionId === bot.mainSessionId && (yield* store.notifiesParent(sessionId))) return;
+      yield* manager.publish({ _tag: "SessionUpserted", session: yield* store.reportTo(sessionId, bot.mainSessionId) });
+    });
+
+  /** `onlyIfNoLead`: refused when the project already has a lead (checked with the write). */
+  const update = (input: UpdateProjectInput, options: { readonly onlyIfNoLead?: boolean } = {}) =>
+    Effect.gen(function* () {
+      const { current, project } = yield* Semaphore.withPermit(
+        writing,
+        Effect.gen(function* () {
+          const current = yield* store.getProject(input.projectId);
+          if (input.context !== undefined && input.expectedContext !== undefined && input.expectedContext.trim() !== current.context) {
+            return yield* invalid(CONTEXT_CONFLICT);
+          }
+          if (options.onlyIfNoLead && current.leadSessionId) {
+            return yield* invalid(`${current.name} already has a lead (${current.leadSessionId})`);
+          }
+          const fields = {
+            name: input.name !== undefined ? oneLine(input.name) : current.name,
+            summary: input.summary !== undefined ? oneLine(input.summary) : current.summary,
+            context: input.context !== undefined ? input.context.trim() : current.context,
+          };
+          const others = (yield* store.listProjects(current.botId)).filter((p) => p.id !== current.id);
+          const problem = projectProblem(fields, others);
+          if (problem) return yield* invalid(problem);
+          const previousLead = current.leadSessionId ?? null;
+          const lead = input.leadSessionId !== undefined ? input.leadSessionId : previousLead;
+          if (lead !== null && lead !== previousLead) {
+            const problem = leadProblem(current, yield* Effect.option(store.getSession(lead)));
+            if (problem) return yield* invalid(problem);
+          }
+          const project = yield* store.updateProject({
+            ...current,
+            ...fields,
+            cwd: input.cwd !== undefined ? yield* workspace(input.cwd) : current.cwd,
+            status: input.status ?? current.status,
+            leadSessionId: lead,
+            updatedAt: Date.now(),
+          });
+          yield* publish({ _tag: "ProjectUpserted", project });
+          return { current, project };
+        }),
+      );
       const previousLead = current.leadSessionId ?? null;
-      const lead = input.leadSessionId !== undefined ? input.leadSessionId : previousLead;
-      if (lead !== null && lead !== previousLead) {
-        const problem = leadProblem(current, yield* Effect.option(store.getSession(lead)));
-        if (problem) return yield* invalid(problem);
-      }
-      const project = yield* store.updateProject({
-        ...current,
-        ...fields,
-        cwd: input.cwd !== undefined ? yield* workspace(input.cwd) : current.cwd,
-        status: input.status ?? current.status,
-        leadSessionId: lead,
-        updatedAt: Date.now(),
-      });
-      yield* publish({ _tag: "ProjectUpserted", project });
+      const lead = project.leadSessionId ?? null;
+      if (lead && lead !== previousLead) yield* reportToOrchestrator(lead);
       // Only what the orchestrator's prompt shows; the context is not in it.
       if (
         project.name !== current.name ||
@@ -197,12 +226,19 @@ const make = Effect.gen(function* () {
   /** Its lead's session went: the project has no lead. */
   const leadGone = (sessionId: SessionId) =>
     Effect.gen(function* () {
-      for (const project of yield* store.listProjects()) {
-        if (project.leadSessionId !== sessionId) continue;
-        const saved = yield* store.updateProject({ ...project, leadSessionId: null, updatedAt: Date.now() });
-        yield* publish({ _tag: "ProjectUpserted", project: saved });
-        yield* refreshOrchestrator(saved.botId);
-      }
+      const cleared = yield* Semaphore.withPermit(
+        writing,
+        Effect.gen(function* () {
+          const saved: Array<Project> = [];
+          for (const project of yield* store.listProjects()) {
+            if (project.leadSessionId !== sessionId) continue;
+            saved.push(yield* store.updateProject({ ...project, leadSessionId: null, updatedAt: Date.now() }));
+            yield* publish({ _tag: "ProjectUpserted", project: saved.at(-1)! });
+          }
+          return saved;
+        }),
+      );
+      for (const project of cleared) yield* refreshOrchestrator(project.botId);
     });
 
   {
@@ -229,6 +265,8 @@ const make = Effect.gen(function* () {
   return {
     list: (botId: BotId) => store.listProjects(botId),
     ledBy,
+    /** Makes the session the project's lead, unless the project has one (checked atomically). */
+    claimLead: (projectId: ProjectId, sessionId: SessionId) => update({ projectId, leadSessionId: sessionId }, { onlyIfNoLead: true }),
     get: store.getProject,
     resolve,
     create,

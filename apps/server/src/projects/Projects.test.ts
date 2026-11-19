@@ -605,6 +605,50 @@ describe("project leads", () => {
     }).pipe(Effect.provide(withTools(f)));
   });
 
+  it.live("report to the orchestrator once promoted, wherever they reported before", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, projects, store, bot } = yield* setup(f.cwd);
+      const send = yield* projects.create({ botId: bot.id, name: "Send", summary: "" });
+      const fromUi = yield* manager.createSession({ botId: bot.id, title: "u", provider: { provider: "codex" }, projectId: send.id });
+      expect(fromUi.parentSessionId).toBeNull();
+      yield* projects.update({ projectId: send.id, leadSessionId: fromUi.id });
+      expect((yield* store.getSession(fromUi.id)).parentSessionId).toBe(bot.mainSessionId);
+      expect(yield* store.notifiesParent(fromUi.id)).toBe(true);
+
+      // Delegated through apollo_send_to_session, its finished turn comes back to the orchestrator.
+      yield* manager.send(fromUi.id, "plan the beta", "bot");
+      yield* until(() => f.opened.some((o) => o.instructions.includes("## Your role: orchestrator")));
+
+      const byLead = yield* manager.createSession({
+        botId: bot.id,
+        title: "w",
+        provider: { provider: "codex" },
+        projectId: send.id,
+        parentSessionId: fromUi.id,
+        notifyParent: true,
+      });
+      yield* projects.update({ projectId: send.id, leadSessionId: byLead.id });
+      expect((yield* store.getSession(byLead.id)).parentSessionId).toBe(bot.mainSessionId);
+    }).pipe(Effect.provide(f.layer));
+  });
+
+  it.live("are claimed by one session at a time", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, projects, bot } = yield* setup(f.cwd);
+      const send = yield* projects.create({ botId: bot.id, name: "Send", summary: "" });
+      const [a, b] = yield* Effect.all(
+        ["a", "b"].map((title) => manager.createSession({ botId: bot.id, title, provider: { provider: "codex" }, projectId: send.id })),
+      );
+      const claims = yield* Effect.all([projects.claimLead(send.id, a!.id), projects.claimLead(send.id, b!.id)].map(Effect.result), {
+        concurrency: "unbounded",
+      });
+      expect(claims.filter((c) => c._tag === "Success")).toHaveLength(1);
+      expect((yield* projects.get(send.id)).leadSessionId).toBe(claims[0]!._tag === "Success" ? a!.id : b!.id);
+    }).pipe(Effect.provide(f.layer));
+  });
+
   it.live("are chosen among the project's worker sessions", () => {
     const f = fixture();
     return Effect.gen(function* () {
@@ -627,4 +671,32 @@ describe("project leads", () => {
       expect((yield* projects.get(send.id)).leadSessionId).toBeNull();
     }).pipe(Effect.provide(withTools(f)));
   });
+});
+
+describe.skipIf(process.platform === "win32")("two leads spawned at once", () => {
+  it.live("start one lead; the other spawn fails and leaves nothing behind", () => {
+    const f = fixture();
+    const repo = slowRepo(f.dir, 0.4);
+    const layer = Scheduler.layerWith({ tickEvery: null, taskTimeout: "5 seconds", heartbeatTimeout: "5 seconds" }).pipe(Layer.provideMerge(f.layer));
+    return Effect.gen(function* () {
+      const { projects, store, bot } = yield* setup(f.cwd);
+      const send = yield* projects.create({ botId: bot.id, name: "Send", summary: "", cwd: repo });
+      const main = { sessionId: bot.mainSessionId, botId: bot.id, role: "main" as const };
+      const spawn = (title: string) =>
+        Effect.gen(function* () {
+          const toolkit = yield* ApolloMcp.ApolloToolkit;
+          const stream = yield* toolkit.handle("apollo_spawn_session", { title, prompt: "lead it", project: "Send", lead: true, isolation: "worktree" });
+          const last = Array.from(yield* Stream.runCollect(stream)).at(-1)!;
+          return { failed: last.isFailure, result: last.result as { id?: SessionId; message?: string } };
+        }).pipe(Effect.provideService(McpCaller, main), Effect.provide(ApolloMcp.handlers));
+      const results = yield* Effect.all([spawn("one"), spawn("two")], { concurrency: "unbounded" });
+      const won = results.filter((r) => !r.failed);
+      expect(won).toHaveLength(1);
+      expect(results.find((r) => r.failed)!.result.message).toContain("already has a lead");
+      expect((yield* projects.get(send.id)).leadSessionId).toBe(won[0]!.result.id);
+      const inside = (yield* store.listSessions(bot.id)).filter((s) => s.projectId === send.id);
+      expect(inside.map((s) => s.id)).toEqual([won[0]!.result.id]);
+      expect(worktrees(repo)).toBe(2);
+    }).pipe(Effect.provide(layer));
+  }, 20_000);
 });

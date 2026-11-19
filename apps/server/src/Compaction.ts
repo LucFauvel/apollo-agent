@@ -108,6 +108,10 @@ export const dropDetail = (db: DatabaseSync, before: number) =>
   );
 
 /** Step 6: returns freed pages to the OS. */
+/** Workers storage may delete when over budget: idle ones, never a project's lead. */
+export const EVICTABLE_WORKERS =
+  "role = 'worker' and status in ('idle', 'error', 'closed') and id not in (select lead_session_id from projects where lead_session_id is not null)";
+
 export const reclaim = (db: DatabaseSync) => {
   db.exec("pragma incremental_vacuum");
   db.exec("pragma wal_checkpoint(truncate)");
@@ -176,7 +180,7 @@ const make = Effect.gen(function* () {
       droppedEvents += yield* Effect.sync(() => dropDetail(db, now - age));
     }
     if (usedBytes(db) > policy.budgetBytes) {
-      const workers = yield* deletable("role = 'worker' and status in ('idle', 'error', 'closed')");
+      const workers = yield* deletable(EVICTABLE_WORKERS);
       for (let i = 0; i < workers.length && usedBytes(db) > policy.budgetBytes; i += 10) {
         deletedSessions += yield* deleteSessions(workers.slice(i, i + 10));
       }
