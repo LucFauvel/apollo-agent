@@ -221,11 +221,12 @@ const make = Effect.gen(function* () {
       )
       .run(pr.sessionId, pr.url, JSON.stringify(pr), digest);
 
-  type ReviewRow = { session_id: string; url: string; auto_address: number; comments: string; seen: string; undelivered: string };
+  type ReviewRow = { session_id: string; url: string; auto_address: number; ask: number; comments: string; seen: string; undelivered: string };
   const toReviews = (row: ReviewRow): PullRequestReviews => ({
     url: row.url,
     sessionId: row.session_id as SessionId,
     autoAddress: row.auto_address === 1,
+    ask: row.ask === 1,
     comments: JSON.parse(row.comments) as Array<ReviewComment>,
   });
   /** How many reviews and comments GitHub listed when the comments were last read: they are read again when that changes. */
@@ -249,16 +250,20 @@ const make = Effect.gen(function* () {
   const putReviews = (reviews: PullRequestReviews) =>
     Effect.gen(function* () {
       db.prepare(
-        `insert into pull_request_reviews (session_id, url, auto_address, comments) values (?, ?, ?, ?)
-         on conflict (session_id, url) do update set auto_address = excluded.auto_address, comments = excluded.comments`,
-      ).run(reviews.sessionId, reviews.url, reviews.autoAddress ? 1 : 0, JSON.stringify(reviews.comments));
+        `insert into pull_request_reviews (session_id, url, auto_address, ask, comments) values (?, ?, ?, ?, ?)
+         on conflict (session_id, url) do update set auto_address = excluded.auto_address, ask = excluded.ask, comments = excluded.comments`,
+      ).run(reviews.sessionId, reviews.url, reviews.autoAddress ? 1 : 0, reviews.ask ? 1 : 0, JSON.stringify(reviews.comments));
       yield* PubSub.publish(reviewChanges, { _tag: "PullRequestReviewsUpserted", reviews });
     });
 
-  /** Turns auto-address on or off; on goes to one session per PR, so two agents never answer the same comment. */
+  /**
+   * Turns auto-address on or off, which answers the question if the user was asked; on goes
+   * to one session per PR, so two agents never answer the same comment.
+   */
   const withAutoAddress = (reviews: PullRequestReviews, enabled: boolean): PullRequestReviews => ({
     ...reviews,
     autoAddress: enabled,
+    ask: false,
     comments: enabled ? reviews.comments : reviews.comments.map((c) => (c.status === "queued" ? { ...c, status: "manual" as const } : c)),
   });
   const applyAutoAddress = (reviews: PullRequestReviews, enabled: boolean) =>
@@ -275,7 +280,12 @@ const make = Effect.gen(function* () {
 
   const publish = (pr: PullRequest) => manager.publish({ _tag: "PullRequestUpserted", pullRequest: pr });
 
-  /** Records what is on the PR when it is first linked, so only comments after that are addressed. */
+  /**
+   * Records what is on the PR when it is first linked, so only comments after that are
+   * addressed. Auto-address starts off: the first time a PR is linked anywhere, the user is
+   * asked (on every device) whether to turn it on. Nothing waits for the answer. A session
+   * linking a PR another one has it on for takes it over.
+   */
   const startReviews = (sessionId: SessionId, pr: PullRequest, seen: string) =>
     Effect.gen(function* () {
       const fetched = yield* github.comments(pr.repo, pr.number);
@@ -283,10 +293,25 @@ const make = Effect.gen(function* () {
       const existing = loadReviews(sessionId, pr.url);
       if (existing) return existing;
       const others = allReviews().filter((r) => r.url === pr.url);
-      const enabled = others.length === 0 || others.some((r) => r.autoAddress);
+      const enabled = others.some((r) => r.autoAddress);
+      // Only watched PRs get new comments to address (merged, closed and unwatched ones do not).
+      const ask = others.length === 0 && pr.watched;
       const { comments } = mergeComments([], fetched, { baseline: true, autoAddress: false, open: true });
-      const reviews = yield* applyAutoAddress({ url: pr.url, sessionId, autoAddress: enabled, comments }, enabled);
+      const reviews = enabled
+        ? yield* applyAutoAddress({ url: pr.url, sessionId, autoAddress: true, comments }, true)
+        : { url: pr.url, sessionId, autoAddress: false, ask, comments };
+      if (!enabled) yield* putReviews(reviews);
       setSeen(sessionId, pr.url, seen);
+      if (ask) {
+        const session = yield* store.getSession(sessionId);
+        yield* manager.publish({
+          _tag: "Notify",
+          botId: session.botId,
+          sessionId,
+          title: `Auto-address reviews on ${pr.repo}#${pr.number}?`,
+          body: `"${pr.title}" was linked. Turn on auto-address to let the agent fix or answer new review comments, push, and reply on GitHub under your account.`,
+        });
+      }
       return reviews;
     });
 
@@ -306,7 +331,14 @@ const make = Effect.gen(function* () {
         // Linking again (after a push, say) takes the PR back if another session had it.
         yield* applyAutoAddress(reviews, true);
       }
-      return { ...pr, failingChecks: now.failing, pendingChecks: now.pending };
+      const state = loadReviews(caller.sessionId, pr.url);
+      return {
+        ...pr,
+        failingChecks: now.failing,
+        pendingChecks: now.pending,
+        autoAddress: state?.autoAddress ?? false,
+        autoAddressAsked: state?.ask ?? false,
+      };
     });
 
   const unlink = (sessionId: SessionId, url: string) =>
@@ -419,6 +451,9 @@ const make = Effect.gen(function* () {
         tracked = true;
       }
 
+      const settled = loadReviews(known.sessionId, row.url);
+      // Nothing left to decide on a merged or closed PR.
+      if (done && settled?.ask) yield* putReviews({ ...settled, ask: false });
       const lines = changeLines(row.digest, now, !tracked).map((l) => `- ${l}`);
       save(pr, now.digest);
       if (row.digest !== now.digest || done) yield* publish(pr);

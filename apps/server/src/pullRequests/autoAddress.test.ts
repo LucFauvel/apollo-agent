@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentEvent, ProviderKind, PullRequestReviewsChange, ReviewComment } from "@apollo/contracts";
+import type { AgentEvent, AppChange, ProviderKind, PullRequestReviewsChange, ReviewComment } from "@apollo/contracts";
 import { ApolloError, ProviderKind as Kinds } from "@apollo/contracts";
 import type { Provider } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
@@ -240,7 +240,8 @@ describe("review comments", () => {
       f.github.add({ kind: "conversation", body: "Before linking" });
       yield* prs.link(caller, URL, true);
       const linked = yield* prs.reviews(worker.id, URL);
-      expect(linked).toMatchObject({ autoAddress: true, comments: [{ status: "earlier", body: "Before linking" }] });
+      expect(linked).toMatchObject({ autoAddress: false, ask: true, comments: [{ status: "earlier", body: "Before linking" }] });
+      yield* prs.setAutoAddress(worker.id, URL, true);
 
       yield* prs.poll;
       expect(f.sent).toEqual([]);
@@ -278,6 +279,7 @@ describe("review comments", () => {
     return Effect.gen(function* () {
       const { manager, prs, bot, worker, caller } = yield* setup(f.cwd);
       yield* prs.link(caller, URL, true);
+      yield* prs.setAutoAddress(caller.sessionId, URL, true);
       const queued = f.github.add({ kind: "inline", body: "Fix this" });
       yield* prs.poll;
       yield* until(() => f.sent.length === 1);
@@ -312,6 +314,7 @@ describe("review comments", () => {
     return Effect.gen(function* () {
       const { prs, worker, caller } = yield* setup(f.cwd);
       yield* prs.link(caller, URL, true);
+      yield* prs.setAutoAddress(caller.sessionId, URL, true);
       const first = f.github.add({ kind: "inline", body: "Rename this" });
       yield* prs.poll;
       yield* until(() => f.sent.length === 1);
@@ -344,6 +347,7 @@ describe("review comments", () => {
     return Effect.gen(function* () {
       const { manager, prs, bot, worker, caller } = yield* setup(f.cwd);
       yield* prs.link(caller, URL, true);
+      yield* prs.setAutoAddress(caller.sessionId, URL, true);
       yield* manager.stopBot(bot.id);
       const ask = f.github.add({ kind: "inline", body: "Fix the typo" });
       yield* prs.poll;
@@ -372,6 +376,7 @@ describe("review comments", () => {
       const { prs, worker, caller } = yield* setup(f.cwd);
       const root = f.github.add({ kind: "inline", body: "Why a map?", path: "src/a.ts", line: 2 });
       yield* prs.link(caller, URL, true);
+      yield* prs.setAutoAddress(caller.sessionId, URL, true);
       const followUp = f.github.add({ kind: "inline", body: "Still unsure, can you use a set?", path: "src/a.ts", line: 2, inReplyTo: root.id });
       yield* prs.poll;
       yield* until(() => f.sent.length === 1);
@@ -389,6 +394,7 @@ describe("review comments", () => {
     return Effect.gen(function* () {
       const { manager, prs, bot, caller } = yield* setup(f.cwd);
       yield* prs.link(caller, URL, true);
+      yield* prs.setAutoAddress(caller.sessionId, URL, true);
       yield* manager.stopBot(bot.id);
       const ask = f.github.add({ kind: "inline", body: "Fix the typo" });
       yield* prs.poll;
@@ -405,6 +411,58 @@ describe("review comments", () => {
       yield* prs.poll;
       yield* Effect.sleep("50 millis");
       expect(f.sent).toHaveLength(1);
+    }).pipe(Effect.provide(f.layer));
+  });
+
+  it.live("starts off and asks the user once, without holding up the agent; either answer settles it", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, prs, bot, worker, caller, changes } = yield* setup(f.cwd);
+      const notices: Array<AppChange> = [];
+      yield* Stream.runForEach(manager.changes, (c) => Effect.sync(() => void notices.push(c))).pipe(Effect.forkChild({ startImmediately: true }));
+      const asked = (n: Array<AppChange>) => n.filter((c) => c._tag === "Notify" && c.title.startsWith("Auto-address reviews on acme/app#7"));
+
+      const linked = yield* prs.link(caller, URL, true);
+      expect(linked).toMatchObject({ autoAddress: false, autoAddressAsked: true });
+      expect(yield* prs.reviews(worker.id, URL)).toMatchObject({ autoAddress: false, ask: true });
+      yield* until(() => asked(notices).length === 1);
+      expect(asked(notices)[0]).toMatchObject({ botId: bot.id, sessionId: worker.id });
+      yield* until(() => changes.some((c) => c._tag === "PullRequestReviewsUpserted" && c.reviews.ask === true));
+
+      // Unanswered: comments are news for the agent, not work, and nothing is posted.
+      f.github.add({ kind: "inline", body: "Rename this" });
+      yield* prs.poll;
+      yield* until(() => f.sent.length === 1);
+      expect(f.sent[0]).toContain("New comment from ada");
+      expect(f.sent[0]).not.toContain("apollo_pr_reply");
+
+      // Linking again, or from another session, does not ask again.
+      expect(yield* prs.link(caller, URL, true)).toMatchObject({ autoAddressAsked: true });
+      const other = yield* manager.createSession({ botId: bot.id, title: "Follow-up", provider: { provider: "codex" } });
+      expect(yield* prs.link({ botId: bot.id, sessionId: other.id }, URL, true)).toMatchObject({ autoAddress: false, autoAddressAsked: false });
+      yield* Effect.sleep("50 millis");
+      expect(asked(notices)).toHaveLength(1);
+
+      // "Not now" answers it and leaves it off; turning it on later still works.
+      yield* prs.setAutoAddress(worker.id, URL, false);
+      expect(yield* prs.reviews(worker.id, URL)).toMatchObject({ autoAddress: false, ask: false });
+      yield* prs.setAutoAddress(worker.id, URL, true);
+      const on = f.github.add({ kind: "inline", body: "Fix this" });
+      yield* prs.poll;
+      // The worker gets it to address; the other session, which also linked the PR, only hears of it.
+      yield* until(() => f.sent.some((t) => t.includes(`[inline:${on.id}]`)));
+      yield* until(() => f.sent.some((t) => t.includes("New comment from ada: Fix this")));
+    }).pipe(Effect.provide(f.layer));
+  });
+
+  it.live("drops an unanswered question once the PR is merged", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { prs, worker, caller } = yield* setup(f.cwd);
+      yield* prs.link(caller, URL, true);
+      f.github.state.prState = "MERGED";
+      yield* prs.poll;
+      expect(yield* prs.reviews(worker.id, URL)).toMatchObject({ autoAddress: false, ask: false });
     }).pipe(Effect.provide(f.layer));
   });
 });

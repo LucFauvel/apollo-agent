@@ -357,6 +357,10 @@ export const MIGRATIONS: ReadonlyArray<string> = [
     primary key (session_id, url)
   );
   `,
+  // 25: auto-address starts off; the user is asked once whether to turn it on for each linked PR.
+  `
+  alter table pull_request_reviews add column ask integer not null default 0;
+  `,
 ];
 
 /**

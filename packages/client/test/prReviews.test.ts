@@ -1,6 +1,6 @@
-import type { PullRequestReviews, ReviewComment, SessionId } from "@apollo/contracts";
+import type { PullRequest, PullRequestReviews, ReviewComment, SessionId } from "@apollo/contracts";
 import { describe, expect, it } from "vitest";
-import { applyReviewsChange, reviewsForPr, reviewsSummary } from "../src/prReviews.ts";
+import { applyReviewsChange, autoAddressAsks, prSessionIds, reviewsForPr, reviewsSummary } from "../src/prReviews.ts";
 
 const url = "https://github.com/acme/app/pull/7";
 const a = "ses_a" as SessionId;
@@ -42,5 +42,36 @@ describe("pull request reviews", () => {
     expect(reviewsForPr(all, new Set([a]), url, a)).toMatchObject({ sessionId: a, autoAddress: false });
     expect(reviewsForPr(all, new Set(["ses_c" as SessionId]), url, a)).toBeNull();
     expect(reviewsSummary([])).toBeNull();
+  });
+
+  it("lists the open PRs still waiting for the user's answer, for an orchestrator its workers' too", () => {
+    const pr = (sessionId: SessionId, state: PullRequest["state"]): PullRequest => ({
+      url,
+      sessionId,
+      repo: "acme/app",
+      number: 7,
+      title: "Add export",
+      state,
+      checks: "none",
+      review: null,
+      watched: true,
+      updatedAt: 1,
+    });
+    const reviewsMap = applyReviewsChange(new Map(), {
+      _tag: "PullRequestReviewsSnapshot",
+      reviews: [{ ...reviews(a, false, []), ask: true }, reviews(b, false, [])],
+    });
+    const prs = new Map([[`${a} ${url}`, pr(a, "open")], [`${b} ${url}`, pr(b, "open")]]);
+    expect(autoAddressAsks(reviewsMap, prs, new Set([a, b])).map((x) => x.sessionId)).toEqual([a]);
+    expect(autoAddressAsks(reviewsMap, prs, new Set([b]))).toEqual([]);
+    expect(autoAddressAsks(reviewsMap, new Map([[`${a} ${url}`, pr(a, "merged")]]), new Set([a]))).toEqual([]);
+
+    const sessions = [
+      { id: a, botId: "bot_1" },
+      { id: b, botId: "bot_1" },
+      { id: "ses_c" as SessionId, botId: "bot_2" },
+    ];
+    expect([...prSessionIds({ id: a, botId: "bot_1", role: "main" }, sessions)]).toEqual([a, b]);
+    expect([...prSessionIds({ id: b, botId: "bot_1", role: "worker" }, sessions)]).toEqual([b]);
   });
 });

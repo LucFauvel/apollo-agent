@@ -48,6 +48,7 @@ import { useApollo } from "../AppState.tsx";
 import { BlobAvatar } from "../BlobAvatar.tsx";
 import { FileLinkContext, Markdown } from "../Markdown.tsx";
 import { ModelMenu } from "../ModelPicker.tsx";
+import { AutoAddressAsk } from "../AutoAddressAsk.tsx";
 import { MonitorStrip } from "../MonitorStrip.tsx";
 import { ArtifactCard, LocalFileViewer, MessageAttachments, RecordingCard, VisualCard } from "../PageCards.tsx";
 import { ActivityGroup } from "../Activity.tsx";
@@ -666,6 +667,7 @@ export function ChatScreen({
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {talking ? <ConversationBar session={session} onEnd={() => setTalking(false)} /> : null}
       <MonitorStrip sessionId={sessionId} />
+      {session ? <AutoAddressAsk session={session} /> : null}
       {mentionMatches.length > 0 ? (
         // Like Discord: a list above the composer, the best match first.
         <FadeIn>

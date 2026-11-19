@@ -53,7 +53,10 @@ export type ReviewComment = typeof ReviewComment.Type;
 export const PullRequestReviews = Schema.Struct({
   url: Schema.String,
   sessionId: SessionId,
+  /** Off until the user turns it on (`pullRequests.setAutoAddress`). */
   autoAddress: Schema.Boolean,
+  /** The user was asked whether to turn auto-address on and has not answered yet. */
+  ask: Schema.optional(Schema.Boolean),
   comments: Schema.Array(ReviewComment),
 });
 export type PullRequestReviews = typeof PullRequestReviews.Type;

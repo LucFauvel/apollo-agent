@@ -31,11 +31,18 @@ const Link = Tool.make("apollo_pr_link", {
     "Link a GitHub pull request to this session right after you create or push to it (pass its URL). The user sees",
     "it, with its CI status, on the session. With watch (default true) Apollo checks it every minute and sends you a",
     "message when its CI checks finish (failed or passed), a review or comment arrives, or it is merged or closed,",
-    "so you can fix failures or address feedback without polling. Unless the user turned it off for the PR, new",
-    "review comments come with ids for you to address and answer with apollo_pr_reply. Uses the GitHub CLI (gh).",
+    "so you can fix failures or address feedback without polling. Auto-address starts off: the first time a PR is",
+    "linked, Apollo asks the user whether to turn it on; do not wait for the answer. Once it is on, new review",
+    "comments come with ids for you to address and answer with apollo_pr_reply. Uses the GitHub CLI (gh).",
   ].join(" "),
   parameters: Schema.Struct({ url: Schema.String, watch: Schema.optional(Schema.Boolean) }),
-  success: Schema.Struct({ ...PrFields, watched: Schema.Boolean }),
+  success: Schema.Struct({
+    ...PrFields,
+    watched: Schema.Boolean,
+    autoAddress: Schema.Boolean,
+    /** The user was just asked whether to turn auto-address on. */
+    autoAddressAsked: Schema.Boolean,
+  }),
 });
 
 const Unwatch = Tool.make("apollo_pr_unwatch", {

@@ -337,7 +337,7 @@ export class ApolloRpcs extends RpcGroup.make(
   Rpc.make("pullRequests.unlink", { payload: { sessionId: SessionId, url: Schema.String }, error }),
   /** Every linked PR's review comments and what the agent did about each, then each change. */
   Rpc.make("pullRequests.watch", { success: PullRequestReviewsChange, stream: true }),
-  /** Turns on or off the agent addressing new review comments on this PR on its own. */
+  /** Turns on or off the agent addressing new review comments on this PR on its own; answers its `ask` either way. */
   Rpc.make("pullRequests.setAutoAddress", {
     payload: { sessionId: SessionId, url: Schema.String, enabled: Schema.Boolean },
     error,

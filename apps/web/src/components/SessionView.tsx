@@ -82,6 +82,7 @@ import { RecordingItem } from "./RecordingItem.tsx";
 import { FullDiff } from "./FullDiff.tsx";
 import { ContextMeter, parseCommand, UsageLimitsMeter, SlashMenu, useSlashCommands } from "./SlashCommands.tsx";
 import { VisualItem } from "./VisualItem.tsx";
+import { AutoAddressAsk } from "./AutoAddressAsk.tsx";
 import { MonitorStrip } from "./MonitorStrip.tsx";
 import { ConversationBar, ConversationButton, DictateButton, ReadAloudButton, useConversation } from "./Voice.tsx";
 import { BotAvatar } from "./Sidebar.tsx";
@@ -582,6 +583,7 @@ function Composer({
         {error ? <div className="mb-2 px-1 text-xs text-red-400">{error}</div> : null}
         <ConversationBar session={session} />
         <MonitorStrip session={session} />
+        <AutoAddressAsk session={session} />
         <div
           className={cx(
             "relative rounded-2xl border bg-zinc-900/80 shadow-lg shadow-black/20 transition-colors focus-within:border-zinc-600",

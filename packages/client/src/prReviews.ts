@@ -1,4 +1,4 @@
-import type { PullRequestReviews, PullRequestReviewsChange, ReviewComment, ReviewCommentStatus, SessionId } from "@apollo/contracts";
+import type { PullRequest, PullRequestReviews, PullRequestReviewsChange, ReviewComment, ReviewCommentStatus, SessionId } from "@apollo/contracts";
 
 const key = (r: { sessionId: SessionId; url: string }) => `${r.sessionId} ${r.url}`;
 
@@ -56,3 +56,22 @@ export const reviewsSummary = (comments: ReadonlyArray<ReviewComment>) => {
 
 /** Where a comment sits: `src/a.ts:12`, "review" or "conversation". */
 export const reviewCommentPlace = (c: ReviewComment) => (c.path ? `${c.path}${c.line ? `:${c.line}` : ""}` : c.kind);
+
+/** The sessions whose pull requests a session's views show: an orchestrator's include its workers'. */
+export const prSessionIds = (session: { id: SessionId; botId: string; role: string }, sessions: Iterable<{ id: SessionId; botId: string }>) =>
+  new Set<SessionId>(session.role === "main" ? [...sessions].filter((s) => s.botId === session.botId).map((s) => s.id) : [session.id]);
+
+/**
+ * Open PRs linked from `sessionIds` whose user has not yet said whether the agent should
+ * address their review comments, oldest question first. Answer with `pullRequests.setAutoAddress`.
+ */
+export const autoAddressAsks = (
+  reviews: ReadonlyMap<string, PullRequestReviews>,
+  pullRequests: ReadonlyMap<string, PullRequest>,
+  sessionIds: ReadonlySet<SessionId>,
+) =>
+  [...reviews.values()].flatMap((r) => {
+    if (!r.ask || !sessionIds.has(r.sessionId)) return [];
+    const pr = pullRequests.get(key(r));
+    return pr && (pr.state === "open" || pr.state === "draft") ? [{ sessionId: r.sessionId, url: r.url, pr }] : [];
+  });
