@@ -853,6 +853,19 @@ const make = Effect.gen(function* () {
       ...excerpt(quoted.text, REPLY_QUOTE).split("\n").map((line) => `> ${line}`),
     ].join("\n");
 
+  /** Notes other services add to the next message an agent reads (the user changed its to-do list, say). */
+  const messageNotes: Array<(session: Session) => Effect.Effect<string | null>> = [];
+
+  const withMessageNotes = (session: Session, text: string) =>
+    Effect.gen(function* () {
+      const notes: Array<string> = [];
+      for (const note of messageNotes) {
+        const added = yield* note(session);
+        if (added) notes.push(added);
+      }
+      return notes.length === 0 ? text : [text, ...notes].join("\n\n");
+    });
+
   // --- public API ---------------------------------------------------------
 
   const send = (
@@ -910,7 +923,7 @@ const make = Effect.gen(function* () {
       if (!isBusy(before.status)) yield* updateSession(id, { status: "running" });
       // `@OtherBot` in the user's message points the agent at that bot: it reads who that is.
       const said = extra.agentText ?? (author === "user" ? yield* withMentionNote(target, text) : text);
-      const agentText = quoted ? `${replyNote(quoted)}\n\n${said}` : said;
+      const agentText = yield* withMessageNotes(target, quoted ? `${replyNote(quoted)}\n\n${said}` : said);
       // A failure to open posts its own notice and marks the session as errored.
       const entry = yield* ensureOpen(id, true);
       yield* entry.provider.send(agentText, files.map((f) => ({ path: f!.path, name: f!.name, mime: f!.mime, size: f!.size }))).pipe(
@@ -1970,6 +1983,9 @@ const make = Effect.gen(function* () {
         }
         return yield* effect;
       }).pipe(Effect.ensuring(Effect.sync(() => deletingProjects.delete(projectId)))),
+
+    /** Adds a note source: what it returns for a session is appended to the next message its agent reads. */
+    addMessageNote: (note: (session: Session) => Effect.Effect<string | null>) => Effect.sync(() => void messageNotes.push(note)),
 
     publishMemoryChanged: (botId: BotId | null) => publish({ _tag: "MemoryChanged", botId }),
     /** Announces a skill change and refreshes the native skill folders. */

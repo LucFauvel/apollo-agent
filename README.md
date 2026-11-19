@@ -23,6 +23,10 @@ Apollo is a desktop app for running **bots**: long-lived personas that orchestra
 - Agents can set up **monitors** (`apollo_monitor_start`): a command whose every output line
   reaches the agent as a message, so it reacts to events without polling. Running monitors show
   above the message box, with a Stop button.
+- Each session keeps a **to-do list** (`apollo_todo_update`, `apollo_todo_list`): the agent plans and checks
+  items off, and you see it above the message box (desktop and phone), where you can add, edit, check off,
+  reorder and remove items too. The agent's next message tells it what you changed. Lists sync on their own
+  `todos.watch` stream rather than `app.changes`, so installed clients built before them keep syncing.
 
 ## Requirements
 

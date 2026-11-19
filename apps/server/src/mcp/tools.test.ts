@@ -10,6 +10,7 @@ import { JobToolkit } from "./JobTools.ts";
 import { MonitorToolkit, timeoutMs } from "./MonitorTools.ts";
 import { ProjectToolkit } from "./ProjectTools.ts";
 import { PullRequestToolkit } from "./PullRequestTools.ts";
+import { TodoToolkit } from "./TodoTools.ts";
 import { UserToolkit } from "./UserTools.ts";
 import { WorktreeToolkit } from "./WorktreeTools.ts";
 
@@ -28,6 +29,7 @@ const toolkits: Record<string, Toolkit.Any> = {
   MonitorToolkit,
   ProjectToolkit,
   PullRequestToolkit,
+  TodoToolkit,
   UserToolkit,
   WorktreeToolkit,
 };

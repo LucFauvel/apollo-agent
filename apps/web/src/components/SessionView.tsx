@@ -18,6 +18,7 @@ import {
   GitCompareArrows,
   Info,
   Library,
+  ListTodo,
   Loader2,
   MoreHorizontal,
   Paperclip,
@@ -83,6 +84,7 @@ import { FullDiff } from "./FullDiff.tsx";
 import { ContextMeter, parseCommand, UsageLimitsMeter, SlashMenu, useSlashCommands } from "./SlashCommands.tsx";
 import { VisualItem } from "./VisualItem.tsx";
 import { MonitorStrip } from "./MonitorStrip.tsx";
+import { setTodosOpen, TodoStrip, useTodos, useTodosOpen } from "./TodoStrip.tsx";
 import { ConversationBar, ConversationButton, DictateButton, ReadAloudButton, useConversation } from "./Voice.tsx";
 import { BotAvatar } from "./Sidebar.tsx";
 import { MentionMenu, PeerMessage, useMentions, WithMentions } from "./Mentions.tsx";
@@ -581,6 +583,7 @@ function Composer({
       <div className="mx-auto max-w-3xl">
         {error ? <div className="mb-2 px-1 text-xs text-red-400">{error}</div> : null}
         <ConversationBar session={session} />
+        <TodoStrip session={session} />
         <MonitorStrip session={session} />
         <div
           className={cx(
@@ -1160,6 +1163,9 @@ export function SessionView({
   };
 
   useConversation(session, items, setActionError);
+  const todos = useTodos(session.id);
+  const todosOpen = useTodosOpen(session.id);
+  const openTodos = todos.filter((t) => !t.done).length;
 
   const respond: Responders = {
     approval: (requestId, decision) => act((c) => c["sessions.respondApproval"]({ sessionId: session.id, requestId, decision })),
@@ -1258,6 +1264,18 @@ export function SessionView({
         ) : null}
 
         <div className="flex items-center gap-0.5 border-l border-zinc-800/80 pl-2">
+          <IconButton
+            icon={ListTodo}
+            label={todos.length > 0 ? `To-do list (${openTodos} open)` : "To-do list"}
+            active={todosOpen}
+            onClick={() => setTodosOpen(session.id, !todosOpen)}
+          >
+            {openTodos > 0 ? (
+              <span className="absolute -top-0.5 -right-0.5 flex size-3.5 items-center justify-center rounded-full bg-sky-500 text-[9px] font-semibold text-white tabular-nums">
+                {openTodos}
+              </span>
+            ) : null}
+          </IconButton>
           <IconButton
             icon={Search}
             label={`Search in conversation (${findShortcut})`}

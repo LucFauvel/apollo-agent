@@ -21,7 +21,7 @@ const useNow = (active: boolean, ms = 10_000) => {
 };
 
 /** How tall the keyboard is now (0 when hidden). */
-const useKeyboardHeight = () => {
+export const useKeyboardHeight = () => {
   const [height, setHeight] = useState(0);
   useEffect(() => {
     const ios = Platform.OS === "ios";

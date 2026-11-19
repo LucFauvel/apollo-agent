@@ -16,6 +16,7 @@ import {
   UpdateScheduleInput,
 } from "./schedule.ts";
 import { CreateProjectInput, Project, ProjectsChange, UpdateProjectInput } from "./projects.ts";
+import { AddTodoInput, TodoItem, TodoList, TodosChange, UpdateTodoInput } from "./todos.ts";
 import { OnePasswordField, OnePasswordItem, OnePasswordStatus, SecretResponse } from "./secrets.ts";
 import { BrowserFrame, BrowserInput, BrowserStatus, BrowserTab } from "./browser.ts";
 import { LlamaBackend, LocalModelsState, ModelCandidate, ModelDetails, SuggestedModel } from "./local.ts";
@@ -312,6 +313,20 @@ export class ApolloRpcs extends RpcGroup.make(
   Rpc.make("projects.update", { payload: UpdateProjectInput, success: Project, error }),
   /** Deletes the project and its memories; its sessions stay, outside any project. */
   Rpc.make("projects.delete", { payload: { projectId: ProjectId }, error }),
+
+  // --- to-do lists (one per session, kept by its agent and the user) -------
+  /** Every non-empty list, then each list that changed (its own stream: see TodosChange). */
+  Rpc.make("todos.watch", { success: TodosChange, stream: true }),
+  Rpc.make("todos.add", { payload: AddTodoInput, success: TodoItem, error }),
+  Rpc.make("todos.update", { payload: UpdateTodoInput, success: TodoItem, error }),
+  Rpc.make("todos.remove", { payload: { todoId: Schema.String }, error }),
+  /**
+   * Puts the session's items in `todoIds` order. Ids no longer in the list are skipped, and
+   * items missing from it keep their relative order after the listed ones.
+   */
+  Rpc.make("todos.reorder", { payload: { sessionId: SessionId, todoIds: Schema.Array(Schema.String) }, success: TodoList, error }),
+  /** Removes the session's checked items. */
+  Rpc.make("todos.clearDone", { payload: { sessionId: SessionId }, success: TodoList, error }),
 
   // --- sessions ----------------------------------------------------------
   Rpc.make("sessions.create", { payload: CreateSessionInput, success: Session, error }),
