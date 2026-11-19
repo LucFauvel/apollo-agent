@@ -345,6 +345,17 @@ export const MIGRATIONS: ReadonlyArray<string> = [
   alter table sessions add column project_id text references projects(id) on delete set null;
   alter table memories add column project_id text references projects(id) on delete cascade;
   `,
+  // 24: review comments on linked pull requests, and what the agent did about each.
+  `
+  create table pull_request_reviews (
+    session_id text not null references sessions(id) on delete cascade,
+    url text not null,
+    auto_address integer not null default 1,
+    comments text not null default '[]', -- JSON Array<ReviewComment>
+    seen text not null default '',       -- review and comment counts when the comments were last read
+    primary key (session_id, url)
+  );
+  `,
 ];
 
 /**

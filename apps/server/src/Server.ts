@@ -25,6 +25,7 @@ import * as Files from "./Files.ts";
 import * as Push from "./push/Push.ts";
 import * as Tailscale from "./remote/Tailscale.ts";
 import * as ProviderVersions from "./ProviderVersions.ts";
+import * as GitHub from "./pullRequests/GitHub.ts";
 import * as PullRequests from "./pullRequests/PullRequests.ts";
 import * as Jobs from "./jobs/Jobs.ts";
 import * as Monitors from "./monitors/Monitors.ts";
@@ -66,7 +67,7 @@ const layerCore = Compaction.layer.pipe(
   Layer.provideMerge(Push.PushSender.expo),
   Layer.provideMerge(Push.Notices.layer),
   Layer.provideMerge(Layer.mergeAll(ProviderVersions.layer, AgentCliModels.layer)),
-  Layer.provideMerge(PullRequests.layer),
+  Layer.provideMerge(PullRequests.layer.pipe(Layer.provide(GitHub.layer))),
   Layer.provideMerge(Layer.mergeAll(Jobs.layer, Monitors.layer)),
   Layer.provideMerge(Layer.mergeAll(Secrets.layer, BotProposals.layer)),
   Layer.provideMerge(Accounts.layer),
