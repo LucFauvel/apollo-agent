@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent, ProviderKind, TodosChange } from "@apollo/contracts";
 import { ProviderKind as Kinds } from "@apollo/contracts";
-import type { Provider } from "@apollo/providers";
+import { type Provider, ProviderError } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -18,8 +18,12 @@ import * as TodoTools from "../mcp/TodoTools.ts";
 import { reordered } from "./Todos.ts";
 import * as Todos from "./Todos.ts";
 
-/** A provider that records what its agent reads and ends each turn at once. */
-const recording = (kind: ProviderKind, sent: Array<string>): Provider => ({
+/** A provider that records what its agent reads and ends each turn at once; `failures` sends fail first. */
+const recording = (
+  kind: ProviderKind,
+  sent: Array<string>,
+  failures: { count: number; during?: Effect.Effect<unknown, unknown> },
+): Provider => ({
   kind,
   listModels: Effect.succeed([]),
   open: (_options, emit) =>
@@ -28,7 +32,12 @@ const recording = (kind: ProviderKind, sent: Array<string>): Provider => ({
       return {
         send: (text: string) =>
           Effect.gen(function* () {
+            if (failures.count > 0) {
+              failures.count--;
+              return yield* new ProviderError({ provider: kind, message: "the agent's process went away" });
+            }
             sent.push(text);
+            if (failures.during) yield* Effect.ignore(failures.during);
             yield* agent({ _tag: "TurnStarted" });
             yield* agent({ _tag: "TurnCompleted", outcome: "completed", error: null });
           }),
@@ -42,22 +51,24 @@ const recording = (kind: ProviderKind, sent: Array<string>): Provider => ({
     }),
 });
 
-const fixture = () => {
+/** `persistent`: the database is a file in the data directory, so a second `layer()` is Apollo after a restart. */
+const fixture = ({ persistent = false } = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "apollo-todos-"));
   const cwd = join(dir, "workspace");
   mkdirSync(cwd);
   const sent: Array<string> = [];
-  const layer = Todos.layer.pipe(
+  const failures: { count: number; during?: Effect.Effect<unknown, unknown> } = { count: 0 };
+  const layer = () => Todos.layer.pipe(
     Layer.provideMerge(SessionManager.layer),
     Layer.provideMerge(
       Layer.succeed(
         SessionManager.Providers,
-        Object.fromEntries(Kinds.literals.map((k) => [k, recording(k, sent)])) as Record<ProviderKind, Provider>,
+        Object.fromEntries(Kinds.literals.map((k) => [k, recording(k, sent, failures)])) as Record<ProviderKind, Provider>,
       ),
     ),
     Layer.provideMerge(AppSettings.layer),
     Layer.provideMerge(Store.layer),
-    Layer.provideMerge(Database.layerMemory),
+    Layer.provideMerge(persistent ? Database.layer : Database.layerMemory),
     Layer.provideMerge(
       Layer.succeed(ServerConfig, {
         host: "127.0.0.1",
@@ -77,7 +88,7 @@ const fixture = () => {
       }),
     ),
   );
-  return { cwd, sent, layer };
+  return { cwd, sent, failures, layer };
 };
 
 const setup = (cwd: string) =>
@@ -156,7 +167,7 @@ describe("to-do lists", () => {
       // A later watcher starts from every list.
       const snapshot = yield* Stream.runHead(todos.watch);
       expect(snapshot._tag === "Some" && snapshot.value._tag === "TodosSnapshot" && snapshot.value.lists.map((l) => l.items.length)).toEqual([1]);
-    }).pipe(Effect.provide(f.layer));
+    }).pipe(Effect.provide(f.layer()));
   });
 
   it.live("tell the agent what the user changed, once, on its next message", () => {
@@ -194,7 +205,66 @@ describe("to-do lists", () => {
       yield* manager.send(session, "and now?");
       yield* until(() => f.sent.length === 4);
       expect(f.sent[3]).toBe("and now?");
-    }).pipe(Effect.provide(f.layer));
+    }).pipe(Effect.provide(f.layer()));
+  });
+
+  it.live("keep the user's changes for the agent across a restart", () => {
+    const f = fixture({ persistent: true });
+    return Effect.gen(function* () {
+      const { session, botId } = yield* Effect.gen(function* () {
+        const { todos, bot } = yield* setup(f.cwd);
+        const caller = { sessionId: bot.mainSessionId, botId: bot.id, role: "main" as const };
+        yield* call(caller, "apollo_todo_update", { add: [{ text: "Plan" }, { text: "Build" }] });
+        const [, build] = (yield* todos.list(bot.mainSessionId, "user")).items;
+        yield* todos.add(bot.mainSessionId, "Test on the phone");
+        yield* todos.reorder(bot.mainSessionId, [build!.id]);
+        return { session: bot.mainSessionId, botId: bot.id };
+      }).pipe(Effect.provide(f.layer()));
+
+      // Apollo restarted: a new server over the same database.
+      yield* Effect.gen(function* () {
+        const manager = yield* SessionManager.SessionManager;
+        expect((yield* manager.snapshot).bots.map((b) => b.id)).toEqual([botId]);
+        yield* manager.send(session, "where are we?");
+        yield* until(() => f.sent.length === 1);
+        expect(f.sent[0]).toContain('[Apollo] The user changed your to-do list: added "Test on the phone"; reordered the list.');
+        expect(f.sent[0]).toContain("1. [ ] Build");
+        expect(f.sent[0]).toContain("3. [ ] Test on the phone");
+      }).pipe(Effect.provide(f.layer()));
+    });
+  });
+
+  it.live("keep the user's changes for the agent until a message reaches it", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, todos, bot } = yield* setup(f.cwd);
+      const session = bot.mainSessionId;
+      yield* todos.add(session, "Write the release notes");
+
+      f.failures.count = 1;
+      expect((yield* Effect.flip(manager.send(session, "first try"))).code).toBe("provider");
+      expect(f.sent).toEqual([]);
+
+      yield* manager.send(session, "second try");
+      yield* until(() => f.sent.length === 1);
+      expect(f.sent[0]).toContain('[Apollo] The user changed your to-do list: added "Write the release notes".');
+
+      yield* manager.send(session, "third");
+      yield* until(() => f.sent.length === 2);
+      expect(f.sent[1]).toBe("third");
+
+      // An edit made while a message is on its way is not in it: it waits for the next one.
+      f.failures.during = todos.add(session, "Tag the release");
+      yield* todos.add(session, "Bump the version");
+      yield* manager.send(session, "fourth");
+      yield* until(() => f.sent.length === 3);
+      delete f.failures.during;
+      expect(f.sent[2]).toContain('added "Bump the version".');
+      expect(f.sent[2]).not.toContain("Tag the release");
+      yield* manager.send(session, "fifth");
+      yield* until(() => f.sent.length === 4);
+      expect(f.sent[3]).toContain('[Apollo] The user changed your to-do list: added "Tag the release".');
+    }).pipe(Effect.provide(f.layer()));
   });
 
   it.live("apply an agent's changes together, or none when one is wrong", () => {
@@ -225,6 +295,6 @@ describe("to-do lists", () => {
       );
       const other = yield* call({ sessionId: worker.id, botId: bot.id, role: "worker" }, "apollo_todo_update", { check: [one!.id] });
       expect(other.failed).toBe(true);
-    }).pipe(Effect.provide(f.layer));
+    }).pipe(Effect.provide(f.layer()));
   });
 });

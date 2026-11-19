@@ -84,8 +84,20 @@ const make = Effect.gen(function* () {
   const store = yield* Store;
   const manager = yield* SessionManager;
   const changes = yield* PubSub.unbounded<TodosChange>();
-  /** What the user changed in each list since its agent last read it. */
-  const userChanges = new Map<SessionId, Array<string>>();
+  /** What the user changed in a list since its agent last read it, oldest first (kept across restarts). */
+  const pending = (sessionId: SessionId): Array<string> => {
+    const row = db.prepare("select changes from todo_notices where session_id = ?").get(sessionId) as Row | undefined;
+    return row ? (JSON.parse(row.changes as string) as Array<string>) : [];
+  };
+  const setPending = (sessionId: SessionId, changes: ReadonlyArray<string>) => {
+    if (changes.length === 0) db.prepare("delete from todo_notices where session_id = ?").run(sessionId);
+    else {
+      db.prepare("insert into todo_notices (session_id, changes) values (?, ?) on conflict(session_id) do update set changes = excluded.changes").run(
+        sessionId,
+        JSON.stringify(changes),
+      );
+    }
+  };
 
   const read = (sessionId: SessionId): Array<TodoItem> =>
     (db.prepare("select * from todos where session_id = ? order by position, created_at").all(sessionId) as Array<Row>).map(toItem);
@@ -190,10 +202,10 @@ const make = Effect.gen(function* () {
         write(sessionId, before, items);
         const list = { sessionId, botId: session.botId, items };
         yield* PubSub.publish(changes, { _tag: "TodoListChanged", list });
-        if (by === "user") userChanges.set(sessionId, [...(userChanges.get(sessionId) ?? []), ...described]);
+        if (by === "user") setPending(sessionId, [...pending(sessionId), ...described]);
       }
       // The agent sees the whole list in its tool's answer.
-      if (by === "agent") userChanges.delete(sessionId);
+      if (by === "agent") setPending(sessionId, []);
       return { list: { sessionId, botId: session.botId, items } as TodoList, added };
     });
 
@@ -207,13 +219,17 @@ const make = Effect.gen(function* () {
 
   yield* manager.addMessageNote((session) =>
     Effect.sync(() => {
-      const described = userChanges.get(session.id);
-      if (!described) return null;
-      userChanges.delete(session.id);
-      return [
-        `[Apollo] The user changed your to-do list: ${described.join("; ")}. It now reads:`,
-        formatTodos(read(session.id)),
-      ].join("\n");
+      const described = pending(session.id);
+      if (described.length === 0) return null;
+      return {
+        text: [`[Apollo] The user changed your to-do list: ${described.join("; ")}. It now reads:`, formatTodos(read(session.id))].join("\n"),
+        // Changes made while the message was on its way stay for the next one. If the agent read
+        // the list meanwhile, the delivered ones are already gone.
+        delivered: Effect.sync(() => {
+          const now = pending(session.id);
+          if (described.every((d, i) => now[i] === d)) setPending(session.id, now.slice(described.length));
+        }),
+      };
     }),
   );
 
@@ -223,7 +239,7 @@ const make = Effect.gen(function* () {
     list: (sessionId: SessionId, by: TodoAuthor) =>
       Effect.gen(function* () {
         const session = yield* store.getSession(sessionId);
-        if (by === "agent") userChanges.delete(sessionId);
+        if (by === "agent") setPending(sessionId, []);
         return listOf(session);
       }),
 

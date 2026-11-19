@@ -360,6 +360,13 @@ export const MIGRATIONS: ReadonlyArray<string> = [
   );
   create index todos_session on todos(session_id, position);
   `,
+  // 25: what the user changed in a to-do list that its agent has not been told yet.
+  `
+  create table todo_notices (
+    session_id text primary key references sessions(id) on delete cascade,
+    changes text not null               -- JSON array of descriptions, oldest first
+  );
+  `,
 ];
 
 /**
