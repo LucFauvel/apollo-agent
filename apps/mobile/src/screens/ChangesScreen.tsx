@@ -1,10 +1,24 @@
-import { cardsTick, codeLanguage, codePlainColor, dismissKey, highlightCode, initialPanel, panelView, reducePanel } from "@apollo/client";
+import {
+  cardsTick,
+  codeLanguage,
+  codePlainColor,
+  dismissKey,
+  highlightCode,
+  initialPanel,
+  panelView,
+  REVIEW_STATUS_LABEL,
+  reducePanel,
+  reviewCommentPlace,
+  reviewsForPr,
+  reviewsSummary,
+} from "@apollo/client";
 import type {
   ChangeReport,
   ClearedChanges,
   OverviewFile,
   PullRequest,
   RepoChanges,
+  ReviewComment,
   SemanticFileDiff,
   SemanticSymbol,
   Session,
@@ -12,7 +26,7 @@ import type {
   SessionId,
 } from "@apollo/contracts";
 import { useEffect, useMemo, useReducer, useState } from "react";
-import { ActivityIndicator, AppState, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, AppState, Linking, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useApollo } from "../AppState.tsx";
 import { errorMessage } from "../connection.ts";
@@ -33,6 +47,7 @@ import {
   HeadingIcon,
   type Icon,
   LayersIcon,
+  MessageSquareIcon,
   SparklesIcon,
   SquareFunctionIcon,
   TypeIcon,
@@ -118,13 +133,13 @@ export function ChangesScreen({
   // Servers that predate clearing from the panel send neither `cleared` nor sections' `turns`.
   const canClear = own.server?.cleared !== undefined;
 
-  const pullRequests = useMemo(() => {
+  const { pullRequests, sessionIds } = useMemo(() => {
     const ids = new Set(
       session.role === "main" ? [...state.sessions.values()].filter((s) => s.botId === session.botId).map((s) => s.id) : [session.id],
     );
     const byUrl = new Map<string, PullRequest>();
     for (const pr of state.pullRequests.values()) if (ids.has(pr.sessionId) && (byUrl.get(pr.url)?.updatedAt ?? 0) < pr.updatedAt) byUrl.set(pr.url, pr);
-    return [...byUrl.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+    return { pullRequests: [...byUrl.values()].sort((a, b) => b.updatedAt - a.updatedAt), sessionIds: ids };
   }, [state.pullRequests, state.sessions, session]);
 
   const fileCount = overview?.sessions.reduce((n, s) => n + s.repos.reduce((m, r) => m + r.files.length, 0), 0) ?? 0;
@@ -194,7 +209,7 @@ export function ChangesScreen({
         {overview && overview.sessions.length > 0 && !canClear ? (
           <Text style={styles.hint}>Update Apollo on your computer to clear changes from here.</Text>
         ) : null}
-        <PullRequests pullRequests={pullRequests} />
+        <PullRequests pullRequests={pullRequests} sessionIds={sessionIds} />
       </ScrollView>
     </View>
   );
@@ -630,7 +645,7 @@ function HunkView({ hunk, language, first }: { hunk: SemanticSymbol["hunks"][num
 
 // --- pull requests ----------------------------------------------------------------------
 
-function PullRequests({ pullRequests }: { pullRequests: ReadonlyArray<PullRequest> }) {
+function PullRequests({ pullRequests, sessionIds }: { pullRequests: ReadonlyArray<PullRequest>; sessionIds: ReadonlySet<SessionId> }) {
   const [showMerged, toggle] = useToggle();
   if (pullRequests.length === 0) return null;
   const active = pullRequests.filter((pr) => pr.state === "open" || pr.state === "draft");
@@ -645,7 +660,7 @@ function PullRequests({ pullRequests }: { pullRequests: ReadonlyArray<PullReques
         </View>
         {active.length === 0 ? <Text style={styles.faintSmall}>No open pull requests.</Text> : null}
         {active.map((pr) => (
-          <PullRequestRow key={pr.url} pr={pr} />
+          <PullRequestRow key={pr.url} pr={pr} sessionIds={sessionIds} />
         ))}
         {done.length > 0 ? (
           <>
@@ -659,7 +674,7 @@ function PullRequests({ pullRequests }: { pullRequests: ReadonlyArray<PullReques
                 <Text style={styles.mergedCountText}>{done.length}</Text>
               </View>
             </Pressable>
-            {showMerged ? done.map((pr) => <PullRequestRow key={pr.url} pr={pr} />) : null}
+            {showMerged ? done.map((pr) => <PullRequestRow key={pr.url} pr={pr} sessionIds={sessionIds} />) : null}
           </>
         ) : null}
       </View>
@@ -674,30 +689,115 @@ const CHECKS: Record<PullRequest["checks"], { icon: Icon; color: string }> = {
   failing: { icon: CircleXIcon, color: RED },
 };
 
-function PullRequestRow({ pr }: { pr: PullRequest }) {
+function PullRequestRow({ pr, sessionIds }: { pr: PullRequest; sessionIds: ReadonlySet<SessionId> }) {
+  const { state } = useApollo();
+  const reviews = useMemo(
+    () => reviewsForPr(state.pullRequestReviews, sessionIds, pr.url, pr.sessionId),
+    [state.pullRequestReviews, sessionIds, pr.url, pr.sessionId],
+  );
   const done = pr.state === "merged" || pr.state === "closed";
   const StateIcon = pr.state === "merged" ? GitMergeIcon : pr.state === "draft" ? GitPullRequestDraftIcon : GitPullRequestIcon;
   const stateColor = pr.state === "merged" ? VIOLET : pr.state === "closed" ? "rgba(252,165,165,0.8)" : pr.state === "draft" ? colors.muted : GREEN;
   const checks = CHECKS[pr.checks];
   const review = pr.review ? pr.review.replace("_", " ") : null;
   return (
-    <Pressable onPress={() => void Linking.openURL(pr.url)} style={({ pressed }) => [styles.pr, pressed && styles.pressed]}>
-      <StateIcon size={16} color={stateColor} strokeWidth={1.75} />
-      <View style={{ flex: 1, minWidth: 0 }}>
-        <Text style={[styles.prTitle, done && { color: colors.muted }]} numberOfLines={1}>
-          {pr.title}
-        </Text>
-        <Text style={styles.prMeta} numberOfLines={1}>
-          {pr.repo}#{pr.number}
-          {pr.state === "closed" ? <Text style={{ color: "rgba(252,165,165,0.8)" }}> · closed</Text> : null}
-          {pr.state === "draft" ? " · draft" : ""}
-          {review ? (
-            <Text style={{ color: pr.review === "approved" ? GREEN : pr.review === "changes_requested" ? "#fcd34d" : colors.faint }}> · {review}</Text>
+    <View style={styles.prCard}>
+      <Pressable onPress={() => void Linking.openURL(pr.url)} style={({ pressed }) => [styles.pr, pressed && styles.pressed]}>
+        <StateIcon size={16} color={stateColor} strokeWidth={1.75} />
+        <View style={{ flex: 1, minWidth: 0 }}>
+          <Text style={[styles.prTitle, done && { color: colors.muted }]} numberOfLines={1}>
+            {pr.title}
+          </Text>
+          <Text style={styles.prMeta} numberOfLines={1}>
+            {pr.repo}#{pr.number}
+            {pr.state === "closed" ? <Text style={{ color: "rgba(252,165,165,0.8)" }}> · closed</Text> : null}
+            {pr.state === "draft" ? " · draft" : ""}
+            {review ? (
+              <Text style={{ color: pr.review === "approved" ? GREEN : pr.review === "changes_requested" ? "#fcd34d" : colors.faint }}> · {review}</Text>
+            ) : null}
+          </Text>
+        </View>
+        {!done ? pr.checks === "pending" ? <ActivityIndicator size="small" color={checks.color} /> : <checks.icon size={16} color={checks.color} /> : null}
+      </Pressable>
+      {reviews && (!done || reviews.comments.length > 0) ? <ReviewActivity url={pr.url} done={done} reviews={reviews} /> : null}
+    </View>
+  );
+}
+
+const REVIEW_STATUS_COLOR: Record<ReviewComment["status"], string> = {
+  earlier: colors.faint,
+  manual: colors.muted,
+  queued: "#fcd34d",
+  addressed: GREEN,
+  answered: "#7dd3fc",
+  declined: colors.textSoft,
+};
+
+/** The PR's review comments and what the agent did about each (it replies under the user's GitHub account). */
+function ReviewActivity({ url, done, reviews }: { url: string; done: boolean; reviews: NonNullable<ReturnType<typeof reviewsForPr>> }) {
+  const { connection } = useApollo();
+  const [open, toggle] = useToggle();
+  const [error, setError] = useState<string | null>(null);
+  const summary = reviewsSummary(reviews.comments);
+  const setAutoAddress = (enabled: boolean) => {
+    setError(null);
+    connection.rpc((c) => c["pullRequests.setAutoAddress"]({ sessionId: reviews.sessionId, url, enabled })).catch((e: unknown) => setError(errorMessage(e)));
+  };
+  return (
+    <View style={styles.reviews}>
+      <View style={styles.reviewsBar}>
+        <Pressable onPress={toggle} disabled={reviews.comments.length === 0} hitSlop={6} style={styles.reviewsSummary}>
+          {reviews.comments.length > 0 ? (
+            <Turn open={open}>
+              <ChevronRightIcon size={12} color={colors.faint} />
+            </Turn>
           ) : null}
-        </Text>
+          <MessageSquareIcon size={12} color={colors.faint} />
+          <Text style={styles.reviewsText} numberOfLines={1}>
+            {summary ?? "No review comments yet"}
+          </Text>
+        </Pressable>
+        {!done ? (
+          <>
+            <Text style={styles.reviewsText}>Auto-address</Text>
+            <Switch
+              value={reviews.autoAddress}
+              onValueChange={setAutoAddress}
+              trackColor={{ true: colors.accent }}
+              style={styles.reviewsSwitch}
+              accessibilityLabel="Auto-address review comments: the agent fixes or answers them, pushes, and replies on GitHub under your account"
+            />
+          </>
+        ) : null}
       </View>
-      {!done ? pr.checks === "pending" ? <ActivityIndicator size="small" color={checks.color} /> : <checks.icon size={16} color={checks.color} /> : null}
-    </Pressable>
+      {error ? <Text style={styles.error}>{error}</Text> : null}
+      {open
+        ? reviews.comments.map((c) => (
+            <View key={c.id} style={styles.reviewComment}>
+              <View style={styles.rowCenter}>
+                <Text style={styles.reviewAuthor}>{c.author}</Text>
+                <Text style={styles.reviewPlace} numberOfLines={1} onPress={() => void Linking.openURL(c.url)}>
+                  {reviewCommentPlace(c)}
+                </Text>
+                <Text style={[styles.reviewStatus, { color: REVIEW_STATUS_COLOR[c.status] }]}>{REVIEW_STATUS_LABEL[c.status]}</Text>
+              </View>
+              <Text style={styles.reviewBody} numberOfLines={2}>
+                {c.body}
+              </Text>
+              {c.reply ? (
+                <View style={styles.reviewReply}>
+                  <Text style={styles.reviewBody} numberOfLines={3}>
+                    {c.reply.body}
+                  </Text>
+                  <Text style={styles.reviewPlace} onPress={() => void Linking.openURL(c.reply!.url)}>
+                    Reply posted as you{c.commit ? ` · ${c.commit.slice(0, 7)}` : ""}
+                  </Text>
+                </View>
+              ) : null}
+            </View>
+          ))
+        : null}
+    </View>
   );
 }
 
@@ -802,17 +902,19 @@ const styles = StyleSheet.create({
   mergedLabel: { color: colors.muted, fontSize: 13 },
   mergedCount: { backgroundColor: colors.border, borderRadius: 5, paddingHorizontal: 6 },
   mergedCountText: { color: colors.muted, fontSize: 11 },
-  pr: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: "rgba(24,24,27,0.4)",
-    paddingHorizontal: 12,
-    paddingVertical: 11,
-  },
+  prCard: { borderRadius: 14, borderWidth: 1, borderColor: colors.border, backgroundColor: "rgba(24,24,27,0.4)", overflow: "hidden" },
+  pr: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 12, paddingVertical: 11 },
+  reviews: { borderTopWidth: 1, borderTopColor: colors.border, paddingHorizontal: 12, paddingVertical: 6, gap: 8 },
+  reviewsBar: { flexDirection: "row", alignItems: "center", gap: 8 },
+  reviewsSummary: { flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 },
+  reviewsText: { color: colors.faint, fontSize: 12, flexShrink: 1 },
+  reviewsSwitch: { transform: [{ scale: 0.75 }] },
+  reviewComment: { gap: 3 },
+  reviewAuthor: { color: colors.textSoft, fontSize: 12, fontWeight: "600" },
+  reviewPlace: { color: colors.faint, fontSize: 12, flexShrink: 1 },
+  reviewStatus: { marginLeft: "auto", fontSize: 12 },
+  reviewBody: { color: colors.muted, fontSize: 12, lineHeight: 17 },
+  reviewReply: { marginLeft: 6, paddingLeft: 8, borderLeftWidth: 1, borderLeftColor: colors.border, gap: 2 },
   prTitle: { color: colors.text, fontSize: 14 },
   prMeta: { color: colors.faint, fontSize: 12, marginTop: 2 },
 });

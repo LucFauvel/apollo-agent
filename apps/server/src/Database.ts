@@ -371,6 +371,22 @@ export const MIGRATIONS: ReadonlyArray<string> = [
   `
   alter table projects add column lead_session_id text;
   `,
+  // 27: review comments on linked pull requests, and what the agent did about each.
+  `
+  create table pull_request_reviews (
+    session_id text not null references sessions(id) on delete cascade,
+    url text not null,
+    auto_address integer not null default 1,
+    comments text not null default '[]', -- JSON Array<ReviewComment>
+    seen text not null default '',       -- review and comment counts when the comments were last read
+    undelivered text not null default '[]', -- JSON ids of new comments the agent has not been told about yet
+    primary key (session_id, url)
+  );
+  `,
+  // 28: auto-address starts off; the user is asked once whether to turn it on for each linked PR.
+  `
+  alter table pull_request_reviews add column ask integer not null default 0;
+  `,
 ];
 
 /**

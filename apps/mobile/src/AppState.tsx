@@ -1,4 +1,4 @@
-import { applyTodos, invalidateChanges, rollBack, type TodoLists, withOrder, withSeenMark } from "@apollo/client";
+import { applyReviewsChange, applyTodos, invalidateChanges, rollBack, type TodoLists, withOrder, withSeenMark } from "@apollo/client";
 import type {
   AccountLimitsChange,
   AppChange,
@@ -11,6 +11,8 @@ import type {
   Project,
   ProjectId,
   ProjectsChange,
+  PullRequestReviews,
+  PullRequestReviewsChange,
   PullRequest,
   Session,
   SessionId,
@@ -35,6 +37,8 @@ export interface AppState {
   readonly monitors: ReadonlyMap<string, Monitor>;
   /** When the user last saw each bot's chats, on any device: its notifications up to then are dismissed. */
   readonly notificationsSeen: ReadonlyMap<string, number>;
+  /** Review comments on linked pull requests and what the agent did about each (from `pullRequests.watch`), keyed like pullRequests. */
+  readonly pullRequestReviews: ReadonlyMap<string, PullRequestReviews>;
   /** Every bot's projects (from `projects.watch`). */
   readonly projects: ReadonlyMap<ProjectId, Project>;
   /** Each session's to-do list (from `todos.watch`). */
@@ -52,6 +56,7 @@ const empty: AppState = {
   bots: new Map(),
   sessions: new Map(),
   pullRequests: new Map(),
+  pullRequestReviews: new Map(),
   changesVersion: new Map(),
   browserTabs: new Map(),
   monitors: new Map(),
@@ -199,6 +204,14 @@ export function AppStateProvider({ connection, pairing, children }: { connection
     [connection],
   );
   useEffect(() => connection.follow((client) => client["limits.watch"](), (change) => setState((s) => applyLimits(s, change))), [connection]);
+  useEffect(
+    () =>
+      connection.follow(
+        (client) => client["pullRequests.watch"](),
+        (change: PullRequestReviewsChange) => setState((s) => ({ ...s, pullRequestReviews: applyReviewsChange(s.pullRequestReviews, change) })),
+      ),
+    [connection],
+  );
   const latest = useRef(state);
   latest.current = state;
   const reorderBots = useCallback(

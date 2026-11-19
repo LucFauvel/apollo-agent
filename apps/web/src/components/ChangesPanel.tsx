@@ -1,5 +1,29 @@
-import { cardsTick, codeLanguage, codePlainColor, dismissKey, highlightCode, initialPanel, panelView, reducePanel } from "@apollo/client";
-import type { Bot, ClearedChanges, OverviewFile, PullRequest, SemanticFileDiff, SemanticSymbol, Session, SessionChanges, SessionId } from "@apollo/contracts";
+import {
+  cardsTick,
+  codeLanguage,
+  codePlainColor,
+  dismissKey,
+  highlightCode,
+  initialPanel,
+  panelView,
+  REVIEW_STATUS_LABEL,
+  reducePanel,
+  reviewCommentPlace,
+  reviewsForPr,
+  reviewsSummary,
+} from "@apollo/client";
+import type {
+  Bot,
+  ClearedChanges,
+  OverviewFile,
+  PullRequest,
+  ReviewComment,
+  SemanticFileDiff,
+  SemanticSymbol,
+  Session,
+  SessionChanges,
+  SessionId,
+} from "@apollo/contracts";
 import {
   Braces,
   ChevronRight,
@@ -15,6 +39,7 @@ import {
   GitPullRequest,
   GitPullRequestDraft,
   Hash,
+  MessageSquare,
   Heading,
   Layers,
   Loader2,
@@ -27,7 +52,7 @@ import {
 import { type ReactNode, useEffect, useMemo, useReducer, useState } from "react";
 import { errorMessage, rpc } from "../rpc.ts";
 import { useApp } from "../store.ts";
-import { Collapse, cx, EmptyState, Panel, Tooltip } from "./ui.tsx";
+import { Collapse, cx, EmptyState, Panel, Toggle, Tooltip } from "./ui.tsx";
 
 /**
  * What the agents changed, and their pull requests. The file lists, the grouping by
@@ -89,7 +114,7 @@ export function ChangesPanel({
 
   const overview = useMemo(() => panelView(own), [own]);
   const fileCount = overview?.sessions.reduce((n, s) => n + s.repos.reduce((m, r) => m + r.files.length, 0), 0) ?? 0;
-  const pullRequests = useSessionPullRequests(session);
+  const { pullRequests, sessionIds } = useSessionPullRequests(session);
 
   return (
     <Panel
@@ -143,7 +168,7 @@ export function ChangesPanel({
             ))}
           </div>
         ) : null}
-        <PullRequests pullRequests={pullRequests} />
+        <PullRequests pullRequests={pullRequests} sessionIds={sessionIds} />
       </div>
     </Panel>
   );
@@ -538,11 +563,11 @@ const useSessionPullRequests = (session: Session) => {
     // One row per URL (a PR can be linked from several sessions), newest first.
     const byUrl = new Map<string, PullRequest>();
     for (const pr of all.values()) if (ids.has(pr.sessionId) && (byUrl.get(pr.url)?.updatedAt ?? 0) < pr.updatedAt) byUrl.set(pr.url, pr);
-    return [...byUrl.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+    return { pullRequests: [...byUrl.values()].sort((a, b) => b.updatedAt - a.updatedAt), sessionIds: ids };
   }, [all, sessions, session]);
 };
 
-function PullRequests({ pullRequests }: { pullRequests: ReadonlyArray<PullRequest> }) {
+function PullRequests({ pullRequests, sessionIds }: { pullRequests: ReadonlyArray<PullRequest>; sessionIds: ReadonlySet<SessionId> }) {
   const [showMerged, setShowMerged] = useState(false);
   const active = pullRequests.filter((pr) => pr.state === "open" || pr.state === "draft");
   const done = pullRequests.filter((pr) => pr.state === "merged" || pr.state === "closed");
@@ -556,7 +581,7 @@ function PullRequests({ pullRequests }: { pullRequests: ReadonlyArray<PullReques
       {active.length === 0 ? <p className="text-xs text-zinc-500">No open pull requests.</p> : null}
       <div className="space-y-1.5">
         {active.map((pr, i) => (
-          <PullRequestRow key={pr.url} pr={pr} index={i} />
+          <PullRequestRow key={pr.url} pr={pr} index={i} sessionIds={sessionIds} />
         ))}
       </div>
       {done.length > 0 ? (
@@ -574,7 +599,7 @@ function PullRequests({ pullRequests }: { pullRequests: ReadonlyArray<PullReques
           <Collapse open={showMerged}>
             <div className="space-y-1.5 pt-1">
               {done.map((pr, i) => (
-                <PullRequestRow key={pr.url} pr={pr} index={i} />
+                <PullRequestRow key={pr.url} pr={pr} index={i} sessionIds={sessionIds} />
               ))}
             </div>
           </Collapse>
@@ -591,41 +616,132 @@ const CHECKS: Record<PullRequest["checks"], { icon: LucideIcon; label: string; c
   failing: { icon: CircleX, label: "Checks failed", className: "text-red-400" },
 };
 
-function PullRequestRow({ pr, index }: { pr: PullRequest; index: number }) {
+function PullRequestRow({ pr, index, sessionIds }: { pr: PullRequest; index: number; sessionIds: ReadonlySet<SessionId> }) {
   const done = pr.state === "merged" || pr.state === "closed";
   const Icon = pr.state === "merged" ? GitMerge : pr.state === "draft" ? GitPullRequestDraft : GitPullRequest;
   const checks = CHECKS[pr.checks];
+  const allReviews = useApp((s) => s.pullRequestReviews);
+  const reviews = useMemo(() => reviewsForPr(allReviews, sessionIds, pr.url, pr.sessionId), [allReviews, sessionIds, pr.url, pr.sessionId]);
   return (
-    <a
-      href={pr.url}
-      target="_blank"
-      rel="noreferrer"
-      className="animate-fade-up group flex min-w-0 items-center gap-2.5 rounded-xl border border-zinc-800/80 bg-zinc-900/30 px-3 py-2 transition-all hover:-translate-y-px hover:border-zinc-700 hover:bg-zinc-900/70"
+    <div
+      className="animate-fade-up overflow-hidden rounded-xl border border-zinc-800/80 bg-zinc-900/30 transition-colors hover:border-zinc-700"
       style={{ animationDelay: `${Math.min(index, 8) * 30}ms` }}
     >
-      <Icon
-        className={cx(
-          "size-4 shrink-0",
-          pr.state === "merged" ? "text-violet-300" : pr.state === "closed" ? "text-red-300/80" : pr.state === "draft" ? "text-zinc-400" : "text-emerald-400",
-        )}
-        strokeWidth={1.75}
-      />
-      <span className="min-w-0 flex-1">
-        <span className={cx("block truncate text-[13px]", done ? "text-zinc-400" : "text-zinc-100")}>{pr.title}</span>
-        <span className="flex items-center gap-1.5 text-[11px] text-zinc-500">
-          <FileCode2 className="size-3" />
-          {pr.repo}#{pr.number}
-          {pr.state === "closed" ? <span className="text-red-300/80">· closed</span> : null}
-          {pr.state === "draft" ? <span>· draft</span> : null}
-          {pr.review ? <span className={pr.review === "approved" ? "text-emerald-400" : pr.review === "changes_requested" ? "text-amber-300" : ""}>· {pr.review.replace("_", " ")}</span> : null}
+      <a href={pr.url} target="_blank" rel="noreferrer" className="group flex min-w-0 items-center gap-2.5 px-3 py-2 transition-colors hover:bg-zinc-900/70">
+        <Icon
+          className={cx(
+            "size-4 shrink-0",
+            pr.state === "merged" ? "text-violet-300" : pr.state === "closed" ? "text-red-300/80" : pr.state === "draft" ? "text-zinc-400" : "text-emerald-400",
+          )}
+          strokeWidth={1.75}
+        />
+        <span className="min-w-0 flex-1">
+          <span className={cx("block truncate text-[13px]", done ? "text-zinc-400" : "text-zinc-100")}>{pr.title}</span>
+          <span className="flex items-center gap-1.5 text-[11px] text-zinc-500">
+            <FileCode2 className="size-3" />
+            {pr.repo}#{pr.number}
+            {pr.state === "closed" ? <span className="text-red-300/80">· closed</span> : null}
+            {pr.state === "draft" ? <span>· draft</span> : null}
+            {pr.review ? <span className={pr.review === "approved" ? "text-emerald-400" : pr.review === "changes_requested" ? "text-amber-300" : ""}>· {pr.review.replace("_", " ")}</span> : null}
+          </span>
         </span>
-      </span>
-      {!done ? (
-        <span title={checks.label} className={cx("flex shrink-0 items-center gap-1 text-[11px]", checks.className)}>
-          {pr.checks === "pending" ? <Loader2 className="size-3.5 animate-spin" /> : <checks.icon className="size-3.5" />}
+        {!done ? (
+          <span title={checks.label} className={cx("flex shrink-0 items-center gap-1 text-[11px]", checks.className)}>
+            {pr.checks === "pending" ? <Loader2 className="size-3.5 animate-spin" /> : <checks.icon className="size-3.5" />}
+          </span>
+        ) : null}
+      </a>
+      {reviews && (!done || reviews.comments.length > 0) ? <ReviewActivity url={pr.url} done={done} reviews={reviews} /> : null}
+    </div>
+  );
+}
+
+const REVIEW_STATUS_CLASS: Record<ReviewComment["status"], string> = {
+  earlier: "text-zinc-500",
+  manual: "text-zinc-400",
+  queued: "text-amber-300",
+  addressed: "text-emerald-400",
+  answered: "text-sky-300",
+  declined: "text-zinc-300",
+};
+
+/** The PR's review comments and what the agent did about each (it replies under the user's GitHub account). */
+function ReviewActivity({ url, done, reviews }: { url: string; done: boolean; reviews: NonNullable<ReturnType<typeof reviewsForPr>> }) {
+  const [open, setOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const summary = reviewsSummary(reviews.comments);
+  const setAutoAddress = (enabled: boolean) => {
+    setError(null);
+    rpc((c) => c["pullRequests.setAutoAddress"]({ sessionId: reviews.sessionId, url, enabled })).catch((e: unknown) => setError(errorMessage(e)));
+  };
+  return (
+    <div className="border-t border-zinc-800/80 px-3 py-1.5">
+      <div className="flex items-center gap-2 text-[11px] text-zinc-500">
+        <button
+          type="button"
+          onClick={() => setOpen(!open)}
+          disabled={reviews.comments.length === 0}
+          aria-expanded={open}
+          className="flex min-w-0 flex-1 items-center gap-1.5 text-left hover:text-zinc-300 disabled:hover:text-zinc-500"
+        >
+          {reviews.comments.length > 0 ? <ChevronRight className={cx("size-3 shrink-0 transition-transform duration-200", open && "rotate-90")} /> : null}
+          <MessageSquare className="size-3 shrink-0" />
+          <span className="truncate">{summary ?? "No review comments yet"}</span>
+        </button>
+        {!done ? (
+          <>
+            <span className="shrink-0">Auto-address</span>
+            <Toggle
+              checked={reviews.autoAddress}
+              onChange={setAutoAddress}
+              title={
+                reviews.autoAddress
+                  ? "The agent fixes or answers new review comments, pushes, and replies on GitHub under your account. Click to stop."
+                  : "Let the agent fix or answer new review comments, push, and reply on GitHub under your account."
+              }
+            />
+          </>
+        ) : null}
+      </div>
+      {error ? <p className="pt-1 text-[11px] text-red-300">{error}</p> : null}
+      <Collapse open={open}>
+        <ul className="space-y-2 py-1.5">
+          {reviews.comments.map((c) => (
+            <ReviewCommentItem key={c.id} comment={c} />
+          ))}
+        </ul>
+      </Collapse>
+    </div>
+  );
+}
+
+function ReviewCommentItem({ comment: c }: { comment: ReviewComment }) {
+  return (
+    <li className="space-y-1 text-[11px]">
+      <div className="flex items-center gap-1.5 text-zinc-500">
+        <span className="font-medium text-zinc-300">{c.author}</span>
+        <a href={c.url} target="_blank" rel="noreferrer" className="truncate hover:text-zinc-300 hover:underline">
+          {reviewCommentPlace(c)}
+        </a>
+        <span className="flex-1" />
+        <span className={cx("shrink-0", REVIEW_STATUS_CLASS[c.status])}>
+          {c.status === "queued" ? <Loader2 className="mr-1 inline size-3 animate-spin" /> : null}
+          {REVIEW_STATUS_LABEL[c.status]}
         </span>
+      </div>
+      <p className="line-clamp-2 whitespace-pre-wrap text-zinc-400">{c.body}</p>
+      {c.reply ? (
+        <div className="ml-2 border-l border-zinc-700 pl-2 text-zinc-400">
+          <p className="line-clamp-3 whitespace-pre-wrap">{c.reply.body}</p>
+          <p className="text-zinc-500">
+            <a href={c.reply.url} target="_blank" rel="noreferrer" className="hover:text-zinc-300 hover:underline">
+              Reply posted as you
+            </a>
+            {c.commit ? <span className="font-mono"> · {c.commit.slice(0, 7)}</span> : null}
+          </p>
+        </div>
       ) : null}
-    </a>
+    </li>
   );
 }
 

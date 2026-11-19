@@ -1,5 +1,5 @@
 import { AppSettings, ProjectInfo, UpdateAppSettingsInput } from "./appSettings.ts";
-import { PullRequest } from "./pullRequests.ts";
+import { PullRequest, PullRequestReviewsChange } from "./pullRequests.ts";
 import { Monitor } from "./monitors.ts";
 import { ChangesOverview, ConversationChanges, SemanticFileDiff } from "./changes.ts";
 import { RemoteAccess } from "./remote.ts";
@@ -350,6 +350,13 @@ export class ApolloRpcs extends RpcGroup.make(
   }),
   /** Stops watching (or forgets) a pull request linked to a session. */
   Rpc.make("pullRequests.unlink", { payload: { sessionId: SessionId, url: Schema.String }, error }),
+  /** Every linked PR's review comments and what the agent did about each, then each change. */
+  Rpc.make("pullRequests.watch", { success: PullRequestReviewsChange, stream: true }),
+  /** Turns on or off the agent addressing new review comments on this PR on its own; answers its `ask` either way. */
+  Rpc.make("pullRequests.setAutoAddress", {
+    payload: { sessionId: SessionId, url: Schema.String, enabled: Schema.Boolean },
+    error,
+  }),
   /** Stops a monitor; its agent is told the user stopped it. */
   Rpc.make("monitors.stop", { payload: { monitorId: Schema.String }, error }),
   /**

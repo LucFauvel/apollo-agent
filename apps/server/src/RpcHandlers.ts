@@ -188,6 +188,8 @@ export const layer = ApolloRpcs.toLayer(
       "sessions.commands": ({ sessionId }) => manager.listCommands(sessionId),
       "sessions.runCommand": ({ sessionId, name, args }) => manager.runCommand(sessionId, name, args),
       "pullRequests.unlink": ({ sessionId, url }) => pullRequests.unlink(sessionId, url),
+      "pullRequests.watch": () => pullRequests.watch,
+      "pullRequests.setAutoAddress": ({ sessionId, url, enabled }) => pullRequests.setAutoAddress(sessionId, url, enabled),
       "monitors.stop": ({ monitorId }) => monitors.stopByUser(monitorId),
       "sessions.setMemoryExclusion": ({ sessionId, seq, excluded }) =>
         manager.setMemoryExclusion(sessionId, seq, excluded),

@@ -7,6 +7,8 @@ import type {
   BrowserTab,
   LocalModelsState,
   PullRequest,
+  PullRequestReviews,
+  PullRequestReviewsChange,
   Monitor,
   Project,
   ProjectId,
@@ -19,7 +21,7 @@ import type {
   TodosChange,
   UsageLimits,
 } from "@apollo/contracts";
-import { applyTodos, invalidateChanges, type TodoLists, withSeenMark } from "@apollo/client";
+import { applyReviewsChange, applyTodos, invalidateChanges, type TodoLists, withSeenMark } from "@apollo/client";
 import * as Stream from "effect/Stream";
 import { useSyncExternalStore } from "react";
 import { sortBots } from "@apollo/contracts";
@@ -43,6 +45,8 @@ export interface AppState {
   readonly browserTabs: ReadonlyMap<string, BrowserTab>;
   /** Pull requests linked to sessions, keyed `${sessionId} ${url}`. */
   readonly pullRequests: ReadonlyMap<string, PullRequest>;
+  /** Review comments on linked pull requests and what the agent did about each, keyed like pullRequests. */
+  readonly pullRequestReviews: ReadonlyMap<string, PullRequestReviews>;
   /** Monitors agents set up, running and recently ended, by id. */
   readonly monitors: ReadonlyMap<string, Monitor>;
   /** Bumped when a bot's sessions changed files or explained changes: the Changes panel refetches. */
@@ -75,6 +79,7 @@ let state: AppState = {
   schedules: new Map(),
   browserTabs: new Map(),
   pullRequests: new Map(),
+  pullRequestReviews: new Map(),
   monitors: new Map(),
   changesVersion: new Map(),
   notificationsSeen: new Map(),
@@ -231,9 +236,14 @@ const applyProjects = (change: ProjectsChange) => {
 
 /** Applies one item of `todos.watch`: each (re)connection starts with every list. */
 const applyTodoChange = (change: TodosChange) => setState({ ...state, todos: applyTodos(state.todos, change) });
+/** Applies one item of `pullRequests.watch`: each (re)connection starts with every linked PR's comments. */
+const applyReviews = (change: PullRequestReviewsChange) =>
+  setState({ ...state, pullRequestReviews: applyReviewsChange(state.pullRequestReviews, change) });
 
 /** Starts syncing app state; each (re)connection begins with a fresh snapshot. */
 export const startSync = () => {
+  // Review comments on linked PRs too (see PullRequestReviewsChange).
+  const stopReviews = follow((client) => client["pullRequests.watch"](), applyReviews);
   // Projects come on their own stream too (see ProjectsChange).
   const stopProjects = follow((client) => client["projects.watch"](), applyProjects);
   // So do to-do lists (see TodosChange).
@@ -277,5 +287,6 @@ export const startSync = () => {
     stopLimits();
     stopProjects();
     stopTodos();
+    stopReviews();
   };
 };
