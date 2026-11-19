@@ -353,6 +353,7 @@ export const MIGRATIONS: ReadonlyArray<string> = [
     auto_address integer not null default 1,
     comments text not null default '[]', -- JSON Array<ReviewComment>
     seen text not null default '',       -- review and comment counts when the comments were last read
+    undelivered text not null default '[]', -- JSON ids of new comments the agent has not been told about yet
     primary key (session_id, url)
   );
   `,

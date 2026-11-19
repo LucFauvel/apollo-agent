@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEvent, ProviderKind, PullRequestReviewsChange, ReviewComment } from "@apollo/contracts";
-import { ProviderKind as Kinds } from "@apollo/contracts";
+import { ApolloError, ProviderKind as Kinds } from "@apollo/contracts";
 import type { Provider } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -25,6 +25,8 @@ const fakeGitHub = () => {
     comments: [] as Array<GhComment>,
     replies: [] as Array<{ repo: string; number: number; to: { kind: GhComment["kind"]; id: number }; body: string }>,
     nextId: 1000,
+    /** Runs while a comments fetch is in flight, before it returns. */
+    duringFetch: null as null | (() => Promise<unknown>),
   };
   const view = (): GhPullRequest => ({
     number: 7,
@@ -53,12 +55,23 @@ const fakeGitHub = () => {
   };
   const service = {
     view: () => Effect.sync(view),
-    comments: () => Effect.sync(() => [...state.comments]),
+    comments: () =>
+      Effect.promise(async () => {
+        const list = [...state.comments];
+        const hook = state.duringFetch;
+        state.duringFetch = null;
+        if (hook) await hook();
+        return list;
+      }),
     reply: (repo: string, number: number, to: { kind: GhComment["kind"]; id: number }, body: string) =>
-      Effect.sync(() => {
+      Effect.suspend(() => {
+        // Like GitHub: an inline reply must target the thread's first comment.
+        if (to.kind === "inline" && state.comments.find((c) => c.id === to.id)?.inReplyTo) {
+          return Effect.fail(new ApolloError({ code: "invalid", message: "could not reply: 422 parent comment is a reply" }));
+        }
         state.replies.push({ repo, number, to, body });
-        const posted = add({ kind: to.kind === "inline" ? "inline" : "conversation", author: "luc", body });
-        return { id: String(posted.id), url: posted.url };
+        const posted = add({ kind: to.kind === "inline" ? "inline" : "conversation", author: "luc", body, ...(to.kind === "inline" ? { inReplyTo: to.id } : {}) });
+        return Effect.succeed({ id: String(posted.id), url: posted.url });
       }),
   };
   return { state, add, layer: Layer.succeed(GitHub, service as unknown as GitHub["Service"]) };
@@ -290,6 +303,83 @@ describe("review comments", () => {
       yield* prs.link({ botId: bot.id, sessionId: other.id }, URL, true);
       expect((yield* prs.reviews(other.id, URL))!.autoAddress).toBe(true);
       expect((yield* prs.reviews(worker.id, URL))!.autoAddress).toBe(false);
+    }).pipe(Effect.provide(f.layer));
+  });
+
+  it.live("keeps the user's switch and the agent's replies made while GitHub was being read", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { prs, worker, caller } = yield* setup(f.cwd);
+      yield* prs.link(caller, URL, true);
+      const first = f.github.add({ kind: "inline", body: "Rename this" });
+      yield* prs.poll;
+      yield* until(() => f.sent.length === 1);
+
+      // The agent replies to the first comment while the poll reads a second one.
+      const second = f.github.add({ kind: "inline", body: "And this" });
+      f.github.state.duringFetch = () =>
+        Effect.runPromise(prs.reply(caller, { url: URL, commentId: `inline:${first.id}`, outcome: "addressed", body: "Done", commit: "abc1234" }));
+      yield* prs.poll;
+      const afterReply = (yield* prs.reviews(worker.id, URL))!;
+      expect(afterReply.comments.find((c) => c.id === `inline:${first.id}`)).toMatchObject({ status: "addressed", reply: { body: "Done" } });
+      expect(afterReply.comments.find((c) => c.id === `inline:${second.id}`)?.status).toBe("queued");
+      yield* until(() => f.sent.length === 2);
+
+      // The user turns it off while the poll reads a third comment.
+      const third = f.github.add({ kind: "inline", body: "Also this" });
+      f.github.state.duringFetch = () => Effect.runPromise(prs.setAutoAddress(worker.id, URL, false));
+      yield* prs.poll;
+      const off = (yield* prs.reviews(worker.id, URL))!;
+      expect(off.autoAddress).toBe(false);
+      expect(off.comments.find((c) => c.id === `inline:${third.id}`)?.status).toBe("manual");
+      yield* until(() => f.sent.length === 3);
+      expect(f.sent[2]).toContain("New comment from ada: Also this");
+      expect(f.sent[2]).not.toContain("apollo_pr_reply");
+    }).pipe(Effect.provide(f.layer));
+  });
+
+  it.live("tells the agent about comments it could not take while its bot was paused, once resumed", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, prs, bot, worker, caller } = yield* setup(f.cwd);
+      yield* prs.link(caller, URL, true);
+      yield* manager.stopBot(bot.id);
+      const ask = f.github.add({ kind: "inline", body: "Fix the typo" });
+      yield* prs.poll;
+      expect(f.sent).toEqual([]);
+      expect((yield* prs.reviews(worker.id, URL))!.comments.find((c) => c.id === `inline:${ask.id}`)?.status).toBe("queued");
+
+      // Still paused: nothing new on GitHub, and still not delivered.
+      yield* prs.poll;
+      expect(f.sent).toEqual([]);
+
+      yield* manager.resumeBot(bot.id);
+      yield* prs.poll;
+      yield* until(() => f.sent.length === 1);
+      expect(f.sent[0]).toContain(`[inline:${ask.id}] ada: Fix the typo`);
+
+      // Delivered once only.
+      yield* prs.poll;
+      yield* Effect.sleep("50 millis");
+      expect(f.sent).toHaveLength(1);
+    }).pipe(Effect.provide(f.layer));
+  });
+
+  it.live("answers a reviewer's follow-up in a thread through the thread's first comment", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { prs, worker, caller } = yield* setup(f.cwd);
+      const root = f.github.add({ kind: "inline", body: "Why a map?", path: "src/a.ts", line: 2 });
+      yield* prs.link(caller, URL, true);
+      const followUp = f.github.add({ kind: "inline", body: "Still unsure, can you use a set?", path: "src/a.ts", line: 2, inReplyTo: root.id });
+      yield* prs.poll;
+      yield* until(() => f.sent.length === 1);
+      expect((yield* prs.reviews(worker.id, URL))!.comments.find((c) => c.id === `inline:${followUp.id}`)).toMatchObject({
+        status: "queued",
+        threadRoot: root.id,
+      });
+      yield* prs.reply(caller, { url: URL, commentId: `inline:${followUp.id}`, outcome: "addressed", body: "Switched to a set.", commit: "def5678" });
+      expect(f.github.state.replies.at(-1)!.to).toEqual({ kind: "inline", id: root.id });
     }).pipe(Effect.provide(f.layer));
   });
 });

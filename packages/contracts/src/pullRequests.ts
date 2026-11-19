@@ -39,6 +39,8 @@ export const ReviewComment = Schema.Struct({
   line: Schema.NullOr(Schema.Number),
   url: Schema.String,
   createdAt: Schema.Number,
+  /** Inline replies in a thread: the GitHub id of the thread's first comment, which replies must target. */
+  threadRoot: Schema.optional(Schema.Number),
   status: ReviewCommentStatus,
   /** The reply the agent posted on GitHub (under the user's account). */
   reply: Schema.NullOr(Schema.Struct({ id: Schema.String, body: Schema.String, url: Schema.String, at: Schema.Number })),

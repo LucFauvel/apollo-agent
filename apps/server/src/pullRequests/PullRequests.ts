@@ -145,6 +145,7 @@ export const mergeComments = (
       line: c.line,
       url: c.url,
       createdAt: Date.parse(c.createdAt) || Date.now(),
+      ...(c.kind === "inline" && c.inReplyTo ? { threadRoot: c.inReplyTo } : {}),
       status: options.baseline ? "earlier" : options.autoAddress && options.open && actionable(c) ? "queued" : "manual",
       reply: null,
       commit: null,
@@ -154,6 +155,12 @@ export const mergeComments = (
 };
 
 const where = (c: ReviewComment) => (c.path ? ` on ${c.path}${c.line ? `:${c.line}` : ""}` : c.kind === "review" ? " (review)" : "");
+
+/** Where to post a reply to `comment`: inline replies go to the first comment of its thread. */
+export const replyTarget = (comment: ReviewComment) => {
+  const [kind, id] = comment.id.split(":") as [ReviewComment["kind"], string];
+  return { kind, id: kind === "inline" && comment.threadRoot ? comment.threadRoot : Number(id) };
+};
 
 /** Lines for the agent about new comments: the ones to address with their ids and how, the rest as news. */
 export const newCommentLines = (fresh: ReadonlyArray<ReviewComment>) => {
@@ -214,7 +221,7 @@ const make = Effect.gen(function* () {
       )
       .run(pr.sessionId, pr.url, JSON.stringify(pr), digest);
 
-  type ReviewRow = { session_id: string; url: string; auto_address: number; comments: string; seen: string };
+  type ReviewRow = { session_id: string; url: string; auto_address: number; comments: string; seen: string; undelivered: string };
   const toReviews = (row: ReviewRow): PullRequestReviews => ({
     url: row.url,
     sessionId: row.session_id as SessionId,
@@ -227,6 +234,13 @@ const make = Effect.gen(function* () {
     (db.prepare("select seen from pull_request_reviews where session_id = ? and url = ?").get(sessionId, url) as { seen: string } | undefined)?.seen ?? "";
   const setSeen = (sessionId: SessionId, url: string, seen: string) =>
     db.prepare("update pull_request_reviews set seen = ? where session_id = ? and url = ?").run(seen, sessionId, url);
+  const undeliveredOf = (sessionId: SessionId, url: string) =>
+    JSON.parse(
+      (db.prepare("select undelivered from pull_request_reviews where session_id = ? and url = ?").get(sessionId, url) as { undelivered: string } | undefined)
+        ?.undelivered ?? "[]",
+    ) as Array<string>;
+  const setUndelivered = (sessionId: SessionId, url: string, ids: ReadonlyArray<string>) =>
+    db.prepare("update pull_request_reviews set undelivered = ? where session_id = ? and url = ?").run(JSON.stringify(ids), sessionId, url);
   const allReviews = () => (db.prepare("select * from pull_request_reviews").all() as Array<ReviewRow>).map(toReviews);
   const loadReviews = (sessionId: SessionId, url: string) => {
     const row = db.prepare("select * from pull_request_reviews where session_id = ? and url = ?").get(sessionId, url) as ReviewRow | undefined;
@@ -265,6 +279,9 @@ const make = Effect.gen(function* () {
   const startReviews = (sessionId: SessionId, pr: PullRequest, seen: string) =>
     Effect.gen(function* () {
       const fetched = yield* github.comments(pr.repo, pr.number);
+      // Decided after the fetch: a link or poll may have started tracking it meanwhile.
+      const existing = loadReviews(sessionId, pr.url);
+      if (existing) return existing;
       const others = allReviews().filter((r) => r.url === pr.url);
       const enabled = others.length === 0 || others.some((r) => r.autoAddress);
       const { comments } = mergeComments([], fetched, { baseline: true, autoAddress: false, open: true });
@@ -327,9 +344,8 @@ const make = Effect.gen(function* () {
       const commit = input.commit?.trim() || null;
       if (input.outcome === "addressed" && !commit) return yield* invalid("outcome addressed needs the commit you pushed");
       const pr = JSON.parse(linked.data) as PullRequest;
-      const [kind, id] = comment.id.split(":") as [ReviewComment["kind"], string];
       const text = replyBody(comment, input.body, commit);
-      const posted = yield* github.reply(pr.repo, pr.number, { kind, id: Number(id) }, text);
+      const posted = yield* github.reply(pr.repo, pr.number, replyTarget(comment), text);
       const done: ReviewComment = { ...comment, status: input.outcome, commit, reply: { id: posted.id, body: input.body.trim(), url: posted.url, at: Date.now() } };
       // Read again: the poll may have added comments while the reply was being posted.
       const latest = loadReviews(caller.sessionId, url) ?? reviews;
@@ -348,36 +364,53 @@ const make = Effect.gen(function* () {
       const done = now.summary.state === "merged" || now.summary.state === "closed";
       const pr = { ...now.summary, watched: !done };
 
-      const reviews = loadReviews(known.sessionId, row.url);
       const seen = seenCounts(now);
       let tracked = false;
-      let fresh: ReadonlyArray<ReviewComment> = [];
-      if (!reviews) {
+      if (!loadReviews(known.sessionId, row.url)) {
         tracked = yield* startReviews(known.sessionId, pr, seen).pipe(
           Effect.as(true),
           Effect.catch(() => Effect.succeed(false)),
         );
       } else if (seenOf(known.sessionId, row.url) !== seen) {
         const comments = yield* github.comments(pr.repo, pr.number).pipe(Effect.option);
-        if (comments._tag === "Some") {
+        // Read again after the network call: the user may have flipped the switch, or the
+        // agent recorded a reply, while GitHub was answering.
+        const current = loadReviews(known.sessionId, row.url);
+        if (comments._tag === "Some" && current) {
           tracked = true;
-          const merged = mergeComments(reviews.comments, comments.value, { baseline: false, autoAddress: reviews.autoAddress, open: !done });
-          fresh = merged.fresh;
-          if (fresh.length > 0) yield* putReviews({ ...reviews, comments: merged.comments });
+          const merged = mergeComments(current.comments, comments.value, { baseline: false, autoAddress: current.autoAddress, open: !done });
+          if (merged.fresh.length > 0) {
+            yield* putReviews({ ...current, comments: merged.comments });
+            setUndelivered(known.sessionId, row.url, [...undeliveredOf(known.sessionId, row.url), ...merged.fresh.map((c) => c.id)]);
+          }
           setSeen(known.sessionId, row.url, seen);
         }
       } else {
         tracked = true;
       }
 
+      // New comments the agent has not been told about yet, this time or on an earlier poll
+      // whose message it could not take (its bot was paused, say).
+      const undelivered = new Set(undeliveredOf(known.sessionId, row.url));
+      const pending = (loadReviews(known.sessionId, row.url)?.comments ?? []).filter(
+        (c) => undelivered.has(c.id) && (c.status === "queued" || c.status === "manual"),
+      );
       const lines = changeLines(row.digest, now, !tracked).map((l) => `- ${l}`);
-      const all = [...lines, ...newCommentLines(fresh)];
+      const all = [...lines, ...newCommentLines(pending)];
       save(pr, now.digest);
       if (row.digest !== now.digest || done) yield* publish(pr);
       if (all.length > 0) {
-        yield* manager.send(known.sessionId, [header(pr), ...all].join("\n"), "system").pipe(
-          Effect.catch((error) => Effect.logWarning(`could not report a change to ${row.url}`, error)),
+        const delivered = yield* manager.send(known.sessionId, [header(pr), ...all].join("\n"), "system").pipe(
+          Effect.as(true),
+          Effect.catch((error) => Effect.logWarning(`could not report a change to ${row.url}; trying again on the next poll`, error).pipe(Effect.as(false))),
         );
+        if (delivered || pending.length === 0) {
+          const sent = new Set(pending.map((c) => c.id));
+          setUndelivered(known.sessionId, row.url, undeliveredOf(known.sessionId, row.url).filter((id) => !sent.has(id) && !undelivered.has(id)));
+        }
+      } else if (undelivered.size > 0) {
+        // Replied to or turned into earlier ones meanwhile: nothing left to tell.
+        setUndelivered(known.sessionId, row.url, []);
       }
     });
 

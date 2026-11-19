@@ -38,6 +38,8 @@ export interface GhComment {
   readonly line: number | null;
   readonly url: string;
   readonly createdAt: string;
+  /** Inline replies: the thread's first comment (GitHub's `in_reply_to_id`). */
+  readonly inReplyTo?: number | null;
   /** Reviews only: APPROVED, CHANGES_REQUESTED, COMMENTED... */
   readonly state?: string;
 }
@@ -97,6 +99,7 @@ const live = {
           line: (c.line as number | null) ?? (c.original_line as number | null) ?? null,
           url: (c.html_url as string) ?? "",
           createdAt: (c.created_at as string) ?? "",
+          inReplyTo: (c.in_reply_to_id as number | undefined) ?? null,
         });
       }
       for (const r of reviews) {
@@ -129,7 +132,10 @@ const live = {
       return out;
     }),
 
-  /** Replies in the comment's thread (inline), or on the PR's conversation (the rest). */
+  /**
+   * Replies in the comment's thread (inline), or on the PR's conversation (the rest). For
+   * inline comments `to.id` must be the thread's first comment: GitHub refuses replies to replies.
+   */
   reply: (repo: string, number: number, to: { kind: GhComment["kind"]; id: number }, body: string) =>
     call(`could not reply on ${repo}#${number}`, async () => {
       const path =
