@@ -18,28 +18,56 @@ import * as TodoTools from "../mcp/TodoTools.ts";
 import { reordered } from "./Todos.ts";
 import * as Todos from "./Todos.ts";
 
-/** A provider that records what its agent reads and ends each turn at once; `failures` sends fail first. */
-const recording = (
-  kind: ProviderKind,
-  sent: Array<string>,
-  failures: { count: number; during?: Effect.Effect<unknown, unknown> },
-): Provider => ({
+/**
+ * How the fake agent behaves. `count` sends fail first; `during` runs while a message is taken.
+ * With `hold`, turns run until `finish` ends them, and messages sent meanwhile queue for the next
+ * turn, as Claude Code's do. `exit` makes the agent's process go away.
+ */
+interface Controls {
+  count: number;
+  during?: Effect.Effect<unknown, unknown>;
+  hold: boolean;
+  finish: (outcome?: "completed" | "interrupted" | "failed") => Effect.Effect<void>;
+  exit: Effect.Effect<void>;
+}
+
+/** A provider that records what its agent reads, behaving as `controls` say. */
+const recording = (kind: ProviderKind, sent: Array<string>, controls: Controls): Provider => ({
   kind,
   listModels: Effect.succeed([]),
   open: (_options, emit) =>
     Effect.sync(() => {
       const agent = (event: AgentEvent) => emit({ _tag: "Event", event });
+      let inTurn = false;
+      let queued = 0;
+      const finish = (outcome: "completed" | "interrupted" | "failed" = "completed") =>
+        Effect.gen(function* () {
+          yield* agent({ _tag: "TurnCompleted", outcome, error: null });
+          inTurn = false;
+          if (queued > 0) {
+            queued--;
+            inTurn = true;
+            yield* agent({ _tag: "TurnStarted" });
+          }
+        });
+      controls.finish = finish;
+      controls.exit = emit({ _tag: "Exited", reason: "the agent's process went away" });
       return {
         send: (text: string) =>
           Effect.gen(function* () {
-            if (failures.count > 0) {
-              failures.count--;
+            if (controls.count > 0) {
+              controls.count--;
               return yield* new ProviderError({ provider: kind, message: "the agent's process went away" });
             }
             sent.push(text);
-            if (failures.during) yield* Effect.ignore(failures.during);
+            if (controls.during) yield* Effect.ignore(controls.during);
+            if (inTurn) {
+              queued++;
+              return;
+            }
+            inTurn = true;
             yield* agent({ _tag: "TurnStarted" });
-            yield* agent({ _tag: "TurnCompleted", outcome: "completed", error: null });
+            if (!controls.hold) yield* finish();
           }),
         interrupt: Effect.void,
         respondApproval: () => Effect.void,
@@ -57,13 +85,13 @@ const fixture = ({ persistent = false } = {}) => {
   const cwd = join(dir, "workspace");
   mkdirSync(cwd);
   const sent: Array<string> = [];
-  const failures: { count: number; during?: Effect.Effect<unknown, unknown> } = { count: 0 };
+  const controls: Controls = { count: 0, hold: false, finish: () => Effect.void, exit: Effect.void };
   const layer = () => Todos.layer.pipe(
     Layer.provideMerge(SessionManager.layer),
     Layer.provideMerge(
       Layer.succeed(
         SessionManager.Providers,
-        Object.fromEntries(Kinds.literals.map((k) => [k, recording(k, sent, failures)])) as Record<ProviderKind, Provider>,
+        Object.fromEntries(Kinds.literals.map((k) => [k, recording(k, sent, controls)])) as Record<ProviderKind, Provider>,
       ),
     ),
     Layer.provideMerge(AppSettings.layer),
@@ -88,7 +116,7 @@ const fixture = ({ persistent = false } = {}) => {
       }),
     ),
   );
-  return { cwd, sent, failures, layer };
+  return { cwd, sent, controls, layer };
 };
 
 const setup = (cwd: string) =>
@@ -118,6 +146,23 @@ const until = (test: () => boolean, ms = 5000) =>
       await new Promise((r) => setTimeout(r, 10));
     }
     throw new Error("timed out");
+  });
+
+/** The changes the session's agent has not been told about yet, as saved. */
+const unread = (sessionId: string) =>
+  Effect.map(Database.Database, (db) => {
+    const row = db.prepare("select changes from todo_notices where session_id = ?").get(sessionId) as { changes: string } | undefined;
+    return row ? (JSON.parse(row.changes) as Array<{ text: string }>).map((c) => c.text) : [];
+  });
+
+/** Waits until the saved unread changes are `expected`. */
+const waitUnread = (sessionId: string, expected: ReadonlyArray<string>) =>
+  Effect.gen(function* () {
+    for (let i = 0; i < 200; i++) {
+      if (JSON.stringify(yield* unread(sessionId)) === JSON.stringify(expected)) return;
+      yield* Effect.sleep("10 millis");
+    }
+    expect(yield* unread(sessionId)).toEqual(expected);
   });
 
 const call = (caller: McpCaller["Service"], name: string, params: Record<string, unknown>) =>
@@ -241,7 +286,7 @@ describe("to-do lists", () => {
       const session = bot.mainSessionId;
       yield* todos.add(session, "Write the release notes");
 
-      f.failures.count = 1;
+      f.controls.count = 1;
       expect((yield* Effect.flip(manager.send(session, "first try"))).code).toBe("provider");
       expect(f.sent).toEqual([]);
 
@@ -254,16 +299,136 @@ describe("to-do lists", () => {
       expect(f.sent[1]).toBe("third");
 
       // An edit made while a message is on its way is not in it: it waits for the next one.
-      f.failures.during = todos.add(session, "Tag the release");
+      f.controls.during = todos.add(session, "Tag the release");
       yield* todos.add(session, "Bump the version");
       yield* manager.send(session, "fourth");
       yield* until(() => f.sent.length === 3);
-      delete f.failures.during;
+      delete f.controls.during;
       expect(f.sent[2]).toContain('added "Bump the version".');
       expect(f.sent[2]).not.toContain("Tag the release");
       yield* manager.send(session, "fifth");
       yield* until(() => f.sent.length === 4);
       expect(f.sent[3]).toContain('[Apollo] The user changed your to-do list: added "Tag the release".');
+    }).pipe(Effect.provide(f.layer()));
+  });
+
+  it.live("keep a notice until the agent has read the message, across an exit or a restart", () => {
+    const f = fixture({ persistent: true });
+    f.controls.hold = true;
+    return Effect.gen(function* () {
+      const session = yield* Effect.gen(function* () {
+        const { manager, todos, bot } = yield* setup(f.cwd);
+        yield* todos.add(bot.mainSessionId, "Check the logs");
+        // The provider took the message, but the agent's process went away before it answered.
+        yield* manager.send(bot.mainSessionId, "first");
+        yield* until(() => f.sent.length === 1);
+        expect(f.sent[0]).toContain('added "Check the logs"');
+        yield* f.controls.exit;
+        yield* until(() => f.sent.length === 1);
+        expect(yield* unread(bot.mainSessionId)).toEqual(['added "Check the logs"']);
+
+        // Sent again; this time Apollo stops before the agent's turn ends.
+        yield* manager.send(bot.mainSessionId, "second");
+        yield* until(() => f.sent.length === 2);
+        expect(f.sent[1]).toContain('added "Check the logs"');
+        return bot.mainSessionId;
+      }).pipe(Effect.provide(f.layer()));
+
+      yield* Effect.gen(function* () {
+        const manager = yield* SessionManager.SessionManager;
+        expect(yield* unread(session)).toEqual(['added "Check the logs"']);
+        yield* manager.send(session, "third");
+        yield* until(() => f.sent.length === 3);
+        expect(f.sent[2]).toContain('added "Check the logs"');
+        yield* f.controls.finish();
+        yield* until(() => f.sent.length === 3);
+        yield* waitUnread(session, []);
+        f.controls.hold = false;
+        yield* manager.send(session, "fourth");
+        yield* until(() => f.sent.length === 4);
+        expect(f.sent[3]).toBe("fourth");
+      }).pipe(Effect.provide(f.layer()));
+    });
+  });
+
+  it.live("let a turn that read the message, not one already running, acknowledge its notice", () => {
+    const f = fixture();
+    f.controls.hold = true;
+    return Effect.gen(function* () {
+      const { manager, todos, bot } = yield* setup(f.cwd);
+      const session = bot.mainSessionId;
+      yield* manager.send(session, "start working");
+      yield* until(() => f.sent.length === 1);
+
+      // Sent while a turn runs: it waits for the next turn, as in Claude Code.
+      yield* todos.add(session, "Review the diff");
+      yield* manager.send(session, "one more thing");
+      yield* until(() => f.sent.length === 2);
+      expect(f.sent[1]).toContain('added "Review the diff"');
+      yield* f.controls.finish();
+      yield* Effect.sleep("50 millis");
+      expect(yield* unread(session)).toEqual(['added "Review the diff"']);
+      yield* f.controls.finish();
+      yield* waitUnread(session, []);
+
+      // A turn that fails does not count as read.
+      yield* todos.add(session, "Write the changelog");
+      yield* manager.send(session, "go on");
+      yield* until(() => f.sent.length === 3);
+      yield* f.controls.finish("failed");
+      yield* Effect.sleep("50 millis");
+      expect(yield* unread(session)).toEqual(['added "Write the changelog"']);
+    }).pipe(Effect.provide(f.layer()));
+  });
+
+  it.live("acknowledge only the changes a message carried, even when a later one reads the same", () => {
+    const f = fixture();
+    f.controls.hold = true;
+    return Effect.gen(function* () {
+      const { manager, todos, bot } = yield* setup(f.cwd);
+      const session = bot.mainSessionId;
+      yield* todos.add(session, "A");
+      const b = yield* todos.add(session, "B");
+      // The agent read the list: nothing is news yet.
+      yield* todos.list(session, "agent");
+      yield* todos.reorder(session, [b.id]);
+      yield* manager.send(session, "first");
+      yield* until(() => f.sent.length === 1);
+      expect(f.sent[0]).toContain("reordered the list");
+
+      // While that turn runs, the agent reads the list, then the user reorders again.
+      yield* todos.list(session, "agent");
+      const a = (yield* todos.list(session, "user")).items.find((i) => i.text === "A")!;
+      yield* todos.reorder(session, [a.id]);
+      yield* f.controls.finish();
+      yield* Effect.sleep("50 millis");
+      expect(yield* unread(session)).toEqual(["reordered the list"]);
+
+      f.controls.hold = false;
+      yield* manager.send(session, "second");
+      yield* until(() => f.sent.length === 2);
+      expect(f.sent[1]).toContain("[Apollo] The user changed your to-do list: reordered the list.");
+      expect(f.sent[1]).toContain("1. [ ] A");
+    }).pipe(Effect.provide(f.layer()));
+  });
+
+  it.live("save a list and its notice together, or neither", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { todos, bot, changes } = yield* setup(f.cwd);
+      const session = bot.mainSessionId;
+      yield* todos.add(session, "Kept");
+      yield* until(() => changes.length === 2);
+      const db = yield* Database.Database;
+      // The notice cannot be saved: the list change must not be either.
+      db.exec("alter table todo_notices rename to todo_notices_gone");
+      const exit = yield* Effect.exit(todos.add(session, "Lost"));
+      db.exec("alter table todo_notices_gone rename to todo_notices");
+      expect(exit._tag).toBe("Failure");
+      expect((yield* todos.list(session, "user")).items.map((i) => i.text)).toEqual(["Kept"]);
+      yield* Effect.sleep("50 millis");
+      expect(changes).toHaveLength(2);
+      expect(yield* unread(session)).toEqual(['added "Kept"']);
     }).pipe(Effect.provide(f.layer()));
   });
 

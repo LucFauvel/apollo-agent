@@ -356,6 +356,7 @@ const make = Effect.gen(function* () {
           case "Exited": {
             // Ignore exits from a session we already replaced or closed on purpose.
             if (generations.get(id) !== generation) return;
+            yield* settleNotes(id, null);
             yield* background(
               Effect.gen(function* () {
                 yield* closeLive(id);
@@ -385,6 +386,7 @@ const make = Effect.gen(function* () {
             const stored = yield* appendEvent(id, event);
             switch (event._tag) {
               case "TurnStarted": {
+                turnsStarted.set(id, (turnsStarted.get(id) ?? 0) + 1);
                 answeredBot.delete(id);
                 yield* updateSession(id, { status: "running" });
                 // Snapshot the session's repositories, to see what this turn changes.
@@ -423,6 +425,7 @@ const make = Effect.gen(function* () {
                 yield* updateSession(id, { lastMessage: event.text });
                 return;
               case "TurnCompleted":
+                yield* settleNotes(id, event.outcome);
                 yield* onTurnCompleted(id, event);
                 return;
               default:
@@ -855,9 +858,29 @@ const make = Effect.gen(function* () {
 
   /**
    * Notes other services add to the next message an agent reads (the user changed its to-do
-   * list, say). `delivered` runs once the provider took the message, so a failed send keeps the note.
+   * list, say). A note's `delivered` runs once the agent has read the message: when a turn that
+   * started after it was sent completes. Providers can take a message and lose it (Claude's
+   * inbox is in memory), and a turn already running may end before reaching it. A turn that fails,
+   * an exit or a restart leaves the note to go out again with the next message.
    */
   const messageNotes: Array<(session: Session) => Effect.Effect<MessageNote | null>> = [];
+  /** Turns each session started (this run). */
+  const turnsStarted = new Map<SessionId, number>();
+  /** Notes sent to each session, waiting for a turn that started after them to complete. */
+  const awaitingRead = new Map<SessionId, Array<{ readonly after: number; readonly delivered: Effect.Effect<void> }>>();
+
+  const settleNotes = (id: SessionId, outcome: "completed" | "interrupted" | "failed" | null) =>
+    Effect.gen(function* () {
+      const waiting = awaitingRead.get(id);
+      if (!waiting) return;
+      const started = turnsStarted.get(id) ?? 0;
+      // An exit (null outcome) drops them all: the agent may never have read them.
+      const due = outcome === null ? waiting : waiting.filter((w) => w.after < started);
+      const rest = outcome === null ? [] : waiting.filter((w) => w.after >= started);
+      if (rest.length > 0) awaitingRead.set(id, rest);
+      else awaitingRead.delete(id);
+      if (outcome === "completed") yield* Effect.forEach(due, (w) => w.delivered, { discard: true });
+    });
 
   const withMessageNotes = (session: Session, text: string) =>
     Effect.gen(function* () {
@@ -868,6 +891,7 @@ const make = Effect.gen(function* () {
       }
       return {
         text: notes.length === 0 ? text : [text, ...notes.map((n) => n.text)].join("\n\n"),
+        noted: notes.length > 0,
         delivered: Effect.forEach(notes, (n) => n.delivered, { discard: true }),
       };
     });
@@ -929,14 +953,22 @@ const make = Effect.gen(function* () {
       if (!isBusy(before.status)) yield* updateSession(id, { status: "running" });
       // `@OtherBot` in the user's message points the agent at that bot: it reads who that is.
       const said = extra.agentText ?? (author === "user" ? yield* withMentionNote(target, text) : text);
-      const { text: agentText, delivered } = yield* withMessageNotes(target, quoted ? `${replyNote(quoted)}\n\n${said}` : said);
+      const { text: agentText, delivered, noted } = yield* withMessageNotes(target, quoted ? `${replyNote(quoted)}\n\n${said}` : said);
       // A failure to open posts its own notice and marks the session as errored.
       const entry = yield* ensureOpen(id, true);
+      // Registered before sending: the provider may start the turn while it takes the message.
+      const waiting = { after: turnsStarted.get(id) ?? 0, delivered };
+      if (noted) awaitingRead.set(id, [...(awaitingRead.get(id) ?? []), waiting]);
       yield* entry.provider.send(agentText, files.map((f) => ({ path: f!.path, name: f!.name, mime: f!.mime, size: f!.size }))).pipe(
         Effect.mapError((error) => providerFailure(error.message)),
-        Effect.tapError(() => updateSession(id, { status: "idle" }).pipe(Effect.ignore)),
+        Effect.tapError(() =>
+          Effect.sync(() => {
+            const left = (awaitingRead.get(id) ?? []).filter((w) => w !== waiting);
+            if (left.length > 0) awaitingRead.set(id, left);
+            else awaitingRead.delete(id);
+          }).pipe(Effect.andThen(updateSession(id, { status: "idle" })), Effect.ignore),
+        ),
       );
-      yield* delivered;
     });
 
   // --- other bots ------------------------------------------------------------
@@ -2001,7 +2033,7 @@ const make = Effect.gen(function* () {
   };
 });
 
-/** Text appended to a message an agent reads; `delivered` runs once the provider took it. */
+/** Text appended to a message an agent reads; `delivered` runs once the agent has read it (see messageNotes). */
 export interface MessageNote {
   readonly text: string;
   readonly delivered: Effect.Effect<void>;

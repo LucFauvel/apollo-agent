@@ -64,6 +64,11 @@ const quote = (text: string) => `"${text.length > 80 ? `${text.slice(0, 79)}…`
 
 type Row = Record<string, unknown>;
 
+interface PendingChange {
+  readonly id: string;
+  readonly text: string;
+}
+
 const toItem = (r: Row): TodoItem => ({
   id: r.id as string,
   sessionId: r.session_id as SessionId,
@@ -84,12 +89,15 @@ const make = Effect.gen(function* () {
   const store = yield* Store;
   const manager = yield* SessionManager;
   const changes = yield* PubSub.unbounded<TodosChange>();
-  /** What the user changed in a list since its agent last read it, oldest first (kept across restarts). */
-  const pending = (sessionId: SessionId): Array<string> => {
+  /**
+   * What the user changed in a list since its agent last read it, oldest first (kept across
+   * restarts). Each change has its own id, so acknowledging a message removes only what it carried.
+   */
+  const pending = (sessionId: SessionId): Array<PendingChange> => {
     const row = db.prepare("select changes from todo_notices where session_id = ?").get(sessionId) as Row | undefined;
-    return row ? (JSON.parse(row.changes as string) as Array<string>) : [];
+    return row ? (JSON.parse(row.changes as string) as Array<PendingChange>) : [];
   };
-  const setPending = (sessionId: SessionId, changes: ReadonlyArray<string>) => {
+  const setPending = (sessionId: SessionId, changes: ReadonlyArray<PendingChange>) => {
     if (changes.length === 0) db.prepare("delete from todo_notices where session_id = ?").run(sessionId);
     else {
       db.prepare("insert into todo_notices (session_id, changes) values (?, ?) on conflict(session_id) do update set changes = excluded.changes").run(
@@ -104,25 +112,30 @@ const make = Effect.gen(function* () {
 
   const listOf = (session: Pick<Session, "id" | "botId">): TodoList => ({ sessionId: session.id, botId: session.botId, items: read(session.id) });
 
-  /** Writes `next` as the session's whole list. */
-  const write = (sessionId: SessionId, before: ReadonlyArray<TodoItem>, next: ReadonlyArray<TodoItem>) => {
-    const kept = new Set(next.map((item) => item.id));
+  /** Runs `body` in one transaction. */
+  const transaction = (body: () => void) => {
     db.exec("begin");
     try {
-      for (const item of before) if (!kept.has(item.id)) db.prepare("delete from todos where id = ?").run(item.id);
-      const upsert = db.prepare(
-        `insert into todos (id, session_id, bot_id, text, done, added_by, position, created_at, updated_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         on conflict(id) do update set text = excluded.text, done = excluded.done, position = excluded.position, updated_at = excluded.updated_at`,
-      );
-      next.forEach((item, position) =>
-        upsert.run(item.id, sessionId, item.botId, item.text, item.done ? 1 : 0, item.addedBy, position, item.createdAt, item.updatedAt),
-      );
+      body();
       db.exec("commit");
     } catch (error) {
       db.exec("rollback");
       throw error;
     }
+  };
+
+  /** Writes `next` as the session's whole list (inside a transaction). */
+  const write = (sessionId: SessionId, before: ReadonlyArray<TodoItem>, next: ReadonlyArray<TodoItem>) => {
+    const kept = new Set(next.map((item) => item.id));
+    for (const item of before) if (!kept.has(item.id)) db.prepare("delete from todos where id = ?").run(item.id);
+    const upsert = db.prepare(
+      `insert into todos (id, session_id, bot_id, text, done, added_by, position, created_at, updated_at)
+       values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       on conflict(id) do update set text = excluded.text, done = excluded.done, position = excluded.position, updated_at = excluded.updated_at`,
+    );
+    next.forEach((item, position) =>
+      upsert.run(item.id, sessionId, item.botId, item.text, item.done ? 1 : 0, item.addedBy, position, item.createdAt, item.updatedAt),
+    );
   };
 
   /** Applies `ops` to the session's list, as `by`; returns the list and the items it added. */
@@ -198,14 +211,18 @@ const make = Effect.gen(function* () {
         return yield* invalid(`a to-do list holds at most ${TODO_LIST_LIMIT} items: remove finished ones first`);
       }
 
-      if (described.length > 0) {
-        write(sessionId, before, items);
-        const list = { sessionId, botId: session.botId, items };
-        yield* PubSub.publish(changes, { _tag: "TodoListChanged", list });
-        if (by === "user") setPending(sessionId, [...pending(sessionId), ...described]);
+      // The list and what the agent should be told about it are saved together. The agent sees
+      // the whole list in its tool's answer.
+      if (described.length > 0 || by === "agent") {
+        transaction(() => {
+          if (described.length > 0) write(sessionId, before, items);
+          if (by === "agent") setPending(sessionId, []);
+          else setPending(sessionId, [...pending(sessionId), ...described.map((text) => ({ id: newId("chg"), text }))]);
+        });
       }
-      // The agent sees the whole list in its tool's answer.
-      if (by === "agent") setPending(sessionId, []);
+      if (described.length > 0) {
+        yield* PubSub.publish(changes, { _tag: "TodoListChanged", list: { sessionId, botId: session.botId, items } });
+      }
       return { list: { sessionId, botId: session.botId, items } as TodoList, added };
     });
 
@@ -221,14 +238,14 @@ const make = Effect.gen(function* () {
     Effect.sync(() => {
       const described = pending(session.id);
       if (described.length === 0) return null;
+      const carried = new Set(described.map((c) => c.id));
       return {
-        text: [`[Apollo] The user changed your to-do list: ${described.join("; ")}. It now reads:`, formatTodos(read(session.id))].join("\n"),
-        // Changes made while the message was on its way stay for the next one. If the agent read
-        // the list meanwhile, the delivered ones are already gone.
-        delivered: Effect.sync(() => {
-          const now = pending(session.id);
-          if (described.every((d, i) => now[i] === d)) setPending(session.id, now.slice(described.length));
-        }),
+        text: [
+          `[Apollo] The user changed your to-do list: ${described.map((c) => c.text).join("; ")}. It now reads:`,
+          formatTodos(read(session.id)),
+        ].join("\n"),
+        // Changes made while the message was on its way stay for the next one.
+        delivered: Effect.sync(() => setPending(session.id, pending(session.id).filter((c) => !carried.has(c.id)))),
       };
     }),
   );
