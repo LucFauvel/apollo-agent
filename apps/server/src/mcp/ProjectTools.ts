@@ -22,6 +22,8 @@ const ProjectSummary = Schema.Struct({
   summary: Schema.String,
   status: ProjectStatus,
   cwd: Schema.NullOr(Schema.String),
+  /** Its lead's session id. */
+  lead: Schema.NullOr(Schema.String),
   updatedAt: Schema.String,
 });
 
@@ -31,6 +33,7 @@ const summarize = (p: Project) => ({
   summary: p.summary,
   status: p.status,
   cwd: p.cwd,
+  lead: p.leadSessionId ?? null,
   updatedAt: new Date(p.updatedAt).toISOString(),
 });
 
@@ -82,7 +85,8 @@ const ProjectUpdate = Tool.make("apollo_project_update", {
     "Update a project. `append` adds a note to the end of its context; `context` replaces the whole context (condense",
     `it: at most ${PROJECT_CONTEXT_LIMIT} characters). \`summary\` is its one line for the orchestrator; \`status\``,
     "`archived` when it is done. `project`: its id or name (omit it for your own project). A session in a project can",
-    "update only that project; the orchestrator, any of the bot's.",
+    "update only that project; the orchestrator, any of the bot's. `lead` (orchestrator only): a worker session in the",
+    "project becomes its lead (\"\" leaves it without one).",
   ].join(" "),
   parameters: Schema.Struct({
     project: ProjectRef,
@@ -92,6 +96,7 @@ const ProjectUpdate = Tool.make("apollo_project_update", {
     append: Schema.optional(Schema.String),
     cwd: Schema.optional(Schema.String),
     status: Schema.optional(ProjectStatus),
+    lead: Schema.optional(Schema.String),
   }),
   success: ProjectSummary,
 });
@@ -150,11 +155,14 @@ export const handlers = ProjectToolkit.toLayer(
           return summarize(yield* projects.create({ botId: caller.botId, name, summary, context, cwd }));
         }),
 
-      apollo_project_update: ({ project: ref, name, summary, context, append, cwd, status }) =>
+      apollo_project_update: ({ project: ref, name, summary, context, append, cwd, status, lead }) =>
         Effect.gen(function* () {
+          const caller = yield* McpCaller;
           const project = yield* target(ref);
           if (context !== undefined && append !== undefined) return yield* invalid("give `context` or `append`, not both");
-          const fields = { projectId: project.id, name, summary, cwd, status };
+          if (lead !== undefined && caller.role !== "main") return yield* invalid("only the bot's orchestrator can choose a project's lead");
+          const leadSessionId = lead === undefined ? undefined : lead.trim() ? (lead.trim() as SessionId) : null;
+          const fields = { projectId: project.id, name, summary, cwd, status, leadSessionId };
           if (append === undefined || !append.trim()) return summarize(yield* projects.update({ ...fields, context }));
           // Appended to the context as stored: another session may append at the same time.
           for (let attempt = 0; ; attempt++) {

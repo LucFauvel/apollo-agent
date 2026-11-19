@@ -243,11 +243,13 @@ const ListSessions = Tool.make("apollo_list_sessions", {
 const SpawnSession = Tool.make("apollo_spawn_session", {
   ...shared,
   description: [
-    "Start a worker session for a task (orchestrator only). It runs in parallel and reports back to you when it",
-    "finishes a turn. Choose the provider that fits the task. `model` must be an id from the provider's available",
-    "models: check it with apollo_list_models first, never guess or reuse a name from memory (an unknown id is",
-    "refused). Leave `model` out to use the default. `project` (id or name): start it in one of the bot's projects;",
-    "it gets the project's context and works in the project's workspace unless `cwd` says otherwise.",
+    "Start a worker session for a task (the orchestrator, or a project lead in its project). It runs in parallel",
+    "and reports back to you when it finishes a turn. Choose the provider that fits the task. `model` must be an id",
+    "from the provider's available models: check it with apollo_list_models first, never guess or reuse a name from",
+    "memory (an unknown id is refused). Leave `model` out to use the default. `project` (id or name): start it in one",
+    "of the bot's projects; it gets the project's context and works in the project's workspace unless `cwd` says",
+    "otherwise (a project lead's workers always start in its project). `lead` (orchestrator, with `project`): the",
+    "worker becomes the project's lead, a long-lived session that owns the project and starts its workers.",
   ].join(" "),
   parameters: Schema.Struct({
     title: Schema.String,
@@ -265,6 +267,7 @@ const SpawnSession = Tool.make("apollo_spawn_session", {
     isolation: Schema.optional(Schema.Literals(["shared", "worktree"])),
     notifyOnCompletion: Schema.optional(Schema.Boolean),
     project: Schema.optional(Schema.String),
+    lead: Schema.optional(Schema.Boolean),
   }),
   success: SessionSummary,
 });
@@ -430,7 +433,7 @@ export const unknownModel = (model: string, provider: string, available: Readonl
     ? null
     : `"${model}" is not a ${provider} model. Available: ${available.map((m) => m.id).join(", ") || "none"}. Use one of these ids, or omit model for the default.`;
 
-const handlers = ApolloToolkit.toLayer(
+export const handlers = ApolloToolkit.toLayer(
   Effect.gen(function* () {
     const appSettings = yield* AppSettings;
     const store = yield* Store;
@@ -690,17 +693,30 @@ const handlers = ApolloToolkit.toLayer(
           return { provider, models: models.map((m) => ({ id: m.id, label: m.label, isDefault: m.isDefault, efforts: m.efforts })) };
         }),
 
-      apollo_spawn_session: ({ title, prompt, provider, model, effort, cwd, isolation, notifyOnCompletion, project }) =>
+      apollo_spawn_session: ({ title, prompt, provider, model, effort, cwd, isolation, notifyOnCompletion, project, lead }) =>
         Effect.gen(function* () {
           const caller = yield* McpCaller;
-          if (caller.role !== "main") {
-            return yield* invalid("only the bot's orchestrator session can spawn workers");
+          const led = caller.role === "main" ? null : yield* projects.ledBy(caller.sessionId);
+          if (caller.role !== "main" && !led) {
+            return yield* invalid("only the bot's orchestrator session or a project lead can spawn workers");
           }
           const bot = yield* store.getBot(caller.botId);
           if (bot.pausedReason !== null) {
             return yield* invalid(`${bot.name} is paused (${bot.pausedReason}). Only the user can resume it.`);
           }
-          const projectId = project?.trim() ? (yield* projects.resolve(bot.id, project)).id : null;
+          const named = project?.trim() ? yield* projects.resolve(bot.id, project) : null;
+          if (led && named && named.id !== led.id) return yield* invalid(`a project lead starts workers only in its project (${led.name})`);
+          const target = led ?? named;
+          if (lead) {
+            if (led) return yield* invalid("a project lead cannot start another lead");
+            if (!target) return yield* invalid("`lead` needs `project`: the project the worker will lead");
+            if (target.leadSessionId) {
+              return yield* invalid(
+                `${target.name} already has a lead (${target.leadSessionId}): send it the work with apollo_send_to_session, or replace it with apollo_project_update \`lead\``,
+              );
+            }
+          }
+          const projectId = target?.id ?? null;
           yield* manager.guardWorkerCapacity(bot.id);
           // A different provider starts from its own defaults; the same one inherits the bot's.
           const base = provider && provider !== bot.defaultWorker.provider ? { provider } : bot.defaultWorker;
@@ -717,12 +733,22 @@ const handlers = ApolloToolkit.toLayer(
             provider: selection,
             cwd,
             isolation,
-            prompt,
+            // A lead's first turn already runs with its lead instructions.
+            prompt: lead ? undefined : prompt,
             parentSessionId: caller.sessionId,
             notifyParent: notifyOnCompletion ?? true,
             author: "bot",
             projectId,
           });
+          if (lead && projectId) {
+            // Another spawn may have made its worker the lead meanwhile: this one then never starts.
+            const claimed = yield* Effect.result(projects.claimLead(projectId, session.id));
+            if (claimed._tag === "Failure") {
+              yield* manager.deleteSession(session.id).pipe(Effect.ignore);
+              return yield* claimed.failure;
+            }
+            yield* manager.send(session.id, prompt, "bot");
+          }
           return summarize(yield* store.getSession(session.id));
         }),
 

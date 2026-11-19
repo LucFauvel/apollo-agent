@@ -7,7 +7,7 @@ import {
   type ProjectId,
   type SessionId,
 } from "@apollo/contracts";
-import { Archive, ArchiveRestore, ArrowLeft, FolderKanban, Plus, SquarePen, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowLeft, Crown, FolderKanban, Plus, SquarePen, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { relativeTime } from "../format.ts";
 import { errorMessage, rpc } from "../rpc.ts";
@@ -164,10 +164,15 @@ function ProjectDetail({
   onOpenSession: (id: SessionId) => void;
 }) {
   const sessions = useApp((s) => s.sessions);
+  const lead = project.leadSessionId ?? null;
   const inside = useMemo(
-    () => [...sessions.values()].filter((s) => s.projectId === project.id && s.role !== "reflection").sort((a, b) => b.updatedAt - a.updatedAt),
-    [sessions, project.id],
+    () =>
+      [...sessions.values()]
+        .filter((s) => s.projectId === project.id && s.role !== "reflection")
+        .sort((a, b) => Number(b.id === lead) - Number(a.id === lead) || b.updatedAt - a.updatedAt),
+    [sessions, project.id, lead],
   );
+  const setLead = (sessionId: SessionId | null) => act((c) => c["projects.update"]({ projectId: project.id, leadSessionId: sessionId }));
   const memories = useProjectMemories(project);
   const [error, setError] = useState<string | null>(null);
   const act = (call: Parameters<typeof rpc>[0]) => rpc(call).catch((e) => setError(errorMessage(e)));
@@ -208,18 +213,39 @@ function ProjectDetail({
           <div className="text-xs text-zinc-500">No sessions yet. Start one here, or ask {bot.name} to delegate work to the project.</div>
         ) : (
           inside.map((s) => (
-            <button
-              key={s.id}
-              onClick={() => onOpenSession(s.id)}
-              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] text-zinc-300 hover:bg-zinc-900"
-            >
-              <ProviderLogo provider={s.provider} size={12} />
-              <span className="min-w-0 flex-1 truncate">{s.title}</span>
-              <StatusDot status={s.status} className={s.status === "idle" ? "opacity-0" : ""} />
-              <span className="text-[10px] text-zinc-600">{relativeTime(s.updatedAt, Date.now())}</span>
-            </button>
+            <div key={s.id} className="group flex items-center gap-1 rounded-lg hover:bg-zinc-900">
+              <button
+                onClick={() => onOpenSession(s.id)}
+                className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left text-[12px] text-zinc-300"
+              >
+                <ProviderLogo provider={s.provider} size={12} />
+                <span className="min-w-0 flex-1 truncate">{s.title}</span>
+                {s.id === lead ? (
+                  <Badge tone="amber" title="Owns the project and starts its workers">
+                    Lead
+                  </Badge>
+                ) : null}
+                <StatusDot status={s.status} className={s.status === "idle" ? "opacity-0" : ""} />
+                <span className="text-[10px] text-zinc-600">{relativeTime(s.updatedAt, Date.now())}</span>
+              </button>
+              {s.role === "worker" ? (
+                <span className="pr-1 opacity-0 transition-opacity group-hover:opacity-100">
+                  <IconButton
+                    icon={Crown}
+                    label={s.id === lead ? "Remove as lead" : "Make it the project's lead"}
+                    size="sm"
+                    onClick={() => setLead(s.id === lead ? null : s.id)}
+                  />
+                </span>
+              ) : null}
+            </div>
           ))
         )}
+        <div className="text-[11px] leading-relaxed text-zinc-600">
+          {lead
+            ? "The lead owns the project: it starts workers in it, and they report to it."
+            : `A lead is a long-lived session that owns the project and starts its workers. Make one of its sessions the lead, or ask ${bot.name} to start one.`}
+        </div>
       </section>
 
       <section className="space-y-1.5">
@@ -302,6 +328,7 @@ export function ProjectsPanel({
         ) : (
           projects.map((p) => {
             const count = [...sessions.values()].filter((s) => s.projectId === p.id && s.role !== "reflection").length;
+            const lead = p.leadSessionId ? sessions.get(p.leadSessionId) : undefined;
             return (
               <button
                 key={p.id}
@@ -320,6 +347,12 @@ export function ProjectsPanel({
                   </span>
                 </span>
                 {p.summary ? <span className="mt-1 block text-[12px] leading-relaxed text-zinc-400">{p.summary}</span> : null}
+                {lead ? (
+                  <span className="mt-1 flex items-center gap-1 text-[11px] text-zinc-500">
+                    <Crown className="size-3 text-amber-400/80" />
+                    <span className="truncate">Lead: {lead.title}</span>
+                  </span>
+                ) : null}
               </button>
             );
           })

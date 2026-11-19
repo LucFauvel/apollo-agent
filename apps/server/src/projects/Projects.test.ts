@@ -2,7 +2,7 @@ import { execSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentEvent, AppChange, Project, ProjectsChange, ProviderKind } from "@apollo/contracts";
+import type { AgentEvent, AppChange, Project, ProjectsChange, ProviderKind, SessionId } from "@apollo/contracts";
 import { ProviderKind as Kinds } from "@apollo/contracts";
 import type { Provider, ProviderSessionOptions } from "@apollo/providers";
 import { describe, expect, it } from "@effect/vitest";
@@ -16,7 +16,9 @@ import * as Database from "../Database.ts";
 import * as SessionManager from "../SessionManager.ts";
 import * as Store from "../Store.ts";
 import { McpCaller } from "../mcp/Caller.ts";
+import * as ApolloMcp from "../mcp/ApolloMcp.ts";
 import * as ProjectTools from "../mcp/ProjectTools.ts";
+import * as Scheduler from "../schedule/Scheduler.ts";
 import { findProject, projectProblem } from "./Projects.ts";
 import * as Projects from "./Projects.ts";
 
@@ -24,6 +26,11 @@ import * as Projects from "./Projects.ts";
 interface StartGate {
   wait: Promise<void>;
   started: number;
+  /** Closing a session's process waits on it; `closing` counts closes begun. */
+  close?: Promise<void>;
+  closing?: number;
+  /** How long a turn runs, so its change tracking has started when it ends. */
+  turnMs?: number;
 }
 
 /** A provider that records how each session was opened and ends each turn at once. */
@@ -35,11 +42,18 @@ const recording = (kind: ProviderKind, opened: Array<ProviderSessionOptions>, ga
       gate.started++;
       yield* Effect.promise(() => gate.wait);
       opened.push(options);
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(() => {
+          gate.closing = (gate.closing ?? 0) + 1;
+          return gate.close ?? Promise.resolve();
+        }),
+      );
       const agent = (event: AgentEvent) => emit({ _tag: "Event", event });
       return {
         send: () =>
           Effect.gen(function* () {
             yield* agent({ _tag: "TurnStarted" });
+            if (gate.turnMs) yield* Effect.sleep(gate.turnMs);
             yield* agent({ _tag: "TurnCompleted", outcome: "completed", error: null });
           }),
         interrupt: Effect.void,
@@ -521,4 +535,267 @@ describe("project tools", () => {
       expect((yield* call(main, "apollo_project_read", {})).failed).toBe(true);
     }).pipe(Effect.provide(f.layer));
   });
+});
+
+describe("project leads", () => {
+  const withTools = (f: ReturnType<typeof fixture>) =>
+    Scheduler.layerWith({ tickEvery: null, taskTimeout: "5 seconds", heartbeatTimeout: "5 seconds" }).pipe(Layer.provideMerge(f.layer));
+
+  type Called = { failed: boolean; result: Record<string, unknown> & { message?: string } };
+  const collect = (stream: Stream.Stream<{ readonly isFailure: boolean; readonly result: unknown }, unknown>) =>
+    Effect.map(Stream.runCollect(stream), (results): Called => {
+      const last = Array.from(results).at(-1)!;
+      return { failed: last.isFailure, result: last.result as Called["result"] };
+    });
+  const call = (caller: McpCaller["Service"], name: string, params: Record<string, unknown>) =>
+    (name.startsWith("apollo_project_")
+      ? Effect.gen(function* () {
+          const toolkit = yield* ProjectTools.ProjectToolkit;
+          return yield* collect(yield* toolkit.handle(name as never, params as never));
+        }).pipe(Effect.provide(ProjectTools.handlers))
+      : Effect.gen(function* () {
+          const toolkit = yield* ApolloMcp.ApolloToolkit;
+          return yield* collect(yield* toolkit.handle(name as never, params as never));
+        }).pipe(Effect.provide(ApolloMcp.handlers))
+    ).pipe(Effect.provideService(McpCaller, caller));
+
+  it.live("own their project: they start its workers, which report to them", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, projects, store, bot, projectChanges } = yield* setup(f.cwd);
+      const send = yield* projects.create({ botId: bot.id, name: "Send", summary: "File sharing" });
+      yield* projects.create({ botId: bot.id, name: "PAM", summary: "" });
+      const main = { sessionId: bot.mainSessionId, botId: bot.id, role: "main" as const };
+
+      const spawned = yield* call(main, "apollo_spawn_session", { title: "Send lead", prompt: "plan the beta", project: "Send", lead: true });
+      expect(spawned.failed).toBe(false);
+      const leadId = spawned.result.id as SessionId;
+      expect((yield* projects.get(send.id)).leadSessionId).toBe(leadId);
+      expect((yield* store.getSession(leadId)).projectId).toBe(send.id);
+      // Its first turn already runs as the lead.
+      yield* until(() => f.opened.length >= 1);
+      expect(f.opened[0]!.instructions).toContain("## Your role: lead of Send");
+
+      const second = yield* call(main, "apollo_spawn_session", { title: "x", prompt: "x", project: "Send", lead: true });
+      expect(second.result.message).toContain("already has a lead");
+
+      const leadCaller = { sessionId: leadId, botId: bot.id, role: "worker" as const };
+      const elsewhere = yield* call(leadCaller, "apollo_spawn_session", { title: "x", prompt: "x", project: "PAM" });
+      expect(elsewhere.result.message).toContain("only in its project");
+      expect((yield* call(leadCaller, "apollo_spawn_session", { title: "x", prompt: "x", lead: true })).result.message).toContain(
+        "cannot start another lead",
+      );
+
+      const leadTurns = (yield* store.getSession(leadId)).completedTurns;
+      const worker = yield* call(leadCaller, "apollo_spawn_session", { title: "Upload API", prompt: "build it" });
+      expect(worker.failed).toBe(false);
+      const workerSession = yield* store.getSession(worker.result.id as SessionId);
+      expect(workerSession).toMatchObject({ projectId: send.id, parentSessionId: leadId });
+      yield* until(() => f.opened.some((o) => o.instructions.includes("started by the lead of Send")));
+      // Its finished turn is reported to the lead, which answers in a turn of its own.
+      yield* Effect.promise(async () => {
+        for (let i = 0; i < 300; i++) {
+          if ((await Effect.runPromise(store.getSession(leadId))).completedTurns > leadTurns) return;
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        throw new Error("the lead got no report");
+      });
+
+      const plain = { sessionId: workerSession.id, botId: bot.id, role: "worker" as const };
+      const refused = yield* call(plain, "apollo_spawn_session", { title: "x", prompt: "x" });
+      expect(refused.result.message).toContain("or a project lead");
+
+      yield* manager.send(bot.mainSessionId, "hello", "user");
+      yield* until(() => f.opened.some((o) => o.instructions.includes("## Your role: orchestrator")));
+      expect(f.opened.find((o) => o.instructions.includes("## Your role: orchestrator"))!.instructions).toContain(
+        `Lead: session \`${leadId}\`.`,
+      );
+
+      yield* manager.deleteSession(leadId);
+      yield* until(() => projectChanges.some((c) => c._tag === "ProjectUpserted" && c.project.id === send.id && c.project.leadSessionId === null));
+      expect((yield* projects.get(send.id)).leadSessionId).toBeNull();
+    }).pipe(Effect.provide(withTools(f)));
+  });
+
+  it.live("report to the orchestrator once promoted, wherever they reported before", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, projects, store, bot } = yield* setup(f.cwd);
+      const send = yield* projects.create({ botId: bot.id, name: "Send", summary: "" });
+      const fromUi = yield* manager.createSession({ botId: bot.id, title: "u", provider: { provider: "codex" }, projectId: send.id });
+      expect(fromUi.parentSessionId).toBeNull();
+      yield* projects.update({ projectId: send.id, leadSessionId: fromUi.id });
+      expect((yield* store.getSession(fromUi.id)).parentSessionId).toBe(bot.mainSessionId);
+      expect(yield* store.notifiesParent(fromUi.id)).toBe(true);
+
+      // Delegated through apollo_send_to_session, its finished turn comes back to the orchestrator.
+      yield* manager.send(fromUi.id, "plan the beta", "bot");
+      yield* until(() => f.opened.some((o) => o.instructions.includes("## Your role: orchestrator")));
+
+      const byLead = yield* manager.createSession({
+        botId: bot.id,
+        title: "w",
+        provider: { provider: "codex" },
+        projectId: send.id,
+        parentSessionId: fromUi.id,
+        notifyParent: true,
+      });
+      yield* projects.update({ projectId: send.id, leadSessionId: byLead.id });
+      expect((yield* store.getSession(byLead.id)).parentSessionId).toBe(bot.mainSessionId);
+    }).pipe(Effect.provide(f.layer));
+  });
+
+  it.live("respect an orchestrator's choice not to hear from them", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { projects, store, bot } = yield* setup(f.cwd);
+      yield* projects.create({ botId: bot.id, name: "Send", summary: "" });
+      const main = { sessionId: bot.mainSessionId, botId: bot.id, role: "main" as const };
+      const spawned = yield* call(main, "apollo_spawn_session", {
+        title: "Send lead",
+        prompt: "plan",
+        project: "Send",
+        lead: true,
+        notifyOnCompletion: false,
+      });
+      expect(spawned.failed).toBe(false);
+      const lead = yield* store.getSession(spawned.result.id as SessionId);
+      expect(lead.parentSessionId).toBe(bot.mainSessionId);
+      expect(yield* store.notifiesParent(lead.id)).toBe(false);
+    }).pipe(Effect.provide(withTools(f)));
+  });
+
+  it.live("are never deleted for storage, nor chosen while being deleted", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, projects, store, bot } = yield* setup(f.cwd);
+      const send = yield* projects.create({ botId: bot.id, name: "Send", summary: "" });
+      const lead = yield* manager.createSession({ botId: bot.id, title: "l", provider: { provider: "codex" }, projectId: send.id });
+      yield* projects.update({ projectId: send.id, leadSessionId: lead.id });
+      expect(yield* manager.evictUnlessLead(lead.id)).toBe(false);
+      expect((yield* store.getSession(lead.id)).id).toBe(lead.id);
+
+      // Chosen for deletion, it stays out of reach until it is gone.
+      const other = yield* manager.createSession({ botId: bot.id, title: "o", provider: { provider: "codex" }, projectId: send.id, prompt: "hi" });
+      yield* until(() => f.opened.length >= 1);
+      yield* until(() => manager.isLive(other.id).pipe(Effect.runSync));
+      let release!: () => void;
+      f.gate.close = new Promise((resolve) => (release = resolve));
+      const closesBefore = f.gate.closing ?? 0;
+      const evicting = yield* manager.evictUnlessLead(other.id).pipe(Effect.forkChild({ startImmediately: true }));
+      yield* until(() => (f.gate.closing ?? 0) > closesBefore);
+      const refused = yield* Effect.flip(projects.update({ projectId: send.id, leadSessionId: other.id }));
+      expect(refused.message).toContain("being deleted");
+      release();
+      expect(yield* Fiber.join(evicting)).toBe(true);
+      expect((yield* projects.get(send.id)).leadSessionId).toBe(lead.id);
+    }).pipe(Effect.provide(f.layer));
+  });
+
+  it.live("are claimed by one session at a time", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, projects, bot } = yield* setup(f.cwd);
+      const send = yield* projects.create({ botId: bot.id, name: "Send", summary: "" });
+      const [a, b] = yield* Effect.all(
+        ["a", "b"].map((title) => manager.createSession({ botId: bot.id, title, provider: { provider: "codex" }, projectId: send.id })),
+      );
+      const claims = yield* Effect.all([projects.claimLead(send.id, a!.id), projects.claimLead(send.id, b!.id)].map(Effect.result), {
+        concurrency: "unbounded",
+      });
+      expect(claims.filter((c) => c._tag === "Success")).toHaveLength(1);
+      expect((yield* projects.get(send.id)).leadSessionId).toBe(claims[0]!._tag === "Success" ? a!.id : b!.id);
+    }).pipe(Effect.provide(f.layer));
+  });
+
+  it.live("are chosen among the project's worker sessions", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, projects, bot } = yield* setup(f.cwd);
+      const send = yield* projects.create({ botId: bot.id, name: "Send", summary: "" });
+      const outside = yield* manager.createSession({ botId: bot.id, title: "o", provider: { provider: "codex" } });
+      const inside = yield* manager.createSession({ botId: bot.id, title: "i", provider: { provider: "codex" }, projectId: send.id });
+      expect((yield* Effect.flip(projects.update({ projectId: send.id, leadSessionId: outside.id }))).message).toContain("one of its sessions");
+      expect((yield* Effect.flip(projects.update({ projectId: send.id, leadSessionId: bot.mainSessionId }))).message).toContain(
+        "only a worker session",
+      );
+      expect((yield* projects.update({ projectId: send.id, leadSessionId: inside.id })).leadSessionId).toBe(inside.id);
+      expect((yield* projects.update({ projectId: send.id, summary: "File sharing" })).leadSessionId).toBe(inside.id);
+
+      const main = { sessionId: bot.mainSessionId, botId: bot.id, role: "main" as const };
+      const worker = { sessionId: inside.id, botId: bot.id, role: "worker" as const };
+      expect((yield* call(worker, "apollo_project_update", { lead: "" })).result.message).toContain("only the bot's orchestrator");
+      const cleared = yield* call(main, "apollo_project_update", { project: "Send", lead: "" });
+      expect(cleared.result.lead).toBeNull();
+      expect((yield* projects.get(send.id)).leadSessionId).toBeNull();
+    }).pipe(Effect.provide(withTools(f)));
+  });
+});
+
+describe.skipIf(process.platform === "win32")("two leads spawned at once", () => {
+  it.live("start one lead; the other spawn fails and leaves nothing behind", () => {
+    const f = fixture();
+    const repo = slowRepo(f.dir, 0.4);
+    const layer = Scheduler.layerWith({ tickEvery: null, taskTimeout: "5 seconds", heartbeatTimeout: "5 seconds" }).pipe(Layer.provideMerge(f.layer));
+    return Effect.gen(function* () {
+      const { projects, store, bot } = yield* setup(f.cwd);
+      const send = yield* projects.create({ botId: bot.id, name: "Send", summary: "", cwd: repo });
+      const main = { sessionId: bot.mainSessionId, botId: bot.id, role: "main" as const };
+      const spawn = (title: string) =>
+        Effect.gen(function* () {
+          const toolkit = yield* ApolloMcp.ApolloToolkit;
+          const stream = yield* toolkit.handle("apollo_spawn_session", { title, prompt: "lead it", project: "Send", lead: true, isolation: "worktree" });
+          const last = Array.from(yield* Stream.runCollect(stream)).at(-1)!;
+          return { failed: last.isFailure, result: last.result as { id?: SessionId; message?: string } };
+        }).pipe(Effect.provideService(McpCaller, main), Effect.provide(ApolloMcp.handlers));
+      const results = yield* Effect.all([spawn("one"), spawn("two")], { concurrency: "unbounded" });
+      const won = results.filter((r) => !r.failed);
+      expect(won).toHaveLength(1);
+      expect(results.find((r) => r.failed)!.result.message).toContain("already has a lead");
+      expect((yield* projects.get(send.id)).leadSessionId).toBe(won[0]!.result.id);
+      const inside = (yield* store.listSessions(bot.id)).filter((s) => s.projectId === send.id);
+      expect(inside.map((s) => s.id)).toEqual([won[0]!.result.id]);
+      expect(worktrees(repo)).toBe(2);
+    }).pipe(Effect.provide(layer));
+  }, 20_000);
+});
+
+/** A repository whose snapshots (`git add`) take `seconds` for each changed file. */
+const slowSnapshots = (dir: string, seconds: number) => {
+  const repo = join(dir, "slow-snapshots");
+  mkdirSync(repo);
+  execSync(
+    `git init -q -b main && git config filter.slow.clean "sleep ${seconds}; cat" && echo "* filter=slow" > .gitattributes && echo x > file && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init`,
+    { cwd: repo },
+  );
+  return repo;
+};
+
+describe.skipIf(process.platform === "win32")("a session made lead while its turn's changes are tracked", () => {
+  it.live("reports that turn to the orchestrator", () => {
+    const f = fixture();
+    const repo = slowSnapshots(f.dir, 1);
+    return Effect.gen(function* () {
+      const { manager, projects, store, bot } = yield* setup(f.cwd);
+      const send = yield* projects.create({ botId: bot.id, name: "Send", summary: "", cwd: repo });
+      const worker = yield* manager.createSession({ botId: bot.id, title: "w", provider: { provider: "codex" }, projectId: send.id });
+      expect(worker.parentSessionId).toBeNull();
+      f.gate.turnMs = 1500;
+      yield* manager.send(worker.id, "work", "user").pipe(Effect.forkChild({ startImmediately: true }));
+      // The turn has ended (recorded) but its changes are still being collected.
+      yield* Effect.promise(async () => {
+        for (let i = 0; i < 500; i++) {
+          const s = await Effect.runPromise(store.getSession(worker.id));
+          if (s.completedTurns === 1) {
+            if (s.status === "idle") throw new Error("change tracking ended before the promotion");
+            return;
+          }
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        throw new Error("the turn did not end");
+      });
+      yield* projects.update({ projectId: send.id, leadSessionId: worker.id });
+      yield* until(() => f.opened.some((o) => o.instructions.includes("## Your role: orchestrator")), 10_000);
+    }).pipe(Effect.provide(f.layer));
+  }, 20_000);
 });

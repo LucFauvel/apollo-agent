@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "@effect/vitest";
-import { dropDetail, reclaim, tidy, usedBytes } from "./Compaction.ts";
+import { dropDetail, EVICTABLE_WORKERS, reclaim, tidy, usedBytes } from "./Compaction.ts";
 import * as Database from "./Database.ts";
 
 const DAY = 86_400_000;
@@ -29,6 +29,20 @@ const eventAt = (db: DatabaseSync, seq: number) =>
   JSON.parse((db.prepare("select event from session_events where seq = ?").get(seq) as { event: string }).event);
 
 describe("compaction", () => {
+  it("never evicts a project's lead", () => {
+    const db = setup();
+    db.exec(`
+      insert into sessions (id, bot_id, role, title, provider, cwd, status, created_at, updated_at)
+        values ('lead', 'a', 'worker', 'L', 'codex', '/tmp', 'idle', 0, 0);
+      insert into projects (id, bot_id, name, summary, context, cwd, status, lead_session_id, created_at, updated_at)
+        values ('p', 'a', 'P', '', '', null, 'active', 'lead', 0, 0);
+      insert into projects (id, bot_id, name, summary, context, cwd, status, lead_session_id, created_at, updated_at)
+        values ('q', 'a', 'Q', '', '', null, 'active', null, 0, 0);
+    `);
+    const ids = (db.prepare(`select id from sessions where ${EVICTABLE_WORKERS}`).all() as Array<{ id: string }>).map((r) => r.id);
+    expect(ids).toEqual(["s"]);
+  });
+
   it("trims old tool output and reasoning but leaves recent detail and messages", () => {
     const db = setup();
     const long = "x".repeat(5000);

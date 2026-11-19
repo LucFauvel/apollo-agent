@@ -142,6 +142,12 @@ optional workspace, a markdown **context** (goals, decisions, status, where thin
 - `apollo_project_list`, `apollo_project_read`, `apollo_project_create` (orchestrator) and
   `apollo_project_update` (`append` adds a note to the context) manage them. A session in a project
   reaches only its own project.
+- A project can have a **lead**: a long-lived worker session in it that owns the project. Besides the
+  orchestrator, only a lead can start workers (`apollo_spawn_session`), always in its own project, and
+  they report to it. The orchestrator starts one with `apollo_spawn_session` `project` and `lead: true`,
+  or picks one with `apollo_project_update` `lead`; the user makes any of the project's sessions its lead
+  from the Projects panel (desktop/web) or by long-pressing it (mobile). Deleting the lead's session
+  leaves the project without one.
 - The sidebar shows each bot's active projects with their sessions nested under them; the Projects
   panel edits them. Archive a project when it is done; deleting it deletes its memories and moves its
   sessions out of it.

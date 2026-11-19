@@ -367,6 +367,10 @@ export const MIGRATIONS: ReadonlyArray<string> = [
     changes text not null               -- JSON array of descriptions, oldest first
   );
   `,
+  // 26: a project's lead, a worker session in it (cleared when the session goes, see Projects).
+  `
+  alter table projects add column lead_session_id text;
+  `,
 ];
 
 /**

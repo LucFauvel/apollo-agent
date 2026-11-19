@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { BotId, ProjectId, Timestamp } from "./domain.ts";
+import { BotId, ProjectId, SessionId, Timestamp } from "./domain.ts";
 
 export const ProjectStatus = Schema.Literals(["active", "archived"]);
 export type ProjectStatus = typeof ProjectStatus.Type;
@@ -25,6 +25,11 @@ export const Project = Schema.Struct({
   /** Workspace of sessions started in it; `null` uses the bot's. */
   cwd: Schema.NullOr(Schema.String),
   status: ProjectStatus,
+  /**
+   * The project lead: a long-lived worker session in the project that owns it and can start
+   * workers in it. Optional: servers before project leads omit it.
+   */
+  leadSessionId: Schema.optional(Schema.NullOr(SessionId)),
   createdAt: Timestamp,
   updatedAt: Timestamp,
 });
@@ -63,5 +68,7 @@ export const UpdateProjectInput = Schema.Struct({
   expectedContext: Schema.optional(Schema.String),
   cwd: Schema.optional(Schema.NullOr(Schema.String)),
   status: Schema.optional(ProjectStatus),
+  /** A worker session in the project becomes its lead; `null` leaves it without one. */
+  leadSessionId: Schema.optional(Schema.NullOr(SessionId)),
 });
 export type UpdateProjectInput = typeof UpdateProjectInput.Type;

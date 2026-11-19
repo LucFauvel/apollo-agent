@@ -9,11 +9,14 @@ import {
   PROJECT_SUMMARY_LIMIT,
   type ProjectId,
   type ProjectsChange,
+  type Session,
+  type SessionId,
   type UpdateProjectInput,
 } from "@apollo/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Stream from "effect/Stream";
 import { AppSettings } from "../AppSettings.ts";
@@ -45,6 +48,18 @@ export const projectProblem = (
 
 /** The context changed under an edit: `projects.update` with `expectedContext` refuses to overwrite it. */
 export const CONTEXT_CONFLICT = "the project's context changed since you started editing it (an agent may have updated it)";
+
+/** Why a session cannot lead the project, or null. */
+export const leadProblem = (
+  project: Pick<Project, "id" | "botId">,
+  session: Option.Option<Pick<Session, "botId" | "role" | "projectId">>,
+): string | null => {
+  if (Option.isNone(session)) return "no such session";
+  if (session.value.botId !== project.botId) return "that session belongs to another bot";
+  if (session.value.role !== "worker") return "only a worker session can lead a project";
+  if (session.value.projectId !== project.id) return "a project's lead must be one of its sessions: start it in the project";
+  return null;
+};
 
 /** The bot's project `ref` names: its id, or its name (any case). */
 export const findProject = (projects: ReadonlyArray<Project>, ref: string): Project | undefined => {
@@ -103,6 +118,7 @@ const make = Effect.gen(function* () {
         ...fields,
         cwd: yield* workspace(input.cwd),
         status: "active",
+        leadSessionId: null,
         createdAt: now,
         updatedAt: now,
       });
@@ -111,31 +127,81 @@ const make = Effect.gen(function* () {
       return project;
     });
 
-  const update = (input: UpdateProjectInput) =>
+  /**
+   * Project writes read the project and write it whole: one at a time, so none undoes another.
+   * The lock is the manager's lead lock, so storage eviction never deletes a new lead.
+   */
+  const locked = <A, E, R>(effect: Effect.Effect<A, E, R>) => manager.withLeadLock(effect);
+
+  /**
+   * A new lead reports its turns to the orchestrator, which hands it the project's work: a
+   * session the user started has no parent, and a lead's own workers report to it instead.
+   * One the orchestrator started keeps its own choice (`notifyOnCompletion: false` stays off).
+   */
+  const reportToOrchestrator = (sessionId: SessionId) =>
     Effect.gen(function* () {
-      const current = yield* store.getProject(input.projectId);
-      if (input.context !== undefined && input.expectedContext !== undefined && input.expectedContext.trim() !== current.context) {
-        return yield* invalid(CONTEXT_CONFLICT);
-      }
-      const fields = {
-        name: input.name !== undefined ? oneLine(input.name) : current.name,
-        summary: input.summary !== undefined ? oneLine(input.summary) : current.summary,
-        context: input.context !== undefined ? input.context.trim() : current.context,
-      };
-      const others = (yield* store.listProjects(current.botId)).filter((p) => p.id !== current.id);
-      const problem = projectProblem(fields, others);
-      if (problem) return yield* invalid(problem);
-      const project = yield* store.updateProject({
-        ...current,
-        ...fields,
-        cwd: input.cwd !== undefined ? yield* workspace(input.cwd) : current.cwd,
-        status: input.status ?? current.status,
-        updatedAt: Date.now(),
-      });
-      yield* publish({ _tag: "ProjectUpserted", project });
+      const session = yield* store.getSession(sessionId);
+      const bot = yield* store.getBot(session.botId);
+      if (session.parentSessionId === bot.mainSessionId) return;
+      yield* manager.publish({ _tag: "SessionUpserted", session: yield* store.reportTo(sessionId, bot.mainSessionId) });
+    });
+
+  /** `onlyIfNoLead`: refused when the project already has a lead (checked with the write). */
+  const update = (input: UpdateProjectInput, options: { readonly onlyIfNoLead?: boolean } = {}) =>
+    Effect.gen(function* () {
+      const { current, project } = yield* locked(
+        Effect.gen(function* () {
+          const current = yield* store.getProject(input.projectId);
+          if (input.context !== undefined && input.expectedContext !== undefined && input.expectedContext.trim() !== current.context) {
+            return yield* invalid(CONTEXT_CONFLICT);
+          }
+          if (options.onlyIfNoLead && current.leadSessionId) {
+            return yield* invalid(`${current.name} already has a lead (${current.leadSessionId})`);
+          }
+          const fields = {
+            name: input.name !== undefined ? oneLine(input.name) : current.name,
+            summary: input.summary !== undefined ? oneLine(input.summary) : current.summary,
+            context: input.context !== undefined ? input.context.trim() : current.context,
+          };
+          const others = (yield* store.listProjects(current.botId)).filter((p) => p.id !== current.id);
+          const problem = projectProblem(fields, others);
+          if (problem) return yield* invalid(problem);
+          const previousLead = current.leadSessionId ?? null;
+          const lead = input.leadSessionId !== undefined ? input.leadSessionId : previousLead;
+          if (lead !== null && lead !== previousLead) {
+            const problem = leadProblem(current, yield* Effect.option(store.getSession(lead)));
+            if (problem) return yield* invalid(problem);
+            if (yield* manager.isEvicting(lead)) return yield* invalid("that session is being deleted to free storage");
+          }
+          const project = yield* store.updateProject({
+            ...current,
+            ...fields,
+            cwd: input.cwd !== undefined ? yield* workspace(input.cwd) : current.cwd,
+            status: input.status ?? current.status,
+            leadSessionId: lead,
+            updatedAt: Date.now(),
+          });
+          yield* publish({ _tag: "ProjectUpserted", project });
+          return { current, project };
+        }),
+      );
+      const previousLead = current.leadSessionId ?? null;
+      const lead = project.leadSessionId ?? null;
+      if (lead && lead !== previousLead) yield* reportToOrchestrator(lead);
       // Only what the orchestrator's prompt shows; the context is not in it.
-      if (project.name !== current.name || project.summary !== current.summary || project.cwd !== current.cwd || project.status !== current.status) {
+      if (
+        project.name !== current.name ||
+        project.summary !== current.summary ||
+        project.cwd !== current.cwd ||
+        project.status !== current.status ||
+        lead !== previousLead
+      ) {
         yield* refreshOrchestrator(project.botId);
+      }
+      // A lead's prompt says it leads the project, and how.
+      if (lead !== previousLead) {
+        if (previousLead) yield* manager.refreshInstructions(previousLead);
+        if (lead) yield* manager.refreshInstructions(lead);
       }
       return project;
     });
@@ -160,8 +226,49 @@ const make = Effect.gen(function* () {
       );
     });
 
+  /** Its lead's session went: the project has no lead. */
+  const leadGone = (sessionId: SessionId) =>
+    Effect.gen(function* () {
+      const cleared = yield* locked(
+        Effect.gen(function* () {
+          const saved: Array<Project> = [];
+          for (const project of yield* store.listProjects()) {
+            if (project.leadSessionId !== sessionId) continue;
+            saved.push(yield* store.updateProject({ ...project, leadSessionId: null, updatedAt: Date.now() }));
+            yield* publish({ _tag: "ProjectUpserted", project: saved.at(-1)! });
+          }
+          return saved;
+        }),
+      );
+      for (const project of cleared) yield* refreshOrchestrator(project.botId);
+    });
+
+  {
+    const known = new Set((yield* store.listSessions()).map((s) => s.id));
+    for (const project of yield* store.listProjects()) {
+      if (project.leadSessionId && !known.has(project.leadSessionId)) {
+        yield* store.updateProject({ ...project, leadSessionId: null });
+      }
+    }
+  }
+  yield* Stream.runForEach(manager.changes, (change) =>
+    change._tag === "SessionDeleted" ? leadGone(change.sessionId).pipe(Effect.catch(() => Effect.void)) : Effect.void,
+  ).pipe(Effect.forkScoped);
+
+  /** The project a session leads, if any. */
+  const ledBy = (sessionId: SessionId) =>
+    Effect.gen(function* () {
+      const session = yield* store.getSession(sessionId);
+      if (!session.projectId) return null;
+      const project = yield* store.getProject(session.projectId);
+      return project.leadSessionId === sessionId ? project : null;
+    });
+
   return {
     list: (botId: BotId) => store.listProjects(botId),
+    ledBy,
+    /** Makes the session the project's lead, unless the project has one (checked atomically). */
+    claimLead: (projectId: ProjectId, sessionId: SessionId) => update({ projectId, leadSessionId: sessionId }, { onlyIfNoLead: true }),
     get: store.getProject,
     resolve,
     create,

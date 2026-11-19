@@ -114,10 +114,20 @@ export const buildInstructions = (input: {
       );
       break;
     case "worker":
+      if (project && project.leadSessionId === session.id) {
+        sections.push(leadSection(bot, project));
+        break;
+      }
       sections.push(
         [
           "## Your role: worker",
-          `You are a worker session of ${bot.name}${session.parentSessionId ? ", started by its orchestrator" : ""}.`,
+          `You are a worker session of ${bot.name}${
+            session.parentSessionId
+              ? project && project.leadSessionId === session.parentSessionId
+                ? `, started by the lead of ${project.name}`
+                : ", started by its orchestrator"
+              : ""
+          }.`,
           "Focus on your task. End each turn with a concise summary of what you did and what remains,",
           "since that final message is what gets reported back.",
           "When a turn changed files, call `apollo_explain_changes` before your final message: Apollo detects the",
@@ -249,6 +259,25 @@ const projectSection = (project: Project) =>
     "`context` replaces it all (keep it condensed). Keep the one-line `summary` current: it is what the orchestrator sees.",
   ].join("\n");
 
+const leadSection = (bot: Bot, project: Project) =>
+  [
+    `## Your role: lead of ${project.name}`,
+    `You are the lead of ${project.name}, a long-lived session of ${bot.name} that owns the project. The orchestrator`,
+    "and the user hand you its work; you plan it, delegate it, review the results and keep the project's context current.",
+    "- `apollo_spawn_session` starts a worker in the project (always in it, whatever `project` says). Pick the provider",
+    "  and a model (by an exact id from `apollo_list_models`) that fit the task. Workers report back to you when they",
+    "  finish a turn; `apollo_wait_session`, `apollo_send_to_session` and `apollo_interrupt_session` manage them.",
+    "  Give them complete, self-contained task descriptions: they do not see this conversation.",
+    "- For code changes, spawn with `isolation: \"worktree\"`; review with `apollo_worktree_status`, then",
+    "  `apollo_worktree_finish` (merge, keep or discard).",
+    `- At most ${bot.limits.maxConcurrentWorkers} of ${bot.name}'s workers run at once, yours included. If a spawn is refused for that,`,
+    "  wait for one with `apollo_wait_session`.",
+    "- Handle small things yourself; delegate substantial or parallel work.",
+    "- Keep the project's context and summary current with `apollo_project_update`: you are its memory between sessions.",
+    "End each turn with a concise summary of where the project stands and what remains: it is reported to whoever",
+    "started you. When a turn changed files, call `apollo_explain_changes` before your final message.",
+  ].join("\n");
+
 const projectLines = (projects: ReadonlyArray<Project>) => {
   const active = projects.filter((p) => p.status === "active");
   const archived = projects.length - active.length;
@@ -260,6 +289,9 @@ const projectLines = (projects: ReadonlyArray<Project>) => {
     "- `apollo_spawn_session` with `project` starts a worker in it: the worker gets the project's context, works in its",
     "  workspace by default, and saves what it learns to the project.",
     "- `apollo_project_update` keeps its summary and context current; set status `archived` when it is done.",
+    "- A project can have a lead: a long-lived worker that owns it and starts its own workers in it. Give a",
+    "  project with a lead its work through the lead (`apollo_send_to_session`) instead of spawning workers yourself.",
+    "  For a project that will see a lot of work, start one with `apollo_spawn_session` `project` and `lead: true`.",
     "",
     "Decide for yourself when a request needs a project; you don't need the user to ask. Before starting work, ask:",
     "will this take several sessions or workers, span days, or build up decisions and state worth coming back to (a",
@@ -276,7 +308,10 @@ const projectLines = (projects: ReadonlyArray<Project>) => {
       ? [
           "Active projects:",
           ...active.map(
-            (p) => `- ${p.name} (\`${p.id}\`): ${p.summary || "(no summary)"}${p.cwd ? ` Workspace: \`${p.cwd}\`.` : ""}`,
+            (p) =>
+              `- ${p.name} (\`${p.id}\`): ${p.summary || "(no summary)"}${p.cwd ? ` Workspace: \`${p.cwd}\`.` : ""}${
+                p.leadSessionId ? ` Lead: session \`${p.leadSessionId}\`.` : ""
+              }`,
           ),
         ].join("\n")
       : "No active projects yet.",
