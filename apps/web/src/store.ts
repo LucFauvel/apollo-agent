@@ -16,9 +16,10 @@ import type {
   Session,
   SessionId,
   Usage,
+  TodosChange,
   UsageLimits,
 } from "@apollo/contracts";
-import { invalidateChanges, withSeenMark } from "@apollo/client";
+import { applyTodos, invalidateChanges, type TodoLists, withSeenMark } from "@apollo/client";
 import * as Stream from "effect/Stream";
 import { useSyncExternalStore } from "react";
 import { sortBots } from "@apollo/contracts";
@@ -50,6 +51,8 @@ export interface AppState {
   readonly notificationsSeen: ReadonlyMap<string, number>;
   /** Every bot's projects. */
   readonly projects: ReadonlyMap<ProjectId, Project>;
+  /** Each session's to-do list (from `todos.watch`). */
+  readonly todos: TodoLists;
 }
 
 export type Notice = Extract<AppChange, { _tag: "Notify" }>;
@@ -76,6 +79,7 @@ let state: AppState = {
   changesVersion: new Map(),
   notificationsSeen: new Map(),
   projects: new Map(),
+  todos: new Map(),
 };
 const listeners = new Set<() => void>();
 
@@ -136,7 +140,8 @@ const apply = (change: AppChange) => {
       const schedules = new Map([...state.schedules].filter(([, s]) => s.botId !== change.botId));
       const browserTabs = new Map([...state.browserTabs].filter(([, t]) => t.botId !== change.botId));
       const projects = new Map([...state.projects].filter(([, p]) => p.botId !== change.botId));
-      return setState({ ...state, bots, sessions, schedules, browserTabs, projects });
+      const todos = new Map([...state.todos].filter(([, items]) => items[0]?.botId !== change.botId));
+      return setState({ ...state, bots, sessions, schedules, browserTabs, projects, todos });
     }
     case "SessionUpserted":
       return setState({
@@ -146,7 +151,9 @@ const apply = (change: AppChange) => {
     case "SessionDeleted": {
       const sessions = new Map(state.sessions);
       sessions.delete(change.sessionId);
-      return setState({ ...state, sessions });
+      const todos = new Map(state.todos);
+      todos.delete(change.sessionId);
+      return setState({ ...state, sessions, todos });
     }
     case "BotUsageToday":
       return setState({ ...state, usageToday: new Map(state.usageToday).set(change.botId, change.usage) });
@@ -222,10 +229,15 @@ const applyProjects = (change: ProjectsChange) => {
   setState({ ...state, projects });
 };
 
+/** Applies one item of `todos.watch`: each (re)connection starts with every list. */
+const applyTodoChange = (change: TodosChange) => setState({ ...state, todos: applyTodos(state.todos, change) });
+
 /** Starts syncing app state; each (re)connection begins with a fresh snapshot. */
 export const startSync = () => {
   // Projects come on their own stream too (see ProjectsChange).
   const stopProjects = follow((client) => client["projects.watch"](), applyProjects);
+  // So do to-do lists (see TodosChange).
+  const stopTodos = follow((client) => client["todos.watch"](), applyTodoChange);
   // Provider accounts' plan limits come on their own stream (see AccountLimitsChange).
   const stopLimits = follow((client) => client["limits.watch"](), applyLimits);
   const stopApp = follow(
@@ -264,5 +276,6 @@ export const startSync = () => {
     stopApp();
     stopLimits();
     stopProjects();
+    stopTodos();
   };
 };

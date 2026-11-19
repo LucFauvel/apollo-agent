@@ -1,4 +1,4 @@
-import { invalidateChanges, rollBack, withOrder, withSeenMark } from "@apollo/client";
+import { applyTodos, invalidateChanges, rollBack, type TodoLists, withOrder, withSeenMark } from "@apollo/client";
 import type {
   AccountLimitsChange,
   AppChange,
@@ -14,6 +14,7 @@ import type {
   PullRequest,
   Session,
   SessionId,
+  TodosChange,
   UsageLimits,
 } from "@apollo/contracts";
 import * as Stream from "effect/Stream";
@@ -36,6 +37,8 @@ export interface AppState {
   readonly notificationsSeen: ReadonlyMap<string, number>;
   /** Every bot's projects (from `projects.watch`). */
   readonly projects: ReadonlyMap<ProjectId, Project>;
+  /** Each session's to-do list (from `todos.watch`). */
+  readonly todos: TodoLists;
   /** Each provider account's latest plan meters, keyed by `limitsAccount` (from `limits.watch`). */
   readonly accountLimits: ReadonlyMap<string, UsageLimits>;
   /** Bumped when a bot's memories changed: screens that list them refetch. */
@@ -54,6 +57,7 @@ const empty: AppState = {
   monitors: new Map(),
   notificationsSeen: new Map(),
   projects: new Map(),
+  todos: new Map(),
   accountLimits: new Map(),
   memoryVersion: new Map(),
   localModels: null,
@@ -120,6 +124,7 @@ const apply = (state: AppState, item: Incoming): AppState => {
         browserTabs: new Map([...state.browserTabs].filter(([, t]) => t.botId !== item.botId)),
         monitors: new Map([...state.monitors].filter(([, m]) => m.botId !== item.botId)),
         projects: new Map([...state.projects].filter(([, p]) => p.botId !== item.botId)),
+        todos: new Map([...state.todos].filter(([, items]) => items[0]?.botId !== item.botId)),
       };
     }
     case "LocalModelsChanged":
@@ -129,7 +134,9 @@ const apply = (state: AppState, item: Incoming): AppState => {
     case "SessionDeleted": {
       const sessions = new Map(state.sessions);
       sessions.delete(item.sessionId);
-      return { ...state, sessions, monitors: new Map([...state.monitors].filter(([, m]) => m.sessionId !== item.sessionId)) };
+      const todos = new Map(state.todos);
+      todos.delete(item.sessionId);
+      return { ...state, sessions, todos, monitors: new Map([...state.monitors].filter(([, m]) => m.sessionId !== item.sessionId)) };
     }
     default:
       return state;
@@ -185,8 +192,12 @@ export function AppStateProvider({ connection, pairing, children }: { connection
       ),
     [connection],
   );
-  // Projects and plan limits come on their own streams, so app.changes stays decodable by older builds.
+  // Projects, to-do lists and plan limits come on their own streams, so app.changes stays decodable by older builds.
   useEffect(() => connection.follow((client) => client["projects.watch"](), (change) => setState((s) => applyProjects(s, change))), [connection]);
+  useEffect(
+    () => connection.follow((client) => client["todos.watch"](), (change: TodosChange) => setState((s) => ({ ...s, todos: applyTodos(s.todos, change) }))),
+    [connection],
+  );
   useEffect(() => connection.follow((client) => client["limits.watch"](), (change) => setState((s) => applyLimits(s, change))), [connection]);
   const latest = useRef(state);
   latest.current = state;

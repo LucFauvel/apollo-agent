@@ -345,6 +345,28 @@ export const MIGRATIONS: ReadonlyArray<string> = [
   alter table sessions add column project_id text references projects(id) on delete set null;
   alter table memories add column project_id text references projects(id) on delete cascade;
   `,
+  // 24: each session's to-do list, kept by its agent and the user.
+  `
+  create table todos (
+    id text primary key,
+    session_id text not null references sessions(id) on delete cascade,
+    bot_id text not null,
+    text text not null,
+    done integer not null default 0,
+    added_by text not null,             -- 'agent' | 'user'
+    position integer not null,
+    created_at integer not null,
+    updated_at integer not null
+  );
+  create index todos_session on todos(session_id, position);
+  `,
+  // 25: what the user changed in a to-do list that its agent has not been told yet.
+  `
+  create table todo_notices (
+    session_id text primary key references sessions(id) on delete cascade,
+    changes text not null               -- JSON array of descriptions, oldest first
+  );
+  `,
 ];
 
 /**

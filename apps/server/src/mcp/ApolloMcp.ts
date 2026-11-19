@@ -30,6 +30,7 @@ import * as ChangeTools from "./ChangeTools.ts";
 import * as JobTools from "./JobTools.ts";
 import * as MonitorTools from "./MonitorTools.ts";
 import * as ProjectTools from "./ProjectTools.ts";
+import * as TodoTools from "./TodoTools.ts";
 import * as PullRequestTools from "./PullRequestTools.ts";
 import * as UserTools from "./UserTools.ts";
 import * as WorktreeTools from "./WorktreeTools.ts";
@@ -813,5 +814,6 @@ export const layer = McpServer.layerHttp({
     McpServer.toolkit(PullRequestTools.PullRequestToolkit).pipe(Layer.provide(PullRequestTools.handlers)),
     McpServer.toolkit(ProjectTools.ProjectToolkit).pipe(Layer.provide(ProjectTools.handlers)),
     McpServer.toolkit(ArtifactTools.ArtifactToolkit).pipe(Layer.provide(ArtifactTools.handlers)),
+    McpServer.toolkit(TodoTools.TodoToolkit).pipe(Layer.provide(TodoTools.handlers)),
   ),
 }).pipe(Layer.provide(authMiddleware));

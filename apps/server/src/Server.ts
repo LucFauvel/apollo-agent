@@ -30,6 +30,7 @@ import * as Jobs from "./jobs/Jobs.ts";
 import * as Monitors from "./monitors/Monitors.ts";
 import * as ProviderSettings from "./ProviderSettings.ts";
 import * as Projects from "./projects/Projects.ts";
+import * as Todos from "./todos/Todos.ts";
 import * as RpcHandlers from "./RpcHandlers.ts";
 import * as Scheduler from "./schedule/Scheduler.ts";
 import * as SessionManager from "./SessionManager.ts";
@@ -71,7 +72,7 @@ const layerCore = Compaction.layer.pipe(
   Layer.provideMerge(Layer.mergeAll(Secrets.layer, BotProposals.layer)),
   Layer.provideMerge(Accounts.layer),
   Layer.provideMerge(Browser.layer),
-  Layer.provideMerge(Layer.mergeAll(Scheduler.layer, Projects.layer)),
+  Layer.provideMerge(Layer.mergeAll(Scheduler.layer, Projects.layer, Todos.layer)),
   Layer.provideMerge(SessionManager.layer),
   Layer.provideMerge(SessionManager.layerProviders),
   Layer.provideMerge(Layer.mergeAll(LocalModels.layer, AgentClis.layer)),

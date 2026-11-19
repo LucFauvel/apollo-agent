@@ -49,6 +49,7 @@ import { BlobAvatar } from "../BlobAvatar.tsx";
 import { FileLinkContext, Markdown } from "../Markdown.tsx";
 import { ModelMenu } from "../ModelPicker.tsx";
 import { MonitorStrip } from "../MonitorStrip.tsx";
+import { TodoStrip, useTodos } from "../TodoStrip.tsx";
 import { ArtifactCard, LocalFileViewer, MessageAttachments, RecordingCard, VisualCard } from "../PageCards.tsx";
 import { ActivityGroup } from "../Activity.tsx";
 import { BrowserScreen, type Handoff } from "./BrowserScreen.tsx";
@@ -71,6 +72,7 @@ import {
   InfoIcon,
   AppWindowIcon,
   FolderKanbanIcon,
+  ListTodoIcon,
   HandIcon,
   KeyRoundIcon,
   LoaderIcon,
@@ -411,6 +413,9 @@ export function ChatScreen({
   const limits = session && bot ? state.accountLimits.get(limitsAccount(session.provider, bot)) : undefined;
   // The bot's projects, from the header or the session's own project.
   const [projectsOpen, setProjectsOpen] = useState<{ focus: ProjectId | null } | null>(null);
+  const [todosOpen, setTodosOpen] = useState(false);
+  const todos = useTodos(sessionId);
+  const openTodos = todos.filter((t) => !t.done).length;
   // Apollo's browser, live: opened from the header, or from a tab an agent handed over.
   const [browser, setBrowser] = useState<{ tabId?: string; handoff?: Handoff } | null>(null);
   const browserTabs = useMemo(() => {
@@ -470,6 +475,23 @@ export function ChatScreen({
             <AppWindowIcon size={19} color={colors.muted} />
           </Pressable>
         ) : null}
+        <Pressable
+          onPress={() => {
+            animateLayout();
+            setTodosOpen((o) => !o);
+          }}
+          hitSlop={8}
+          accessibilityLabel={todos.length > 0 ? `To-do list, ${openTodos} open` : "To-do list"}
+          accessibilityState={{ expanded: todosOpen }}
+          style={({ pressed }) => [styles.headerButton, pressed && { opacity: 0.6 }]}
+        >
+          <ListTodoIcon size={19} color={todosOpen ? colors.text : colors.muted} />
+          {openTodos > 0 ? (
+            <View style={[styles.prBadge, styles.todoBadge]}>
+              <Text style={styles.badgeCount}>{openTodos}</Text>
+            </View>
+          ) : null}
+        </Pressable>
         <Pressable
           onPress={() => setProjectsOpen({ focus: null })}
           hitSlop={8}
@@ -665,6 +687,7 @@ export function ChatScreen({
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {talking ? <ConversationBar session={session} onEnd={() => setTalking(false)} /> : null}
+      <TodoStrip sessionId={sessionId} open={todosOpen} onToggle={() => setTodosOpen((o) => !o)} />
       <MonitorStrip sessionId={sessionId} />
       {mentionMatches.length > 0 ? (
         // Like Discord: a list above the composer, the best match first.
@@ -1469,6 +1492,7 @@ const styles = StyleSheet.create({
     borderWidth: 2,
     borderColor: colors.bg,
   },
+  todoBadge: { backgroundColor: "#0ea5e9" },
   badgeCount: { color: "#fff", fontSize: 9, fontWeight: "700" },
   changesDot: { position: "absolute", top: 6, right: 6, width: 7, height: 7, borderRadius: 4, backgroundColor: "#fbbf24", borderWidth: 1.5, borderColor: colors.bg },
   peerCard: { borderRadius: 12, borderWidth: 1, borderColor: "rgba(39,39,42,0.8)", backgroundColor: "rgba(24,24,27,0.4)" },
