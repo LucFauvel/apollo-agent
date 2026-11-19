@@ -26,6 +26,11 @@ import * as Projects from "./Projects.ts";
 interface StartGate {
   wait: Promise<void>;
   started: number;
+  /** Closing a session's process waits on it; `closing` counts closes begun. */
+  close?: Promise<void>;
+  closing?: number;
+  /** How long a turn runs, so its change tracking has started when it ends. */
+  turnMs?: number;
 }
 
 /** A provider that records how each session was opened and ends each turn at once. */
@@ -37,11 +42,18 @@ const recording = (kind: ProviderKind, opened: Array<ProviderSessionOptions>, ga
       gate.started++;
       yield* Effect.promise(() => gate.wait);
       opened.push(options);
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(() => {
+          gate.closing = (gate.closing ?? 0) + 1;
+          return gate.close ?? Promise.resolve();
+        }),
+      );
       const agent = (event: AgentEvent) => emit({ _tag: "Event", event });
       return {
         send: () =>
           Effect.gen(function* () {
             yield* agent({ _tag: "TurnStarted" });
+            if (gate.turnMs) yield* Effect.sleep(gate.turnMs);
             yield* agent({ _tag: "TurnCompleted", outcome: "completed", error: null });
           }),
         interrupt: Effect.void,
@@ -633,6 +645,53 @@ describe("project leads", () => {
     }).pipe(Effect.provide(f.layer));
   });
 
+  it.live("respect an orchestrator's choice not to hear from them", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { projects, store, bot } = yield* setup(f.cwd);
+      yield* projects.create({ botId: bot.id, name: "Send", summary: "" });
+      const main = { sessionId: bot.mainSessionId, botId: bot.id, role: "main" as const };
+      const spawned = yield* call(main, "apollo_spawn_session", {
+        title: "Send lead",
+        prompt: "plan",
+        project: "Send",
+        lead: true,
+        notifyOnCompletion: false,
+      });
+      expect(spawned.failed).toBe(false);
+      const lead = yield* store.getSession(spawned.result.id as SessionId);
+      expect(lead.parentSessionId).toBe(bot.mainSessionId);
+      expect(yield* store.notifiesParent(lead.id)).toBe(false);
+    }).pipe(Effect.provide(withTools(f)));
+  });
+
+  it.live("are never deleted for storage, nor chosen while being deleted", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, projects, store, bot } = yield* setup(f.cwd);
+      const send = yield* projects.create({ botId: bot.id, name: "Send", summary: "" });
+      const lead = yield* manager.createSession({ botId: bot.id, title: "l", provider: { provider: "codex" }, projectId: send.id });
+      yield* projects.update({ projectId: send.id, leadSessionId: lead.id });
+      expect(yield* manager.evictUnlessLead(lead.id)).toBe(false);
+      expect((yield* store.getSession(lead.id)).id).toBe(lead.id);
+
+      // Chosen for deletion, it stays out of reach until it is gone.
+      const other = yield* manager.createSession({ botId: bot.id, title: "o", provider: { provider: "codex" }, projectId: send.id, prompt: "hi" });
+      yield* until(() => f.opened.length >= 1);
+      yield* until(() => manager.isLive(other.id).pipe(Effect.runSync));
+      let release!: () => void;
+      f.gate.close = new Promise((resolve) => (release = resolve));
+      const closesBefore = f.gate.closing ?? 0;
+      const evicting = yield* manager.evictUnlessLead(other.id).pipe(Effect.forkChild({ startImmediately: true }));
+      yield* until(() => (f.gate.closing ?? 0) > closesBefore);
+      const refused = yield* Effect.flip(projects.update({ projectId: send.id, leadSessionId: other.id }));
+      expect(refused.message).toContain("being deleted");
+      release();
+      expect(yield* Fiber.join(evicting)).toBe(true);
+      expect((yield* projects.get(send.id)).leadSessionId).toBe(lead.id);
+    }).pipe(Effect.provide(f.layer));
+  });
+
   it.live("are claimed by one session at a time", () => {
     const f = fixture();
     return Effect.gen(function* () {
@@ -698,5 +757,45 @@ describe.skipIf(process.platform === "win32")("two leads spawned at once", () =>
       expect(inside.map((s) => s.id)).toEqual([won[0]!.result.id]);
       expect(worktrees(repo)).toBe(2);
     }).pipe(Effect.provide(layer));
+  }, 20_000);
+});
+
+/** A repository whose snapshots (`git add`) take `seconds` for each changed file. */
+const slowSnapshots = (dir: string, seconds: number) => {
+  const repo = join(dir, "slow-snapshots");
+  mkdirSync(repo);
+  execSync(
+    `git init -q -b main && git config filter.slow.clean "sleep ${seconds}; cat" && echo "* filter=slow" > .gitattributes && echo x > file && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init`,
+    { cwd: repo },
+  );
+  return repo;
+};
+
+describe.skipIf(process.platform === "win32")("a session made lead while its turn's changes are tracked", () => {
+  it.live("reports that turn to the orchestrator", () => {
+    const f = fixture();
+    const repo = slowSnapshots(f.dir, 1);
+    return Effect.gen(function* () {
+      const { manager, projects, store, bot } = yield* setup(f.cwd);
+      const send = yield* projects.create({ botId: bot.id, name: "Send", summary: "", cwd: repo });
+      const worker = yield* manager.createSession({ botId: bot.id, title: "w", provider: { provider: "codex" }, projectId: send.id });
+      expect(worker.parentSessionId).toBeNull();
+      f.gate.turnMs = 1500;
+      yield* manager.send(worker.id, "work", "user").pipe(Effect.forkChild({ startImmediately: true }));
+      // The turn has ended (recorded) but its changes are still being collected.
+      yield* Effect.promise(async () => {
+        for (let i = 0; i < 500; i++) {
+          const s = await Effect.runPromise(store.getSession(worker.id));
+          if (s.completedTurns === 1) {
+            if (s.status === "idle") throw new Error("change tracking ended before the promotion");
+            return;
+          }
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        throw new Error("the turn did not end");
+      });
+      yield* projects.update({ projectId: send.id, leadSessionId: worker.id });
+      yield* until(() => f.opened.some((o) => o.instructions.includes("## Your role: orchestrator")), 10_000);
+    }).pipe(Effect.provide(f.layer));
   }, 20_000);
 });

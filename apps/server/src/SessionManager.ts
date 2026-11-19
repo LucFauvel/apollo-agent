@@ -215,6 +215,13 @@ const make = Effect.gen(function* () {
   const tokens = new Map<string, SessionId>();
   const locks = new Map<SessionId, Semaphore.Semaphore>();
 
+  /**
+   * Project leads are chosen under this lock, and storage eviction checks a session is no
+   * lead under it too; a session being evicted cannot become a lead until it is gone.
+   */
+  const leadLock = Semaphore.makeUnsafe(1);
+  const evicting = new Set<SessionId>();
+
   const lockFor = (id: SessionId) => {
     let lock = locks.get(id);
     if (!lock) {
@@ -730,7 +737,11 @@ const make = Effect.gen(function* () {
         return;
       }
 
-      if (session.parentSessionId !== null && (yield* store.notifiesParent(id))) {
+      // Where it reports is read now: change tracking can take a while, and the session may
+      // have been made a project's lead (reporting to the orchestrator) meanwhile.
+      const routing = yield* store.getSession(id).pipe(Effect.option);
+      const parentId = Option.isSome(routing) ? routing.value.parentSessionId : null;
+      if (parentId !== null && (yield* store.notifiesParent(id))) {
         const report = [
           `[Apollo] Worker session "${session.title}" (${session.id}, ${session.provider}) finished a turn: ${event.outcome}.`,
           event.error ? `Error: ${event.error}` : null,
@@ -739,7 +750,6 @@ const make = Effect.gen(function* () {
         ]
           .filter((line) => line !== null)
           .join("\n");
-        const parentId = session.parentSessionId;
         yield* background(
           send(parentId, report, "system").pipe(
             // Paused bots hold reports back; say so where the user will look.
@@ -1936,6 +1946,38 @@ const make = Effect.gen(function* () {
 
     /** Whether the session has a running provider process. */
     isLive: (id: SessionId) => Effect.sync(() => live.has(id)),
+
+    /** Runs a change of project leads: no eviction decides meanwhile (see `evictUnlessLead`). */
+    withLeadLock: <A, E, R>(effect: Effect.Effect<A, E, R>) => Semaphore.withPermit(leadLock, effect),
+    /** Being deleted by storage compaction: it cannot become a project's lead. */
+    isEvicting: (id: SessionId) => Effect.sync(() => evicting.has(id)),
+    /**
+     * Deletes a session for storage, unless it is a project's lead. Once it is chosen for
+     * deletion, it cannot be made a lead until the deletion ends. True when it was deleted.
+     */
+    evictUnlessLead: (id: SessionId) =>
+      Effect.gen(function* () {
+        const chosen = yield* Semaphore.withPermit(
+          leadLock,
+          Effect.gen(function* () {
+            const session = yield* store.getSession(id).pipe(Effect.option);
+            if (Option.isNone(session)) return false;
+            const projectId = session.value.projectId;
+            if (projectId) {
+              const project = yield* store.getProject(projectId).pipe(Effect.option);
+              if (Option.isSome(project) && project.value.leadSessionId === id) return false;
+            }
+            evicting.add(id);
+            return true;
+          }),
+        );
+        if (!chosen) return false;
+        return yield* removeSession(id).pipe(
+          Effect.as(true),
+          Effect.catch(() => Effect.succeed(false)),
+          Effect.ensuring(Effect.sync(() => evicting.delete(id))),
+        );
+      }),
 
     /** Resolves an MCP bearer token to the session it was issued to. */
     resolveToken: (token: string) => Effect.sync(() => tokens.get(token)),

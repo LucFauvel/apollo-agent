@@ -158,9 +158,11 @@ const make = Effect.gen(function* () {
     });
 
   const deleteSessions = (ids: ReadonlyArray<SessionId>) =>
-    Effect.forEach(ids, (id) => manager.deleteSession(id).pipe(Effect.ignore), { discard: true }).pipe(
-      Effect.as(ids.length),
-    );
+    Effect.gen(function* () {
+      let deleted = 0;
+      for (const id of ids) if (yield* manager.evictUnlessLead(id)) deleted++;
+      return deleted;
+    });
 
   const compact = Effect.gen(function* () {
     const now = Date.now();

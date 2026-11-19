@@ -18,7 +18,6 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
-import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { AppSettings } from "../AppSettings.ts";
 import { SessionManager } from "../SessionManager.ts";
@@ -128,26 +127,29 @@ const make = Effect.gen(function* () {
       return project;
     });
 
-  /** Project writes read the project and write it whole: one at a time, so none undoes another. */
-  const writing = Semaphore.makeUnsafe(1);
+  /**
+   * Project writes read the project and write it whole: one at a time, so none undoes another.
+   * The lock is the manager's lead lock, so storage eviction never deletes a new lead.
+   */
+  const locked = <A, E, R>(effect: Effect.Effect<A, E, R>) => manager.withLeadLock(effect);
 
   /**
    * A new lead reports its turns to the orchestrator, which hands it the project's work: a
    * session the user started has no parent, and a lead's own workers report to it instead.
+   * One the orchestrator started keeps its own choice (`notifyOnCompletion: false` stays off).
    */
   const reportToOrchestrator = (sessionId: SessionId) =>
     Effect.gen(function* () {
       const session = yield* store.getSession(sessionId);
       const bot = yield* store.getBot(session.botId);
-      if (session.parentSessionId === bot.mainSessionId && (yield* store.notifiesParent(sessionId))) return;
+      if (session.parentSessionId === bot.mainSessionId) return;
       yield* manager.publish({ _tag: "SessionUpserted", session: yield* store.reportTo(sessionId, bot.mainSessionId) });
     });
 
   /** `onlyIfNoLead`: refused when the project already has a lead (checked with the write). */
   const update = (input: UpdateProjectInput, options: { readonly onlyIfNoLead?: boolean } = {}) =>
     Effect.gen(function* () {
-      const { current, project } = yield* Semaphore.withPermit(
-        writing,
+      const { current, project } = yield* locked(
         Effect.gen(function* () {
           const current = yield* store.getProject(input.projectId);
           if (input.context !== undefined && input.expectedContext !== undefined && input.expectedContext.trim() !== current.context) {
@@ -169,6 +171,7 @@ const make = Effect.gen(function* () {
           if (lead !== null && lead !== previousLead) {
             const problem = leadProblem(current, yield* Effect.option(store.getSession(lead)));
             if (problem) return yield* invalid(problem);
+            if (yield* manager.isEvicting(lead)) return yield* invalid("that session is being deleted to free storage");
           }
           const project = yield* store.updateProject({
             ...current,
@@ -226,8 +229,7 @@ const make = Effect.gen(function* () {
   /** Its lead's session went: the project has no lead. */
   const leadGone = (sessionId: SessionId) =>
     Effect.gen(function* () {
-      const cleared = yield* Semaphore.withPermit(
-        writing,
+      const cleared = yield* locked(
         Effect.gen(function* () {
           const saved: Array<Project> = [];
           for (const project of yield* store.listProjects()) {
