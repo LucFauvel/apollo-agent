@@ -354,10 +354,40 @@ const make = Effect.gen(function* () {
       return { commentId: done.id, status: done.status, replyUrl: posted.url, stillToAddress: waiting };
     });
 
+  /**
+   * Sends the agent `lines` plus the new comments it has not been told about yet, this poll's
+   * or an earlier one's whose message it could not take (its bot was paused, say). Those stay
+   * undelivered until a message goes through.
+   */
+  const deliver = (sessionId: SessionId, url: string, pr: PullRequest, lines: ReadonlyArray<string>) =>
+    Effect.gen(function* () {
+      const undelivered = new Set(undeliveredOf(sessionId, url));
+      const pending = (loadReviews(sessionId, url)?.comments ?? []).filter(
+        (c) => undelivered.has(c.id) && (c.status === "queued" || c.status === "manual"),
+      );
+      const all = [...lines, ...newCommentLines(pending)];
+      if (all.length === 0) {
+        // Replied to or turned into earlier ones meanwhile: nothing left to tell.
+        if (undelivered.size > 0) setUndelivered(sessionId, url, []);
+        return;
+      }
+      const delivered = yield* manager.send(sessionId, [header(pr), ...all].join("\n"), "system").pipe(
+        Effect.as(true),
+        Effect.catch((error) => Effect.logWarning(`could not report a change to ${url}; trying again on the next poll`, error).pipe(Effect.as(false))),
+      );
+      if (delivered || pending.length === 0) {
+        setUndelivered(sessionId, url, undeliveredOf(sessionId, url).filter((id) => !undelivered.has(id)));
+      }
+    });
+
   const pollOne = (row: { session_id: string; url: string; data: string; digest: string }) =>
     Effect.gen(function* () {
       const known = JSON.parse(row.data) as PullRequest;
-      if (!known.watched) return;
+      if (!known.watched) {
+        // Merged or closed (or unwatched) before the agent could be told about its last comments.
+        if (undeliveredOf(known.sessionId, row.url).length > 0) yield* deliver(known.sessionId, row.url, known, []);
+        return;
+      }
       const fetched = yield* github.view(row.url).pipe(Effect.option);
       if (fetched._tag === "None") return;
       const now = summarize(known.sessionId, fetched.value, true);
@@ -389,29 +419,10 @@ const make = Effect.gen(function* () {
         tracked = true;
       }
 
-      // New comments the agent has not been told about yet, this time or on an earlier poll
-      // whose message it could not take (its bot was paused, say).
-      const undelivered = new Set(undeliveredOf(known.sessionId, row.url));
-      const pending = (loadReviews(known.sessionId, row.url)?.comments ?? []).filter(
-        (c) => undelivered.has(c.id) && (c.status === "queued" || c.status === "manual"),
-      );
       const lines = changeLines(row.digest, now, !tracked).map((l) => `- ${l}`);
-      const all = [...lines, ...newCommentLines(pending)];
       save(pr, now.digest);
       if (row.digest !== now.digest || done) yield* publish(pr);
-      if (all.length > 0) {
-        const delivered = yield* manager.send(known.sessionId, [header(pr), ...all].join("\n"), "system").pipe(
-          Effect.as(true),
-          Effect.catch((error) => Effect.logWarning(`could not report a change to ${row.url}; trying again on the next poll`, error).pipe(Effect.as(false))),
-        );
-        if (delivered || pending.length === 0) {
-          const sent = new Set(pending.map((c) => c.id));
-          setUndelivered(known.sessionId, row.url, undeliveredOf(known.sessionId, row.url).filter((id) => !sent.has(id) && !undelivered.has(id)));
-        }
-      } else if (undelivered.size > 0) {
-        // Replied to or turned into earlier ones meanwhile: nothing left to tell.
-        setUndelivered(known.sessionId, row.url, []);
-      }
+      yield* deliver(known.sessionId, row.url, pr, lines);
     });
 
   const poll = Effect.suspend(() => Effect.forEach(rows(), pollOne, { discard: true })).pipe(

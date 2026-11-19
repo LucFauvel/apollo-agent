@@ -27,11 +27,12 @@ const fakeGitHub = () => {
     nextId: 1000,
     /** Runs while a comments fetch is in flight, before it returns. */
     duringFetch: null as null | (() => Promise<unknown>),
+    prState: "OPEN",
   };
   const view = (): GhPullRequest => ({
     number: 7,
     title: "Add export",
-    state: "OPEN",
+    state: state.prState,
     isDraft: false,
     url: URL,
     reviewDecision: null,
@@ -380,6 +381,30 @@ describe("review comments", () => {
       });
       yield* prs.reply(caller, { url: URL, commentId: `inline:${followUp.id}`, outcome: "addressed", body: "Switched to a set.", commit: "def5678" });
       expect(f.github.state.replies.at(-1)!.to).toEqual({ kind: "inline", id: root.id });
+    }).pipe(Effect.provide(f.layer));
+  });
+
+  it.live("still tells the agent about comments it missed while paused when the PR closed meanwhile", () => {
+    const f = fixture();
+    return Effect.gen(function* () {
+      const { manager, prs, bot, caller } = yield* setup(f.cwd);
+      yield* prs.link(caller, URL, true);
+      yield* manager.stopBot(bot.id);
+      const ask = f.github.add({ kind: "inline", body: "Fix the typo" });
+      yield* prs.poll;
+      f.github.state.prState = "MERGED";
+      yield* prs.poll;
+      expect(f.sent).toEqual([]);
+      expect((yield* prs.list).find((pr) => pr.url === URL)?.watched).toBe(false);
+
+      yield* manager.resumeBot(bot.id);
+      yield* prs.poll;
+      yield* until(() => f.sent.length === 1);
+      expect(f.sent[0]).toContain(`[inline:${ask.id}] ada: Fix the typo`);
+
+      yield* prs.poll;
+      yield* Effect.sleep("50 millis");
+      expect(f.sent).toHaveLength(1);
     }).pipe(Effect.provide(f.layer));
   });
 });
